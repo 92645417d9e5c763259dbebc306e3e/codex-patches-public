@@ -1,0 +1,385 @@
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_spec.rs b/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
+index 8aad428411..773c3eaf2a 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
+@@ -661,7 +661,7 @@ fn spawn_agent_tool_description(
+         {tool_description}
+ This spawn_agent tool provides you access to sub-agents that inherit your current model by default. Do not set the `model` field unless the user explicitly asks for a different model or there is a clear task-specific reason. You should follow the rules and guidelines below to use this tool.
+ 
+-Only use `spawn_agent` if and only if the user explicitly asks for sub-agents, delegation, or parallel agent work.
++Only use `spawn_agent` if and only if the user explicitly asks for sub-agents, delegation, or parallel agent work, or the active skill/project instructions explicitly require delegation.
+ Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.
+ {agent_role_usage_hint}
+ 
+@@ -716,7 +716,7 @@ fn spawn_agent_tool_description_v2(
+         {agent_role_guidance}
+         Spawns an agent to work on the specified task. If your current task is `/root/task1` and you spawn_agent with task_name "task_3" the agent will have canonical task name `/root/task1/task_3`.
+ You are then able to refer to this agent as `task_3` or `/root/task1/task_3` interchangeably. However an agent `/root/task2/task_3` would only be able to communicate with this agent via its canonical name `/root/task1/task_3`.
+-The spawned agent will have the same tools as you and the ability to spawn its own subagents.
++The spawned agent will have the same tools as you, subject to active instructions and packet boundaries.
+ {SPAWN_AGENT_INHERITED_MODEL_GUIDANCE}
+ It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
+ The new agent's canonical task name will be provided to it along with the message.
+diff --git a/codex-rs/core/tests/suite/spawn_agent_description.rs b/codex-rs/core/tests/suite/spawn_agent_description.rs
+index fbeb90fba5..6bd5d45105 100644
+--- a/codex-rs/core/tests/suite/spawn_agent_description.rs
++++ b/codex-rs/core/tests/suite/spawn_agent_description.rs
+@@ -207,7 +207,7 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
+     );
+     assert!(
+         description.contains(
+-            "Only use `spawn_agent` if and only if the user explicitly asks for sub-agents, delegation, or parallel agent work."
++            "Only use `spawn_agent` if and only if the user explicitly asks for sub-agents, delegation, or parallel agent work, or the active skill/project instructions explicitly require delegation."
+         ),
+         "expected explicit authorization rule in spawn_agent description: {description:?}"
+     );
+diff --git a/codex-rs/tui/src/app/config_persistence.rs b/codex-rs/tui/src/app/config_persistence.rs
+index e83662c2a2..e9f8471274 100644
+--- a/codex-rs/tui/src/app/config_persistence.rs
++++ b/codex-rs/tui/src/app/config_persistence.rs
+@@ -687,24 +687,6 @@ impl App {
+             .add_info_message("Reset local memories.".to_string(), /*hint*/ None);
+     }
+ 
+-    pub(super) fn reasoning_label(reasoning_effort: Option<ReasoningEffortConfig>) -> &'static str {
+-        match reasoning_effort {
+-            Some(ReasoningEffortConfig::Minimal) => "minimal",
+-            Some(ReasoningEffortConfig::Low) => "low",
+-            Some(ReasoningEffortConfig::Medium) => "medium",
+-            Some(ReasoningEffortConfig::High) => "high",
+-            Some(ReasoningEffortConfig::XHigh) => "xhigh",
+-            None | Some(ReasoningEffortConfig::None) => "default",
+-        }
+-    }
+-
+-    pub(super) fn reasoning_label_for(
+-        model: &str,
+-        reasoning_effort: Option<ReasoningEffortConfig>,
+-    ) -> Option<&'static str> {
+-        (!model.starts_with("codex-auto-")).then(|| Self::reasoning_label(reasoning_effort))
+-    }
+-
+     pub(crate) fn token_usage(&self) -> crate::token_usage::TokenUsage {
+         self.chat_widget.token_usage()
+     }
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index d67b3b5162..170e41682b 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -1340,12 +1340,6 @@ impl App {
+                             .map(|selected_effort| selected_effort.to_string())
+                             .unwrap_or_else(|| "default".to_string());
+                         tracing::info!("Selected model: {model}, Selected effort: {effort_label}");
+-                        let mut message = format!("Model changed to {model}");
+-                        if let Some(label) = Self::reasoning_label_for(&model, effort) {
+-                            message.push(' ');
+-                            message.push_str(label);
+-                        }
+-                        self.chat_widget.add_info_message(message, /*hint*/ None);
+                     }
+                     Err(err) => {
+                         tracing::error!(
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 86bdcaf93f..b3c2911cfa 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -561,6 +561,7 @@ pub(crate) struct ChatWidget {
+     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
+     refreshing_status_outputs: Vec<(u64, StatusHistoryHandle)>,
+     next_status_refresh_request_id: u64,
++    active_turn_model_context: Option<ActiveTurnModelContext>,
+     plan_type: Option<PlanType>,
+     codex_rate_limit_reached_type: Option<RateLimitReachedType>,
+     rate_limit_warnings: RateLimitWarningState,
+@@ -793,6 +794,12 @@ enum PlanModeNudgeScope {
+     Thread(ThreadId),
+ }
+ 
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub(crate) struct ActiveTurnModelContext {
++    pub(crate) model: String,
++    pub(crate) reasoning_effort: Option<ReasoningEffortConfig>,
++}
++
+ #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+ pub(crate) enum TurnAbortReason {
+     Interrupted,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 0baa7860ab..536fa467d3 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -124,6 +124,7 @@ impl ChatWidget {
+             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
+             refreshing_status_outputs: Vec::new(),
+             next_status_refresh_request_id: 0,
++            active_turn_model_context: None,
+             plan_type: initial_plan_type,
+             codex_rate_limit_reached_type: None,
+             rate_limit_warnings: RateLimitWarningState::default(),
+diff --git a/codex-rs/tui/src/chatwidget/input_submission.rs b/codex-rs/tui/src/chatwidget/input_submission.rs
+index b0a07d3686..6f26d4e98d 100644
+--- a/codex-rs/tui/src/chatwidget/input_submission.rs
++++ b/codex-rs/tui/src/chatwidget/input_submission.rs
+@@ -349,13 +349,15 @@ impl ChatWidget {
+             .filter(|_| self.current_model_supports_personality());
+         let service_tier = self.service_tier_update_for_core();
+         let active_permission_profile = self.config.permissions.active_permission_profile();
++        let submitted_model = effective_mode.model().to_string();
++        let submitted_effort = effective_mode.reasoning_effort();
+         let op = AppCommand::user_turn(
+             items,
+             self.config.cwd.to_path_buf(),
+             AskForApproval::from(self.config.permissions.approval_policy.value()),
+             active_permission_profile,
+-            effective_mode.model().to_string(),
+-            effective_mode.reasoning_effort(),
++            submitted_model.clone(),
++            submitted_effort,
+             /*summary*/ None,
+             service_tier,
+             /*final_output_json_schema*/ None,
+@@ -368,6 +370,11 @@ impl ChatWidget {
+             return (false, None);
+         }
+         if render_in_history {
++            self.active_turn_model_context = Some(ActiveTurnModelContext {
++                model: submitted_model,
++                reasoning_effort: submitted_effort,
++            });
++            self.refresh_model_dependent_surfaces();
+             self.input_queue.user_turn_pending_start = true;
+         }
+ 
+diff --git a/codex-rs/tui/src/chatwidget/session_flow.rs b/codex-rs/tui/src/chatwidget/session_flow.rs
+index 01a6b7d578..7b2ccbd712 100644
+--- a/codex-rs/tui/src/chatwidget/session_flow.rs
++++ b/codex-rs/tui/src/chatwidget/session_flow.rs
+@@ -27,6 +27,7 @@ impl ChatWidget {
+         }
+         self.refresh_plan_mode_nudge();
+         self.turn_lifecycle.reset_thread();
++        self.active_turn_model_context = None;
+         self.thread_name = session.thread_name.clone();
+         self.current_goal_status_indicator = None;
+         self.current_goal_status = None;
+diff --git a/codex-rs/tui/src/chatwidget/settings.rs b/codex-rs/tui/src/chatwidget/settings.rs
+index 45dbc362e9..0488ea6426 100644
+--- a/codex-rs/tui/src/chatwidget/settings.rs
++++ b/codex-rs/tui/src/chatwidget/settings.rs
+@@ -708,9 +708,6 @@ impl ChatWidget {
+         if !self.collaboration_modes_enabled() {
+             return;
+         }
+-        let previous_mode = self.active_mode_kind();
+-        let previous_model = self.current_model().to_string();
+-        let previous_effort = self.effective_reasoning_effort();
+         if mask.mode == Some(ModeKind::Plan)
+             && let Some(effort) = self.config.plan_mode_reasoning_effort
+         {
+@@ -724,30 +721,6 @@ impl ChatWidget {
+         self.update_collaboration_mode_indicator();
+         self.refresh_plan_mode_nudge();
+         self.refresh_model_dependent_surfaces();
+-        let next_mode = self.active_mode_kind();
+-        let next_model = self.current_model();
+-        let next_effort = self.effective_reasoning_effort();
+-        if previous_mode != next_mode
+-            && (previous_model != next_model || previous_effort != next_effort)
+-        {
+-            let mut message = format!("Model changed to {next_model}");
+-            if !next_model.starts_with("codex-auto-") {
+-                let reasoning_label = match next_effort {
+-                    Some(ReasoningEffortConfig::Minimal) => "minimal",
+-                    Some(ReasoningEffortConfig::Low) => "low",
+-                    Some(ReasoningEffortConfig::Medium) => "medium",
+-                    Some(ReasoningEffortConfig::High) => "high",
+-                    Some(ReasoningEffortConfig::XHigh) => "xhigh",
+-                    None | Some(ReasoningEffortConfig::None) => "default",
+-                };
+-                message.push(' ');
+-                message.push_str(reasoning_label);
+-            }
+-            message.push_str(" for ");
+-            message.push_str(next_mode.display_name());
+-            message.push_str(" mode.");
+-            self.add_info_message(message, /*hint*/ None);
+-        }
+         self.request_redraw();
+     }
+ 
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index e1583c8dc1..e830778ffa 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -831,7 +831,9 @@ impl ChatWidget {
+     }
+ 
+     fn model_with_reasoning_display_name(&self) -> String {
+-        let label = Self::status_line_reasoning_effort_label(self.effective_reasoning_effort());
++        let model = self.status_line_model();
++        let effort = self.status_line_reasoning_effort();
++        let label = Self::status_line_reasoning_effort_label(effort);
+         let service_tier_label = self
+             .current_service_tier()
+             .and_then(|service_tier| {
+@@ -843,18 +845,17 @@ impl ChatWidget {
+             .filter(|_| self.has_chatgpt_account)
+             .map(|tier| format!(" {tier}"))
+             .unwrap_or_default();
+-        format!("{} {label}{service_tier_label}", self.model_display_name())
++        format!("{model} {label}{service_tier_label}")
+     }
+ 
+     fn model_display_line(&self) -> Line<'static> {
+-        Line::from(Span::styled(
+-            self.model_display_name().to_string(),
+-            model_style(self.current_model()),
+-        ))
++        let model = self.status_line_model();
++        Line::from(Span::styled(model.to_string(), model_style(model)))
+     }
+ 
+     fn model_with_reasoning_display_line(&self) -> Line<'static> {
+-        let effort = self.effective_reasoning_effort();
++        let model = self.status_line_model();
++        let effort = self.status_line_reasoning_effort();
+         let label = Self::status_line_reasoning_effort_label(effort);
+         let service_tier_label = self
+             .current_service_tier()
+@@ -868,10 +869,7 @@ impl ChatWidget {
+             .map(|tier| format!(" {tier}"))
+             .unwrap_or_default();
+         let mut line = Line::from(vec![
+-            Span::styled(
+-                self.model_display_name().to_string(),
+-                model_style(self.current_model()),
+-            ),
++            Span::styled(model.to_string(), model_style(model)),
+             " ".into(),
+         ]);
+         line.extend(Self::status_line_reasoning_effort_line(label, effort).spans);
+@@ -879,6 +877,20 @@ impl ChatWidget {
+         line
+     }
+ 
++    fn status_line_model(&self) -> &str {
++        self.active_turn_model_context
++            .as_ref()
++            .map(|context| context.model.as_str())
++            .unwrap_or_else(|| self.model_display_name())
++    }
++
++    fn status_line_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
++        self.active_turn_model_context
++            .as_ref()
++            .map(|context| context.reasoning_effort)
++            .unwrap_or_else(|| self.effective_reasoning_effort())
++    }
++
+     fn status_line_reasoning_effort_line(
+         label: &'static str,
+         effort: Option<ReasoningEffortConfig>,
+diff --git a/codex-rs/tui/src/chatwidget/tests/plan_mode.rs b/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
+index c96e8c4c5b..1511eb3403 100644
+--- a/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
++++ b/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
+@@ -1321,7 +1321,7 @@ async fn collab_mode_shift_tab_cycles_only_when_idle() {
+ }
+ 
+ #[tokio::test]
+-async fn mode_switch_surfaces_model_change_notification_when_effective_model_changes() {
++async fn mode_switch_does_not_surface_model_change_notification_when_effective_model_changes() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+     chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+     let default_model = chat.current_model().to_string();
+@@ -1338,8 +1338,8 @@ async fn mode_switch_surfaces_model_change_notification_when_effective_model_cha
+         .collect::<Vec<_>>()
+         .join("\n");
+     assert!(
+-        plan_messages.contains("Model changed to gpt-5.4-mini medium for Plan mode."),
+-        "expected Plan-mode model switch notice, got: {plan_messages:?}"
++        !plan_messages.contains("Model changed to"),
++        "did not expect Plan-mode model switch notice, got: {plan_messages:?}"
+     );
+ 
+     let default_mask = collaboration_modes::default_mask(chat.model_catalog.as_ref())
+@@ -1354,13 +1354,13 @@ async fn mode_switch_surfaces_model_change_notification_when_effective_model_cha
+     let expected_default_message =
+         format!("Model changed to {default_model} default for Default mode.");
+     assert!(
+-        default_messages.contains(&expected_default_message),
+-        "expected Default-mode model switch notice, got: {default_messages:?}"
++        !default_messages.contains(&expected_default_message),
++        "did not expect Default-mode model switch notice, got: {default_messages:?}"
+     );
+ }
+ 
+ #[tokio::test]
+-async fn mode_switch_surfaces_reasoning_change_notification_when_model_stays_same() {
++async fn mode_switch_does_not_surface_reasoning_change_notification_when_model_stays_same() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+     chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+     chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
+@@ -1375,8 +1375,8 @@ async fn mode_switch_surfaces_reasoning_change_notification_when_model_stays_sam
+         .collect::<Vec<_>>()
+         .join("\n");
+     assert!(
+-        plan_messages.contains("Model changed to gpt-5.3-codex medium for Plan mode."),
+-        "expected reasoning-change notice in Plan mode, got: {plan_messages:?}"
++        !plan_messages.contains("Model changed to"),
++        "did not expect reasoning-change notice in Plan mode, got: {plan_messages:?}"
+     );
+ }
+ 
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index 77f3cb2e28..66c0675b77 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -2281,6 +2281,27 @@ async fn status_line_model_with_reasoning_updates_on_mode_switch_without_manual_
+     );
+ }
+ 
++#[tokio::test]
++async fn status_line_model_with_reasoning_uses_submitted_turn_context_while_active() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("deepseek-v4")).await;
++    chat.thread_id = Some(ThreadId::new());
++    chat.config.tui_status_line = Some(vec!["model-with-reasoning".to_string()]);
++    chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
++
++    chat.submit_user_message(UserMessage::from("run with deepseek"));
++    chat.set_model("gpt-5.4");
++    chat.set_reasoning_effort(Some(ReasoningEffortConfig::Low));
++
++    assert_eq!(
++        status_line_text(&chat),
++        Some("deepseek-v4 high".to_string())
++    );
++
++    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
++
++    assert_eq!(status_line_text(&chat), Some("gpt-5.4 low".to_string()));
++}
++
+ #[tokio::test]
+ async fn status_line_model_with_reasoning_plan_mode_footer_snapshot() {
+     use ratatui::Terminal;
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+index b105cb612e..9f95be7143 100644
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -53,6 +53,7 @@ impl ChatWidget {
+ 
+     pub(super) fn on_task_started_at(&mut self, started_at: Option<Instant>) {
+         self.input_queue.user_turn_pending_start = false;
++        self.active_turn_model_context = None;
+         let started_at = started_at.unwrap_or_else(Instant::now);
+         self.turn_lifecycle.start(started_at);
+         self.transcript.reset_turn_flags();
+@@ -166,6 +167,7 @@ impl ChatWidget {
+         // Mark task stopped and request redraw now that all content is in history.
+         self.status_state.pending_status_indicator_restore = false;
+         self.input_queue.user_turn_pending_start = false;
++        self.active_turn_model_context = None;
+         self.turn_lifecycle.finish();
+         self.update_task_running_state();
+         self.running_commands.clear();

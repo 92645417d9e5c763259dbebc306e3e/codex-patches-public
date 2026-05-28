@@ -1,0 +1,164 @@
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index 9c2533b9af..9b9296d6b3 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -9,6 +9,7 @@ mod apply_patch;
+ mod apps;
+ mod client;
+ mod client_common;
++pub mod mimo_side_route;
+ mod realtime_context;
+ mod realtime_conversation;
+ mod realtime_prompt;
+diff --git a/codex-rs/core/src/mimo_side_route.rs b/codex-rs/core/src/mimo_side_route.rs
+new file mode 100644
+index 0000000000..c9cbb9a1f5
+--- /dev/null
++++ b/codex-rs/core/src/mimo_side_route.rs
+@@ -0,0 +1,146 @@
++use std::fs;
++use std::path::Path;
++use std::sync::Arc;
++use std::time::Duration;
++
++use codex_api::AuthProvider;
++use codex_api::Provider;
++use codex_api::RetryConfig;
++use codex_model_provider::BearerAuthProvider;
++use codex_protocol::error::CodexErr;
++use codex_protocol::error::EnvVarError;
++use codex_protocol::error::Result;
++
++pub(crate) const MIMO_MODEL: &str = "mimo-v2.5";
++pub(crate) const MIMO_API_MODEL: &str = "mimo-v2.5";
++pub(crate) const MIMO_PRO_API_MODEL: &str = "mimo-v2.5-pro";
++
++const API_KEY_FILE: &str = "mimo.toml";
++const API_KEY_PLACEHOLDER: &str = "sk-dummy";
++const API_KEY_FIELD: &str = "api_key";
++const BASE_URL_FIELD: &str = "base_url";
++const DEFAULT_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
++const STREAM_MAX_RETRIES: u64 = 5;
++pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
++const EXAMPLE_API_KEY_FILE: &str = concat!(
++    "# MiMo side-route credentials for Codex.\n",
++    "api_key = \"sk-dummy\"\n",
++    "base_url = \"https://api.xiaomimimo.com/v1\"\n",
++);
++
++pub fn is_mimo_model(model: &str) -> bool {
++    model == MIMO_MODEL
++}
++
++pub(crate) fn ensure_api_key_file(codex_home: &Path) {
++    let path = codex_home.join(API_KEY_FILE);
++    if path.exists() {
++        return;
++    }
++    if fs::create_dir_all(codex_home).is_ok() {
++        let _ = fs::write(path, EXAMPLE_API_KEY_FILE);
++    }
++}
++
++pub(crate) fn provider_and_auth(codex_home: &Path) -> Result<(Provider, Arc<dyn AuthProvider>)> {
++    ensure_api_key_file(codex_home);
++    let config = read_config(codex_home)?;
++    let provider = Provider {
++        name: "MiMo".to_string(),
++        base_url: config.base_url,
++        query_params: None,
++        headers: Default::default(),
++        retry: RetryConfig {
++            max_attempts: STREAM_MAX_RETRIES,
++            base_delay: Duration::from_millis(200),
++            retry_429: true,
++            retry_5xx: true,
++            retry_transport: true,
++        },
++        stream_idle_timeout: STREAM_IDLE_TIMEOUT,
++    };
++    Ok((provider, Arc::new(BearerAuthProvider::new(config.api_key))))
++}
++
++struct MimoConfig {
++    api_key: String,
++    base_url: String,
++}
++
++fn read_config(codex_home: &Path) -> Result<MimoConfig> {
++    let path = codex_home.join(API_KEY_FILE);
++    let contents = fs::read_to_string(&path)?;
++    let Some(api_key) = parse_field(&contents, API_KEY_FIELD)
++        .filter(|api_key| !api_key.is_empty() && api_key != API_KEY_PLACEHOLDER)
++    else {
++        return Err(missing_api_key_error(&path));
++    };
++    let base_url = parse_field(&contents, BASE_URL_FIELD)
++        .filter(|base_url| !base_url.is_empty())
++        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
++    Ok(MimoConfig { api_key, base_url })
++}
++
++fn parse_field(contents: &str, field: &str) -> Option<String> {
++    contents.lines().find_map(|line| {
++        let line = line.trim();
++        if line.is_empty() || line.starts_with('#') {
++            return None;
++        }
++        let (key, value) = line.split_once('=')?;
++        if key.trim() != field {
++            return None;
++        }
++        Some(
++            value
++                .trim()
++                .trim_matches('"')
++                .trim_matches('\'')
++                .to_string(),
++        )
++    })
++}
++
++fn missing_api_key_error(path: &Path) -> CodexErr {
++    CodexErr::EnvVar(EnvVarError {
++        var: path.display().to_string(),
++        instructions: Some(format!(
++            "Fill `{API_KEY_FIELD}` in this file with a MiMo API key before selecting `{MIMO_MODEL}`."
++        )),
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use pretty_assertions::assert_eq;
++
++    #[test]
++    fn reads_configured_api_key_and_base_url() {
++        let temp_home = tempfile::TempDir::new().expect("temp home");
++        fs::write(
++            temp_home.path().join(API_KEY_FILE),
++            "api_key = \"mimo-key\"\nbase_url = \"https://example.test/v1\"\n",
++        )
++        .expect("write config");
++
++        let config = read_config(temp_home.path()).expect("read config");
++
++        assert_eq!(config.api_key, "mimo-key");
++        assert_eq!(config.base_url, "https://example.test/v1");
++    }
++
++    #[test]
++    fn default_base_url_matches_mimo_openai_endpoint() {
++        let temp_home = tempfile::TempDir::new().expect("temp home");
++        fs::write(
++            temp_home.path().join(API_KEY_FILE),
++            "api_key = \"mimo-key\"\n",
++        )
++        .expect("write config");
++
++        let config = read_config(temp_home.path()).expect("read config");
++
++        assert_eq!(config.base_url, DEFAULT_BASE_URL);
++    }
++}

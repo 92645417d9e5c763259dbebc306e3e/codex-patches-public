@@ -1,0 +1,744 @@
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+index a44919c216..984df9ad91 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -16,7 +16,7 @@
+ //! - Approval mode
+ //! - Context usage (remaining %, used %, window size)
+ //! - Usage limits (primary, secondary)
+-//! - Session info (thread title, thread ID, tokens used)
++//! - Session info (account, thread title, thread ID, tokens used)
+ //! - Application version
+ 
+ use ratatui::buffer::Buffer;
+@@ -131,6 +131,9 @@ pub(crate) enum StatusLineItem {
+     /// Whether raw scrollback mode is currently active.
+     RawOutput,
+ 
++    /// Active ChatGPT account (if any).
++    Account,
++
+     /// Current thread title (if set by user).
+     ThreadTitle,
+ 
+@@ -178,6 +181,7 @@ impl StatusLineItem {
+             StatusLineItem::SessionId => "Current thread identifier (omitted until thread starts)",
+             StatusLineItem::FastMode => "Whether Fast mode is currently active",
+             StatusLineItem::RawOutput => "Whether raw scrollback mode is active",
++            StatusLineItem::Account => "Active ChatGPT account (omitted when using API key auth)",
+             StatusLineItem::ThreadTitle => {
+                 "Current thread title, or thread identifier when unnamed"
+             }
+@@ -211,6 +215,7 @@ impl StatusLineItem {
+             StatusLineItem::SessionId => StatusSurfacePreviewItem::SessionId,
+             StatusLineItem::FastMode => StatusSurfacePreviewItem::FastMode,
+             StatusLineItem::RawOutput => StatusSurfacePreviewItem::RawOutput,
++            StatusLineItem::Account => StatusSurfacePreviewItem::Account,
+             StatusLineItem::ThreadTitle => StatusSurfacePreviewItem::ThreadTitle,
+             StatusLineItem::TaskProgress => StatusSurfacePreviewItem::TaskProgress,
+         }
+@@ -420,6 +425,15 @@ mod tests {
+             "context-remaining"
+         );
+     }
++    #[test]
++    fn account_is_selectable_id() {
++        assert_eq!(
++            "account".parse::<StatusLineItem>(),
++            Ok(StatusLineItem::Account)
++        );
++        assert_eq!(StatusLineItem::Account.to_string(), "account");
++    }
++
+     #[test]
+     fn project_name_is_canonical_and_accepts_legacy_ids() {
+         assert_eq!(StatusLineItem::ProjectRoot.to_string(), "project-name");
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+index ffb2a289e9..31a8c78c69 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -4,7 +4,6 @@ use ratatui::prelude::Stylize;
+ use ratatui::style::Color;
+ use ratatui::style::Style;
+ use ratatui::text::Line;
+-use ratatui::text::Span;
+ 
+ use super::status_line_setup::StatusLineItem;
+ use crate::render::highlight::foreground_style_for_scopes;
+@@ -23,6 +22,7 @@ enum StatusLineAccent {
+     Limit,
+     Metadata,
+     Mode,
++    Account,
+     Thread,
+     Progress,
+ }
+@@ -47,6 +47,7 @@ impl StatusLineAccent {
+             StatusLineItem::FastMode | StatusLineItem::RawOutput => Self::Mode,
+             StatusLineItem::Permissions => Self::Mode,
+             StatusLineItem::ApprovalMode => Self::Mode,
++            StatusLineItem::Account => Self::Account,
+             StatusLineItem::ThreadTitle => Self::Thread,
+             StatusLineItem::TaskProgress => Self::Progress,
+         }
+@@ -62,6 +63,7 @@ impl StatusLineAccent {
+             Self::Limit => &["constant.language", "storage.type"],
+             Self::Metadata => &["comment", "constant.other"],
+             Self::Mode => &["storage.modifier", "keyword.operator"],
++            Self::Account => &["variable.other.member", "support.constant"],
+             Self::Thread => &["markup.heading", "entity.name.section"],
+             Self::Progress => &["markup.inserted", "constant.numeric"],
+         }
+@@ -71,34 +73,36 @@ impl StatusLineAccent {
+         match self {
+             Self::Model | Self::State | Self::Metadata | Self::Mode => Style::default().cyan(),
+             Self::Path | Self::Usage | Self::Progress => Style::default().green(),
+-            Self::Branch | Self::Limit | Self::Thread => Style::default().magenta(),
++            Self::Branch | Self::Limit | Self::Account | Self::Thread => Style::default().magenta(),
+         }
+     }
+ }
+ 
+-pub(crate) fn status_line_from_segments<I>(
++pub(crate) fn status_line_from_segments<I, T>(
+     segments: I,
+     use_theme_colors: bool,
+ ) -> Option<Line<'static>>
+ where
+-    I: IntoIterator<Item = (StatusLineItem, String)>,
++    I: IntoIterator<Item = (StatusLineItem, T)>,
++    T: Into<Line<'static>>,
+ {
+     status_line_from_segments_with_resolver(segments, use_theme_colors, |accent| {
+         foreground_style_for_scopes(accent.scopes())
+     })
+ }
+ 
+-fn status_line_from_segments_with_resolver<I, F>(
++fn status_line_from_segments_with_resolver<I, T, F>(
+     segments: I,
+     use_theme_colors: bool,
+     theme_style_for_accent: F,
+ ) -> Option<Line<'static>>
+ where
+-    I: IntoIterator<Item = (StatusLineItem, String)>,
++    I: IntoIterator<Item = (StatusLineItem, T)>,
++    T: Into<Line<'static>>,
+     F: Fn(StatusLineAccent) -> Option<Style>,
+ {
+     let mut spans = Vec::new();
+-    for (item, text) in segments {
++    for (item, segment) in segments {
+         if !spans.is_empty() {
+             spans.push(STATUS_LINE_SEPARATOR.dim());
+         }
+@@ -115,7 +119,12 @@ where
+         } else {
+             style
+         };
+-        spans.push(Span::styled(text, style));
++        for mut span in segment.into().spans {
++            if span.style == Style::default() {
++                span.style = style;
++            }
++            spans.push(span);
++        }
+     }
+ 
+     (!spans.is_empty()).then(|| Line::from(spans))
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+index 71353c298a..9b2761503b 100644
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -30,6 +30,7 @@ pub(crate) enum StatusSurfacePreviewItem {
+     SessionId,
+     FastMode,
+     RawOutput,
++    Account,
+     Model,
+     ModelWithReasoning,
+     TaskProgress,
+@@ -61,6 +62,7 @@ impl StatusSurfacePreviewItem {
+             StatusSurfacePreviewItem::SessionId => "550e8400-e29b-41d4",
+             StatusSurfacePreviewItem::FastMode => "Fast on",
+             StatusSurfacePreviewItem::RawOutput => "raw output",
++            StatusSurfacePreviewItem::Account => "u***r@g***l.com Pro",
+             StatusSurfacePreviewItem::Model => "gpt-5.2-codex",
+             StatusSurfacePreviewItem::ModelWithReasoning => "gpt-5.2-codex medium",
+             StatusSurfacePreviewItem::TaskProgress => "Tasks 0/0",
+@@ -92,6 +94,7 @@ impl StatusSurfacePreviewItem {
+             Self::SessionId,
+             Self::FastMode,
+             Self::RawOutput,
++            Self::Account,
+             Self::Model,
+             Self::ModelWithReasoning,
+             Self::TaskProgress,
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 3673cced6b..1543897021 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -77,7 +77,6 @@ use crate::status::RateLimitWindowDisplay;
+ use crate::status::StatusAccountDisplay;
+ use crate::status::StatusHistoryHandle;
+ use crate::status::format_directory_display;
+-use crate::status::format_tokens_compact;
+ use crate::status::rate_limit_snapshot_display_for_limit;
+ use crate::terminal_title::SetTerminalTitleResult;
+ use crate::terminal_title::clear_terminal_title;
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 2b2b7d52df..ee4efb5f5d 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -9,12 +9,17 @@ use crate::branch_summary;
+ use crate::chatwidget::limit_label_for_window;
+ use crate::chatwidget::rate_limits::get_limits_duration;
+ use crate::legacy_core::config::Config;
++use crate::shimmer::rainbow_spans;
++use crate::status::StatusAccountDisplay;
++use crate::status::account_plan_style;
++use crate::status::compose_account_display;
+ use crate::status::format_tokens_compact;
+ use codex_app_server_protocol::AskForApproval;
+ use codex_protocol::config_types::ApprovalsReviewer;
+ use codex_protocol::config_types::ServiceTier;
+ use codex_protocol::models::PermissionProfile;
+ use codex_utils_sandbox_summary::summarize_permission_profile;
++use ratatui::text::Span;
+ 
+ use super::status_state::TerminalTitleStatusKind;
+ 
+@@ -170,7 +175,7 @@ impl ChatWidget {
+ 
+         let mut segments = Vec::new();
+         for item in &selections.status_line_items {
+-            if let Some(value) = self.status_line_value_for_item(*item) {
++            if let Some(value) = self.status_line_line_for_item(item) {
+                 segments.push((*item, value));
+             }
+         }
+@@ -641,6 +646,7 @@ impl ChatWidget {
+                 },
+             ),
+             StatusLineItem::RawOutput => self.raw_output_mode().then(|| "raw output".to_string()),
++            StatusLineItem::Account => self.status_line_account_display(),
+             StatusLineItem::ThreadTitle => self.thread_name.as_ref().map_or_else(
+                 || self.thread_id.map(|id| id.to_string()),
+                 |name| {
+@@ -663,6 +669,46 @@ impl ChatWidget {
+             .map(|pull_request| pull_request.url.clone())
+     }
+ 
++    fn status_line_account_display(&self) -> Option<String> {
++        match compose_account_display(self.status_account_display.as_ref())? {
++            StatusAccountDisplay::ChatGpt { email, plan } => match (email, plan) {
++                (Some(email), Some(plan)) => Some(format!("{email} {plan}")),
++                (Some(email), None) => Some(email),
++                (None, Some(plan)) => Some(plan),
++                (None, None) => Some("ChatGPT".to_string()),
++            },
++            StatusAccountDisplay::ApiKey => None,
++        }
++    }
++
++    fn status_line_account_display_line(&self) -> Option<Line<'static>> {
++        match compose_account_display(self.status_account_display.as_ref())? {
++            StatusAccountDisplay::ChatGpt { email, plan } => match (email, plan) {
++                (Some(email), Some(plan)) => Some(Line::from(vec![
++                    Span::from(email),
++                    Span::from(" "),
++                    Span::styled(plan.clone(), account_plan_style(&plan)),
++                ])),
++                (Some(email), None) => Some(Line::from(email)),
++                (None, Some(plan)) => Some(Line::from(vec![Span::styled(
++                    plan.clone(),
++                    account_plan_style(&plan),
++                )])),
++                (None, None) => Some(Line::from("ChatGPT")),
++            },
++            StatusAccountDisplay::ApiKey => None,
++        }
++    }
++
++    fn status_line_line_for_item(&mut self, item: &StatusLineItem) -> Option<Line<'static>> {
++        match item {
++            StatusLineItem::ModelWithReasoning => Some(self.model_with_reasoning_display_line()),
++            StatusLineItem::FastMode => Some(self.fast_mode_display_line()),
++            StatusLineItem::Account => self.status_line_account_display_line(),
++            _ => self.status_line_value_for_item(*item).map(Line::from),
++        }
++    }
++
+     pub(super) fn status_surface_preview_value_for_item(
+         &mut self,
+         item: StatusSurfacePreviewItem,
+@@ -692,6 +738,7 @@ impl ChatWidget {
+             StatusSurfacePreviewItem::SessionId => StatusLineItem::SessionId,
+             StatusSurfacePreviewItem::FastMode => StatusLineItem::FastMode,
+             StatusSurfacePreviewItem::RawOutput => StatusLineItem::RawOutput,
++            StatusSurfacePreviewItem::Account => StatusLineItem::Account,
+             StatusSurfacePreviewItem::Model => StatusLineItem::ModelName,
+             StatusSurfacePreviewItem::ModelWithReasoning => StatusLineItem::ModelWithReasoning,
+         };
+@@ -779,6 +826,74 @@ impl ChatWidget {
+         format!("{} {label}{service_tier_label}", self.model_display_name())
+     }
+ 
++    fn model_with_reasoning_display_line(&self) -> Line<'static> {
++        let effort = self.effective_reasoning_effort();
++        let label = Self::status_line_reasoning_effort_label(effort);
++        let service_tier_label = self
++            .current_service_tier()
++            .and_then(|service_tier| {
++                self.current_model_service_tier_commands()
++                    .into_iter()
++                    .find(|tier| tier.id == service_tier)
++                    .map(|tier| tier.name)
++            })
++            .filter(|_| self.has_chatgpt_account)
++            .map(|tier| format!(" {tier}"))
++            .unwrap_or_default();
++        let mut line = Line::from(vec![
++            self.model_display_name().to_string().into(),
++            " ".into(),
++        ]);
++        line.extend(Self::status_line_reasoning_effort_line(label, effort).spans);
++        line.push_span(service_tier_label);
++        line
++    }
++
++    fn status_line_reasoning_effort_line(
++        label: &'static str,
++        effort: Option<ReasoningEffortConfig>,
++    ) -> Line<'static> {
++        let span = Span::from(label);
++        match effort {
++            Some(ReasoningEffortConfig::Minimal) | Some(ReasoningEffortConfig::Low) => {
++                Line::from(span.yellow())
++            }
++            #[allow(clippy::disallowed_methods)]
++            Some(ReasoningEffortConfig::Medium) => Line::from(span.fg(Color::Rgb(255, 128, 0))),
++            Some(ReasoningEffortConfig::High) => Line::from(span.red()),
++            Some(ReasoningEffortConfig::XHigh) => Line::from(rainbow_spans(label)),
++            None | Some(ReasoningEffortConfig::None) => Line::from(span),
++        }
++    }
++
++    fn fast_mode_display_line(&self) -> Line<'static> {
++        if matches!(
++            self.current_service_tier(),
++            Some(service_tier) if service_tier == ServiceTier::Fast.request_value()
++        ) {
++            Line::from(vec!["Fast ".into(), "on".red()])
++        } else {
++            Line::from("Fast off")
++        }
++    }
++
++    #[cfg(test)]
++    fn status_line_reasoning_effort_span(
++        label: &'static str,
++        effort: Option<ReasoningEffortConfig>,
++    ) -> Span<'static> {
++        let span = Span::from(label);
++        match effort {
++            Some(ReasoningEffortConfig::Minimal) | Some(ReasoningEffortConfig::Low) => {
++                span.yellow()
++            }
++            #[allow(clippy::disallowed_methods)]
++            Some(ReasoningEffortConfig::Medium) => span.fg(Color::Rgb(255, 128, 0)),
++            Some(ReasoningEffortConfig::High) => span.red(),
++            Some(ReasoningEffortConfig::XHigh) | None | Some(ReasoningEffortConfig::None) => span,
++        }
++    }
++
+     /// Computes the compact runtime status label used by word-based status items.
+     ///
+     /// Startup takes precedence over normal task states, and idle state renders
+@@ -1044,3 +1159,79 @@ where
+     }
+     (items, invalid)
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use pretty_assertions::assert_eq;
++
++    #[allow(clippy::disallowed_methods)]
++    #[test]
++    fn reasoning_effort_status_line_uses_color_without_dim_override() {
++        let cases = [
++            (Some(ReasoningEffortConfig::Minimal), Some(Color::Yellow)),
++            (Some(ReasoningEffortConfig::Low), Some(Color::Yellow)),
++            (
++                Some(ReasoningEffortConfig::Medium),
++                Some(Color::Rgb(255, 128, 0)),
++            ),
++            (Some(ReasoningEffortConfig::High), Some(Color::Red)),
++            (Some(ReasoningEffortConfig::None), None),
++            (None, None),
++        ];
++
++        for (effort, expected_color) in cases {
++            let label = ChatWidget::status_line_reasoning_effort_label(effort);
++            let span = ChatWidget::status_line_reasoning_effort_span(label, effort);
++            assert_eq!(span.style.fg, expected_color, "effort: {effort:?}");
++            assert_eq!(
++                span.style.add_modifier.contains(Modifier::DIM),
++                false,
++                "effort: {effort:?}"
++            );
++            assert_eq!(
++                span.style.sub_modifier.contains(Modifier::DIM),
++                false,
++                "effort: {effort:?}"
++            );
++        }
++    }
++
++    #[test]
++    fn xhigh_reasoning_effort_status_line_is_rainbow() {
++        let line = ChatWidget::status_line_reasoning_effort_line(
++            "xhigh",
++            Some(ReasoningEffortConfig::XHigh),
++        );
++
++        assert_eq!(
++            line.spans
++                .iter()
++                .map(|span| span.content.as_ref())
++                .collect::<String>(),
++            "xhigh"
++        );
++        assert_eq!(line.spans.len(), 5);
++        assert!(
++            line.spans
++                .iter()
++                .all(|span| !span.style.add_modifier.contains(Modifier::DIM))
++        );
++        assert!(
++            line.spans
++                .iter()
++                .all(|span| !span.style.sub_modifier.contains(Modifier::DIM))
++        );
++    }
++
++    #[test]
++    fn fast_mode_on_status_line_is_red_without_dim_override() {
++        let line = Line::from(vec!["Fast ".into(), "on".red()]);
++        let on = &line.spans[1];
++
++        assert_eq!(on.content.as_ref(), "on");
++        assert_eq!(on.style.fg, Some(Color::Red));
++        assert_eq!(on.style.add_modifier.contains(Modifier::DIM), false);
++        assert_eq!(on.style.sub_modifier.contains(Modifier::DIM), false);
++    }
++}
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index 9e33286b94..dfd07d059d 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -2147,6 +2147,60 @@ async fn status_line_fast_mode_footer_snapshot() {
+     );
+ }
+ 
++#[tokio::test]
++async fn status_line_account_renders_chatgpt_account() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.status_account_display = Some(crate::status::StatusAccountDisplay::ChatGpt {
++        email: Some("sydney@gmail.com".to_string()),
++        plan: Some("Pro Lite".to_string()),
++    });
++    chat.config.tui_status_line = Some(vec!["fast-mode".to_string(), "account".to_string()]);
++
++    chat.refresh_status_line();
++
++    assert_eq!(
++        status_line_text(&chat),
++        Some("Fast off · s***y@g***l.com Pro Lite".to_string())
++    );
++}
++
++#[tokio::test]
++async fn status_line_account_hides_api_key_auth() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.status_account_display = Some(crate::status::StatusAccountDisplay::ApiKey);
++    chat.config.tui_status_line = Some(vec!["fast-mode".to_string(), "account".to_string()]);
++
++    chat.refresh_status_line();
++
++    assert_eq!(status_line_text(&chat), Some("Fast off".to_string()));
++}
++
++#[tokio::test]
++async fn status_line_account_footer_snapshot() {
++    use ratatui::Terminal;
++    use ratatui::backend::TestBackend;
++
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.show_welcome_banner = false;
++    chat.status_account_display = Some(crate::status::StatusAccountDisplay::ChatGpt {
++        email: Some("sydney@gmail.com".to_string()),
++        plan: Some("Pro Lite".to_string()),
++    });
++    chat.config.tui_status_line = Some(vec!["fast-mode".to_string(), "account".to_string()]);
++    chat.refresh_status_line();
++
++    let width = 80;
++    let height = chat.desired_height(width);
++    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("create terminal");
++    terminal
++        .draw(|f| chat.render(f.area(), f.buffer_mut()))
++        .expect("draw account footer");
++    assert_chatwidget_snapshot!(
++        "status_line_account_footer",
++        normalized_backend_snapshot(terminal.backend())
++    );
++}
++
+ #[tokio::test]
+ async fn status_line_model_with_reasoning_includes_fast_for_fast_capable_models() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+diff --git a/codex-rs/tui/src/status/card.rs b/codex-rs/tui/src/status/card.rs
+index 7f7768e2cf..85bb92ed29 100644
+--- a/codex-rs/tui/src/status/card.rs
++++ b/codex-rs/tui/src/status/card.rs
+@@ -33,6 +33,7 @@ use super::format::FieldFormatter;
+ use super::format::line_display_width;
+ use super::format::push_label;
+ use super::format::truncate_line_to_width;
++use super::helpers::account_plan_style;
+ use super::helpers::compose_account_display;
+ use super::helpers::compose_model_display;
+ use super::helpers::format_directory_display;
+@@ -680,6 +681,26 @@ fn status_approval_label(
+     }
+ }
+ 
++fn account_display_spans(account: &StatusAccountDisplay) -> Vec<Span<'static>> {
++    match account {
++        StatusAccountDisplay::ChatGpt { email, plan } => match (email, plan) {
++            (Some(email), Some(plan)) => vec![
++                Span::from(email.clone()),
++                Span::from(" "),
++                Span::styled(plan.clone(), account_plan_style(plan)),
++            ],
++            (Some(email), None) => vec![Span::from(email.clone())],
++            (None, Some(plan)) => vec![Span::styled(plan.clone(), account_plan_style(plan))],
++            (None, None) => vec![Span::from("ChatGPT")],
++        },
++        StatusAccountDisplay::ApiKey => {
++            vec![Span::from(
++                "API key configured (run codex login to use ChatGPT)",
++            )]
++        }
++    }
++}
++
+ impl HistoryCell for StatusHistoryCell {
+     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+         let mut lines: Vec<Line<'static>> = Vec::new();
+@@ -696,17 +717,7 @@ impl HistoryCell for StatusHistoryCell {
+             return Vec::new();
+         }
+ 
+-        let account_value = self.account.as_ref().map(|account| match account {
+-            StatusAccountDisplay::ChatGpt { email, plan } => match (email, plan) {
+-                (Some(email), Some(plan)) => format!("{email} ({plan})"),
+-                (Some(email), None) => email.clone(),
+-                (None, Some(plan)) => plan.clone(),
+-                (None, None) => "ChatGPT".to_string(),
+-            },
+-            StatusAccountDisplay::ApiKey => {
+-                "API key configured (run codex login to use ChatGPT)".to_string()
+-            }
+-        });
++        let account_value = self.account.as_ref().map(account_display_spans);
+ 
+         let mut labels: Vec<String> = vec!["Model", "Directory", "Permissions", "Agents.md"]
+             .into_iter()
+@@ -793,7 +804,7 @@ impl HistoryCell for StatusHistoryCell {
+         lines.push(formatter.line("Agents.md", vec![Span::from(agents_summary)]));
+ 
+         if let Some(account_value) = account_value {
+-            lines.push(formatter.line("Account", vec![Span::from(account_value)]));
++            lines.push(formatter.line("Account", account_value));
+         }
+ 
+         if let Some(thread_name) = thread_name {
+diff --git a/codex-rs/tui/src/status/helpers.rs b/codex-rs/tui/src/status/helpers.rs
+index df7e9c0f1f..df35727dd3 100644
+--- a/codex-rs/tui/src/status/helpers.rs
++++ b/codex-rs/tui/src/status/helpers.rs
+@@ -6,6 +6,8 @@ use chrono::DateTime;
+ use chrono::Local;
+ use codex_protocol::account::PlanType;
+ use codex_utils_absolute_path::AbsolutePathBuf;
++use ratatui::style::Color;
++use ratatui::style::Style;
+ use std::path::Path;
+ use unicode_width::UnicodeWidthStr;
+ 
+@@ -103,6 +105,22 @@ pub(crate) fn plan_type_display_name(plan_type: PlanType) -> String {
+     }
+ }
+ 
++#[allow(clippy::disallowed_methods)]
++pub(crate) fn account_plan_style(plan: &str) -> Style {
++    match plan
++        .to_ascii_lowercase()
++        .replace([' ', '-', '_'], "")
++        .as_str()
++    {
++        "free" => Style::default().fg(Color::DarkGray),
++        "plus" => Style::default().fg(Color::Green),
++        "business" | "team" | "enterprise" => Style::default().fg(Color::Cyan),
++        "prolite" => Style::default().fg(Color::Yellow),
++        "pro" => Style::default().fg(Color::Magenta),
++        _ => Style::default().fg(Color::Blue),
++    }
++}
++
+ pub(crate) fn format_tokens_compact(value: i64) -> String {
+     let value = value.max(0);
+     if value == 0 {
+@@ -193,16 +211,30 @@ fn mask_status_email(email: &str) -> String {
+         return email.to_string();
+     };
+ 
+-    let mut local_chars = local.chars().collect::<Vec<_>>();
+-    let Some(first) = local_chars.first().copied() else {
++    let Some((domain_name, domain_suffix)) = domain.split_once('.') else {
+         return email.to_string();
+     };
+ 
+-    let suffix_len = local_chars.len().saturating_sub(1).min(2);
+-    let suffix = local_chars.split_off(local_chars.len().saturating_sub(suffix_len));
+-    let suffix = suffix.into_iter().collect::<String>();
++    let Some(masked_local) = mask_email_part(local) else {
++        return email.to_string();
++    };
++    let Some(masked_domain_name) = mask_email_part(domain_name) else {
++        return email.to_string();
++    };
+ 
+-    format!("{first}***{suffix}@{domain}")
++    format!("{masked_local}@{masked_domain_name}.{domain_suffix}")
++}
++
++fn mask_email_part(part: &str) -> Option<String> {
++    let chars = part.chars().collect::<Vec<_>>();
++    let first = chars.first().copied()?;
++    let last = chars.last().copied()?;
++
++    Some(if chars.len() == 1 {
++        first.to_string()
++    } else {
++        format!("{first}***{last}")
++    })
+ }
+ 
+ #[cfg(test)]
+@@ -257,13 +289,22 @@ mod tests {
+ 
+         match display {
+             Some(StatusAccountDisplay::ChatGpt { email, plan }) => {
+-                assert_eq!(email.as_deref(), Some("g***de@outlook.com"));
++                assert_eq!(email.as_deref(), Some("g***e@o***k.com"));
+                 assert_eq!(plan.as_deref(), Some("Pro"));
+             }
+             other => panic!("expected masked ChatGPT account display, got {other:?}"),
+         }
+     }
+ 
++    #[test]
++    fn account_plan_style_uses_plan_rank_colors() {
++        assert_eq!(account_plan_style("Free").fg, Some(Color::DarkGray));
++        assert_eq!(account_plan_style("Plus").fg, Some(Color::Green));
++        assert_eq!(account_plan_style("Business").fg, Some(Color::Cyan));
++        assert_eq!(account_plan_style("Pro Lite").fg, Some(Color::Yellow));
++        assert_eq!(account_plan_style("Pro").fg, Some(Color::Magenta));
++    }
++
+     #[test]
+     fn compose_account_display_preserves_api_key_account() {
+         assert!(matches!(
+diff --git a/codex-rs/tui/src/status/mod.rs b/codex-rs/tui/src/status/mod.rs
+index d618863384..8b7ba7b14b 100644
+--- a/codex-rs/tui/src/status/mod.rs
++++ b/codex-rs/tui/src/status/mod.rs
+@@ -19,6 +19,8 @@ pub(crate) use card::new_status_output;
+ #[cfg(test)]
+ pub(crate) use card::new_status_output_with_rate_limits;
+ pub(crate) use card::new_status_output_with_rate_limits_handle;
++pub(crate) use helpers::account_plan_style;
++pub(crate) use helpers::compose_account_display;
+ pub(crate) use helpers::compose_agents_summary;
+ pub(crate) use helpers::format_directory_display;
+ pub(crate) use helpers::format_tokens_compact;
+diff --git a/codex-rs/tui/src/status/tests.rs b/codex-rs/tui/src/status/tests.rs
+index e6fa90071a..1551a3a20a 100644
+--- a/codex-rs/tui/src/status/tests.rs
++++ b/codex-rs/tui/src/status/tests.rs
+@@ -1670,6 +1670,60 @@ async fn status_snapshot_shows_stale_limits_message() {
+     assert_snapshot!(sanitized);
+ }
+ 
++#[tokio::test]
++async fn status_account_line_masks_email_and_colors_plan() {
++    let temp_home = TempDir::new().expect("temp home");
++    let mut config = test_config(&temp_home).await;
++    config.cwd = test_path_buf("/workspace/tests").abs();
++    let account_display = StatusAccountDisplay::ChatGpt {
++        email: Some("sydney@gmail.com".to_string()),
++        plan: Some("Pro Lite".to_string()),
++    };
++    let usage = TokenUsage::default();
++    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
++    let composite = new_status_output(
++        &config,
++        Some(&account_display),
++        /*token_info*/ None,
++        &usage,
++        &None,
++        /*thread_name*/ None,
++        /*forked_from*/ None,
++        /*rate_display*/ None,
++        None,
++        chrono::Local
++            .with_ymd_and_hms(2024, 1, 2, 3, 4, 5)
++            .single()
++            .expect("timestamp"),
++        &model_slug,
++        /*collaboration_mode*/ None,
++        /*reasoning_effort_override*/ None,
++    );
++    let lines = composite.display_lines(/*width*/ 80);
++    let rendered_lines = render_lines(&lines);
++    assert!(
++        rendered_lines
++            .iter()
++            .any(|line| line.contains("Account:") && line.contains("s***y@g***l.com Pro Lite")),
++        "missing formatted account line: {rendered_lines:?}"
++    );
++
++    let account_line = lines
++        .iter()
++        .find(|line| {
++            line.spans
++                .iter()
++                .any(|span| span.content.as_ref() == "Pro Lite")
++        })
++        .expect("account line");
++    let plan_span = account_line
++        .spans
++        .iter()
++        .find(|span| span.content.as_ref() == "Pro Lite")
++        .expect("plan span");
++    assert_eq!(plan_span.style.fg, Some(Color::Yellow));
++}
++
+ #[tokio::test]
+ async fn status_snapshot_cached_limits_hide_credits_without_flag() {
+     let temp_home = TempDir::new().expect("temp home");

@@ -1,0 +1,191 @@
+diff --git a/codex-rs/thread-store/src/live_thread.rs b/codex-rs/thread-store/src/live_thread.rs
+index 06aec3450a..92b1e07b10 100644
+--- a/codex-rs/thread-store/src/live_thread.rs
++++ b/codex-rs/thread-store/src/live_thread.rs
+@@ -1,5 +1,7 @@
+ use std::path::PathBuf;
+ use std::sync::Arc;
++use std::sync::atomic::AtomicBool;
++use std::sync::atomic::Ordering;
+ 
+ use codex_protocol::ThreadId;
+ use codex_protocol::protocol::RolloutItem;
+@@ -20,6 +22,7 @@ use crate::StoredThreadHistory;
+ use crate::ThreadEventPersistenceMode;
+ use crate::ThreadMetadataPatch;
+ use crate::ThreadStore;
++use crate::ThreadStoreError;
+ use crate::ThreadStoreResult;
+ use crate::UpdateThreadMetadataParams;
+ use crate::thread_metadata_sync::ThreadMetadataSync;
+@@ -35,6 +38,7 @@ pub struct LiveThread {
+     thread_store: Arc<dyn ThreadStore>,
+     event_persistence_mode: EventPersistenceMode,
+     metadata_sync: Arc<Mutex<ThreadMetadataSync>>,
++    closed: Arc<AtomicBool>,
+ }
+ 
+ /// Owns a live thread while session initialization is still fallible.
+@@ -100,6 +104,7 @@ impl LiveThread {
+             thread_store,
+             event_persistence_mode,
+             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
++            closed: Arc::new(AtomicBool::new(false)),
+         })
+     }
+ 
+@@ -133,20 +138,34 @@ impl LiveThread {
+             thread_store,
+             event_persistence_mode,
+             metadata_sync: Arc::new(Mutex::new(metadata_sync)),
++            closed: Arc::new(AtomicBool::new(false)),
+         })
+     }
+ 
+     pub async fn append_items(&self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
++        if self.closed.load(Ordering::Acquire) {
++            return Ok(());
++        }
++
+         let canonical_items = persisted_rollout_items(items, self.event_persistence_mode);
+         if canonical_items.is_empty() {
+             return Ok(());
+         }
+-        self.thread_store
++        match self
++            .thread_store
+             .append_items(AppendThreadItemsParams {
+                 thread_id: self.thread_id,
+                 items: canonical_items.clone(),
+             })
+-            .await?;
++            .await
++        {
++            Ok(()) => {}
++            Err(ThreadStoreError::ThreadNotFound { thread_id }) if thread_id == self.thread_id => {
++                self.closed.store(true, Ordering::Release);
++                return Ok(());
++            }
++            Err(err) => return Err(err),
++        }
+         let update = self
+             .metadata_sync
+             .lock()
+@@ -182,11 +201,15 @@ impl LiveThread {
+     pub async fn shutdown(&self) -> ThreadStoreResult<()> {
+         self.flush_pending_metadata_update_for_existing_history()
+             .await?;
+-        self.thread_store.shutdown_thread(self.thread_id).await
++        self.thread_store.shutdown_thread(self.thread_id).await?;
++        self.closed.store(true, Ordering::Release);
++        Ok(())
+     }
+ 
+     pub async fn discard(&self) -> ThreadStoreResult<()> {
+-        self.thread_store.discard_thread(self.thread_id).await
++        self.thread_store.discard_thread(self.thread_id).await?;
++        self.closed.store(true, Ordering::Release);
++        Ok(())
+     }
+ 
+     pub async fn load_history(
+@@ -308,3 +331,68 @@ fn event_persistence_mode(mode: ThreadEventPersistenceMode) -> EventPersistenceM
+         ThreadEventPersistenceMode::Extended => EventPersistenceMode::Extended,
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use codex_protocol::models::BaseInstructions;
++    use codex_protocol::protocol::SessionSource;
++
++    use super::*;
++    use crate::InMemoryThreadStore;
++    use crate::ThreadEventPersistenceMode;
++
++    #[tokio::test]
++    async fn append_items_after_shutdown_clone_is_noop() {
++        let store = InMemoryThreadStore::for_id("live-thread-shutdown-noop");
++        let live_thread =
++            LiveThread::create(store.clone(), create_thread_params(ThreadId::default()))
++                .await
++                .expect("create live thread");
++        let stale_clone = live_thread.clone();
++
++        live_thread.shutdown().await.expect("shutdown live thread");
++        stale_clone
++            .append_items(&[])
++            .await
++            .expect("append after shutdown");
++
++        assert_eq!(store.calls().await.append_items, 0);
++        InMemoryThreadStore::remove_id("live-thread-shutdown-noop");
++    }
++
++    #[tokio::test]
++    async fn append_items_after_discard_clone_is_noop() {
++        let store = InMemoryThreadStore::for_id("live-thread-discard-noop");
++        let live_thread =
++            LiveThread::create(store.clone(), create_thread_params(ThreadId::default()))
++                .await
++                .expect("create live thread");
++        let stale_clone = live_thread.clone();
++
++        live_thread.discard().await.expect("discard live thread");
++        stale_clone
++            .append_items(&[])
++            .await
++            .expect("append after discard");
++
++        assert_eq!(store.calls().await.append_items, 0);
++        InMemoryThreadStore::remove_id("live-thread-discard-noop");
++    }
++
++    fn create_thread_params(thread_id: ThreadId) -> CreateThreadParams {
++        CreateThreadParams {
++            thread_id,
++            forked_from_id: None,
++            source: SessionSource::Exec,
++            thread_source: None,
++            base_instructions: BaseInstructions::default(),
++            dynamic_tools: Vec::new(),
++            metadata: crate::ThreadPersistenceMetadata {
++                cwd: Some(std::env::current_dir().expect("cwd")),
++                model_provider: "test-provider".to_string(),
++                memory_mode: codex_protocol::protocol::ThreadMemoryMode::Enabled,
++            },
++            event_persistence_mode: ThreadEventPersistenceMode::Limited,
++        }
++    }
++}
+diff --git a/codex-rs/thread-store/src/local/mod.rs b/codex-rs/thread-store/src/local/mod.rs
+index f6a48a400b..19909a3a70 100644
+--- a/codex-rs/thread-store/src/local/mod.rs
++++ b/codex-rs/thread-store/src/local/mod.rs
+@@ -667,6 +667,26 @@ mod tests {
+         );
+     }
+ 
++    #[tokio::test]
++    async fn stale_live_thread_append_after_store_discard_is_noop() {
++        let home = TempDir::new().expect("temp dir");
++        let store = Arc::new(LocalThreadStore::new(test_config(home.path()), None));
++        let thread_id = ThreadId::default();
++        let live_thread = crate::LiveThread::create(store.clone(), create_thread_params(thread_id))
++            .await
++            .expect("create live thread");
++
++        store
++            .discard_thread(thread_id)
++            .await
++            .expect("discard live thread outside handle");
++
++        live_thread
++            .append_items(&[user_message_item("write after external discard")])
++            .await
++            .expect("stale live thread append should be a no-op");
++    }
++
+     #[tokio::test]
+     async fn resume_thread_reopens_live_writer_and_appends() {
+         let home = TempDir::new().expect("temp dir");

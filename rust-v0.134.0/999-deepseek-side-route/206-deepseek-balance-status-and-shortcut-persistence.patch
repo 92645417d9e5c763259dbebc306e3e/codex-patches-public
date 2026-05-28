@@ -1,0 +1,1363 @@
+diff --git a/codex-rs/app-server-client/src/lib.rs b/codex-rs/app-server-client/src/lib.rs
+index 7c31170779..0772e3b20f 100644
+--- a/codex-rs/app-server-client/src/lib.rs
++++ b/codex-rs/app-server-client/src/lib.rs
+@@ -74,6 +74,7 @@ pub mod legacy_core {
+     pub use codex_core::LOCAL_AGENTS_MD_FILENAME;
+     pub use codex_core::McpManager;
+     pub use codex_core::check_execpolicy_for_warnings;
++    pub use codex_core::deepseek_side_route;
+     pub use codex_core::format_exec_policy_error_with_source;
+     pub use codex_core::grant_read_root_non_elevated;
+     pub use codex_core::web_search_detail;
+diff --git a/codex-rs/app-server-client/src/remote.rs b/codex-rs/app-server-client/src/remote.rs
+index dd9c083e49..665702c32b 100644
+--- a/codex-rs/app-server-client/src/remote.rs
++++ b/codex-rs/app-server-client/src/remote.rs
+@@ -416,10 +416,24 @@ impl RemoteAppServerClient {
+                                 ));
+                                 break;
+                             }
+-                            Some(Ok(Message::Binary(_)))
+-                            | Some(Ok(Message::Ping(_)))
+-                            | Some(Ok(Message::Pong(_)))
+-                            | Some(Ok(Message::Frame(_))) => {}
++                            Some(Ok(Message::Ping(payload))) => {
++                                if let Err(err) = stream.send(Message::Pong(payload)).await {
++                                    let err_message = err.to_string();
++                                    let message = format!(
++                                        "remote app server at `{endpoint}` write failed: {err_message}"
++                                    );
++                                    let _ = deliver_event(
++                                        &event_tx,
++                                        AppServerEvent::Disconnected {
++                                            message: message.clone(),
++                                        },
++                                    );
++                                    worker_exit_error = Some((ErrorKind::BrokenPipe, message));
++                                    break;
++                                }
++                            }
++                            Some(Ok(Message::Pong(_))) => {}
++                            Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => {}
+                             Some(Err(err)) => {
+                                 let message = format!(
+                                     "remote app server at `{endpoint}` transport failed: {err}"
+diff --git a/codex-rs/core/src/deepseek_side_route.rs b/codex-rs/core/src/deepseek_side_route.rs
+index 1035b5a92e..4fe8ddb4cc 100644
+--- a/codex-rs/core/src/deepseek_side_route.rs
++++ b/codex-rs/core/src/deepseek_side_route.rs
+@@ -10,6 +10,8 @@ use codex_model_provider::BearerAuthProvider;
+ use codex_protocol::error::CodexErr;
+ use codex_protocol::error::EnvVarError;
+ use codex_protocol::error::Result;
++use codex_protocol::error::UnexpectedResponseError;
++use serde::Deserialize;
+ 
+ pub(crate) const DEEPSEEK_MODEL: &str = "deepseek-v4";
+ pub(crate) const DEEPSEEK_PRO_API_MODEL: &str = "deepseek-v4-pro";
+@@ -20,13 +22,14 @@ const API_KEY_PLACEHOLDER: &str = "sk-dummy";
+ const API_KEY_FIELD: &str = "api_key";
+ const BASE_URL_FIELD: &str = "base_url";
+ const DEFAULT_BASE_URL: &str = "https://api.deepseek.com/v1";
++const BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
+ const EXAMPLE_API_KEY_FILE: &str = concat!(
+     "# DeepSeek side-route credentials for Codex.\n",
+     "api_key = \"sk-dummy\"\n",
+     "base_url = \"https://api.deepseek.com/v1\"\n",
+ );
+ 
+-pub(crate) fn is_deepseek_model(model: &str) -> bool {
++pub fn is_deepseek_model(model: &str) -> bool {
+     model == DEEPSEEK_MODEL
+ }
+ 
+@@ -42,7 +45,7 @@ pub(crate) fn ensure_api_key_file(codex_home: &Path) {
+ 
+ pub(crate) fn provider_and_auth(codex_home: &Path) -> Result<(Provider, Arc<dyn AuthProvider>)> {
+     ensure_api_key_file(codex_home);
+-    let api_key = read_api_key(codex_home)?;
++    let api_key = read_required_api_key(codex_home)?;
+     let provider = Provider {
+         name: "DeepSeek".to_string(),
+         base_url: read_base_url(codex_home)?,
+@@ -60,15 +63,39 @@ pub(crate) fn provider_and_auth(codex_home: &Path) -> Result<(Provider, Arc<dyn
+     Ok((provider, Arc::new(BearerAuthProvider::new(api_key))))
+ }
+ 
+-fn read_api_key(codex_home: &Path) -> Result<String> {
++pub async fn fetch_balance_display(codex_home: &Path) -> Result<Option<String>> {
++    let Some(api_key) = read_configured_api_key(codex_home)? else {
++        return Ok(None);
++    };
++    let response = reqwest::Client::new()
++        .get(BALANCE_URL)
++        .bearer_auth(api_key)
++        .send()
++        .await
++        .map_err(balance_transport_error)?;
++    let status = response.status();
++    let url = response.url().to_string();
++    let body = response.text().await.map_err(balance_transport_error)?;
++    if !status.is_success() {
++        return Err(CodexErr::UnexpectedStatus(UnexpectedResponseError {
++            status,
++            body,
++            url: Some(url),
++            cf_ray: None,
++            request_id: None,
++            identity_authorization_error: None,
++            identity_error_code: None,
++        }));
++    }
++    let response = serde_json::from_str::<DeepSeekBalanceResponse>(&body)?;
++    Ok(response.display_balance())
++}
++
++fn read_required_api_key(codex_home: &Path) -> Result<String> {
+     let path = codex_home.join(API_KEY_FILE);
+-    let contents = fs::read_to_string(&path)?;
+-    let Some(api_key) = parse_field(&contents, API_KEY_FIELD) else {
++    let Some(api_key) = read_configured_api_key(codex_home)? else {
+         return Err(missing_api_key_error(&path));
+     };
+-    if api_key.is_empty() || api_key == API_KEY_PLACEHOLDER {
+-        return Err(missing_api_key_error(&path));
+-    }
+     Ok(api_key)
+ }
+ 
+@@ -86,6 +113,17 @@ fn read_base_url(codex_home: &Path) -> Result<String> {
+         .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()))
+ }
+ 
++fn read_configured_api_key(codex_home: &Path) -> Result<Option<String>> {
++    let path = codex_home.join(API_KEY_FILE);
++    let contents = match fs::read_to_string(&path) {
++        Ok(contents) => contents,
++        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
++        Err(err) => return Err(err.into()),
++    };
++    Ok(parse_field(&contents, API_KEY_FIELD)
++        .filter(|api_key| !api_key.is_empty() && api_key != API_KEY_PLACEHOLDER))
++}
++
+ fn parse_field(contents: &str, field: &str) -> Option<String> {
+     contents.lines().find_map(|line| {
+         let line = line.trim();
+@@ -106,6 +144,29 @@ fn parse_field(contents: &str, field: &str) -> Option<String> {
+     })
+ }
+ 
++fn balance_transport_error(err: reqwest::Error) -> CodexErr {
++    CodexErr::Stream(format!("DeepSeek balance request failed: {err}"), None)
++}
++
++#[derive(Debug, Deserialize)]
++struct DeepSeekBalanceResponse {
++    balance_infos: Vec<DeepSeekBalanceInfo>,
++}
++
++impl DeepSeekBalanceResponse {
++    fn display_balance(&self) -> Option<String> {
++        self.balance_infos
++            .first()
++            .map(|balance| format!("{} {}", balance.currency, balance.total_balance))
++    }
++}
++
++#[derive(Debug, Deserialize)]
++struct DeepSeekBalanceInfo {
++    currency: String,
++    total_balance: String,
++}
++
+ fn missing_api_key_error(path: &Path) -> CodexErr {
+     CodexErr::EnvVar(EnvVarError {
+         var: path.display().to_string(),
+@@ -114,3 +175,40 @@ fn missing_api_key_error(path: &Path) -> CodexErr {
+         )),
+     })
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use pretty_assertions::assert_eq;
++
++    #[test]
++    fn parse_balance_response_returns_display_balance() {
++        let response = serde_json::from_str::<DeepSeekBalanceResponse>(
++            r#"{
++                "is_available": true,
++                "balance_infos": [
++                    {
++                        "currency": "CNY",
++                        "total_balance": "50.39",
++                        "granted_balance": "0.00",
++                        "topped_up_balance": "50.39"
++                    }
++                ]
++            }"#,
++        )
++        .expect("parse balance response");
++
++        assert_eq!(Some("CNY 50.39".to_string()), response.display_balance());
++    }
++
++    #[test]
++    fn parse_api_key_ignores_placeholder() {
++        let temp_home = tempfile::TempDir::new().expect("temp home");
++        fs::write(temp_home.path().join(API_KEY_FILE), EXAMPLE_API_KEY_FILE)
++            .expect("write placeholder");
++
++        let api_key = read_configured_api_key(temp_home.path()).expect("read api key");
++
++        assert_eq!(None, api_key);
++    }
++}
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index b92b9630e9..211795b4b7 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -10,7 +10,7 @@ mod apps;
+ mod chat_completions;
+ mod client;
+ mod client_common;
+-mod deepseek_side_route;
++pub mod deepseek_side_route;
+ pub mod mimo_side_route;
+ mod realtime_context;
+ mod realtime_conversation;
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index 6f5f62a398..4eb02cc83e 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -194,6 +194,9 @@ use tokio::sync::mpsc::unbounded_channel;
+ use tokio::task::JoinHandle;
+ use toml::Value as TomlValue;
+ use uuid::Uuid;
++
++const DEEPSEEK_BALANCE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
++
+ mod agent_message_consolidation;
+ mod agent_navigation;
+ mod app_server_event_targets;
+@@ -557,6 +560,9 @@ pub(crate) struct App {
+     pending_primary_events: VecDeque<ThreadBufferedEvent>,
+     pending_app_server_requests: PendingAppServerRequests,
+     pending_startup_thread_start: bool,
++    deepseek_balance_last_refresh_at: Option<Instant>,
++    deepseek_balance_stale_refresh_in_flight: bool,
++    deepseek_balance_loaded: bool,
+     // Serialize plugin enablement writes per plugin so stale completions cannot
+     // overwrite a newer toggle, even if the plugin is toggled from different
+     // cwd contexts.
+@@ -1030,6 +1036,9 @@ See the Codex keymap documentation for supported actions and examples."
+             pending_primary_events: VecDeque::new(),
+             pending_app_server_requests: PendingAppServerRequests::default(),
+             pending_startup_thread_start,
++            deepseek_balance_last_refresh_at: None,
++            deepseek_balance_stale_refresh_in_flight: false,
++            deepseek_balance_loaded: false,
+             pending_plugin_enabled_writes: HashMap::new(),
+             pending_hook_enabled_writes: HashMap::new(),
+         };
+@@ -1096,6 +1105,10 @@ See the Codex keymap documentation for supported actions and examples."
+         if has_chatgpt_account {
+             app.refresh_rate_limits(&app_server, RateLimitRefreshOrigin::StartupPrefetch);
+         }
++        app.refresh_deepseek_balance(
++            RateLimitRefreshOrigin::StartupPrefetch,
++            /*retry_until_loaded*/ true,
++        );
+ 
+         let mut listen_for_app_server_events = true;
+         let mut waiting_for_initial_session_configured = wait_for_initial_session_configured;
+diff --git a/codex-rs/tui/src/app/background_requests.rs b/codex-rs/tui/src/app/background_requests.rs
+index dcf1f672be..df5be341a4 100644
+--- a/codex-rs/tui/src/app/background_requests.rs
++++ b/codex-rs/tui/src/app/background_requests.rs
+@@ -61,6 +61,46 @@ impl App {
+         });
+     }
+ 
++    pub(super) fn refresh_deepseek_balance(
++        &mut self,
++        origin: RateLimitRefreshOrigin,
++        retry_until_loaded: bool,
++    ) {
++        if retry_until_loaded && self.deepseek_balance_loaded {
++            return;
++        }
++
++        let stale_refresh = matches!(origin, RateLimitRefreshOrigin::StartupPrefetch);
++        if stale_refresh {
++            if self.deepseek_balance_stale_refresh_in_flight {
++                return;
++            }
++            if self
++                .deepseek_balance_last_refresh_at
++                .is_some_and(|refreshed_at| {
++                    refreshed_at.elapsed() < DEEPSEEK_BALANCE_REFRESH_INTERVAL
++                })
++            {
++                return;
++            }
++            self.deepseek_balance_stale_refresh_in_flight = true;
++        }
++        self.deepseek_balance_last_refresh_at = Some(Instant::now());
++        let app_event_tx = self.app_event_tx.clone();
++        let codex_home = self.config.codex_home.clone();
++        tokio::spawn(async move {
++            let result =
++                crate::legacy_core::deepseek_side_route::fetch_balance_display(&codex_home)
++                    .await
++                    .map_err(|err| err.to_string());
++            app_event_tx.send(AppEvent::DeepSeekBalanceLoaded {
++                origin,
++                retry_until_loaded,
++                result,
++            });
++        });
++    }
++
+     pub(super) fn send_add_credits_nudge_email(
+         &mut self,
+         app_server: &AppServerSession,
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index 170e41682b..43439942a2 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -731,6 +731,13 @@ impl App {
+             }
+             AppEvent::RefreshRateLimits { origin } => {
+                 self.refresh_rate_limits(app_server, origin);
++                self.refresh_deepseek_balance(origin, /*retry_until_loaded*/ false);
++            }
++            AppEvent::RefreshDeepSeekBalance {
++                origin,
++                retry_until_loaded,
++            } => {
++                self.refresh_deepseek_balance(origin, retry_until_loaded);
+             }
+             AppEvent::OpenThreadGoalMenu { thread_id } => {
+                 self.open_thread_goal_menu(app_server, thread_id).await;
+@@ -788,6 +795,45 @@ impl App {
+                     }
+                 }
+             },
++            AppEvent::DeepSeekBalanceLoaded {
++                origin,
++                retry_until_loaded,
++                result,
++            } => {
++                if matches!(origin, RateLimitRefreshOrigin::StartupPrefetch) {
++                    self.deepseek_balance_stale_refresh_in_flight = false;
++                }
++                match result {
++                    Ok(balance) => {
++                        if balance.is_some() {
++                            self.deepseek_balance_loaded = true;
++                        }
++                        self.chat_widget.on_deepseek_balance(balance);
++                    }
++                    Err(err) => {
++                        tracing::warn!("DeepSeek balance refresh failed during TUI refresh: {err}");
++                    }
++                }
++                match origin {
++                    RateLimitRefreshOrigin::StartupPrefetch => {
++                        tui.frame_requester().schedule_frame();
++                        if retry_until_loaded && !self.deepseek_balance_loaded {
++                            let app_event_tx = self.app_event_tx.clone();
++                            tokio::spawn(async move {
++                                tokio::time::sleep(DEEPSEEK_BALANCE_REFRESH_INTERVAL).await;
++                                app_event_tx.send(AppEvent::RefreshDeepSeekBalance {
++                                    origin: RateLimitRefreshOrigin::StartupPrefetch,
++                                    retry_until_loaded: true,
++                                });
++                            });
++                        }
++                    }
++                    RateLimitRefreshOrigin::StatusCommand { request_id } => {
++                        self.chat_widget
++                            .finish_status_deepseek_balance_refresh(request_id);
++                    }
++                }
++            }
+             AppEvent::ConnectorsLoaded { result, is_final } => {
+                 self.chat_widget.on_connectors_loaded(result, is_final);
+             }
+diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
+index bf5ffdad36..8153519ecd 100644
+--- a/codex-rs/tui/src/app/session_lifecycle.rs
++++ b/codex-rs/tui/src/app/session_lifecycle.rs
+@@ -260,6 +260,7 @@ impl App {
+     /// This helper copies every known nickname/role from `AgentNavigationState` into the
+     /// replacement widget so that replayed collab items render agent names immediately.
+     pub(super) fn replace_chat_widget(&mut self, mut chat_widget: ChatWidget) {
++        chat_widget.inherit_status_cache_from(&self.chat_widget);
+         // Transfer the last-written terminal title to the replacement widget
+         // so it knows what OSC title is currently displayed. Without this, the
+         // new widget would redundantly clear and rewrite the same title, causing
+@@ -372,6 +373,7 @@ impl App {
+         }
+         self.drain_active_thread_events(tui).await?;
+         self.refresh_pending_thread_approvals().await;
++        self.prefetch_rate_limits_for_current_widget(app_server);
+ 
+         Ok(())
+     }
+@@ -506,16 +508,20 @@ impl App {
+                     self.chat_widget.add_error_message(format!(
+                         "Failed to attach to fresh app-server thread: {err}"
+                     ));
+-                } else if let Some(summary) = summary {
+-                    let mut lines: Vec<Line<'static>> = Vec::new();
+-                    if let Some(usage_line) = summary.usage_line {
+-                        lines.push(usage_line.into());
+-                    }
+-                    if let Some(command) = summary.resume_hint {
+-                        let spans = vec!["To continue this session, run ".into(), command.cyan()];
+-                        lines.push(spans.into());
++                } else {
++                    self.prefetch_rate_limits_for_current_widget(app_server);
++                    if let Some(summary) = summary {
++                        let mut lines: Vec<Line<'static>> = Vec::new();
++                        if let Some(usage_line) = summary.usage_line {
++                            lines.push(usage_line.into());
++                        }
++                        if let Some(command) = summary.resume_hint {
++                            let spans =
++                                vec!["To continue this session, run ".into(), command.cyan()];
++                            lines.push(spans.into());
++                        }
++                        self.chat_widget.add_plain_history_lines(lines);
+                     }
+-                    self.chat_widget.add_plain_history_lines(lines);
+                 }
+             }
+             Err(err) => {
+@@ -528,6 +534,21 @@ impl App {
+         tui.frame_requester().schedule_frame();
+     }
+ 
++    pub(super) fn prefetch_rate_limits_for_current_widget(
++        &mut self,
++        app_server: &AppServerSession,
++    ) -> bool {
++        let refresh_rate_limits = self.chat_widget.should_prefetch_rate_limits();
++        if refresh_rate_limits {
++            self.refresh_rate_limits(app_server, RateLimitRefreshOrigin::StartupPrefetch);
++        }
++        self.refresh_deepseek_balance(
++            RateLimitRefreshOrigin::StartupPrefetch,
++            /*retry_until_loaded*/ true,
++        );
++        refresh_rate_limits
++    }
++
+     pub(super) async fn replace_chat_widget_with_app_server_thread(
+         &mut self,
+         tui: &mut tui::Tui,
+diff --git a/codex-rs/tui/src/app/test_support.rs b/codex-rs/tui/src/app/test_support.rs
+index f52929ff38..689ee6936d 100644
+--- a/codex-rs/tui/src/app/test_support.rs
++++ b/codex-rs/tui/src/app/test_support.rs
+@@ -61,6 +61,9 @@ pub(super) async fn make_test_app() -> App {
+         pending_primary_events: VecDeque::new(),
+         pending_app_server_requests: PendingAppServerRequests::default(),
+         pending_startup_thread_start: false,
++        deepseek_balance_last_refresh_at: None,
++        deepseek_balance_stale_refresh_in_flight: false,
++        deepseek_balance_loaded: false,
+         pending_plugin_enabled_writes: HashMap::new(),
+         pending_hook_enabled_writes: HashMap::new(),
+     }
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index 4dde7d6d0b..2a5c9dfc71 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -1161,6 +1161,46 @@ async fn token_usage_update_refreshes_status_line_with_runtime_context_window()
+     );
+ }
+ 
++#[tokio::test]
++async fn deepseek_balance_stale_refresh_is_throttled_but_status_refresh_is_forced() {
++    let (mut app, _rx, _op_rx) = make_test_app_with_channels().await;
++
++    app.refresh_deepseek_balance(
++        RateLimitRefreshOrigin::StartupPrefetch,
++        /*retry_until_loaded*/ true,
++    );
++    let first_refresh = app
++        .deepseek_balance_last_refresh_at
++        .expect("first refresh timestamp");
++    assert!(app.deepseek_balance_stale_refresh_in_flight);
++
++    app.refresh_deepseek_balance(
++        RateLimitRefreshOrigin::StartupPrefetch,
++        /*retry_until_loaded*/ true,
++    );
++    assert_eq!(Some(first_refresh), app.deepseek_balance_last_refresh_at);
++
++    app.refresh_deepseek_balance(
++        RateLimitRefreshOrigin::StatusCommand { request_id: 1 },
++        /*retry_until_loaded*/ false,
++    );
++    assert!(
++        app.deepseek_balance_last_refresh_at
++            .is_some_and(|refreshed_at| refreshed_at >= first_refresh)
++    );
++
++    let forced_refresh = app
++        .deepseek_balance_last_refresh_at
++        .expect("forced refresh timestamp");
++    app.deepseek_balance_loaded = true;
++    app.deepseek_balance_stale_refresh_in_flight = false;
++    app.refresh_deepseek_balance(
++        RateLimitRefreshOrigin::StartupPrefetch,
++        /*retry_until_loaded*/ true,
++    );
++    assert_eq!(Some(forced_refresh), app.deepseek_balance_last_refresh_at);
++}
++
+ #[tokio::test]
+ async fn collab_receiver_notification_caches_thread_without_app_server_read() {
+     let mut app = make_test_app().await;
+@@ -4067,6 +4107,34 @@ async fn clear_ui_header_shows_fast_status_for_fast_capable_models() {
+     assert_app_snapshot!("clear_ui_header_fast_status_fast_capable_models", rendered);
+ }
+ 
++#[tokio::test]
++async fn clear_replacement_prefetches_rate_limits_for_chatgpt_status_line() {
++    let mut app = make_test_app().await;
++    set_chatgpt_auth(&mut app.chat_widget);
++    let app_server = crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
++        .await
++        .expect("embedded app server");
++
++    let requested = app.prefetch_rate_limits_for_current_widget(&app_server);
++
++    assert_eq!(requested, true);
++    app_server.shutdown().await.expect("shutdown app server");
++}
++
++#[tokio::test]
++async fn clear_replacement_prefetches_deepseek_balance_without_chatgpt_account() {
++    let mut app = make_test_app().await;
++    let app_server = crate::start_embedded_app_server_for_picker(app.chat_widget.config_ref())
++        .await
++        .expect("embedded app server");
++
++    let requested = app.prefetch_rate_limits_for_current_widget(&app_server);
++
++    assert_eq!(requested, false);
++    assert!(app.deepseek_balance_last_refresh_at.is_some());
++    app_server.shutdown().await.expect("shutdown app server");
++}
++
+ async fn make_test_app() -> App {
+     let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+     let config = chat_widget.config_ref().clone();
+@@ -4121,6 +4189,9 @@ async fn make_test_app() -> App {
+         pending_primary_events: VecDeque::new(),
+         pending_app_server_requests: PendingAppServerRequests::default(),
+         pending_startup_thread_start: false,
++        deepseek_balance_last_refresh_at: None,
++        deepseek_balance_stale_refresh_in_flight: false,
++        deepseek_balance_loaded: false,
+         pending_plugin_enabled_writes: HashMap::new(),
+         pending_hook_enabled_writes: HashMap::new(),
+     }
+@@ -4185,6 +4256,9 @@ async fn make_test_app_with_channels() -> (
+             pending_primary_events: VecDeque::new(),
+             pending_app_server_requests: PendingAppServerRequests::default(),
+             pending_startup_thread_start: false,
++            deepseek_balance_last_refresh_at: None,
++            deepseek_balance_stale_refresh_in_flight: false,
++            deepseek_balance_loaded: false,
+             pending_plugin_enabled_writes: HashMap::new(),
+             pending_hook_enabled_writes: HashMap::new(),
+         },
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+index dbfa997c24..cbcc89aaeb 100644
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -1454,6 +1454,10 @@ impl App {
+             ThreadBufferedEvent::Notification(ServerNotification::TurnStarted(_))
+                 | ThreadBufferedEvent::Notification(ServerNotification::ThreadTokenUsageUpdated(_))
+         );
++        let completed_deepseek_turn = matches!(
++            &event,
++            ThreadBufferedEvent::Notification(ServerNotification::TurnCompleted(_))
++        ) && self.chat_widget.active_turn_uses_deepseek_model();
+         match event {
+             ThreadBufferedEvent::Notification(notification) => {
+                 self.cache_collab_receiver_threads_for_notification(&notification);
+@@ -1479,6 +1483,12 @@ impl App {
+         if needs_refresh {
+             self.refresh_status_line();
+         }
++        if completed_deepseek_turn {
++            self.refresh_deepseek_balance(
++                RateLimitRefreshOrigin::StartupPrefetch,
++                /*retry_until_loaded*/ false,
++            );
++        }
+     }
+ 
+     pub(super) fn handle_thread_event_replay(&mut self, event: ThreadBufferedEvent) {
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+index 7aea7c607b..69b3b6f1f6 100644
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -263,6 +263,12 @@ pub(crate) enum AppEvent {
+         origin: RateLimitRefreshOrigin,
+     },
+ 
++    /// Refresh the DeepSeek side-route balance in the background.
++    RefreshDeepSeekBalance {
++        origin: RateLimitRefreshOrigin,
++        retry_until_loaded: bool,
++    },
++
+     /// Open the current thread goal summary/action menu.
+     OpenThreadGoalMenu {
+         thread_id: ThreadId,
+@@ -297,6 +303,13 @@ pub(crate) enum AppEvent {
+         result: Result<Vec<RateLimitSnapshot>, String>,
+     },
+ 
++    /// Result of refreshing the DeepSeek side-route account balance.
++    DeepSeekBalanceLoaded {
++        origin: RateLimitRefreshOrigin,
++        retry_until_loaded: bool,
++        result: Result<Option<String>, String>,
++    },
++
+     /// Send a user-confirmed request to notify the workspace owner.
+     SendAddCreditsNudgeEmail {
+         credit_type: AddCreditsNudgeCreditType,
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+index 09efc43fa9..ef4c9edf3b 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -134,6 +134,10 @@ pub(crate) enum StatusLineItem {
+     /// Active ChatGPT account (if any).
+     Account,
+ 
++    /// DeepSeek side-route account balance.
++    #[strum(to_string = "deepseek-balance", serialize = "deep-seek-balance")]
++    DeepSeekBalance,
++
+     /// Model WebSocket RTT or disconnect state.
+     RemoteConnection,
+ 
+@@ -185,6 +189,9 @@ impl StatusLineItem {
+             StatusLineItem::FastMode => "Whether Fast mode is currently active",
+             StatusLineItem::RawOutput => "Whether raw scrollback mode is active",
+             StatusLineItem::Account => "Active ChatGPT account (omitted when using API key auth)",
++            StatusLineItem::DeepSeekBalance => {
++                "DeepSeek side-route balance (omitted when unavailable)"
++            }
+             StatusLineItem::RemoteConnection => {
+                 "Model WebSocket RTT or disconnect state (omitted when unavailable)"
+             }
+@@ -222,6 +229,7 @@ impl StatusLineItem {
+             StatusLineItem::FastMode => StatusSurfacePreviewItem::FastMode,
+             StatusLineItem::RawOutput => StatusSurfacePreviewItem::RawOutput,
+             StatusLineItem::Account => StatusSurfacePreviewItem::Account,
++            StatusLineItem::DeepSeekBalance => StatusSurfacePreviewItem::DeepSeekBalance,
+             StatusLineItem::RemoteConnection => StatusSurfacePreviewItem::RemoteConnection,
+             StatusLineItem::ThreadTitle => StatusSurfacePreviewItem::ThreadTitle,
+             StatusLineItem::TaskProgress => StatusSurfacePreviewItem::TaskProgress,
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+index 08f94a5ed9..69e99aca91 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -52,7 +52,7 @@ impl StatusLineAccent {
+             StatusLineItem::FastMode | StatusLineItem::RawOutput => Self::Mode,
+             StatusLineItem::Permissions => Self::Mode,
+             StatusLineItem::ApprovalMode => Self::Mode,
+-            StatusLineItem::Account => Self::Account,
++            StatusLineItem::Account | StatusLineItem::DeepSeekBalance => Self::Account,
+             StatusLineItem::ThreadTitle => Self::Thread,
+             StatusLineItem::TaskProgress => Self::Progress,
+         }
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+index b86429b62b..255166cb28 100644
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -31,6 +31,7 @@ pub(crate) enum StatusSurfacePreviewItem {
+     FastMode,
+     RawOutput,
+     Account,
++    DeepSeekBalance,
+     RemoteConnection,
+     Model,
+     ModelWithReasoning,
+@@ -64,6 +65,7 @@ impl StatusSurfacePreviewItem {
+             StatusSurfacePreviewItem::FastMode => "Fast on",
+             StatusSurfacePreviewItem::RawOutput => "raw output",
+             StatusSurfacePreviewItem::Account => "u***r@g***l.com Pro",
++            StatusSurfacePreviewItem::DeepSeekBalance => "CNY 50.39",
+             StatusSurfacePreviewItem::RemoteConnection => "42ms",
+             StatusSurfacePreviewItem::Model => "gpt-5.2-codex",
+             StatusSurfacePreviewItem::ModelWithReasoning => "gpt-5.2-codex medium",
+@@ -97,6 +99,7 @@ impl StatusSurfacePreviewItem {
+             Self::FastMode,
+             Self::RawOutput,
+             Self::Account,
++            Self::DeepSeekBalance,
+             Self::RemoteConnection,
+             Self::Model,
+             Self::ModelWithReasoning,
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index e3c255e170..9398c3e4fc 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -484,8 +484,12 @@ use unicode_segmentation::UnicodeSegmentation;
+ const USER_SHELL_COMMAND_HELP_TITLE: &str = "Prefix a command with ! to run it locally";
+ const USER_SHELL_COMMAND_HELP_HINT: &str = "Example: !ls";
+ const AUTO_REVIEW_DESCRIPTION: &str = "Same workspace-write permissions as Default, but eligible `on-request` approvals are routed through the auto-reviewer subagent.";
+-const DEFAULT_STATUS_LINE_ITEMS: [&str; 3] =
+-    ["model-with-reasoning", "remote-connection", "current-dir"];
++const DEFAULT_STATUS_LINE_ITEMS: [&str; 4] = [
++    "model-with-reasoning",
++    "deepseek-balance",
++    "remote-connection",
++    "current-dir",
++];
+ const MAX_AGENT_COPY_HISTORY: usize = 32;
+ 
+ /// Common initialization parameters shared by all `ChatWidget` constructors.
+@@ -563,7 +567,9 @@ pub(crate) struct ChatWidget {
+     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
+     model_websocket_status: Option<ModelWebsocketStatus>,
+     refreshing_status_outputs: Vec<(u64, StatusHistoryHandle)>,
++    refreshing_deepseek_balance_status_outputs: Vec<(u64, StatusHistoryHandle)>,
+     next_status_refresh_request_id: u64,
++    deepseek_balance_display: Option<String>,
+     active_turn_model_context: Option<ActiveTurnModelContext>,
+     plan_type: Option<PlanType>,
+     codex_rate_limit_reached_type: Option<RateLimitReachedType>,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 94d6e5b021..fe9920fb15 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -124,7 +124,9 @@ impl ChatWidget {
+             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
+             model_websocket_status: None,
+             refreshing_status_outputs: Vec::new(),
++            refreshing_deepseek_balance_status_outputs: Vec::new(),
+             next_status_refresh_request_id: 0,
++            deepseek_balance_display: None,
+             active_turn_model_context: None,
+             plan_type: initial_plan_type,
+             codex_rate_limit_reached_type: None,
+diff --git a/codex-rs/tui/src/chatwidget/rate_limits.rs b/codex-rs/tui/src/chatwidget/rate_limits.rs
+index 73e16898ca..6ef7a5df42 100644
+--- a/codex-rs/tui/src/chatwidget/rate_limits.rs
++++ b/codex-rs/tui/src/chatwidget/rate_limits.rs
+@@ -252,7 +252,7 @@ impl ChatWidget {
+     }
+ 
+     #[cfg_attr(not(test), allow(dead_code))]
+-    pub(super) fn should_prefetch_rate_limits(&self) -> bool {
++    pub(crate) fn should_prefetch_rate_limits(&self) -> bool {
+         self.has_chatgpt_account
+     }
+ 
+diff --git a/codex-rs/tui/src/chatwidget/slash_dispatch.rs b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+index 19010da6b2..680954a6c4 100644
+--- a/codex-rs/tui/src/chatwidget/slash_dispatch.rs
++++ b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+@@ -377,18 +377,20 @@ impl ChatWidget {
+                 self.add_hooks_output();
+             }
+             SlashCommand::Status => {
+-                if self.should_prefetch_rate_limits() {
+-                    let request_id = self.next_status_refresh_request_id;
+-                    self.next_status_refresh_request_id =
+-                        self.next_status_refresh_request_id.wrapping_add(1);
+-                    self.add_status_output(/*refreshing_rate_limits*/ true, Some(request_id));
+-                    self.app_event_tx.send(AppEvent::RefreshRateLimits {
+-                        origin: RateLimitRefreshOrigin::StatusCommand { request_id },
+-                    });
++                let refresh_rate_limits = self.should_prefetch_rate_limits();
++                let request_id = self.next_status_refresh_request_id;
++                self.next_status_refresh_request_id =
++                    self.next_status_refresh_request_id.wrapping_add(1);
++                self.add_status_output(refresh_rate_limits, Some(request_id));
++                let origin = RateLimitRefreshOrigin::StatusCommand { request_id };
++                if refresh_rate_limits {
++                    self.app_event_tx
++                        .send(AppEvent::RefreshRateLimits { origin });
+                 } else {
+-                    self.add_status_output(
+-                        /*refreshing_rate_limits*/ false, /*request_id*/ None,
+-                    );
++                    self.app_event_tx.send(AppEvent::RefreshDeepSeekBalance {
++                        origin,
++                        retry_until_loaded: false,
++                    });
+                 }
+             }
+             SlashCommand::Ide => {
+diff --git a/codex-rs/tui/src/chatwidget/status_controls.rs b/codex-rs/tui/src/chatwidget/status_controls.rs
+index 107268a2da..8623d5e3a0 100644
+--- a/codex-rs/tui/src/chatwidget/status_controls.rs
++++ b/codex-rs/tui/src/chatwidget/status_controls.rs
+@@ -227,10 +227,11 @@ impl ChatWidget {
+             .collect();
+         let agents_summary =
+             crate::status::compose_agents_summary(&self.config, &self.instruction_source_paths);
+-        let (cell, handle) = crate::status::new_status_output_with_rate_limits_handle(
++        let (cell, handle) = crate::status::new_status_output_with_rate_limits_handle_and_deepseek(
+             &self.config,
+             self.runtime_model_provider_base_url.as_deref(),
+             self.status_account_display.as_ref(),
++            self.deepseek_balance_display.clone(),
+             token_info,
+             total_usage,
+             &self.thread_id,
+@@ -246,11 +247,35 @@ impl ChatWidget {
+             refreshing_rate_limits,
+         );
+         if let Some(request_id) = request_id {
+-            self.refreshing_status_outputs.push((request_id, handle));
++            self.refreshing_status_outputs
++                .push((request_id, handle.clone()));
++            self.refreshing_deepseek_balance_status_outputs
++                .push((request_id, handle));
+         }
+         self.add_to_history(cell);
+     }
+ 
++    pub(crate) fn on_deepseek_balance(&mut self, balance: Option<String>) {
++        self.deepseek_balance_display = balance;
++        self.refresh_status_line();
++    }
++
++    pub(crate) fn inherit_status_cache_from(&mut self, previous: &ChatWidget) {
++        self.rate_limit_snapshots_by_limit_id = previous.rate_limit_snapshots_by_limit_id.clone();
++        self.deepseek_balance_display = previous.deepseek_balance_display.clone();
++        self.plan_type = previous.plan_type;
++        self.codex_rate_limit_reached_type = previous.codex_rate_limit_reached_type;
++        self.refresh_status_line();
++    }
++
++    pub(crate) fn active_turn_uses_deepseek_model(&self) -> bool {
++        self.active_turn_model_context
++            .as_ref()
++            .is_some_and(|context| {
++                crate::legacy_core::deepseek_side_route::is_deepseek_model(&context.model)
++            })
++    }
++
+     pub(crate) fn finish_status_rate_limit_refresh(&mut self, request_id: u64) {
+         if self.refreshing_status_outputs.is_empty() {
+             return;
+@@ -278,6 +303,31 @@ impl ChatWidget {
+         }
+     }
+ 
++    pub(crate) fn finish_status_deepseek_balance_refresh(&mut self, request_id: u64) {
++        if self.refreshing_deepseek_balance_status_outputs.is_empty() {
++            return;
++        }
++
++        let balance = self.deepseek_balance_display.clone();
++        let mut remaining =
++            Vec::with_capacity(self.refreshing_deepseek_balance_status_outputs.len());
++        let mut updated_any = false;
++        for (pending_request_id, handle) in
++            self.refreshing_deepseek_balance_status_outputs.drain(..)
++        {
++            if pending_request_id == request_id {
++                updated_any = true;
++                handle.finish_deepseek_balance_refresh(balance.clone());
++            } else {
++                remaining.push((pending_request_id, handle));
++            }
++        }
++        self.refreshing_deepseek_balance_status_outputs = remaining;
++        if updated_any {
++            self.request_redraw();
++        }
++    }
++
+     pub(super) fn open_status_line_setup(&mut self) {
+         let configured_status_line_items = self.configured_status_line_items();
+         let view = StatusLineSetupView::new(
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 6f11a8f871..92677056c6 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -653,6 +653,7 @@ impl ChatWidget {
+             ),
+             StatusLineItem::RawOutput => self.raw_output_mode().then(|| "raw output".to_string()),
+             StatusLineItem::Account => self.status_line_account_display(),
++            StatusLineItem::DeepSeekBalance => self.deepseek_balance_display.clone(),
+             StatusLineItem::RemoteConnection => self.status_line_remote_connection_display(),
+             StatusLineItem::ThreadTitle => self.thread_name.as_ref().map_or_else(
+                 || self.thread_id.map(|id| id.to_string()),
+@@ -791,6 +792,7 @@ impl ChatWidget {
+             StatusSurfacePreviewItem::FastMode => StatusLineItem::FastMode,
+             StatusSurfacePreviewItem::RawOutput => StatusLineItem::RawOutput,
+             StatusSurfacePreviewItem::Account => StatusLineItem::Account,
++            StatusSurfacePreviewItem::DeepSeekBalance => StatusLineItem::DeepSeekBalance,
+             StatusSurfacePreviewItem::RemoteConnection => StatusLineItem::RemoteConnection,
+             StatusSurfacePreviewItem::Model => StatusLineItem::ModelName,
+             StatusSurfacePreviewItem::ModelWithReasoning => StatusLineItem::ModelWithReasoning,
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index c3da6b23b1..1a2e78d6c3 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -975,6 +975,63 @@ async fn rate_limit_snapshots_keep_separate_entries_per_limit_id() {
+     assert!(other.credits.is_none());
+ }
+ 
++#[tokio::test]
++async fn status_cache_survives_chat_widget_replacement() {
++    let (mut previous, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    previous.on_deepseek_balance(Some("DeepSeek $7.42".to_string()));
++    previous.on_rate_limit_snapshot(Some(RateLimitSnapshot {
++        limit_id: Some("codex".to_string()),
++        limit_name: Some("codex".to_string()),
++        primary: Some(RateLimitWindow {
++            used_percent: 20,
++            window_duration_mins: Some(300),
++            resets_at: None,
++        }),
++        secondary: None,
++        credits: None,
++        plan_type: Some(PlanType::Pro),
++        rate_limit_reached_type: None,
++    }));
++    previous.on_rate_limit_snapshot(Some(RateLimitSnapshot {
++        limit_id: Some("codex_other".to_string()),
++        limit_name: Some("spark".to_string()),
++        primary: Some(RateLimitWindow {
++            used_percent: 90,
++            window_duration_mins: Some(60),
++            resets_at: None,
++        }),
++        secondary: None,
++        credits: None,
++        plan_type: Some(PlanType::Pro),
++        rate_limit_reached_type: None,
++    }));
++
++    let (mut replacement, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    replacement.inherit_status_cache_from(&previous);
++
++    assert_eq!(
++        replacement.status_line_value_for_item(crate::bottom_pane::StatusLineItem::DeepSeekBalance),
++        Some("DeepSeek $7.42".to_string())
++    );
++    assert_eq!(
++        replacement
++            .rate_limit_snapshots_by_limit_id
++            .get("codex")
++            .and_then(|snapshot| snapshot.primary.as_ref())
++            .map(|window| window.used_percent),
++        Some(20.0)
++    );
++    assert_eq!(
++        replacement
++            .rate_limit_snapshots_by_limit_id
++            .get("codex_other")
++            .and_then(|snapshot| snapshot.primary.as_ref())
++            .map(|window| window.used_percent),
++        Some(90.0)
++    );
++    assert_eq!(replacement.plan_type, Some(PlanType::Pro));
++}
++
+ #[tokio::test]
+ async fn rate_limit_switch_prompt_skips_when_on_lower_cost_model() {
+     let (mut chat, _, _) = make_chatwidget_manual(Some(NUDGE_MODEL_SLUG)).await;
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_command_tests.rs b/codex-rs/tui/src/chatwidget/tests/status_command_tests.rs
+index c206313549..a5f8dc304e 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_command_tests.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_command_tests.rs
+@@ -1,6 +1,22 @@
+ use super::*;
+ use assert_matches::assert_matches;
+ 
++fn expect_deepseek_refresh(
++    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
++    expected_request_id: u64,
++) {
++    match rx.try_recv() {
++        Ok(AppEvent::RefreshDeepSeekBalance {
++            origin: RateLimitRefreshOrigin::StatusCommand { request_id },
++            retry_until_loaded,
++        }) => {
++            pretty_assertions::assert_eq!(request_id, expected_request_id);
++            pretty_assertions::assert_eq!(retry_until_loaded, false);
++        }
++        other => panic!("expected DeepSeek balance refresh request, got {other:?}"),
++    }
++}
++
+ #[tokio::test]
+ async fn status_command_renders_immediately_and_refreshes_rate_limits_for_chatgpt_auth() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+@@ -46,7 +62,9 @@ async fn status_command_refresh_updates_cached_limits_for_future_status_outputs(
+     };
+ 
+     chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 92.0)));
++    chat.on_deepseek_balance(Some("CNY 50.39".to_string()));
+     chat.finish_status_rate_limit_refresh(first_request_id);
++    chat.finish_status_deepseek_balance_refresh(first_request_id);
+     drain_insert_history(&mut rx);
+ 
+     chat.dispatch_command(SlashCommand::Status);
+@@ -60,15 +78,20 @@ async fn status_command_refresh_updates_cached_limits_for_future_status_outputs(
+         refreshed.contains("8% left"),
+         "expected a future /status output to use refreshed cached limits, got: {refreshed}"
+     );
++    assert!(
++        refreshed.contains("CNY 50.39"),
++        "expected a future /status output to use refreshed cached DeepSeek balance, got: {refreshed}"
++    );
+ }
+ 
+ #[tokio::test]
+-async fn status_command_renders_immediately_without_rate_limit_refresh() {
++async fn status_command_renders_immediately_without_rate_limit_refresh_but_refreshes_deepseek() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+ 
+     chat.dispatch_command(SlashCommand::Status);
+ 
+     assert_matches!(rx.try_recv(), Ok(AppEvent::InsertHistoryCell(_)));
++    expect_deepseek_refresh(&mut rx, 0);
+     assert!(
+         !std::iter::from_fn(|| rx.try_recv().ok())
+             .any(|event| matches!(event, AppEvent::RefreshRateLimits { .. })),
+@@ -156,9 +179,14 @@ async fn status_command_overlapping_refreshes_update_matching_cells_only() {
+     );
+ 
+     chat.finish_status_rate_limit_refresh(first_request_id);
++    chat.finish_status_deepseek_balance_refresh(first_request_id);
+     pretty_assertions::assert_eq!(chat.refreshing_status_outputs.len(), 1);
++    pretty_assertions::assert_eq!(chat.refreshing_deepseek_balance_status_outputs.len(), 1);
+ 
+     chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 92.0)));
++    chat.on_deepseek_balance(Some("CNY 50.39".to_string()));
+     chat.finish_status_rate_limit_refresh(second_request_id);
++    chat.finish_status_deepseek_balance_refresh(second_request_id);
+     assert!(chat.refreshing_status_outputs.is_empty());
++    assert!(chat.refreshing_deepseek_balance_status_outputs.is_empty());
+ }
+diff --git a/codex-rs/tui/src/status/card.rs b/codex-rs/tui/src/status/card.rs
+index e6a7029b10..88c4ee0031 100644
+--- a/codex-rs/tui/src/status/card.rs
++++ b/codex-rs/tui/src/status/card.rs
+@@ -75,6 +75,7 @@ struct StatusRateLimitState {
+ #[derive(Debug, Clone)]
+ pub(crate) struct StatusHistoryHandle {
+     rate_limit_state: Arc<RwLock<StatusRateLimitState>>,
++    deepseek_balance: Arc<RwLock<Option<String>>>,
+ }
+ 
+ impl StatusHistoryHandle {
+@@ -96,6 +97,15 @@ impl StatusHistoryHandle {
+         state.rate_limits = rate_limits;
+         state.refreshing_rate_limits = false;
+     }
++
++    pub(crate) fn finish_deepseek_balance_refresh(&self, balance: Option<String>) {
++        #[expect(clippy::expect_used)]
++        let mut state = self
++            .deepseek_balance
++            .write()
++            .expect("status history DeepSeek balance state poisoned");
++        *state = balance;
++    }
+ }
+ 
+ #[derive(Debug)]
+@@ -109,6 +119,7 @@ struct StatusHistoryCell {
+     model_provider: Option<String>,
+     show_chatgpt_usage_link: bool,
+     account: Option<StatusAccountDisplay>,
++    deepseek_balance: Arc<RwLock<Option<String>>>,
+     thread_name: Option<String>,
+     session_id: Option<String>,
+     forked_from: Option<String>,
+@@ -191,6 +202,7 @@ pub(crate) fn new_status_output_with_rate_limits(
+     .0
+ }
+ 
++#[cfg(test)]
+ #[allow(clippy::too_many_arguments)]
+ pub(crate) fn new_status_output_with_rate_limits_handle(
+     config: &Config,
+@@ -209,12 +221,54 @@ pub(crate) fn new_status_output_with_rate_limits_handle(
+     reasoning_effort_override: Option<Option<ReasoningEffort>>,
+     agents_summary: String,
+     refreshing_rate_limits: bool,
++) -> (CompositeHistoryCell, StatusHistoryHandle) {
++    new_status_output_with_rate_limits_handle_and_deepseek(
++        config,
++        runtime_model_provider_base_url,
++        account_display,
++        /*deepseek_balance*/ None,
++        token_info,
++        total_usage,
++        session_id,
++        thread_name,
++        forked_from,
++        rate_limits,
++        _plan_type,
++        now,
++        model_name,
++        collaboration_mode,
++        reasoning_effort_override,
++        agents_summary,
++        refreshing_rate_limits,
++    )
++}
++
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn new_status_output_with_rate_limits_handle_and_deepseek(
++    config: &Config,
++    runtime_model_provider_base_url: Option<&str>,
++    account_display: Option<&StatusAccountDisplay>,
++    deepseek_balance: Option<String>,
++    token_info: Option<&TokenUsageInfo>,
++    total_usage: &TokenUsage,
++    session_id: &Option<ThreadId>,
++    thread_name: Option<String>,
++    forked_from: Option<ThreadId>,
++    rate_limits: &[RateLimitSnapshotDisplay],
++    _plan_type: Option<PlanType>,
++    now: DateTime<Local>,
++    model_name: &str,
++    collaboration_mode: Option<&str>,
++    reasoning_effort_override: Option<Option<ReasoningEffort>>,
++    agents_summary: String,
++    refreshing_rate_limits: bool,
+ ) -> (CompositeHistoryCell, StatusHistoryHandle) {
+     let command = PlainHistoryCell::new(vec!["/status".magenta().into()]);
+     let (card, handle) = StatusHistoryCell::new(
+         config,
+         runtime_model_provider_base_url,
+         account_display,
++        deepseek_balance,
+         token_info,
+         total_usage,
+         session_id,
+@@ -242,6 +296,7 @@ impl StatusHistoryCell {
+         config: &Config,
+         runtime_model_provider_base_url: Option<&str>,
+         account_display: Option<&StatusAccountDisplay>,
++        deepseek_balance: Option<String>,
+         token_info: Option<&TokenUsageInfo>,
+         total_usage: &TokenUsage,
+         session_id: &Option<ThreadId>,
+@@ -282,13 +337,16 @@ impl StatusHistoryCell {
+                 .map(|effort| effort.to_string())
+                 .unwrap_or_else(|| "none".to_string());
+             config_entries.push(("reasoning effort", effort_value));
+-            config_entries.push((
+-                "reasoning summaries",
+-                config
+-                    .model_reasoning_summary
+-                    .map(|summary| summary.to_string())
+-                    .unwrap_or_else(|| "auto".to_string()),
+-            ));
++            let reasoning_summaries =
++                if crate::legacy_core::deepseek_side_route::is_deepseek_model(model_name) {
++                    "off".to_string()
++                } else {
++                    config
++                        .model_reasoning_summary
++                        .map(|summary| summary.to_string())
++                        .unwrap_or_else(|| "auto".to_string())
++                };
++            config_entries.push(("reasoning summaries", reasoning_summaries));
+         }
+         let (model_name, model_details) = compose_model_display(model_name, &config_entries);
+         let approval = config_entries
+@@ -312,6 +370,7 @@ impl StatusHistoryCell {
+         let model_provider = format_model_provider(config, runtime_model_provider_base_url);
+         let show_chatgpt_usage_link = config.model_provider.requires_openai_auth;
+         let account = compose_account_display(account_display);
++        let deepseek_balance = Arc::new(RwLock::new(deepseek_balance));
+         let session_id = session_id.as_ref().map(std::string::ToString::to_string);
+         let forked_from = forked_from.map(|id| id.to_string());
+         let default_usage = TokenUsage::default();
+@@ -352,6 +411,7 @@ impl StatusHistoryCell {
+                 model_provider,
+                 show_chatgpt_usage_link,
+                 account,
++                deepseek_balance: deepseek_balance.clone(),
+                 thread_name,
+                 session_id,
+                 forked_from,
+@@ -359,7 +419,10 @@ impl StatusHistoryCell {
+                 agents_summary,
+                 rate_limit_state: rate_limit_state.clone(),
+             },
+-            StatusHistoryHandle { rate_limit_state },
++            StatusHistoryHandle {
++                rate_limit_state,
++                deepseek_balance,
++            },
+         )
+     }
+ 
+@@ -718,6 +781,12 @@ impl HistoryCell for StatusHistoryCell {
+         }
+ 
+         let account_value = self.account.as_ref().map(account_display_spans);
++        #[expect(clippy::expect_used)]
++        let deepseek_balance = self
++            .deepseek_balance
++            .read()
++            .expect("status history DeepSeek balance state poisoned")
++            .clone();
+ 
+         let mut labels: Vec<String> = vec!["Model", "Directory", "Permissions", "Agents.md"]
+             .into_iter()
+@@ -743,6 +812,9 @@ impl HistoryCell for StatusHistoryCell {
+         if account_value.is_some() {
+             push_label(&mut labels, &mut seen, "Account");
+         }
++        if deepseek_balance.is_some() {
++            push_label(&mut labels, &mut seen, "DeepSeek balance");
++        }
+         if thread_name.is_some() {
+             push_label(&mut labels, &mut seen, "Thread name");
+         }
+@@ -806,6 +878,9 @@ impl HistoryCell for StatusHistoryCell {
+         if let Some(account_value) = account_value {
+             lines.push(formatter.line("Account", account_value));
+         }
++        if let Some(balance) = deepseek_balance {
++            lines.push(formatter.line("DeepSeek balance", vec![Span::from(balance)]));
++        }
+ 
+         if let Some(thread_name) = thread_name {
+             lines.push(formatter.line("Thread name", vec![Span::from(thread_name.to_string())]));
+diff --git a/codex-rs/tui/src/status/mod.rs b/codex-rs/tui/src/status/mod.rs
+index 8b7ba7b14b..914bafa146 100644
+--- a/codex-rs/tui/src/status/mod.rs
++++ b/codex-rs/tui/src/status/mod.rs
+@@ -18,7 +18,9 @@ pub(crate) use card::StatusHistoryHandle;
+ pub(crate) use card::new_status_output;
+ #[cfg(test)]
+ pub(crate) use card::new_status_output_with_rate_limits;
++#[cfg(test)]
+ pub(crate) use card::new_status_output_with_rate_limits_handle;
++pub(crate) use card::new_status_output_with_rate_limits_handle_and_deepseek;
+ pub(crate) use helpers::account_plan_style;
+ pub(crate) use helpers::compose_account_display;
+ pub(crate) use helpers::compose_agents_summary;
+diff --git a/codex-rs/tui/src/status/tests.rs b/codex-rs/tui/src/status/tests.rs
+index 1551a3a20a..058ea08ef8 100644
+--- a/codex-rs/tui/src/status/tests.rs
++++ b/codex-rs/tui/src/status/tests.rs
+@@ -1,6 +1,7 @@
+ use super::new_status_output;
+ use super::new_status_output_with_rate_limits;
+ use super::new_status_output_with_rate_limits_handle;
++use super::new_status_output_with_rate_limits_handle_and_deepseek;
+ use super::rate_limit_snapshot_display;
+ use crate::history_cell::HistoryCell;
+ use crate::legacy_core::config::Config;
+@@ -1045,6 +1046,88 @@ async fn status_snapshot_shows_positive_credits() {
+     );
+ }
+ 
++#[tokio::test]
++async fn status_snapshot_shows_deepseek_balance() {
++    let temp_home = TempDir::new().expect("temp home");
++    let mut config = test_config(&temp_home).await;
++    set_workspace_cwd(&mut config, test_path_buf("/workspace/tests").abs());
++    let account_display = test_status_account_display();
++    let usage = TokenUsage::default();
++    let captured_at = chrono::Local
++        .with_ymd_and_hms(2024, 3, 4, 5, 6, 7)
++        .single()
++        .expect("timestamp");
++    let model_slug = crate::legacy_core::test_support::get_model_offline(config.model.as_deref());
++    let token_info = token_info_for(&model_slug, &config, &usage);
++    let (composite, _) = new_status_output_with_rate_limits_handle_and_deepseek(
++        &config,
++        /*runtime_model_provider_base_url*/ None,
++        account_display.as_ref(),
++        Some("CNY 50.39".to_string()),
++        Some(&token_info),
++        &usage,
++        &None,
++        /*thread_name*/ None,
++        /*forked_from*/ None,
++        &[],
++        None,
++        captured_at,
++        &model_slug,
++        /*collaboration_mode*/ None,
++        /*reasoning_effort_override*/ None,
++        "<none>".to_string(),
++        /*refreshing_rate_limits*/ false,
++    );
++    let sanitized =
++        sanitize_directory(render_lines(&composite.display_lines(/*width*/ 120))).join("\n");
++    assert_snapshot!(sanitized);
++}
++
++#[tokio::test]
++async fn status_snapshot_shows_deepseek_summaries_off() {
++    let temp_home = TempDir::new().expect("temp home");
++    let mut config = test_config(&temp_home).await;
++    config.model = Some("deepseek-v4".to_string());
++    config.model_reasoning_effort = Some(ReasoningEffort::XHigh);
++    config.model_reasoning_summary = Some(ReasoningSummary::Detailed);
++    set_workspace_cwd(&mut config, test_path_buf("/workspace/tests").abs());
++
++    let account_display = test_status_account_display();
++    let usage = TokenUsage::default();
++    let captured_at = chrono::Local
++        .with_ymd_and_hms(2024, 3, 4, 5, 6, 7)
++        .single()
++        .expect("timestamp");
++    let model_slug = "deepseek-v4";
++    let token_info = token_info_for(model_slug, &config, &usage);
++    let (composite, _) = new_status_output_with_rate_limits_handle_and_deepseek(
++        &config,
++        /*runtime_model_provider_base_url*/ None,
++        account_display.as_ref(),
++        Some("CNY 50.39".to_string()),
++        Some(&token_info),
++        &usage,
++        &None,
++        /*thread_name*/ None,
++        /*forked_from*/ None,
++        &[],
++        None,
++        captured_at,
++        model_slug,
++        /*collaboration_mode*/ None,
++        /*reasoning_effort_override*/ None,
++        "<none>".to_string(),
++        /*refreshing_rate_limits*/ false,
++    );
++    let rendered = render_lines(&composite.display_lines(/*width*/ 120));
++    assert!(
++        rendered
++            .iter()
++            .any(|line| line.contains("deepseek-v4 (reasoning xhigh, summaries off)")),
++        "expected DeepSeek summaries to render off, got {rendered:?}"
++    );
++}
++
+ #[tokio::test]
+ async fn status_snapshot_hides_zero_credits() {
+     let temp_home = TempDir::new().expect("temp home");

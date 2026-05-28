@@ -1,0 +1,137 @@
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+index 95873191b9..29b67d44f1 100644
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -2036,6 +2036,7 @@ async fn run_interactive_tui(
+         .map(codex_tui::resolve_remote_addr)
+         .transpose()
+         .map_err(std::io::Error::other)?;
++    let mut default_local_daemon = false;
+     if let Some(remote_auth_token_env) = remote_auth_token_env {
+         let Some(endpoint) = remote_endpoint.as_mut() else {
+             return Ok(AppExitInfo::fatal(
+@@ -2058,6 +2059,15 @@ async fn run_interactive_tui(
+             ));
+         };
+         *slot = Some(auth_token);
++    } else if remote_endpoint.is_none() {
++        let output = codex_app_server_daemon::run(AppServerLifecycleCommand::Start)
++            .await
++            .map_err(std::io::Error::other)?;
++        remote_endpoint = Some(codex_tui::RemoteAppServerEndpoint::UnixSocket {
++            socket_path: AbsolutePathBuf::from_absolute_path(output.socket_path)
++                .map_err(std::io::Error::other)?,
++        });
++        default_local_daemon = true;
+     }
+     let start_tui = || {
+         codex_tui::run_main(
+@@ -2065,6 +2075,7 @@ async fn run_interactive_tui(
+             arg0_paths.clone(),
+             codex_config::LoaderOverrides::default(),
+             remote_endpoint.clone(),
++            default_local_daemon,
+         )
+     };
+     let mut attempted_repair = false;
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index 94b8cb7442..69ffe3ca82 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -814,10 +814,14 @@ fn latest_session_cwd_filter<'a>(
+ 
+ fn app_server_target_for_launch(
+     explicit_remote_endpoint: Option<RemoteAppServerEndpoint>,
++    explicit_remote_endpoint_is_default_local_daemon: bool,
+     default_daemon_socket: Option<AbsolutePathBuf>,
+     can_reuse_implicit_local_daemon: bool,
+ ) -> AppServerTarget {
+     match explicit_remote_endpoint {
++        Some(endpoint) if explicit_remote_endpoint_is_default_local_daemon => {
++            AppServerTarget::LocalDaemon { endpoint }
++        }
+         Some(endpoint) => AppServerTarget::Remote { endpoint },
+         None if can_reuse_implicit_local_daemon => {
+             default_daemon_socket.map_or(AppServerTarget::Embedded, |socket_path| {
+@@ -866,6 +870,7 @@ pub async fn run_main(
+     arg0_paths: Arg0DispatchPaths,
+     loader_overrides: LoaderOverrides,
+     explicit_remote_endpoint: Option<RemoteAppServerEndpoint>,
++    explicit_remote_endpoint_is_default_local_daemon: bool,
+ ) -> std::io::Result<AppExitInfo> {
+     let strict_config = cli.strict_config;
+     let (sandbox_mode, approval_policy) = if cli.dangerously_bypass_approvals_and_sandbox {
+@@ -931,6 +936,7 @@ pub async fn run_main(
+     };
+     let app_server_target = app_server_target_for_launch(
+         explicit_remote_endpoint,
++        explicit_remote_endpoint_is_default_local_daemon,
+         default_daemon,
+         reuse_implicit_local_daemon,
+     );
+@@ -2105,6 +2111,7 @@ mod tests {
+         let socket_path = AbsolutePathBuf::relative_to_current_dir("codex.sock")?;
+         let target = app_server_target_for_launch(
+             /*explicit_remote_endpoint*/ None,
++            /*explicit_remote_endpoint_is_default_local_daemon*/ false,
+             Some(socket_path.clone()),
+             /*can_reuse_implicit_local_daemon*/ true,
+         );
+@@ -2127,6 +2134,7 @@ mod tests {
+         };
+         let target = app_server_target_for_launch(
+             Some(explicit_endpoint.clone()),
++            /*explicit_remote_endpoint_is_default_local_daemon*/ false,
+             Some(AbsolutePathBuf::relative_to_current_dir("default.sock")?),
+             /*can_reuse_implicit_local_daemon*/ false,
+         );
+@@ -2142,12 +2150,37 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[test]
++    fn app_server_target_for_launch_accepts_explicit_default_local_daemon() -> color_eyre::Result<()>
++    {
++        let explicit_endpoint = RemoteAppServerEndpoint::UnixSocket {
++            socket_path: AbsolutePathBuf::relative_to_current_dir("explicit.sock")?,
++        };
++        let target = app_server_target_for_launch(
++            Some(explicit_endpoint.clone()),
++            /*explicit_remote_endpoint_is_default_local_daemon*/ true,
++            /*default_daemon_socket*/ None,
++            /*can_reuse_implicit_local_daemon*/ false,
++        );
++
++        assert_eq!(
++            target,
++            AppServerTarget::LocalDaemon {
++                endpoint: explicit_endpoint,
++            }
++        );
++        assert!(!target.uses_remote_workspace());
++        assert_eq!(target.thread_params_mode(), ThreadParamsMode::Embedded);
++        Ok(())
++    }
++
+     #[test]
+     fn app_server_target_for_launch_skips_local_daemon_when_launch_config_is_not_replayable()
+     -> color_eyre::Result<()> {
+         let socket_path = AbsolutePathBuf::relative_to_current_dir("codex.sock")?;
+         let target = app_server_target_for_launch(
+             /*explicit_remote_endpoint*/ None,
++            /*explicit_remote_endpoint_is_default_local_daemon*/ false,
+             Some(socket_path),
+             /*can_reuse_implicit_local_daemon*/ false,
+         );
+diff --git a/codex-rs/tui/src/main.rs b/codex-rs/tui/src/main.rs
+index 9c69c7c81a..10e4fd3e03 100644
+--- a/codex-rs/tui/src/main.rs
++++ b/codex-rs/tui/src/main.rs
+@@ -57,6 +57,7 @@ fn main() -> anyhow::Result<()> {
+             arg0_paths,
+             LoaderOverrides::default(),
+             /*explicit_remote_endpoint*/ None,
++            /*explicit_remote_endpoint_is_default_local_daemon*/ false,
+         )
+         .await?;
+         match exit_info.exit_reason {

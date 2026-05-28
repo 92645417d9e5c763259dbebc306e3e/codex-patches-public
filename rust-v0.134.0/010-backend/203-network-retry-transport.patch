@@ -1,0 +1,733 @@
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index d84b32a8b4..7ea724215c 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -1,8 +1,8 @@
+ //! Session- and turn-scoped helpers for talking to model provider APIs.
+ //!
+ //! `ModelClient` is intended to live for the lifetime of a Codex session and holds the stable
+-//! configuration and state needed to talk to a provider (auth, provider selection, conversation id,
+-//! and transport fallback state).
++//! configuration and state needed to talk to a provider (auth, provider selection, and
++//! conversation id).
+ //!
+ //! Per-turn settings (model selection, reasoning controls, telemetry context, and turn metadata)
+ //! are passed explicitly to streaming and unary methods so that the turn lifetime is visible at the
+@@ -21,7 +21,7 @@
+ //! ## Retry-Budget Tradeoff
+ //!
+ //! WebSocket prewarm is treated as the first websocket connection attempt for a turn. If it
+-//! fails, normal stream retry/fallback logic handles recovery on the same turn.
++//! fails, normal stream retry logic handles recovery on the same turn.
+ 
+ use std::collections::HashMap;
+ use std::sync::Arc;
+@@ -207,10 +207,7 @@ impl RequestRouteTelemetry {
+ /// A session-scoped client for model-provider API calls.
+ ///
+ /// This holds configuration and state that should be shared across turns within a Codex session
+-/// (auth, provider selection, thread id, and transport fallback state).
+-///
+-/// WebSocket fallback is session-scoped: once a turn activates the HTTP fallback, subsequent turns
+-/// will also use HTTP for the remainder of the session.
++/// (auth, provider selection, and thread id).
+ ///
+ /// Turn-scoped settings (model selection, reasoning controls, telemetry context, and turn
+ /// metadata) are passed explicitly to the relevant methods to keep turn lifetime visible at the
+@@ -406,27 +403,6 @@ impl ModelClient {
+             .unwrap_or_else(std::sync::PoisonError::into_inner) = websocket_session;
+     }
+ 
+-    pub(crate) fn force_http_fallback(
+-        &self,
+-        session_telemetry: &SessionTelemetry,
+-        _model_info: &ModelInfo,
+-    ) -> bool {
+-        let websocket_enabled = self.responses_websocket_enabled();
+-        let activated =
+-            websocket_enabled && !self.state.disable_websockets.swap(true, Ordering::Relaxed);
+-        if activated {
+-            warn!("falling back to HTTP");
+-            session_telemetry.counter(
+-                "codex.transport.fallback_to_http",
+-                /*inc*/ 1,
+-                &[("from_wire_api", "responses_websocket")],
+-            );
+-        }
+-
+-        self.store_cached_websocket_session(WebsocketSession::default());
+-        activated
+-    }
+-
+     /// Compacts the current conversation history using the Compact endpoint.
+     ///
+     /// This is a unary call (no streaming) that returns a new list of
+@@ -774,7 +750,7 @@ impl ModelClient {
+ 
+     /// Returns whether the Responses-over-WebSocket transport is active for this session.
+     ///
+-    /// WebSocket use is controlled by provider capability and session-scoped fallback state.
++    /// WebSocket use is controlled by provider capability.
+     pub fn responses_websocket_enabled(&self) -> bool {
+         if !self.state.provider.info().supports_websockets
+             || self.state.disable_websockets.load(Ordering::Relaxed)
+@@ -1550,10 +1526,7 @@ impl ModelClientSession {
+                 }
+                 Ok(())
+             }
+-            Ok(WebsocketStreamOutcome::FallbackToHttp) => {
+-                self.try_switch_fallback_transport(session_telemetry, model_info);
+-                Ok(())
+-            }
++            Ok(WebsocketStreamOutcome::FallbackToHttp) => Err(websocket_http_fallback_disabled()),
+             Err(err) => Err(err),
+         }
+     }
+@@ -1563,10 +1536,9 @@ impl ModelClientSession {
+     ///
+     /// The caller is responsible for passing per-turn settings explicitly (model selection,
+     /// reasoning settings, telemetry context, and turn metadata). This method will prefer the
+-    /// Responses WebSocket transport when the provider supports it and it remains healthy, and will
+-    /// fall back to the HTTP Responses API transport otherwise. The trace context may be enabled or
+-    /// disabled, but is always explicit so transport paths do not need separate trace/no-trace
+-    /// branches.
++    /// Responses WebSocket transport when the provider supports it and it remains healthy. The
++    /// trace context may be enabled or disabled, but is always explicit so transport paths do not
++    /// need separate trace/no-trace branches.
+     pub async fn stream(
+         &mut self,
+         prompt: &Prompt,
+@@ -1600,7 +1572,7 @@ impl ModelClientSession {
+                     {
+                         WebsocketStreamOutcome::Stream(stream) => return Ok(stream),
+                         WebsocketStreamOutcome::FallbackToHttp => {
+-                            self.try_switch_fallback_transport(session_telemetry, model_info);
++                            return Err(websocket_http_fallback_disabled());
+                         }
+                     }
+                 }
+@@ -1619,24 +1591,12 @@ impl ModelClientSession {
+             }
+         }
+     }
++}
+ 
+-    /// Permanently disables WebSockets for this Codex session and resets WebSocket state.
+-    ///
+-    /// This is used after exhausting the provider retry budget, to force subsequent requests onto
+-    /// the HTTP transport.
+-    ///
+-    /// Returns `true` if this call activated fallback, or `false` if fallback was already active.
+-    pub(crate) fn try_switch_fallback_transport(
+-        &mut self,
+-        session_telemetry: &SessionTelemetry,
+-        model_info: &ModelInfo,
+-    ) -> bool {
+-        let activated = self
+-            .client
+-            .force_http_fallback(session_telemetry, model_info);
+-        self.websocket_session = WebsocketSession::default();
+-        activated
+-    }
++fn websocket_http_fallback_disabled() -> codex_protocol::error::CodexErr {
++    map_api_error(ApiError::Stream(
++        "websocket transport cannot continue and HTTP fallback is disabled".to_string(),
++    ))
+ }
+ 
+ /// Parses per-turn metadata into an HTTP header value.
+diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
+index f2bded8d06..9198b81a51 100644
+--- a/codex-rs/core/src/compact.rs
++++ b/codex-rs/core/src/compact.rs
+@@ -14,6 +14,10 @@ use crate::session::session::Session;
+ use crate::session::turn::get_last_assistant_message_from_turn;
+ use crate::session::turn_context::TurnContext;
+ use crate::util::backoff;
++use crate::ws_stream_retry::WS_STREAM_MAX_RETRIES;
++use crate::ws_stream_retry::WS_STREAM_RETRY_BUDGET;
++use crate::ws_stream_retry::is_ws_stream_retryable;
++use crate::ws_stream_retry::ws_stream_retry_delay;
+ use codex_analytics::CodexCompactionEvent;
+ use codex_analytics::CompactionImplementation;
+ use codex_analytics::CompactionPhase;
+@@ -187,6 +191,7 @@ async fn run_compact_task_inner_impl(
+ 
+     let max_retries = turn_context.provider.info().stream_max_retries();
+     let mut retries = 0;
++    let mut ws_stream_retry_started_at: Option<Instant> = None;
+     let mut client_session = sess.services.model_client.new_session();
+     // Reuse one client session so turn-scoped state (sticky routing, websocket incremental
+     // request tracking)
+@@ -237,9 +242,32 @@ async fn run_compact_task_inner_impl(
+                 return Err(e);
+             }
+             Err(e) => {
++                let ws_stream_retry = sess.services.model_client.responses_websocket_enabled()
++                    && is_ws_stream_retryable(&e);
++                let max_retries = if ws_stream_retry {
++                    WS_STREAM_MAX_RETRIES
++                } else {
++                    max_retries
++                };
+                 if retries < max_retries {
+                     retries += 1;
+-                    let delay = backoff(retries);
++                    let delay = if ws_stream_retry {
++                        let started_at =
++                            *ws_stream_retry_started_at.get_or_insert_with(Instant::now);
++                        let elapsed = started_at.elapsed();
++                        let Some(delay) = ws_stream_retry_delay(elapsed) else {
++                            let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
++                            sess.send_event(&turn_context, event).await;
++                            return Err(e);
++                        };
++                        tracing::warn!(
++                            "websocket compact stream disconnected - retrying \
++                             ({retries}/{max_retries}; {elapsed:?}/{WS_STREAM_RETRY_BUDGET:?}; next in {delay:?})..."
++                        );
++                        delay
++                    } else {
++                        backoff(retries)
++                    };
+                     sess.notify_stream_error(
+                         turn_context.as_ref(),
+                         format!("Reconnecting... {retries}/{max_retries}"),
+diff --git a/codex-rs/core/src/compact_remote.rs b/codex-rs/core/src/compact_remote.rs
+index 969da47544..818546075c 100644
+--- a/codex-rs/core/src/compact_remote.rs
++++ b/codex-rs/core/src/compact_remote.rs
+@@ -1,4 +1,5 @@
+ use std::sync::Arc;
++use std::time::Duration;
+ 
+ use crate::Prompt;
+ use crate::client::CompactConversationRequestSettings;
+@@ -32,10 +33,14 @@ use codex_protocol::protocol::CompactedItem;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::TurnStartedEvent;
+ use codex_rollout_trace::CompactionCheckpointTracePayload;
+-use futures::TryFutureExt;
++use codex_rollout_trace::CompactionTraceContext;
+ use tokio_util::sync::CancellationToken;
+ use tracing::error;
+ use tracing::info;
++use tracing::warn;
++
++const REMOTE_COMPACT_V1_MAX_RETRIES: u64 = 30;
++const REMOTE_COMPACT_V1_RETRY_DELAY: Duration = Duration::from_secs(60);
+ 
+ pub(crate) async fn run_inline_remote_auto_compact_task(
+     sess: Arc<Session>,
+@@ -186,37 +191,9 @@ async fn run_remote_compact_task_inner_impl(
+         output_schema: None,
+         output_schema_strict: true,
+     };
+-    let mut new_history = sess
+-        .services
+-        .model_client
+-        .compact_conversation_history(
+-            &prompt,
+-            &turn_context.model_info,
+-            CompactConversationRequestSettings {
+-                effort: turn_context.reasoning_effort,
+-                summary: turn_context.reasoning_summary,
+-                service_tier: if sess.services.auth_manager.auth_mode() == Some(AuthMode::ApiKey) {
+-                    None
+-                } else {
+-                    turn_context.config.service_tier.clone()
+-                },
+-            },
+-            &turn_context.session_telemetry,
+-            &compaction_trace,
+-        )
+-        .or_else(|err| async {
+-            let total_usage_breakdown = sess.get_total_token_usage_breakdown().await;
+-            let compact_request_log_data =
+-                build_compact_request_log_data(&prompt.input, &prompt.base_instructions.text);
+-            log_remote_compact_failure(
+-                turn_context,
+-                &compact_request_log_data,
+-                total_usage_breakdown,
+-                &err,
+-            );
+-            Err(err)
+-        })
+-        .await?;
++    let mut new_history =
++        compact_conversation_history_with_retry(sess, turn_context, &prompt, &compaction_trace)
++            .await?;
+     new_history = process_compacted_history(
+         sess.as_ref(),
+         turn_context.as_ref(),
+@@ -249,6 +226,64 @@ async fn run_remote_compact_task_inner_impl(
+     Ok(())
+ }
+ 
++async fn compact_conversation_history_with_retry(
++    sess: &Session,
++    turn_context: &TurnContext,
++    prompt: &Prompt,
++    compaction_trace: &CompactionTraceContext,
++) -> CodexResult<Vec<ResponseItem>> {
++    let compact_request_log_data =
++        build_compact_request_log_data(&prompt.input, &prompt.base_instructions.text);
++    let mut retries = 0;
++
++    loop {
++        let result = sess
++            .services
++            .model_client
++            .compact_conversation_history(
++                prompt,
++                &turn_context.model_info,
++                CompactConversationRequestSettings {
++                    effort: turn_context.reasoning_effort,
++                    summary: turn_context.reasoning_summary,
++                    service_tier: if sess.services.auth_manager.auth_mode()
++                        == Some(AuthMode::ApiKey)
++                    {
++                        None
++                    } else {
++                        turn_context.config.service_tier.clone()
++                    },
++                },
++                &turn_context.session_telemetry,
++                compaction_trace,
++            )
++            .await;
++
++        match result {
++            Ok(new_history) => return Ok(new_history),
++            Err(err) => {
++                let total_usage_breakdown = sess.get_total_token_usage_breakdown().await;
++                log_remote_compact_failure(
++                    turn_context,
++                    &compact_request_log_data,
++                    total_usage_breakdown,
++                    &err,
++                );
++
++                if !err.is_retryable() || retries >= REMOTE_COMPACT_V1_MAX_RETRIES {
++                    return Err(err);
++                }
++
++                retries += 1;
++                warn!(
++                    "remote compact v1 failed - retrying ({retries}/{REMOTE_COMPACT_V1_MAX_RETRIES} in {REMOTE_COMPACT_V1_RETRY_DELAY:?})..."
++                );
++                tokio::time::sleep(REMOTE_COMPACT_V1_RETRY_DELAY).await;
++            }
++        }
++    }
++}
++
+ pub(crate) async fn process_compacted_history(
+     sess: &Session,
+     turn_context: &TurnContext,
+diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_remote_v2.rs
+index 0e235a941f..fd11e76519 100644
+--- a/codex-rs/core/src/compact_remote_v2.rs
++++ b/codex-rs/core/src/compact_remote_v2.rs
+@@ -1,4 +1,5 @@
+ use std::sync::Arc;
++use std::time::Instant;
+ 
+ use crate::Prompt;
+ use crate::ResponseStream;
+@@ -20,6 +21,10 @@ use crate::session::session::Session;
+ use crate::session::turn::built_tools;
+ use crate::session::turn_context::TurnContext;
+ use crate::util::backoff;
++use crate::ws_stream_retry::WS_STREAM_MAX_RETRIES;
++use crate::ws_stream_retry::WS_STREAM_RETRY_BUDGET;
++use crate::ws_stream_retry::is_ws_stream_retryable;
++use crate::ws_stream_retry::ws_stream_retry_delay;
+ use codex_analytics::CompactionImplementation;
+ use codex_analytics::CompactionPhase;
+ use codex_analytics::CompactionReason;
+@@ -35,7 +40,6 @@ use codex_protocol::protocol::CompactedItem;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::TruncationPolicy;
+ use codex_protocol::protocol::TurnStartedEvent;
+-use codex_protocol::protocol::WarningEvent;
+ use codex_rollout_trace::CompactionCheckpointTracePayload;
+ use codex_rollout_trace::InferenceTraceContext;
+ use codex_utils_output_truncation::approx_token_count;
+@@ -289,6 +293,7 @@ async fn run_remote_compaction_request_v2(
+         .stream_max_retries()
+         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
+     let mut retries = 0;
++    let mut ws_stream_retry_started_at: Option<Instant> = None;
+     loop {
+         let result = match client_session
+             .stream(
+@@ -313,31 +318,42 @@ async fn run_remote_compaction_request_v2(
+                 log_remote_compaction_request_failure(sess, turn_context, prompt, &err).await;
+                 return Err(err);
+             }
+-            Err(err)
+-                if retries >= max_retries
+-                    && client_session.try_switch_fallback_transport(
+-                        &turn_context.session_telemetry,
+-                        &turn_context.model_info,
+-                    ) =>
+-            {
+-                sess.send_event(
+-                    turn_context,
+-                    EventMsg::Warning(WarningEvent {
+-                        message: format!(
+-                            "Falling back from WebSockets to HTTPS transport. {err:#}"
+-                        ),
+-                    }),
+-                )
+-                .await;
+-                retries = 0;
+-            }
+-            Err(err) if retries < max_retries => {
++            Err(err) => {
++                let ws_stream_retry = sess.services.model_client.responses_websocket_enabled()
++                    && is_ws_stream_retryable(&err);
++                let max_retries = if ws_stream_retry {
++                    WS_STREAM_MAX_RETRIES
++                } else {
++                    max_retries
++                };
++                if retries >= max_retries {
++                    log_remote_compaction_request_failure(sess, turn_context, prompt, &err).await;
++                    return Err(err);
++                }
+                 retries += 1;
+-                let delay = match &err {
+-                    CodexErr::Stream(_, requested_delay) => {
+-                        requested_delay.unwrap_or_else(|| backoff(retries))
++                let delay = if ws_stream_retry {
++                    let started_at = *ws_stream_retry_started_at.get_or_insert_with(Instant::now);
++                    let elapsed = started_at.elapsed();
++                    let Some(delay) = ws_stream_retry_delay(elapsed) else {
++                        log_remote_compaction_request_failure(sess, turn_context, prompt, &err)
++                            .await;
++                        return Err(err);
++                    };
++                    warn!(
++                        turn_id = %turn_context.sub_id,
++                        retries,
++                        max_retries,
++                        compact_error = %err,
++                        "remote compaction v2 websocket stream failed; retrying request ({elapsed:?}/{WS_STREAM_RETRY_BUDGET:?}) after delay"
++                    );
++                    delay
++                } else {
++                    match &err {
++                        CodexErr::Stream(_, requested_delay) => {
++                            requested_delay.unwrap_or_else(|| backoff(retries))
++                        }
++                        _ => backoff(retries),
+                     }
+-                    _ => backoff(retries),
+                 };
+                 warn!(
+                     turn_id = %turn_context.sub_id,
+@@ -360,10 +376,6 @@ async fn run_remote_compaction_request_v2(
+                 }
+                 tokio::time::sleep(delay).await;
+             }
+-            Err(err) => {
+-                log_remote_compaction_request_failure(sess, turn_context, prompt, &err).await;
+-                return Err(err);
+-            }
+         }
+     }
+ }
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index d5c1237638..9c2533b9af 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -99,6 +99,7 @@ mod stream_events_utils;
+ pub mod test_support;
+ mod unified_exec;
+ pub mod windows_sandbox;
++mod ws_stream_retry;
+ pub use client::X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER;
+ pub use codex_protocol::config_types::ModelProviderAuthInfo;
+ mod event_mapping;
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index 162c454b93..03bcfd4265 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -3,6 +3,7 @@ use std::collections::HashSet;
+ use std::sync::Arc;
+ use std::sync::atomic::Ordering;
+ use std::time::Duration;
++use std::time::Instant;
+ 
+ use crate::SkillInjections;
+ use crate::build_skill_injections;
+@@ -61,6 +62,10 @@ use crate::turn_diff_tracker::TurnDiffTracker;
+ use crate::turn_timing::record_turn_ttft_metric;
+ use crate::util::backoff;
+ use crate::util::error_or_panic;
++use crate::ws_stream_retry::WS_STREAM_MAX_RETRIES;
++use crate::ws_stream_retry::WS_STREAM_RETRY_BUDGET;
++use crate::ws_stream_retry::is_ws_stream_retryable;
++use crate::ws_stream_retry::ws_stream_retry_delay;
+ use codex_analytics::AppInvocation;
+ use codex_analytics::CompactionPhase;
+ use codex_analytics::CompactionReason;
+@@ -924,6 +929,7 @@ async fn run_sampling_request(
+         .await;
+     let mut retries = 0;
+     let mut initial_input = Some(input);
++    let mut ws_stream_retry_started_at: Option<Instant> = None;
+     loop {
+         let prompt_input = if let Some(input) = initial_input.take() {
+             input
+@@ -972,30 +978,35 @@ async fn run_sampling_request(
+             return Err(err);
+         }
+ 
+-        // Use the configured provider-specific stream retry budget.
+-        let max_retries = turn_context.provider.info().stream_max_retries();
+-        if retries >= max_retries
+-            && client_session.try_switch_fallback_transport(
+-                &turn_context.session_telemetry,
+-                &turn_context.model_info,
+-            )
+-        {
+-            sess.send_event(
+-                &turn_context,
+-                EventMsg::Warning(WarningEvent {
+-                    message: format!("Falling back from WebSockets to HTTPS transport. {err:#}"),
+-                }),
+-            )
+-            .await;
+-            retries = 0;
+-            continue;
+-        }
++        // Use a longer fixed retry budget for WebSocket stream transport failures, and keep the
++        // provider-specific stream retry budget for other retryable errors.
++        let ws_stream_retry = sess.services.model_client.responses_websocket_enabled()
++            && is_ws_stream_retryable(&err);
++        let max_retries = if ws_stream_retry {
++            WS_STREAM_MAX_RETRIES
++        } else {
++            turn_context.provider.info().stream_max_retries()
++        };
+         if retries < max_retries {
+             retries += 1;
+-            let delay = sampling_retry_delay(&err, retries);
+-            warn!(
+-                "stream disconnected - retrying sampling request ({retries}/{max_retries} in {delay:?})...",
+-            );
++            let delay = if ws_stream_retry {
++                let started_at = *ws_stream_retry_started_at.get_or_insert_with(Instant::now);
++                let elapsed = started_at.elapsed();
++                let Some(delay) = ws_stream_retry_delay(elapsed) else {
++                    return Err(err);
++                };
++                warn!(
++                    "websocket stream disconnected - retrying sampling request \
++                     ({retries}/{max_retries}; {elapsed:?}/{WS_STREAM_RETRY_BUDGET:?}; next in {delay:?})...",
++                );
++                delay
++            } else {
++                let delay = sampling_retry_delay(&err, retries);
++                warn!(
++                    "stream disconnected - retrying sampling request ({retries}/{max_retries} in {delay:?})...",
++                );
++                delay
++            };
+ 
+             // In release builds, hide the first websocket retry notification to reduce noisy
+             // transient reconnect messages. In debug builds, keep full visibility for diagnosis.
+diff --git a/codex-rs/core/src/ws_stream_retry.rs b/codex-rs/core/src/ws_stream_retry.rs
+new file mode 100644
+index 0000000000..215f572876
+--- /dev/null
++++ b/codex-rs/core/src/ws_stream_retry.rs
+@@ -0,0 +1,85 @@
++use std::time::Duration;
++
++use codex_protocol::error::CodexErr;
++
++pub(crate) const WS_STREAM_MAX_RETRIES: u64 = 30;
++pub(crate) const WS_STREAM_RETRY_BUDGET: Duration = Duration::from_secs(30 * 60);
++
++const WS_STREAM_RETRY_DELAY: Duration = Duration::from_secs(60);
++
++pub(crate) fn is_ws_stream_retryable(err: &CodexErr) -> bool {
++    match err {
++        CodexErr::Stream(message, _) => {
++            let message = message.to_ascii_lowercase();
++            message.contains("websocket")
++                || message.contains("connection reset")
++                || message.contains("connection closed")
++                || message.contains("closed connection")
++                || message.contains("connection refused")
++                || message.contains("connection aborted")
++                || message.contains("stream closed")
++                || message.contains("unexpected eof")
++                || message.contains("tls handshake eof")
++                || message.contains("close_notify")
++                || message.contains("failed to write whole buffer")
++                || message.contains("timed out")
++                || message.contains("timeout")
++                || message.contains("network error")
++                || message.contains("dns error")
++                || message.contains("failed to lookup")
++                || message.contains("name resolution")
++                || message.contains("temporary failure in name resolution")
++        }
++        CodexErr::Timeout | CodexErr::RequestTimeout => true,
++        _ => false,
++    }
++}
++
++pub(crate) fn ws_stream_retry_delay(elapsed: Duration) -> Option<Duration> {
++    if elapsed >= WS_STREAM_RETRY_BUDGET {
++        None
++    } else {
++        Some(WS_STREAM_RETRY_DELAY.min(WS_STREAM_RETRY_BUDGET - elapsed))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn retry_delay_stays_inside_budget() {
++        assert_eq!(
++            ws_stream_retry_delay(Duration::ZERO),
++            Some(WS_STREAM_RETRY_DELAY)
++        );
++        assert_eq!(
++            ws_stream_retry_delay(WS_STREAM_RETRY_BUDGET - Duration::from_secs(1)),
++            Some(Duration::from_secs(1))
++        );
++        assert_eq!(ws_stream_retry_delay(WS_STREAM_RETRY_BUDGET), None);
++    }
++
++    #[test]
++    fn classifies_websocket_stream_errors() {
++        assert!(is_ws_stream_retryable(&CodexErr::Stream(
++            "websocket closed".to_string(),
++            None,
++        )));
++        assert!(is_ws_stream_retryable(&CodexErr::Stream(
++            "tls handshake eof".to_string(),
++            None,
++        )));
++        assert!(is_ws_stream_retryable(&CodexErr::Stream(
++            "IO error: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof".to_string(),
++            None,
++        )));
++        assert!(is_ws_stream_retryable(&CodexErr::Stream(
++            "network error: error sending request for url (https://api.openai.com/v1/responses): error trying to connect: dns error: failed to lookup address information: Temporary failure in name resolution".to_string(),
++            None,
++        )));
++        assert!(is_ws_stream_retryable(&CodexErr::Timeout));
++        assert!(is_ws_stream_retryable(&CodexErr::RequestTimeout));
++        assert!(!is_ws_stream_retryable(&CodexErr::UsageNotIncluded));
++    }
++}
+diff --git a/codex-rs/core/tests/common/test_codex_exec.rs b/codex-rs/core/tests/common/test_codex_exec.rs
+index ad32bcb025..36ab72bbee 100644
+--- a/codex-rs/core/tests/common/test_codex_exec.rs
++++ b/codex-rs/core/tests/common/test_codex_exec.rs
+@@ -24,8 +24,7 @@ impl TestCodexExecBuilder {
+     pub fn cmd_with_server(&self, server: &MockServer) -> assert_cmd::Command {
+         let mut cmd = self.cmd();
+         let base = format!("{}/v1", server.uri());
+-        cmd.arg("-c")
+-            .arg(format!("openai_base_url={}", toml_string_literal(&base)));
++        configure_responses_provider(&mut cmd, &base);
+         cmd
+     }
+ 
+@@ -37,6 +36,31 @@ impl TestCodexExecBuilder {
+     }
+ }
+ 
++pub fn configure_responses_provider(cmd: &mut assert_cmd::Command, base: &str) {
++    for config in responses_provider_config(base) {
++        cmd.arg("-c").arg(config);
++    }
++}
++
++pub fn responses_provider_config(base: &str) -> Vec<String> {
++    let provider_id = "test-openai";
++    vec![
++        format!("model_provider={}", toml_string_literal(provider_id)),
++        format!("model_providers.{provider_id}.name=\"Test OpenAI\""),
++        format!(
++            "model_providers.{provider_id}.base_url={}",
++            toml_string_literal(base)
++        ),
++        format!(
++            "model_providers.{provider_id}.env_key={}",
++            toml_string_literal(CODEX_API_KEY_ENV_VAR)
++        ),
++        format!("model_providers.{provider_id}.wire_api=\"responses\""),
++        format!("model_providers.{provider_id}.requires_openai_auth=false"),
++        format!("model_providers.{provider_id}.supports_websockets=false"),
++    ]
++}
++
+ fn toml_string_literal(value: &str) -> String {
+     serde_json::to_string(value).expect("serialize TOML string literal")
+ }
+diff --git a/codex-rs/exec/tests/suite/resume.rs b/codex-rs/exec/tests/suite/resume.rs
+index 904c6a8f19..41f294bb66 100644
+--- a/codex-rs/exec/tests/suite/resume.rs
++++ b/codex-rs/exec/tests/suite/resume.rs
+@@ -2,6 +2,7 @@
+ use anyhow::Context;
+ use core_test_support::responses;
+ use core_test_support::skip_if_no_network;
++use core_test_support::test_codex_exec::responses_provider_config;
+ use core_test_support::test_codex_exec::test_codex_exec;
+ use pretty_assertions::assert_eq;
+ use serde_json::Value;
+@@ -161,9 +162,9 @@ async fn exec_resume_last_appends_to_existing_file() -> anyhow::Result<()> {
+         .arg("--skip-git-repo-check")
+         .arg("-C")
+         .arg(&repo_root)
+-        .arg(&prompt2)
+         .arg("resume")
+         .arg("--last")
++        .arg(&prompt2)
+         .assert()
+         .success();
+ 
+@@ -355,13 +356,12 @@ async fn exec_resume_accepts_global_flags_after_subcommand() -> anyhow::Result<(
+ 
+     // Resume while passing global flags after the subcommand to ensure clap accepts them.
+     let base = format!("{}/v1", server.uri());
+-    let base_config = format!("openai_base_url={}", serde_json::to_string(&base)?);
+-    test.cmd()
+-        .arg("resume")
+-        .arg("--last")
+-        .arg("--config")
+-        .arg(base_config)
+-        .arg("--json")
++    let mut cmd = test.cmd();
++    cmd.arg("resume").arg("--last");
++    for config in responses_provider_config(&base) {
++        cmd.arg("--config").arg(config);
++    }
++    cmd.arg("--json")
+         .arg("--model")
+         .arg("gpt-5.2-codex")
+         .arg("--config")
+@@ -527,9 +527,9 @@ async fn exec_resume_preserves_cli_configuration_overrides() -> anyhow::Result<(
+         .arg("gpt-5.1-high")
+         .arg("-C")
+         .arg(&repo_root)
+-        .arg(&prompt2)
+         .arg("resume")
+         .arg("--last")
++        .arg(&prompt2)
+         .output()
+         .context("resume run should succeed")?;
+ 

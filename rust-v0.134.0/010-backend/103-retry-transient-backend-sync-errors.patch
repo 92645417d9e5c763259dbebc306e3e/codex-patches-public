@@ -1,0 +1,264 @@
+diff --git a/codex-rs/codex-api/src/api_bridge.rs b/codex-rs/codex-api/src/api_bridge.rs
+index 1c34d8bbf2..665083e005 100644
+--- a/codex-rs/codex-api/src/api_bridge.rs
++++ b/codex-rs/codex-api/src/api_bridge.rs
+@@ -14,6 +14,9 @@ use codex_protocol::error::UsageLimitReachedError;
+ use http::HeaderMap;
+ use serde::Deserialize;
+ use serde_json::Value;
++use std::time::Duration;
++
++const TRANSIENT_BACKEND_RETRY_DELAY: Duration = Duration::from_secs(5);
+ 
+ pub fn map_api_error(err: ApiError) -> CodexErr {
+     match err {
+@@ -59,16 +62,27 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
+                 if status == http::StatusCode::BAD_REQUEST {
+                     if let Ok(parsed) = serde_json::from_str::<Value>(&body_text)
+                         && let Some(error) = parsed.get("error")
+-                        && error.get("code").and_then(Value::as_str)
+-                            == Some(CYBER_POLICY_ERROR_CODE)
++                        && let Some(code) = error.get("code").and_then(Value::as_str)
+                     {
+-                        let message = error
+-                            .get("message")
+-                            .and_then(Value::as_str)
+-                            .filter(|message| !message.trim().is_empty())
+-                            .map(str::to_string)
+-                            .unwrap_or_else(|| CYBER_POLICY_FALLBACK_MESSAGE.to_string());
+-                        CodexErr::CyberPolicy { message }
++                        if code == CYBER_POLICY_ERROR_CODE {
++                            let message = error
++                                .get("message")
++                                .and_then(Value::as_str)
++                                .filter(|message| !message.trim().is_empty())
++                                .map(str::to_string)
++                                .unwrap_or_else(|| CYBER_POLICY_FALLBACK_MESSAGE.to_string());
++                            CodexErr::CyberPolicy { message }
++                        } else if code == PREVIOUS_RESPONSE_NOT_FOUND_ERROR_CODE {
++                            let message = error
++                                .get("message")
++                                .and_then(Value::as_str)
++                                .filter(|message| !message.trim().is_empty())
++                                .map(str::to_string)
++                                .unwrap_or_else(|| body_text.clone());
++                            CodexErr::Stream(message, Some(TRANSIENT_BACKEND_RETRY_DELAY))
++                        } else {
++                            CodexErr::InvalidRequest(body_text)
++                        }
+                     } else if body_text
+                         .contains("The image data you provided does not represent a valid image")
+                     {
+@@ -143,6 +157,7 @@ const CF_RAY_HEADER: &str = "cf-ray";
+ const X_OPENAI_AUTHORIZATION_ERROR_HEADER: &str = "x-openai-authorization-error";
+ const X_ERROR_JSON_HEADER: &str = "x-error-json";
+ const CYBER_POLICY_ERROR_CODE: &str = "cyber_policy";
++const PREVIOUS_RESPONSE_NOT_FOUND_ERROR_CODE: &str = "previous_response_not_found";
+ const CYBER_POLICY_FALLBACK_MESSAGE: &str =
+     "This request has been flagged for possible cybersecurity risk.";
+ 
+diff --git a/codex-rs/codex-api/src/api_bridge_tests.rs b/codex-rs/codex-api/src/api_bridge_tests.rs
+index 101e5566fe..12774e196e 100644
+--- a/codex-rs/codex-api/src/api_bridge_tests.rs
++++ b/codex-rs/codex-api/src/api_bridge_tests.rs
+@@ -124,6 +124,33 @@ fn map_api_error_keeps_unknown_400_errors_generic() {
+     assert_eq!(message, body);
+ }
+ 
++#[test]
++fn map_api_error_retries_previous_response_not_found() {
++    let body = serde_json::json!({
++        "type": "error",
++        "error": {
++            "type": "invalid_request_error",
++            "code": "previous_response_not_found",
++            "message": "Previous response with id 'resp_1' not found.",
++            "param": "previous_response_id"
++        },
++        "status": 400
++    })
++    .to_string();
++    let err = map_api_error(ApiError::Transport(TransportError::Http {
++        status: http::StatusCode::BAD_REQUEST,
++        url: Some("http://example.com/v1/responses".to_string()),
++        headers: None,
++        body: Some(body),
++    }));
++
++    let CodexErr::Stream(message, delay) = err else {
++        panic!("expected CodexErr::Stream, got {err:?}");
++    };
++    assert_eq!(message, "Previous response with id 'resp_1' not found.");
++    assert_eq!(delay, Some(Duration::from_secs(5)));
++}
++
+ #[test]
+ fn map_api_error_maps_usage_limit_limit_name_header() {
+     let mut headers = HeaderMap::new();
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index 5a2ed71dda..162c454b93 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -2,6 +2,7 @@ use std::collections::HashMap;
+ use std::collections::HashSet;
+ use std::sync::Arc;
+ use std::sync::atomic::Ordering;
++use std::time::Duration;
+ 
+ use crate::SkillInjections;
+ use crate::build_skill_injections;
+@@ -114,6 +115,8 @@ use tracing::trace;
+ use tracing::trace_span;
+ use tracing::warn;
+ 
++const TRANSIENT_BACKEND_RETRY_DELAY: Duration = Duration::from_secs(5);
++
+ /// Takes initial turn input and runs a loop where, at each sampling request,
+ /// the model replies with either:
+ ///
+@@ -960,7 +963,7 @@ async fn run_sampling_request(
+                 if let Some(rate_limits) = rate_limits {
+                     sess.update_rate_limits(&turn_context, *rate_limits).await;
+                 }
+-                return Err(CodexErr::UsageLimitReached(e));
++                CodexErr::UsageLimitReached(e)
+             }
+             Err(err) => err,
+         };
+@@ -989,12 +992,7 @@ async fn run_sampling_request(
+         }
+         if retries < max_retries {
+             retries += 1;
+-            let delay = match &err {
+-                CodexErr::Stream(_, requested_delay) => {
+-                    requested_delay.unwrap_or_else(|| backoff(retries))
+-                }
+-                _ => backoff(retries),
+-            };
++            let delay = sampling_retry_delay(&err, retries);
+             warn!(
+                 "stream disconnected - retrying sampling request ({retries}/{max_retries} in {delay:?})...",
+             );
+@@ -1022,6 +1020,16 @@ async fn run_sampling_request(
+     }
+ }
+ 
++fn sampling_retry_delay(err: &CodexErr, retries: u64) -> Duration {
++    match err {
++        CodexErr::Stream(_, requested_delay) => requested_delay.unwrap_or_else(|| backoff(retries)),
++        CodexErr::UsageLimitReached(_) | CodexErr::QuotaExceeded | CodexErr::ServerOverloaded => {
++            TRANSIENT_BACKEND_RETRY_DELAY
++        }
++        _ => backoff(retries),
++    }
++}
++
+ #[expect(
+     clippy::await_holding_invalid_type,
+     reason = "tool router construction reads through the session-owned manager guard"
+diff --git a/codex-rs/core/src/session/turn_tests.rs b/codex-rs/core/src/session/turn_tests.rs
+index 81a43ff5a9..ec7026178c 100644
+--- a/codex-rs/core/src/session/turn_tests.rs
++++ b/codex-rs/core/src/session/turn_tests.rs
+@@ -1,6 +1,7 @@
+ use super::*;
+ use codex_extension_api::ExtensionData;
+ use codex_extension_api::TurnItemContributor;
++use codex_protocol::error::UsageLimitReachedError;
+ use codex_protocol::items::AgentMessageContent;
+ use pretty_assertions::assert_eq;
+ use std::sync::Arc;
+@@ -63,3 +64,36 @@ async fn plan_mode_uses_contributed_turn_item_for_last_agent_message() {
+         Some("plan contributed assistant text")
+     );
+ }
++
++#[test]
++fn transient_limit_errors_use_longer_retry_delay() {
++    let usage_limit = CodexErr::UsageLimitReached(UsageLimitReachedError {
++        plan_type: None,
++        resets_at: None,
++        rate_limits: None,
++        promo_message: None,
++        rate_limit_reached_type: None,
++    });
++
++    assert_eq!(
++        sampling_retry_delay(&usage_limit, /*retries*/ 1),
++        Duration::from_secs(5)
++    );
++    assert_eq!(
++        sampling_retry_delay(&CodexErr::QuotaExceeded, /*retries*/ 1),
++        Duration::from_secs(5)
++    );
++    assert_eq!(
++        sampling_retry_delay(&CodexErr::ServerOverloaded, /*retries*/ 1),
++        Duration::from_secs(5)
++    );
++}
++
++#[test]
++fn stream_retry_delay_honors_requested_delay() {
++    let err = CodexErr::Stream("retry later".to_string(), Some(Duration::from_secs(5)));
++    assert_eq!(
++        sampling_retry_delay(&err, /*retries*/ 1),
++        Duration::from_secs(5)
++    );
++}
+diff --git a/codex-rs/protocol/src/error.rs b/codex-rs/protocol/src/error.rs
+index d7e953af0b..f22c400f81 100644
+--- a/codex-rs/protocol/src/error.rs
++++ b/codex-rs/protocol/src/error.rs
+@@ -177,7 +177,6 @@ impl CodexErr {
+             | CodexErr::EnvVar(_)
+             | CodexErr::Fatal(_)
+             | CodexErr::UsageNotIncluded
+-            | CodexErr::QuotaExceeded
+             | CodexErr::InvalidImageRequest()
+             | CodexErr::InvalidRequest(_)
+             | CodexErr::RefreshTokenFailed(_)
+@@ -190,10 +189,11 @@ impl CodexErr {
+             | CodexErr::AgentLimitReached { .. }
+             | CodexErr::Spawn
+             | CodexErr::SessionConfiguredNotFirstEvent
+-            | CodexErr::UsageLimitReached(_)
+-            | CodexErr::ServerOverloaded
+             | CodexErr::CyberPolicy { .. } => false,
+             CodexErr::Stream(..)
++            | CodexErr::QuotaExceeded
++            | CodexErr::UsageLimitReached(_)
++            | CodexErr::ServerOverloaded
+             | CodexErr::Timeout
+             | CodexErr::RequestTimeout
+             | CodexErr::UnexpectedStatus(_)
+diff --git a/codex-rs/protocol/src/error_tests.rs b/codex-rs/protocol/src/error_tests.rs
+index 11bd26133b..5f8cc279e9 100644
+--- a/codex-rs/protocol/src/error_tests.rs
++++ b/codex-rs/protocol/src/error_tests.rs
+@@ -111,6 +111,26 @@ fn server_overloaded_maps_to_protocol() {
+     );
+ }
+ 
++#[test]
++fn transient_backend_sync_errors_are_retryable() {
++    let usage_limit = CodexErr::UsageLimitReached(UsageLimitReachedError {
++        plan_type: None,
++        resets_at: None,
++        rate_limits: None,
++        promo_message: None,
++        rate_limit_reached_type: None,
++    });
++
++    assert_eq!(
++        [
++            CodexErr::QuotaExceeded.is_retryable(),
++            usage_limit.is_retryable(),
++            CodexErr::ServerOverloaded.is_retryable(),
++        ],
++        [true, true, true]
++    );
++}
++
+ #[test]
+ fn sandbox_denied_uses_aggregated_output_when_stderr_empty() {
+     let output = ExecToolCallOutput {

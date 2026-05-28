@@ -1,0 +1,157 @@
+diff --git a/codex-rs/models-manager/src/lib.rs b/codex-rs/models-manager/src/lib.rs
+index 8bf30d0b60..5774e12a7a 100644
+--- a/codex-rs/models-manager/src/lib.rs
++++ b/codex-rs/models-manager/src/lib.rs
+@@ -7,8 +7,24 @@ pub mod model_presets;
+ pub mod test_support;
+ 
+ pub use codex_app_server_protocol::AuthMode;
++use codex_protocol::openai_models::ModelInfo;
+ pub use config::ModelsManagerConfig;
+ 
++pub fn with_deepseek_side_route_models(mut models: Vec<ModelInfo>) -> Vec<ModelInfo> {
++    models.retain(|model| !model_info::is_obsolete_side_route_model(&model.slug));
++    for model in model_info::side_route_models() {
++        if let Some(existing_index) = models
++            .iter()
++            .position(|existing| existing.slug == model.slug)
++        {
++            models[existing_index] = model;
++        } else {
++            models.push(model);
++        }
++    }
++    models
++}
++
+ /// Load the bundled model catalog shipped with `codex-models-manager`.
+ pub fn bundled_models_response()
+ -> std::result::Result<codex_protocol::openai_models::ModelsResponse, serde_json::Error> {
+diff --git a/codex-rs/models-manager/src/model_info.rs b/codex-rs/models-manager/src/model_info.rs
+index 17b843440a..02af25d480 100644
+--- a/codex-rs/models-manager/src/model_info.rs
++++ b/codex-rs/models-manager/src/model_info.rs
+@@ -1,9 +1,12 @@
+ use codex_protocol::config_types::ReasoningSummary;
+ use codex_protocol::openai_models::ConfigShellToolType;
++use codex_protocol::openai_models::InputModality;
+ use codex_protocol::openai_models::ModelInfo;
+ use codex_protocol::openai_models::ModelInstructionsVariables;
+ use codex_protocol::openai_models::ModelMessages;
+ use codex_protocol::openai_models::ModelVisibility;
++use codex_protocol::openai_models::ReasoningEffort;
++use codex_protocol::openai_models::ReasoningEffortPreset;
+ use codex_protocol::openai_models::TruncationMode;
+ use codex_protocol::openai_models::TruncationPolicyConfig;
+ use codex_protocol::openai_models::WebSearchToolType;
+@@ -19,6 +22,9 @@ const LOCAL_FRIENDLY_TEMPLATE: &str =
+     "You optimize for team morale and being a supportive teammate as much as code quality.";
+ const LOCAL_PRAGMATIC_TEMPLATE: &str = "You are a deeply pragmatic, effective software engineer.";
+ const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
++const MIMO_V2_5: &str = "mimo-v2.5";
++const OBSOLETE_MIMO_V2_5_PRO: &str = "mimo-v2.5-pro";
++const SIDE_ROUTE_CONTEXT_WINDOW: i64 = 384_000;
+ 
+ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig) -> ModelInfo {
+     if let Some(supports_reasoning_summaries) = config.model_supports_reasoning_summaries
+@@ -62,6 +68,72 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
+     model
+ }
+ 
++pub fn side_route_models() -> [ModelInfo; 1] {
++    [mimo_side_route_model()]
++}
++
++pub fn is_obsolete_side_route_model(slug: &str) -> bool {
++    matches!(slug, OBSOLETE_MIMO_V2_5_PRO)
++}
++
++fn mimo_side_route_model() -> ModelInfo {
++    ModelInfo {
++        slug: MIMO_V2_5.to_string(),
++        display_name: "MiMo-V2.5".to_string(),
++        description: Some("MiMo side-route model with four reasoning depths.".to_string()),
++        default_reasoning_level: Some(ReasoningEffort::Medium),
++        supported_reasoning_levels: vec![
++            reasoning_effort_preset(ReasoningEffort::Low),
++            reasoning_effort_preset(ReasoningEffort::Medium),
++            reasoning_effort_preset(ReasoningEffort::High),
++            reasoning_effort_preset(ReasoningEffort::XHigh),
++        ],
++        shell_type: ConfigShellToolType::ShellCommand,
++        visibility: ModelVisibility::List,
++        supported_in_api: true,
++        priority: 96,
++        additional_speed_tiers: Vec::new(),
++        service_tiers: Vec::new(),
++        default_service_tier: None,
++        availability_nux: None,
++        upgrade: None,
++        base_instructions: BASE_INSTRUCTIONS.to_string(),
++        model_messages: local_personality_messages_for_slug(MIMO_V2_5),
++        supports_reasoning_summaries: false,
++        default_reasoning_summary: ReasoningSummary::None,
++        support_verbosity: false,
++        default_verbosity: None,
++        apply_patch_tool_type: None,
++        web_search_tool_type: WebSearchToolType::Text,
++        truncation_policy: TruncationPolicyConfig::tokens(/*limit*/ 10_000),
++        supports_parallel_tool_calls: false,
++        supports_image_detail_original: false,
++        context_window: Some(SIDE_ROUTE_CONTEXT_WINDOW),
++        max_context_window: Some(SIDE_ROUTE_CONTEXT_WINDOW),
++        auto_compact_token_limit: None,
++        effective_context_window_percent: 100,
++        experimental_supported_tools: Vec::new(),
++        input_modalities: vec![InputModality::Text],
++        used_fallback_model_metadata: false,
++        supports_search_tool: false,
++    }
++}
++
++fn reasoning_effort_preset(effort: ReasoningEffort) -> ReasoningEffortPreset {
++    ReasoningEffortPreset {
++        effort,
++        description: match effort {
++            ReasoningEffort::None => "No reasoning",
++            ReasoningEffort::Minimal => "Minimal reasoning",
++            ReasoningEffort::Low => "Fast responses with lighter reasoning",
++            ReasoningEffort::Medium => "Balances speed and reasoning depth for everyday tasks",
++            ReasoningEffort::High => "Greater reasoning depth for complex problems",
++            ReasoningEffort::XHigh => "Extra high reasoning depth for complex problems",
++        }
++        .to_string(),
++    }
++}
++
+ /// Build a minimal fallback model descriptor for missing/unknown slugs.
+ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
+     warn!("Unknown model {slug} is used. This will use fallback model metadata.");
+@@ -104,16 +176,18 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
+ 
+ fn local_personality_messages_for_slug(slug: &str) -> Option<ModelMessages> {
+     match slug {
+-        "gpt-5.2-codex" | "exp-codex-personality" => Some(ModelMessages {
+-            instructions_template: Some(format!(
+-                "{DEFAULT_PERSONALITY_HEADER}\n\n{PERSONALITY_PLACEHOLDER}\n\n{BASE_INSTRUCTIONS}"
+-            )),
+-            instructions_variables: Some(ModelInstructionsVariables {
+-                personality_default: Some(String::new()),
+-                personality_friendly: Some(LOCAL_FRIENDLY_TEMPLATE.to_string()),
+-                personality_pragmatic: Some(LOCAL_PRAGMATIC_TEMPLATE.to_string()),
++        "gpt-5.2-codex" | "exp-codex-personality" | MIMO_V2_5 => {
++            Some(ModelMessages {
++                instructions_template: Some(format!(
++                    "{DEFAULT_PERSONALITY_HEADER}\n\n{PERSONALITY_PLACEHOLDER}\n\n{BASE_INSTRUCTIONS}"
++                )),
++                instructions_variables: Some(ModelInstructionsVariables {
++                    personality_default: Some(String::new()),
++                    personality_friendly: Some(LOCAL_FRIENDLY_TEMPLATE.to_string()),
++                    personality_pragmatic: Some(LOCAL_PRAGMATIC_TEMPLATE.to_string()),
++                }),
+             }),
+-        }),
++        }
+         _ => None,
+     }
+ }

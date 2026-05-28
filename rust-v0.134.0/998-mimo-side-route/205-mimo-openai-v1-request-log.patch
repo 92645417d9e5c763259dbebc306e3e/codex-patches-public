@@ -1,0 +1,398 @@
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index ac2d38173b..b3c86d1cd9 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -24,6 +24,7 @@
+ //! fails, normal stream retry logic handles recovery on the same turn.
+ 
+ use std::collections::HashMap;
++use std::path::PathBuf;
+ use std::sync::Arc;
+ use std::sync::Mutex as StdMutex;
+ use std::sync::OnceLock;
+@@ -1273,22 +1274,76 @@ impl ModelClientSession {
+         let tool_aliases = request_parts.tool_aliases;
+         let inference_trace_attempt = inference_trace.start_attempt();
+         inference_trace_attempt.record_started(&request);
++        let request_log =
++            mimo_side_route::request_log_enabled(&codex_home).then(|| OpenAiV1RequestLog {
++                provider: OpenAiV1RequestLogProvider::Mimo,
++                codex_home: codex_home.to_path_buf(),
++                started_at: Instant::now(),
++                requested_model: model_info.slug.clone(),
++                api_model: request.model.clone(),
++                base_url: api_provider.base_url.clone(),
++                url: api_provider.url_for_path(CHAT_COMPLETIONS_ENDPOINT),
++            });
++        if let Some(request_log) = &request_log {
++            request_log.log(format!(
++                "start model={} api_model={} provider={} base_url={} url={} thinking={:?} reasoning_effort={:?}",
++                request_log.requested_model,
++                request_log.api_model,
++                api_provider.name,
++                request_log.base_url,
++                request_log.url,
++                request.thinking,
++                request.reasoning_effort,
++            ));
++        }
+ 
+         let client = ApiChatCompletionsClient::new(transport, api_provider, api_auth)
+             .with_telemetry(Some(request_telemetry));
+-        let stream_response = client
++        let stream_response = match client
+             .stream_request(request, ApiChatCompletionsOptions::default())
+             .await
+-            .map_err(map_api_error)?;
++        {
++            Ok(stream_response) => stream_response,
++            Err(err) => {
++                if let Some(request_log) = &request_log {
++                    request_log.log(format!(
++                        "failed model={} api_model={} base_url={} url={} elapsed_ms={} error={err}",
++                        request_log.requested_model,
++                        request_log.api_model,
++                        request_log.base_url,
++                        request_log.url,
++                        request_log.elapsed_ms(),
++                    ));
++                }
++                return Err(map_api_error(err));
++            }
++        };
++        if let Some(request_log) = &request_log {
++            let upstream_request_id = stream_response
++                .headers
++                .get("x-request-id")
++                .and_then(|value| value.to_str().ok())
++                .unwrap_or("none");
++            request_log.log(format!(
++                "response_headers model={} api_model={} base_url={} url={} elapsed_ms={} upstream_request_id={}",
++                request_log.requested_model,
++                request_log.api_model,
++                request_log.base_url,
++                request_log.url,
++                request_log.elapsed_ms(),
++                upstream_request_id,
++            ));
++        }
+         let api_stream = spawn_chat_completions_stream(
+             stream_response,
+             mimo_side_route::STREAM_IDLE_TIMEOUT,
+             tool_aliases,
+         );
+-        let (stream, _) = map_response_stream(
++        let (stream, _) = map_response_stream_with_log(
+             api_stream,
+             session_telemetry.clone(),
+             inference_trace_attempt,
++            request_log,
+         );
+         Ok(stream)
+     }
+@@ -1832,10 +1887,49 @@ fn parent_thread_id_header_value(session_source: &SessionSource) -> Option<Strin
+ const RESPONSE_STREAM_CHANNEL_CAPACITY: usize = 1600;
+ const STREAM_DROPPED_REASON: &str = "response stream dropped before provider terminal event";
+ 
++#[derive(Clone)]
++struct OpenAiV1RequestLog {
++    provider: OpenAiV1RequestLogProvider,
++    codex_home: PathBuf,
++    started_at: Instant,
++    requested_model: String,
++    api_model: String,
++    base_url: String,
++    url: String,
++}
++
++#[derive(Clone, Copy)]
++enum OpenAiV1RequestLogProvider {
++    Mimo,
++}
++
++impl OpenAiV1RequestLog {
++    fn log(&self, message: impl AsRef<str>) {
++        match self.provider {
++            OpenAiV1RequestLogProvider::Mimo => {
++                mimo_side_route::log_event(&self.codex_home, message)
++            }
++        }
++    }
++
++    fn elapsed_ms(&self) -> u128 {
++        self.started_at.elapsed().as_millis()
++    }
++}
++
+ fn map_response_stream(
+     api_stream: codex_api::ResponseStream,
+     session_telemetry: SessionTelemetry,
+     inference_trace_attempt: InferenceTraceAttempt,
++) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
++    map_response_stream_with_log(api_stream, session_telemetry, inference_trace_attempt, None)
++}
++
++fn map_response_stream_with_log(
++    api_stream: codex_api::ResponseStream,
++    session_telemetry: SessionTelemetry,
++    inference_trace_attempt: InferenceTraceAttempt,
++    request_log: Option<OpenAiV1RequestLog>,
+ ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
+     let codex_api::ResponseStream {
+         rx_event,
+@@ -1850,6 +1944,7 @@ fn map_response_stream(
+         api_stream,
+         session_telemetry,
+         inference_trace_attempt,
++        request_log,
+     )
+ }
+ 
+@@ -1858,6 +1953,7 @@ fn map_response_events<S>(
+     api_stream: S,
+     session_telemetry: SessionTelemetry,
+     inference_trace_attempt: InferenceTraceAttempt,
++    request_log: Option<OpenAiV1RequestLog>,
+ ) -> (ResponseStream, oneshot::Receiver<LastResponse>)
+ where
+     S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
+@@ -1916,6 +2012,24 @@ where
+                     token_usage,
+                     end_turn,
+                 }) => {
++                    if let Some(request_log) = &request_log {
++                        let usage = token_usage.as_ref();
++                        request_log.log(format!(
++                            "completed model={} api_model={} base_url={} url={} elapsed_ms={} response_id={} upstream_request_id={} input_tokens={} cached_input_tokens={} output_tokens={} reasoning_output_tokens={} total_tokens={}",
++                            request_log.requested_model,
++                            request_log.api_model,
++                            request_log.base_url,
++                            request_log.url,
++                            request_log.elapsed_ms(),
++                            response_id,
++                            upstream_request_id.unwrap_or("none"),
++                            usage.map_or(0, |usage| usage.input_tokens),
++                            usage.map_or(0, |usage| usage.cached_input_tokens),
++                            usage.map_or(0, |usage| usage.output_tokens),
++                            usage.map_or(0, |usage| usage.reasoning_output_tokens),
++                            usage.map_or(0, |usage| usage.total_tokens),
++                        ));
++                    }
+                     feedback_tags!(last_model_response_id = &response_id);
+                     if let Some(usage) = &token_usage {
+                         session_telemetry.sse_event_completed(
+@@ -1965,6 +2079,18 @@ where
+                         extract_response_debug_context_from_api_error(&err);
+                     let upstream_request_id =
+                         upstream_request_id.or(response_debug_context.request_id.as_deref());
++                    if let Some(request_log) = &request_log {
++                        request_log.log(format!(
++                            "failed model={} api_model={} base_url={} url={} elapsed_ms={} upstream_request_id={} error={}",
++                            request_log.requested_model,
++                            request_log.api_model,
++                            request_log.base_url,
++                            request_log.url,
++                            request_log.elapsed_ms(),
++                            upstream_request_id.unwrap_or("none"),
++                            err
++                        ));
++                    }
+                     if let Some(upstream_request_id) = upstream_request_id {
+                         feedback_tags!(last_model_request_id = upstream_request_id);
+                     }
+@@ -1984,6 +2110,17 @@ where
+                 }
+             }
+         }
++        if let Some(request_log) = &request_log {
++            request_log.log(format!(
++                "failed model={} api_model={} base_url={} url={} elapsed_ms={} upstream_request_id={} error=stream closed before response.completed",
++                request_log.requested_model,
++                request_log.api_model,
++                request_log.base_url,
++                request_log.url,
++                request_log.elapsed_ms(),
++                upstream_request_id.unwrap_or("none"),
++            ));
++        }
+         inference_trace_attempt.record_failed(
+             "stream closed before response.completed",
+             upstream_request_id,
+diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.rs
+index 50fd12181e..b7a28ad8ba 100644
+--- a/codex-rs/core/src/client_tests.rs
++++ b/codex-rs/core/src/client_tests.rs
+@@ -347,6 +347,7 @@ async fn dropped_response_stream_traces_cancelled_partial_output() -> anyhow::Re
+         api_stream,
+         test_session_telemetry(),
+         attempt,
++        None,
+     );
+ 
+     let observed = stream
+@@ -396,6 +397,7 @@ async fn response_stream_records_last_model_feedback_ids() {
+         api_stream,
+         test_session_telemetry(),
+         InferenceTraceAttempt::disabled(),
++        None,
+     );
+ 
+     while stream.next().await.is_some() {}
+@@ -437,6 +439,7 @@ async fn dropped_backpressured_response_stream_traces_cancelled_partial_output()
+         api_stream,
+         test_session_telemetry(),
+         attempt,
++        None,
+     );
+ 
+     // Fill the mapper channel with non-terminal events, then yield one output
+diff --git a/codex-rs/core/src/mimo_side_route.rs b/codex-rs/core/src/mimo_side_route.rs
+index c9cbb9a1f5..ce9d891d3e 100644
+--- a/codex-rs/core/src/mimo_side_route.rs
++++ b/codex-rs/core/src/mimo_side_route.rs
+@@ -1,7 +1,10 @@
+ use std::fs;
++use std::io::Write;
+ use std::path::Path;
+ use std::sync::Arc;
+ use std::time::Duration;
++use std::time::SystemTime;
++use std::time::UNIX_EPOCH;
+ 
+ use codex_api::AuthProvider;
+ use codex_api::Provider;
+@@ -19,6 +22,7 @@ const API_KEY_FILE: &str = "mimo.toml";
+ const API_KEY_PLACEHOLDER: &str = "sk-dummy";
+ const API_KEY_FIELD: &str = "api_key";
+ const BASE_URL_FIELD: &str = "base_url";
++const REQUEST_LOG_FIELD: &str = "request_log";
+ const DEFAULT_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
+ const STREAM_MAX_RETRIES: u64 = 5;
+ pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+@@ -26,6 +30,7 @@ const EXAMPLE_API_KEY_FILE: &str = concat!(
+     "# MiMo side-route credentials for Codex.\n",
+     "api_key = \"sk-dummy\"\n",
+     "base_url = \"https://api.xiaomimimo.com/v1\"\n",
++    "request_log = false\n",
+ );
+ 
+ pub fn is_mimo_model(model: &str) -> bool {
+@@ -35,6 +40,7 @@ pub fn is_mimo_model(model: &str) -> bool {
+ pub(crate) fn ensure_api_key_file(codex_home: &Path) {
+     let path = codex_home.join(API_KEY_FILE);
+     if path.exists() {
++        ensure_request_log_field(&path);
+         return;
+     }
+     if fs::create_dir_all(codex_home).is_ok() {
+@@ -42,6 +48,17 @@ pub(crate) fn ensure_api_key_file(codex_home: &Path) {
+     }
+ }
+ 
++fn ensure_request_log_field(path: &Path) {
++    let Ok(contents) = fs::read_to_string(path) else {
++        return;
++    };
++    if parse_field(&contents, REQUEST_LOG_FIELD).is_some() {
++        return;
++    }
++    let separator = if contents.ends_with('\n') { "" } else { "\n" };
++    let _ = fs::write(path, format!("{contents}{separator}request_log = false\n"));
++}
++
+ pub(crate) fn provider_and_auth(codex_home: &Path) -> Result<(Provider, Arc<dyn AuthProvider>)> {
+     ensure_api_key_file(codex_home);
+     let config = read_config(codex_home)?;
+@@ -62,6 +79,30 @@ pub(crate) fn provider_and_auth(codex_home: &Path) -> Result<(Provider, Arc<dyn
+     Ok((provider, Arc::new(BearerAuthProvider::new(config.api_key))))
+ }
+ 
++pub(crate) fn request_log_enabled(codex_home: &Path) -> bool {
++    let path = codex_home.join(API_KEY_FILE);
++    fs::read_to_string(path)
++        .ok()
++        .and_then(|contents| parse_bool_field(&contents, REQUEST_LOG_FIELD))
++        .unwrap_or(false)
++}
++
++pub(crate) fn log_event(codex_home: &Path, message: impl AsRef<str>) {
++    let log_dir = codex_home.join("log");
++    if fs::create_dir_all(&log_dir).is_err() {
++        return;
++    }
++    let path = log_dir.join("mimo.log");
++    let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) else {
++        return;
++    };
++    let timestamp = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|duration| duration.as_secs())
++        .unwrap_or_default();
++    let _ = writeln!(file, "[{timestamp}] {}", message.as_ref());
++}
++
+ struct MimoConfig {
+     api_key: String,
+     base_url: String,
+@@ -101,6 +142,14 @@ fn parse_field(contents: &str, field: &str) -> Option<String> {
+     })
+ }
+ 
++fn parse_bool_field(contents: &str, field: &str) -> Option<bool> {
++    parse_field(contents, field).and_then(|value| match value.to_ascii_lowercase().as_str() {
++        "true" => Some(true),
++        "false" => Some(false),
++        _ => None,
++    })
++}
++
+ fn missing_api_key_error(path: &Path) -> CodexErr {
+     CodexErr::EnvVar(EnvVarError {
+         var: path.display().to_string(),
+@@ -120,7 +169,7 @@ mod tests {
+         let temp_home = tempfile::TempDir::new().expect("temp home");
+         fs::write(
+             temp_home.path().join(API_KEY_FILE),
+-            "api_key = \"mimo-key\"\nbase_url = \"https://example.test/v1\"\n",
++            "api_key = \"mimo-key\"\nbase_url = \"https://example.test/v1\"\nrequest_log = true\n",
+         )
+         .expect("write config");
+ 
+@@ -128,6 +177,25 @@ mod tests {
+ 
+         assert_eq!(config.api_key, "mimo-key");
+         assert_eq!(config.base_url, "https://example.test/v1");
++        assert!(request_log_enabled(temp_home.path()));
++    }
++
++    #[test]
++    fn ensure_existing_config_adds_request_log_default() {
++        let temp_home = tempfile::TempDir::new().expect("temp home");
++        fs::write(
++            temp_home.path().join(API_KEY_FILE),
++            "api_key = \"mimo-key\"\nbase_url = \"https://example.test/v1\"\n",
++        )
++        .expect("write config");
++
++        ensure_api_key_file(temp_home.path());
++
++        let contents =
++            fs::read_to_string(temp_home.path().join(API_KEY_FILE)).expect("read config");
++        assert!(contents.contains("api_key = \"mimo-key\""));
++        assert!(contents.contains("base_url = \"https://example.test/v1\""));
++        assert!(contents.contains("request_log = false"));
+     }
+ 
+     #[test]
+diff --git a/codex-rs/models-manager/src/lib.rs b/codex-rs/models-manager/src/lib.rs
+index 474cf037d5..f38485b1db 100644
+--- a/codex-rs/models-manager/src/lib.rs
++++ b/codex-rs/models-manager/src/lib.rs
+@@ -17,6 +17,7 @@ const MIMO_API_KEY_EXAMPLE: &str = concat!(
+     "# MiMo side-route credentials for Codex.\n",
+     "api_key = \"sk-dummy\"\n",
+     "base_url = \"https://api.xiaomimimo.com/v1\"\n",
++    "request_log = false\n",
+ );
+ 
+ pub fn with_deepseek_side_route_models(mut models: Vec<ModelInfo>) -> Vec<ModelInfo> {

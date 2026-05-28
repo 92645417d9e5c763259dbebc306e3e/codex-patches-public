@@ -1,0 +1,668 @@
+diff --git a/codex-rs/app-server-protocol/src/export.rs b/codex-rs/app-server-protocol/src/export.rs
+index fcaa8a1eb5..e2ff418f8a 100644
+--- a/codex-rs/app-server-protocol/src/export.rs
++++ b/codex-rs/app-server-protocol/src/export.rs
+@@ -2152,8 +2152,7 @@ mod tests {
+                         || stem == "InitializeCapabilities"
+                         || matches!(
+                             stem,
+-                            "CollabAgentRef"
+-                                | "CollabAgentStatusEntry"
++                            "CollabAgentStatusEntry"
+                                 | "CollabAgentSpawnEndEvent"
+                                 | "CollabAgentInteractionEndEvent"
+                                 | "CollabCloseEndEvent"
+diff --git a/codex-rs/core/src/hook_runtime.rs b/codex-rs/core/src/hook_runtime.rs
+index 6452e9d5ad..a3e2ffa540 100644
+--- a/codex-rs/core/src/hook_runtime.rs
++++ b/codex-rs/core/src/hook_runtime.rs
+@@ -21,6 +21,7 @@ use codex_hooks::UserPromptSubmitOutcome;
+ use codex_hooks::UserPromptSubmitRequest;
+ use codex_otel::HOOK_RUN_DURATION_METRIC;
+ use codex_otel::HOOK_RUN_METRIC;
++use codex_protocol::config_types::ModeKind;
+ use codex_protocol::items::TurnItem;
+ use codex_protocol::items::UserMessageItem;
+ use codex_protocol::models::ResponseItem;
+@@ -341,6 +342,10 @@ pub(crate) async fn run_turn_stop_hooks(
+         SessionSource::SubAgent(_) => return StopOutcome::default(),
+         _ => (StopHookTarget::Stop, sess.hook_transcript_path().await),
+     };
++    let (completed_at, duration_ms) = turn_context
++        .turn_timing_state
++        .completed_at_and_duration_ms()
++        .await;
+     let request = codex_hooks::StopRequest {
+         session_id: sess.session_id().into(),
+         turn_id: turn_context.sub_id.clone(),
+@@ -349,6 +354,8 @@ pub(crate) async fn run_turn_stop_hooks(
+         transcript_path,
+         model: turn_context.model_info.slug.clone(),
+         permission_mode: hook_permission_mode(turn_context),
++        completed_at,
++        duration_ms,
+         stop_hook_active,
+         last_assistant_message,
+         target,
+@@ -420,6 +427,7 @@ pub(crate) async fn run_post_compact_hooks(
+ 
+     let outcome = sess.hooks().run_post_compact(request).await;
+     emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
++    record_additional_contexts(sess, turn_context, outcome.additional_contexts).await;
+     if outcome.should_stop {
+         PostCompactHookOutcome::Stopped
+     } else {
+@@ -510,17 +518,21 @@ pub(crate) async fn inspect_pending_input(
+                 transcript_path: sess.hook_transcript_path().await,
+                 model: turn_context.model_info.slug.clone(),
+                 permission_mode: hook_permission_mode(turn_context),
++                collaboration_mode: collaboration_mode_name(turn_context.collaboration_mode.mode)
++                    .to_string(),
++                latest_accepted_plan: sess.latest_accepted_plan().await,
+                 prompt: UserMessageItem::new(content).message(),
+             };
+             let hooks = sess.hooks();
+             let preview_runs = hooks.preview_user_prompt_submit(&request);
+-            run_context_injecting_hook(
++            let outcome = run_context_injecting_hook(
+                 sess,
+                 turn_context,
+                 preview_runs,
+                 hooks.run_user_prompt_submit(request),
+             )
+-            .await
++            .await;
++            outcome
+         }
+         TurnInput::ResponseInputItem(_) => HookRuntimeOutcome {
+             should_stop: false,
+@@ -731,6 +743,13 @@ fn hook_permission_mode(turn_context: &TurnContext) -> String {
+     .to_string()
+ }
+ 
++fn collaboration_mode_name(mode: ModeKind) -> &'static str {
++    match mode {
++        ModeKind::Plan => "plan",
++        ModeKind::Default | ModeKind::PairProgramming | ModeKind::Execute => "default",
++    }
++}
++
+ fn thread_spawn_subagent_hook_context(
+     sess: &Arc<Session>,
+     turn_context: &TurnContext,
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 675e794aee..fe5df74b7b 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -1275,6 +1275,7 @@ impl Session {
+             self.set_auto_compact_window_estimated_prefill_for_scope(turn_context, prefix_tokens)
+                 .await;
+         }
++        self.clear_latest_accepted_plan().await;
+         self.set_previous_turn_settings(previous_turn_settings.clone())
+             .await;
+         previous_turn_settings
+@@ -1316,6 +1317,21 @@ impl Session {
+         state.set_previous_turn_settings(previous_turn_settings);
+     }
+ 
++    pub(crate) async fn latest_accepted_plan(&self) -> Option<String> {
++        let state = self.state.lock().await;
++        state.latest_accepted_plan()
++    }
++
++    pub(crate) async fn set_latest_accepted_plan(&self, plan: String) {
++        let mut state = self.state.lock().await;
++        state.set_latest_accepted_plan(plan);
++    }
++
++    pub(crate) async fn clear_latest_accepted_plan(&self) {
++        let mut state = self.state.lock().await;
++        state.clear_latest_accepted_plan();
++    }
++
+     fn maybe_refresh_shell_snapshot_for_cwd(
+         &self,
+         previous_cwd: &AbsolutePathBuf,
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index 03bcfd4265..4cc0527441 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -1273,6 +1273,7 @@ impl ProposedPlanItemState {
+             return;
+         }
+         self.completed = true;
++        sess.set_latest_accepted_plan(text.clone()).await;
+         let item = TurnItem::Plan(PlanItem {
+             id: self.item_id.clone(),
+             text,
+diff --git a/codex-rs/core/src/state/session.rs b/codex-rs/core/src/state/session.rs
+index baeaddbbf9..fd5ab55c52 100644
+--- a/codex-rs/core/src/state/session.rs
++++ b/codex-rs/core/src/state/session.rs
+@@ -35,6 +35,7 @@ pub(crate) struct SessionState {
+     pub(crate) startup_prewarm: Option<SessionStartupPrewarmHandle>,
+     pub(crate) active_connector_selection: HashSet<String>,
+     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
++    latest_accepted_plan: Option<String>,
+     granted_permissions: Option<AdditionalPermissionProfile>,
+     next_turn_is_first: bool,
+ }
+@@ -54,6 +55,7 @@ impl SessionState {
+             startup_prewarm: None,
+             active_connector_selection: HashSet::new(),
+             pending_session_start_sources: VecDeque::new(),
++            latest_accepted_plan: None,
+             granted_permissions: None,
+             next_turn_is_first: true,
+         }
+@@ -78,6 +80,18 @@ impl SessionState {
+         self.previous_turn_settings = previous_turn_settings;
+     }
+ 
++    pub(crate) fn latest_accepted_plan(&self) -> Option<String> {
++        self.latest_accepted_plan.clone()
++    }
++
++    pub(crate) fn set_latest_accepted_plan(&mut self, plan: String) {
++        self.latest_accepted_plan = Some(plan);
++    }
++
++    pub(crate) fn clear_latest_accepted_plan(&mut self) {
++        self.latest_accepted_plan = None;
++    }
++
+     pub(crate) fn set_next_turn_is_first(&mut self, value: bool) {
+         self.next_turn_is_first = value;
+     }
+diff --git a/codex-rs/hooks/schema/generated/post-compact.command.output.schema.json b/codex-rs/hooks/schema/generated/post-compact.command.output.schema.json
+index 0221ac29b4..3acdddc6d9 100644
+--- a/codex-rs/hooks/schema/generated/post-compact.command.output.schema.json
++++ b/codex-rs/hooks/schema/generated/post-compact.command.output.schema.json
+@@ -1,11 +1,38 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "additionalProperties": false,
++  "definitions": {
++    "PostCompactHookSpecificOutputWire": {
++      "additionalProperties": false,
++      "properties": {
++        "additionalContext": {
++          "default": null,
++          "type": "string"
++        },
++        "hookEventName": {
++          "const": "PostCompact",
++          "type": "string"
++        }
++      },
++      "required": [
++        "hookEventName"
++      ],
++      "type": "object"
++    }
++  },
+   "properties": {
+     "continue": {
+       "default": true,
+       "type": "boolean"
+     },
++    "hookSpecificOutput": {
++      "allOf": [
++        {
++          "$ref": "#/definitions/PostCompactHookSpecificOutputWire"
++        }
++      ],
++      "default": null
++    },
+     "stopReason": {
+       "default": null,
+       "type": "string"
+diff --git a/codex-rs/hooks/schema/generated/stop.command.input.schema.json b/codex-rs/hooks/schema/generated/stop.command.input.schema.json
+index dbd4a3f648..7523a87562 100644
+--- a/codex-rs/hooks/schema/generated/stop.command.input.schema.json
++++ b/codex-rs/hooks/schema/generated/stop.command.input.schema.json
+@@ -2,6 +2,12 @@
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "additionalProperties": false,
+   "definitions": {
++    "NullableI64": {
++      "type": [
++        "integer",
++        "null"
++      ]
++    },
+     "NullableString": {
+       "type": [
+         "string",
+@@ -10,9 +16,15 @@
+     }
+   },
+   "properties": {
++    "completed_at": {
++      "$ref": "#/definitions/NullableI64"
++    },
+     "cwd": {
+       "type": "string"
+     },
++    "duration_ms": {
++      "$ref": "#/definitions/NullableI64"
++    },
+     "hook_event_name": {
+       "const": "Stop",
+       "type": "string"
+@@ -48,7 +60,9 @@
+     }
+   },
+   "required": [
++    "completed_at",
+     "cwd",
++    "duration_ms",
+     "hook_event_name",
+     "last_assistant_message",
+     "model",
+diff --git a/codex-rs/hooks/schema/generated/user-prompt-submit.command.input.schema.json b/codex-rs/hooks/schema/generated/user-prompt-submit.command.input.schema.json
+index 6a10a9f75c..f51e69fe01 100644
+--- a/codex-rs/hooks/schema/generated/user-prompt-submit.command.input.schema.json
++++ b/codex-rs/hooks/schema/generated/user-prompt-submit.command.input.schema.json
+@@ -10,6 +10,13 @@
+     }
+   },
+   "properties": {
++    "collaboration_mode": {
++      "enum": [
++        "default",
++        "plan"
++      ],
++      "type": "string"
++    },
+     "agent_id": {
+       "type": "string"
+     },
+@@ -23,6 +30,9 @@
+       "const": "UserPromptSubmit",
+       "type": "string"
+     },
++    "latest_accepted_plan": {
++      "$ref": "#/definitions/NullableString"
++    },
+     "model": {
+       "type": "string"
+     },
+@@ -51,8 +61,10 @@
+     }
+   },
+   "required": [
++    "collaboration_mode",
+     "cwd",
+     "hook_event_name",
++    "latest_accepted_plan",
+     "model",
+     "permission_mode",
+     "prompt",
+@@ -62,4 +74,4 @@
+   ],
+   "title": "user-prompt-submit.command.input",
+   "type": "object"
+-}
+\ No newline at end of file
++}
+diff --git a/codex-rs/hooks/src/engine/output_parser.rs b/codex-rs/hooks/src/engine/output_parser.rs
+index 11b44395c8..4190b607ab 100644
+--- a/codex-rs/hooks/src/engine/output_parser.rs
++++ b/codex-rs/hooks/src/engine/output_parser.rs
+@@ -70,6 +70,7 @@ pub(crate) struct PreCompactOutput {
+ #[derive(Debug, Clone)]
+ pub(crate) struct StatelessHookOutput {
+     pub universal: UniversalOutput,
++    pub additional_context: Option<String>,
+     pub invalid_reason: Option<String>,
+ }
+ 
+@@ -249,8 +250,12 @@ pub(crate) fn parse_pre_compact(stdout: &str) -> Option<PreCompactOutput> {
+ pub(crate) fn parse_post_compact(stdout: &str) -> Option<StatelessHookOutput> {
+     let wire: PostCompactCommandOutputWire = parse_json(stdout)?;
+     let universal = UniversalOutput::from(wire.universal);
++    let additional_context = wire
++        .hook_specific_output
++        .and_then(|output| output.additional_context);
+     Some(StatelessHookOutput {
+         universal,
++        additional_context,
+         invalid_reason: None,
+     })
+ }
+diff --git a/codex-rs/hooks/src/events/compact.rs b/codex-rs/hooks/src/events/compact.rs
+index cb3080219a..1bbd8e509b 100644
+--- a/codex-rs/hooks/src/events/compact.rs
++++ b/codex-rs/hooks/src/events/compact.rs
+@@ -44,6 +44,7 @@ pub struct PostCompactRequest {
+ #[derive(Debug)]
+ pub struct StatelessHookOutcome {
+     pub hook_events: Vec<HookCompletedEvent>,
++    pub additional_contexts: Vec<String>,
+     pub should_stop: bool,
+     pub stop_reason: Option<String>,
+ }
+@@ -164,6 +165,7 @@ pub(crate) async fn run_post(
+     if matched.is_empty() {
+         return StatelessHookOutcome {
+             hook_events: Vec::new(),
++            additional_contexts: Vec::new(),
+             should_stop: false,
+             stop_reason: None,
+         };
+@@ -178,6 +180,7 @@ pub(crate) async fn run_post(
+                     Some(request.turn_id),
+                     format!("failed to serialize post compact hook input: {error}"),
+                 ),
++                additional_contexts: Vec::new(),
+                 should_stop: false,
+                 stop_reason: None,
+             };
+@@ -197,8 +200,14 @@ pub(crate) async fn run_post(
+     let stop_reason = results
+         .iter()
+         .find_map(|result| result.data.stop_reason.clone());
++    let additional_contexts = common::flatten_additional_contexts(
++        results
++            .iter()
++            .map(|result| result.data.additional_contexts_for_model.as_slice()),
++    );
+     StatelessHookOutcome {
+         hook_events: results.into_iter().map(|result| result.completed).collect(),
++        additional_contexts,
+         should_stop,
+         stop_reason,
+     }
+@@ -223,6 +232,7 @@ fn post_command_input_json(request: &PostCompactRequest) -> Result<String, serde
+ struct CompactHandlerData {
+     should_stop: bool,
+     stop_reason: Option<String>,
++    additional_contexts_for_model: Vec<String>,
+ }
+ 
+ fn parse_pre_completed(
+@@ -307,6 +317,7 @@ fn parse_pre_completed(
+         data: CompactHandlerData {
+             should_stop,
+             stop_reason,
++            additional_contexts_for_model: Vec::new(),
+         },
+         completion_order: 0,
+     }
+@@ -337,6 +348,7 @@ fn parse_completed(
+     let mut status = HookRunStatus::Completed;
+     let mut should_stop = false;
+     let mut stop_reason = None;
++    let mut additional_contexts_for_model = Vec::new();
+ 
+     match run_result.error.as_deref() {
+         Some(error) => {
+@@ -358,6 +370,13 @@ fn parse_completed(
+                         });
+                     }
+                     let _ = parsed.universal.suppress_output;
++                    if let Some(additional_context) = parsed.additional_context {
++                        common::append_additional_context(
++                            &mut entries,
++                            &mut additional_contexts_for_model,
++                            additional_context,
++                        );
++                    }
+                     if !parsed.universal.continue_processing {
+                         status = HookRunStatus::Stopped;
+                         should_stop = true;
+@@ -410,6 +429,7 @@ fn parse_completed(
+         data: CompactHandlerData {
+             should_stop,
+             stop_reason,
++            additional_contexts_for_model,
+         },
+         completion_order: 0,
+     }
+@@ -567,6 +587,32 @@ mod tests {
+         assert_eq!(parsed.completed.run.entries, Vec::new());
+     }
+ 
++    #[test]
++    fn post_compact_adds_hook_specific_context() {
++        let parsed = parse_post_completed(
++            &handler(HookEventName::PostCompact),
++            run_result(
++                Some(0),
++                r#"{"hookSpecificOutput":{"hookEventName":"PostCompact","additionalContext":"reload workflow execution surface"}}"#,
++                "",
++            ),
++            Some("turn-1".to_string()),
++        );
++
++        assert_eq!(parsed.completed.run.status, HookRunStatus::Completed);
++        assert_eq!(
++            parsed.completed.run.entries,
++            vec![HookOutputEntry {
++                kind: HookOutputEntryKind::Context,
++                text: "reload workflow execution surface".to_string(),
++            }]
++        );
++        assert_eq!(
++            parsed.data.additional_contexts_for_model,
++            vec!["reload workflow execution surface".to_string()]
++        );
++    }
++
+     fn pre_request() -> super::PreCompactRequest {
+         super::PreCompactRequest {
+             session_id: ThreadId::from_string("00000000-0000-4000-8000-000000000001")
+diff --git a/codex-rs/hooks/src/events/stop.rs b/codex-rs/hooks/src/events/stop.rs
+index 24920c569b..b0844dbecd 100644
+--- a/codex-rs/hooks/src/events/stop.rs
++++ b/codex-rs/hooks/src/events/stop.rs
+@@ -16,6 +16,7 @@ use crate::engine::ConfiguredHandler;
+ use crate::engine::command_runner::CommandRunResult;
+ use crate::engine::dispatcher;
+ use crate::engine::output_parser;
++use crate::schema::NullableI64;
+ use crate::schema::NullableString;
+ use crate::schema::StopCommandInput;
+ use crate::schema::SubagentStopCommandInput;
+@@ -28,6 +29,8 @@ pub struct StopRequest {
+     pub transcript_path: Option<PathBuf>,
+     pub model: String,
+     pub permission_mode: String,
++    pub completed_at: Option<i64>,
++    pub duration_ms: Option<i64>,
+     pub stop_hook_active: bool,
+     pub last_assistant_message: Option<String>,
+     pub target: StopHookTarget,
+@@ -123,6 +126,8 @@ pub(crate) async fn run(
+                 hook_event_name: "Stop".to_string(),
+                 model: request.model.clone(),
+                 permission_mode: request.permission_mode.clone(),
++                completed_at: NullableI64::from_i64(request.completed_at),
++                duration_ms: NullableI64::from_i64(request.duration_ms),
+                 stop_hook_active: request.stop_hook_active,
+                 last_assistant_message: NullableString::from_string(
+                     request.last_assistant_message.clone(),
+diff --git a/codex-rs/hooks/src/events/user_prompt_submit.rs b/codex-rs/hooks/src/events/user_prompt_submit.rs
+index 2934bd3523..f88c148fde 100644
+--- a/codex-rs/hooks/src/events/user_prompt_submit.rs
++++ b/codex-rs/hooks/src/events/user_prompt_submit.rs
+@@ -28,6 +28,8 @@ pub struct UserPromptSubmitRequest {
+     pub transcript_path: Option<PathBuf>,
+     pub model: String,
+     pub permission_mode: String,
++    pub collaboration_mode: String,
++    pub latest_accepted_plan: Option<String>,
+     pub prompt: String,
+ }
+ 
+@@ -90,6 +92,8 @@ pub(crate) async fn run(
+         hook_event_name: "UserPromptSubmit".to_string(),
+         model: request.model.clone(),
+         permission_mode: request.permission_mode.clone(),
++        collaboration_mode: request.collaboration_mode.clone(),
++        latest_accepted_plan: NullableString::from_string(request.latest_accepted_plan.clone()),
+         prompt: request.prompt.clone(),
+     }) {
+         Ok(input_json) => input_json,
+diff --git a/codex-rs/hooks/src/schema.rs b/codex-rs/hooks/src/schema.rs
+index 3f17986dec..f560e39d94 100644
+--- a/codex-rs/hooks/src/schema.rs
++++ b/codex-rs/hooks/src/schema.rs
+@@ -50,6 +50,29 @@ impl NullableString {
+     }
+ }
+ 
++#[derive(Debug, Clone, Serialize)]
++#[serde(transparent)]
++pub(crate) struct NullableI64(Option<i64>);
++
++impl NullableI64 {
++    pub(crate) fn from_i64(value: Option<i64>) -> Self {
++        Self(value)
++    }
++}
++
++impl JsonSchema for NullableI64 {
++    fn schema_name() -> String {
++        "NullableI64".to_string()
++    }
++
++    fn json_schema(_gen: &mut SchemaGenerator) -> Schema {
++        Schema::Object(SchemaObject {
++            instance_type: Some(vec![InstanceType::Integer, InstanceType::Null].into()),
++            ..Default::default()
++        })
++    }
++}
++
+ impl JsonSchema for NullableString {
+     fn schema_name() -> String {
+         "NullableString".to_string()
+@@ -176,6 +199,8 @@ pub(crate) struct PreCompactCommandOutputWire {
+ pub(crate) struct PostCompactCommandOutputWire {
+     #[serde(flatten)]
+     pub universal: HookUniversalOutputWire,
++    #[serde(default)]
++    pub hook_specific_output: Option<PostCompactHookSpecificOutputWire>,
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+@@ -211,6 +236,16 @@ pub(crate) struct PermissionRequestDecisionWire {
+     pub interrupt: bool,
+ }
+ 
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
++#[serde(rename_all = "camelCase")]
++#[serde(deny_unknown_fields)]
++pub(crate) struct PostCompactHookSpecificOutputWire {
++    #[schemars(schema_with = "post_compact_hook_event_name_schema")]
++    pub hook_event_name: HookEventNameWire,
++    #[serde(default)]
++    pub additional_context: Option<String>,
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+ pub(crate) enum PermissionRequestBehaviorWire {
+     #[serde(rename = "allow")]
+@@ -537,6 +572,9 @@ pub(crate) struct UserPromptSubmitCommandInput {
+     pub model: String,
+     #[schemars(schema_with = "permission_mode_schema")]
+     pub permission_mode: String,
++    #[schemars(schema_with = "collaboration_mode_schema")]
++    pub collaboration_mode: String,
++    pub latest_accepted_plan: NullableString,
+     pub prompt: String,
+ }
+ 
+@@ -554,6 +592,8 @@ pub(crate) struct StopCommandInput {
+     pub model: String,
+     #[schemars(schema_with = "permission_mode_schema")]
+     pub permission_mode: String,
++    pub completed_at: NullableI64,
++    pub duration_ms: NullableI64,
+     pub stop_hook_active: bool,
+     pub last_assistant_message: NullableString,
+ }
+@@ -772,6 +812,10 @@ fn session_start_source_schema(_gen: &mut SchemaGenerator) -> Schema {
+     string_enum_schema(&["startup", "resume", "clear", "compact"])
+ }
+ 
++fn collaboration_mode_schema(_gen: &mut SchemaGenerator) -> Schema {
++    string_enum_schema(&["default", "plan"])
++}
++
+ fn compaction_trigger_schema(_gen: &mut SchemaGenerator) -> Schema {
+     string_enum_schema(&["manual", "auto"])
+ }
+@@ -1015,6 +1059,16 @@ mod tests {
+                     .contains(&Value::String("turn_id".to_string()))
+             );
+         }
++
++        assert_eq!(
++            user_prompt_submit["properties"]["collaboration_mode"]["enum"],
++            serde_json::json!(["default", "plan"])
++        );
++        assert_eq!(
++            user_prompt_submit["properties"]["latest_accepted_plan"]["$ref"],
++            serde_json::json!("#/definitions/NullableString")
++        );
++        assert!(user_prompt_submit["properties"]["plan_mode_turn_index"].is_null());
+     }
+ 
+     #[test]
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index b3b58cbc82..6d56330367 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -332,10 +332,8 @@ impl ChatWidget {
+                 reasoning_effort,
+                 agents_states,
+             }),
+-            ThreadItem::EnteredReviewMode { review, .. } => {
+-                if !from_replay {
+-                    self.enter_review_mode_with_hint(review, /*from_replay*/ false);
+-                }
++            ThreadItem::EnteredReviewMode { review, .. } if !from_replay => {
++                self.enter_review_mode_with_hint(review, /*from_replay*/ false);
+             }
+             _ => {}
+         }
+diff --git a/codex-rs/tui/src/multi_agents.rs b/codex-rs/tui/src/multi_agents.rs
+index 4fb5c8c265..91dfba27f1 100644
+--- a/codex-rs/tui/src/multi_agents.rs
++++ b/codex-rs/tui/src/multi_agents.rs
+@@ -516,7 +516,7 @@ fn wait_complete_lines(
+                 .then(|| (parsed_thread_id, agent_metadata(parsed_thread_id), status))
+         })
+         .collect::<Vec<_>>();
+-    extras.sort_by(|left, right| left.0.to_string().cmp(&right.0.to_string()));
++    extras.sort_by_key(|left| left.0.to_string());
+     entries.extend(extras);
+ 
+     if entries.is_empty() {
+
+diff --git a/codex-rs/core/src/hook_runtime.rs b/codex-rs/core/src/hook_runtime.rs
+index a3e2ffa..83ae6d6 100644
+--- a/codex-rs/core/src/hook_runtime.rs
++++ b/codex-rs/core/src/hook_runtime.rs
+@@ -525,14 +525,14 @@ pub(crate) async fn inspect_pending_input(
+             };
+             let hooks = sess.hooks();
+             let preview_runs = hooks.preview_user_prompt_submit(&request);
+-            let outcome = run_context_injecting_hook(
++
++            run_context_injecting_hook(
+                 sess,
+                 turn_context,
+                 preview_runs,
+                 hooks.run_user_prompt_submit(request),
+             )
+-            .await;
+-            outcome
++            .await
+         }
+         TurnInput::ResponseInputItem(_) => HookRuntimeOutcome {
+             should_stop: false,

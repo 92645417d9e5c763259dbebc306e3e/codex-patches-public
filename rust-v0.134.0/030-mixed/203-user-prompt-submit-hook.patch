@@ -1,0 +1,3605 @@
+diff --git a/codex-rs/app-server/src/request_processors/turn_processor.rs b/codex-rs/app-server/src/request_processors/turn_processor.rs
+index ff2825be67..c0ead6b452 100644
+--- a/codex-rs/app-server/src/request_processors/turn_processor.rs
++++ b/codex-rs/app-server/src/request_processors/turn_processor.rs
+@@ -1,5 +1,7 @@
+ use super::*;
+ 
++const SUPPRESS_USER_PROMPT_SUBMIT_HOOK_METADATA_KEY: &str = "codex.suppressUserPromptSubmitHook";
++
+ #[derive(Clone)]
+ pub(crate) struct TurnRequestProcessor {
+     auth_manager: Arc<AuthManager>,
+@@ -355,7 +357,7 @@ impl TurnRequestProcessor {
+     async fn turn_start_inner(
+         &self,
+         request_id: ConnectionRequestId,
+-        params: TurnStartParams,
++        mut params: TurnStartParams,
+         app_server_client_name: Option<String>,
+         app_server_client_version: Option<String>,
+     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
+@@ -384,6 +386,22 @@ impl TurnRequestProcessor {
+         })?;
+ 
+         let environment_selections = self.parse_environment_selections(params.environments)?;
++        let suppress_user_prompt_submit_hook = params
++            .responsesapi_client_metadata
++            .as_mut()
++            .is_some_and(|metadata| {
++                metadata
++                    .remove(SUPPRESS_USER_PROMPT_SUBMIT_HOOK_METADATA_KEY)
++                    .as_deref()
++                    == Some("true")
++            });
++        if params
++            .responsesapi_client_metadata
++            .as_ref()
++            .is_some_and(HashMap::is_empty)
++        {
++            params.responsesapi_client_metadata = None;
++        }
+ 
+         // Map v2 input items to core input items.
+         let mapped_items: Vec<CoreInputItem> = params
+@@ -419,6 +437,7 @@ impl TurnRequestProcessor {
+             environments: environment_selections,
+             final_output_json_schema: params.output_schema,
+             responsesapi_client_metadata: params.responsesapi_client_metadata,
++            suppress_user_prompt_submit_hook,
+             thread_settings,
+         };
+         let turn_id = self
+diff --git a/codex-rs/core/src/agent/control_tests.rs b/codex-rs/core/src/agent/control_tests.rs
+index ed39df1548..cb5e1cfcf9 100644
+--- a/codex-rs/core/src/agent/control_tests.rs
++++ b/codex-rs/core/src/agent/control_tests.rs
+@@ -444,6 +444,7 @@ async fn send_input_submits_user_message() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         },
+     );
+@@ -598,6 +599,7 @@ async fn spawn_agent_creates_thread_and_sends_prompt() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         },
+     );
+@@ -770,6 +772,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         },
+     );
+diff --git a/codex-rs/core/src/codex_delegate.rs b/codex-rs/core/src/codex_delegate.rs
+index 4ed6b2368c..bb7a61bf3a 100644
+--- a/codex-rs/core/src/codex_delegate.rs
++++ b/codex-rs/core/src/codex_delegate.rs
+@@ -192,6 +192,7 @@ pub(crate) async fn run_codex_thread_one_shot(
+         items: input,
+         final_output_json_schema,
+         responsesapi_client_metadata: None,
++        suppress_user_prompt_submit_hook: false,
+         thread_settings: Default::default(),
+     })
+     .await?;
+diff --git a/codex-rs/core/src/guardian/review_session.rs b/codex-rs/core/src/guardian/review_session.rs
+index 15d6c142ca..5f834226af 100644
+--- a/codex-rs/core/src/guardian/review_session.rs
++++ b/codex-rs/core/src/guardian/review_session.rs
+@@ -714,6 +714,7 @@ async fn run_review_on_session(
+             environments: None,
+             final_output_json_schema: Some(params.schema.clone()),
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 #[allow(deprecated)]
+                 cwd: Some(params.parent_turn.cwd.to_path_buf()),
+diff --git a/codex-rs/core/src/session/handlers.rs b/codex-rs/core/src/session/handlers.rs
+index b1e36b0347..3d3409f4ab 100644
+--- a/codex-rs/core/src/session/handlers.rs
++++ b/codex-rs/core/src/session/handlers.rs
+@@ -194,6 +194,7 @@ pub(super) async fn user_input_or_turn_inner(
+         environments,
+         final_output_json_schema,
+         responsesapi_client_metadata,
++        suppress_user_prompt_submit_hook,
+         thread_settings,
+     } = op
+     else {
+@@ -246,12 +247,13 @@ pub(super) async fn user_input_or_turn_inner(
+             )
+             .await;
+             let accepted_items = items.clone();
+-            sess.spawn_task(
+-                Arc::clone(&current_context),
+-                items,
+-                crate::tasks::RegularTask::new(),
+-            )
+-            .await;
++            let task = if suppress_user_prompt_submit_hook {
++                crate::tasks::RegularTask::without_user_prompt_submit_hook()
++            } else {
++                crate::tasks::RegularTask::new()
++            };
++            sess.spawn_task(Arc::clone(&current_context), items, task)
++                .await;
+             Some(accepted_items)
+         }
+         Err(err) => {
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 8764e808c2..2ca403382a 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -1086,6 +1086,7 @@ impl Session {
+                 }],
+                 final_output_json_schema: None,
+                 responsesapi_client_metadata: None,
++                suppress_user_prompt_submit_hook: false,
+                 thread_settings: Default::default(),
+             },
+             /*mirror_user_text_to_realtime*/ None,
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index 30d26191d7..9b244c4cd4 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -2287,6 +2287,7 @@ async fn fork_startup_context_then_first_turn_diff_snapshot() -> anyhow::Result<
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2333,6 +2334,7 @@ async fn fork_startup_context_then_first_turn_diff_snapshot() -> anyhow::Result<
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: ThreadSettingsOverrides {
+                 approval_policy: Some(AskForApproval::Never),
+                 collaboration_mode: Some(collaboration_mode),
+@@ -5429,6 +5431,7 @@ fn op_kind_for_input_and_context_ops() {
+             items: vec![],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         }
+         .kind(),
+@@ -5459,6 +5462,7 @@ async fn user_turn_updates_approvals_reviewer() {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(config.cwd.to_path_buf()),
+                 approval_policy: Some(config.permissions.approval_policy.value()),
+@@ -8476,6 +8480,7 @@ async fn active_goal_continuation_runs_again_after_no_tool_turn() -> anyhow::Res
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -8581,6 +8586,7 @@ async fn pending_request_user_input_does_not_spawn_extra_goal_continuation() ->
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -9128,6 +9134,7 @@ async fn completed_goal_accounts_current_turn_tokens_before_tool_response() -> a
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index 4cc0527441..a0e1c61d5a 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -143,6 +143,7 @@ pub(crate) async fn run_turn(
+     input: Vec<TurnInput>,
+     prewarmed_client_session: Option<ModelClientSession>,
+     cancellation_token: CancellationToken,
++    suppress_user_prompt_submit_hook: bool,
+ ) -> Option<String> {
+     let mut client_session =
+         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+@@ -174,7 +175,14 @@ pub(crate) async fn run_turn(
+         return None;
+     }
+     let mut can_drain_pending_input = input.is_empty();
+-    if run_hooks_and_record_inputs(&sess, &turn_context, &input).await {
++    if run_hooks_and_record_inputs(
++        &sess,
++        &turn_context,
++        &input,
++        suppress_user_prompt_submit_hook,
++    )
++    .await
++    {
+         return None;
+     }
+ 
+@@ -229,7 +237,7 @@ pub(crate) async fn run_turn(
+             Vec::new()
+         };
+ 
+-        if run_hooks_and_record_inputs(&sess, &turn_context, &pending_input).await {
++        if run_hooks_and_record_inputs(&sess, &turn_context, &pending_input, false).await {
+             break;
+         }
+ 
+@@ -411,11 +419,19 @@ async fn run_hooks_and_record_inputs(
+     sess: &Arc<Session>,
+     turn_context: &Arc<TurnContext>,
+     input: &[TurnInput],
++    suppress_user_prompt_submit_hook: bool,
+ ) -> bool {
+     let mut blocked_input = false;
+     let mut accepted_input = false;
+     for input_item in input {
+-        let hook_outcome = inspect_pending_input(sess, turn_context, input_item).await;
++        let hook_outcome = if suppress_user_prompt_submit_hook {
++            crate::hook_runtime::HookRuntimeOutcome {
++                should_stop: false,
++                additional_contexts: Vec::new(),
++            }
++        } else {
++            inspect_pending_input(sess, turn_context, input_item).await
++        };
+         if hook_outcome.should_stop {
+             blocked_input = true;
+             record_additional_contexts(sess, turn_context, hook_outcome.additional_contexts).await;
+diff --git a/codex-rs/core/src/tasks/regular.rs b/codex-rs/core/src/tasks/regular.rs
+index 6c6a0e5b09..1a11a44294 100644
+--- a/codex-rs/core/src/tasks/regular.rs
++++ b/codex-rs/core/src/tasks/regular.rs
+@@ -16,11 +16,21 @@ use super::SessionTask;
+ use super::SessionTaskContext;
+ 
+ #[derive(Default)]
+-pub(crate) struct RegularTask;
++pub(crate) struct RegularTask {
++    suppress_user_prompt_submit_hook: bool,
++}
+ 
+ impl RegularTask {
+     pub(crate) fn new() -> Self {
+-        Self
++        Self {
++            suppress_user_prompt_submit_hook: false,
++        }
++    }
++
++    pub(crate) fn without_user_prompt_submit_hook() -> Self {
++        Self {
++            suppress_user_prompt_submit_hook: true,
++        }
+     }
+ }
+ 
+@@ -78,6 +88,7 @@ impl SessionTask for RegularTask {
+                 next_input,
+                 prewarmed_client_session.take(),
+                 cancellation_token.child_token(),
++                self.suppress_user_prompt_submit_hook,
+             )
+             .instrument(run_turn_span.clone())
+             .await;
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+index a582805ed2..8c78c5b89c 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+@@ -2592,6 +2592,7 @@ async fn send_input_accepts_structured_items() {
+         ],
+         final_output_json_schema: None,
+         responsesapi_client_metadata: None,
++        suppress_user_prompt_submit_hook: false,
+         thread_settings: Default::default(),
+     };
+     let captured = manager
+diff --git a/codex-rs/core/tests/common/test_codex.rs b/codex-rs/core/tests/common/test_codex.rs
+index a398758291..877b3b48c1 100644
+--- a/codex-rs/core/tests/common/test_codex.rs
++++ b/codex-rs/core/tests/common/test_codex.rs
+@@ -767,6 +767,7 @@ impl TestCodex {
+                 environments,
+                 final_output_json_schema: None,
+                 responsesapi_client_metadata: None,
++                suppress_user_prompt_submit_hook: false,
+                 thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                     cwd: Some(self.config.cwd.to_path_buf()),
+                     approval_policy: Some(approval_policy),
+diff --git a/codex-rs/core/tests/suite/abort_tasks.rs b/codex-rs/core/tests/suite/abort_tasks.rs
+index c41502a9dc..9a0456a368 100644
+--- a/codex-rs/core/tests/suite/abort_tasks.rs
++++ b/codex-rs/core/tests/suite/abort_tasks.rs
+@@ -53,6 +53,7 @@ async fn interrupt_long_running_tool_emits_turn_aborted() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -110,6 +111,7 @@ async fn interrupt_tool_records_history_entries() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -131,6 +133,7 @@ async fn interrupt_tool_records_history_entries() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -214,6 +217,7 @@ async fn interrupt_persists_turn_aborted_marker_in_next_request() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -235,6 +239,7 @@ async fn interrupt_persists_turn_aborted_marker_in_next_request() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+diff --git a/codex-rs/core/tests/suite/apply_patch_cli.rs b/codex-rs/core/tests/suite/apply_patch_cli.rs
+index f5a35003f8..3e8eeeee2c 100644
+--- a/codex-rs/core/tests/suite/apply_patch_cli.rs
++++ b/codex-rs/core/tests/suite/apply_patch_cli.rs
+@@ -91,6 +91,7 @@ async fn submit_without_wait_with_turn_permissions(
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(harness.cwd().to_path_buf()),
+                 approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/approvals.rs b/codex-rs/core/tests/suite/approvals.rs
+index 924253d8b8..c4981b46a8 100644
+--- a/codex-rs/core/tests/suite/approvals.rs
++++ b/codex-rs/core/tests/suite/approvals.rs
+@@ -653,6 +653,7 @@ async fn submit_turn(
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(test.cwd.path().to_path_buf()),
+                 approval_policy: Some(approval_policy),
+@@ -2597,6 +2598,7 @@ async fn matched_prefix_rule_runs_unsandboxed_under_zsh_fork() -> Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(test.cwd.path().to_path_buf()),
+                 approval_policy: Some(approval_policy),
+diff --git a/codex-rs/core/tests/suite/client.rs b/codex-rs/core/tests/suite/client.rs
+index 948fe3779b..7b07efeada 100644
+--- a/codex-rs/core/tests/suite/client.rs
++++ b/codex-rs/core/tests/suite/client.rs
+@@ -392,6 +392,7 @@ async fn resume_includes_initial_messages_and_sends_prior_items() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -758,6 +759,7 @@ async fn includes_session_id_thread_id_and_model_headers_in_request() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -969,6 +971,7 @@ async fn includes_base_instructions_override_in_request() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1026,6 +1029,7 @@ async fn chatgpt_auth_sends_correct_request() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1150,6 +1154,7 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1189,6 +1194,7 @@ async fn includes_user_instructions_message_in_request() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1277,6 +1283,7 @@ async fn includes_apps_guidance_as_developer_message_for_chatgpt_auth() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1340,6 +1347,7 @@ async fn omits_apps_guidance_for_api_key_auth_even_when_feature_enabled() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1399,6 +1407,7 @@ async fn omits_apps_guidance_when_configured_off() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1441,6 +1450,7 @@ async fn omits_environment_context_when_configured_off() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1498,6 +1508,7 @@ async fn skills_append_to_developer_message() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1581,6 +1592,7 @@ async fn skills_use_aliases_in_developer_message_under_budget_pressure() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1642,6 +1654,7 @@ async fn includes_configured_effort_in_request() -> anyhow::Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1684,6 +1697,7 @@ async fn includes_no_effort_in_request() -> anyhow::Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1727,6 +1741,7 @@ async fn includes_default_reasoning_effort_in_request_when_defined_by_model_info
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1778,6 +1793,7 @@ async fn user_turn_collaboration_mode_overrides_model_and_effort() -> anyhow::Re
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(config.cwd.to_path_buf()),
+                 approval_policy: Some(config.permissions.approval_policy.value()),
+@@ -1834,6 +1850,7 @@ async fn configured_reasoning_summary_is_sent() -> anyhow::Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1899,6 +1916,7 @@ async fn user_turn_explicit_reasoning_summary_overrides_model_catalog_default()
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(config.cwd.to_path_buf()),
+                 approval_policy: Some(config.permissions.approval_policy.value()),
+@@ -1959,6 +1977,7 @@ async fn reasoning_summary_is_omitted_when_disabled() -> anyhow::Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -2018,6 +2037,7 @@ async fn reasoning_summary_none_overrides_model_catalog_default() -> anyhow::Res
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -2057,6 +2077,7 @@ async fn includes_default_verbosity_in_request() -> anyhow::Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -2105,6 +2126,7 @@ async fn configured_verbosity_not_sent_for_models_without_support() -> anyhow::R
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -2152,6 +2174,7 @@ async fn configured_verbosity_is_sent() -> anyhow::Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -2204,6 +2227,7 @@ async fn includes_developer_instructions_message_in_request() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -2505,6 +2529,7 @@ async fn token_count_includes_rate_limits_snapshot() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -2644,6 +2669,7 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -2721,6 +2747,7 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2736,6 +2763,7 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2821,6 +2849,7 @@ async fn incomplete_response_emits_content_filter_error_message() -> anyhow::Res
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2932,6 +2961,7 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -3021,6 +3051,7 @@ async fn env_var_overrides_loaded_auth() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -3078,6 +3109,7 @@ async fn history_dedupes_streamed_and_final_messages_across_turns() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -3094,6 +3126,7 @@ async fn history_dedupes_streamed_and_final_messages_across_turns() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -3110,6 +3143,7 @@ async fn history_dedupes_streamed_and_final_messages_across_turns() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+diff --git a/codex-rs/core/tests/suite/client_websockets.rs b/codex-rs/core/tests/suite/client_websockets.rs
+index 74eb053325..bb0bb79060 100755
+--- a/codex-rs/core/tests/suite/client_websockets.rs
++++ b/codex-rs/core/tests/suite/client_websockets.rs
+@@ -1319,6 +1319,7 @@ async fn responses_websocket_usage_limit_error_emits_rate_limit_event() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1408,6 +1409,7 @@ async fn responses_websocket_invalid_request_error_with_status_is_forwarded() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+diff --git a/codex-rs/core/tests/suite/code_mode.rs b/codex-rs/core/tests/suite/code_mode.rs
+index 406981fad9..ea89c7b1d8 100644
+--- a/codex-rs/core/tests/suite/code_mode.rs
++++ b/codex-rs/core/tests/suite/code_mode.rs
+@@ -2779,6 +2779,7 @@ text(
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd),
+                 approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/collaboration_instructions.rs b/codex-rs/core/tests/suite/collaboration_instructions.rs
+index 0f9bee9431..25dbf2422f 100644
+--- a/codex-rs/core/tests/suite/collaboration_instructions.rs
++++ b/codex-rs/core/tests/suite/collaboration_instructions.rs
+@@ -79,6 +79,7 @@ async fn no_collaboration_instructions_by_default() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -133,6 +134,7 @@ async fn user_input_includes_collaboration_instructions_after_override() -> Resu
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -170,6 +172,7 @@ async fn collaboration_instructions_added_on_user_turn() -> Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(test.config.cwd.to_path_buf()),
+                 approval_policy: Some(test.config.permissions.approval_policy.value()),
+@@ -220,6 +223,7 @@ async fn collaboration_instructions_omitted_when_disabled() -> Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(test.config.cwd.to_path_buf()),
+                 approval_policy: Some(test.config.permissions.approval_policy.value()),
+@@ -279,6 +283,7 @@ async fn override_then_next_turn_uses_updated_collaboration_instructions() -> Re
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -327,6 +332,7 @@ async fn user_turn_overrides_collaboration_instructions_after_override() -> Resu
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(test.config.cwd.to_path_buf()),
+                 approval_policy: Some(test.config.permissions.approval_policy.value()),
+@@ -391,6 +397,7 @@ async fn collaboration_mode_update_emits_new_instruction_message() -> Result<()>
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -414,6 +421,7 @@ async fn collaboration_mode_update_emits_new_instruction_message() -> Result<()>
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -466,6 +474,7 @@ async fn collaboration_mode_update_noop_does_not_append() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -489,6 +498,7 @@ async fn collaboration_mode_update_noop_does_not_append() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -543,6 +553,7 @@ async fn collaboration_mode_update_emits_new_instruction_message_when_mode_chang
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -569,6 +580,7 @@ async fn collaboration_mode_update_emits_new_instruction_message_when_mode_chang
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -624,6 +636,7 @@ async fn collaboration_mode_update_noop_does_not_append_when_mode_is_unchanged()
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -650,6 +663,7 @@ async fn collaboration_mode_update_noop_does_not_append_when_mode_is_unchanged()
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -708,6 +722,7 @@ async fn resume_replays_collaboration_instructions() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -724,6 +739,7 @@ async fn resume_replays_collaboration_instructions() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -776,6 +792,7 @@ async fn empty_collaboration_instructions_are_ignored() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+diff --git a/codex-rs/core/tests/suite/compact.rs b/codex-rs/core/tests/suite/compact.rs
+index 140b4ec2b1..ab6c0c5c60 100644
+--- a/codex-rs/core/tests/suite/compact.rs
++++ b/codex-rs/core/tests/suite/compact.rs
+@@ -97,6 +97,7 @@ fn disabled_permission_user_turn(text: impl Into<String>, cwd: PathBuf, model: S
+         environments: None,
+         final_output_json_schema: None,
+         responsesapi_client_metadata: None,
++        suppress_user_prompt_submit_hook: false,
+         thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+             cwd: Some(cwd),
+             approval_policy: Some(AskForApproval::Never),
+@@ -408,6 +409,7 @@ async fn summarize_context_three_requests_and_instructions() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -433,6 +435,7 @@ async fn summarize_context_three_requests_and_instructions() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -610,6 +613,7 @@ async fn manual_pre_compact_block_decision_does_not_block_compaction() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -683,6 +687,7 @@ async fn compact_hooks_respect_matchers_and_post_runs_after_compaction() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -753,6 +758,7 @@ async fn manual_compact_uses_custom_prompt() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -900,6 +906,7 @@ async fn manual_compact_emits_context_compaction_items() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1066,6 +1073,7 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1538,6 +1546,7 @@ async fn auto_compact_runs_after_token_limit_hit() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1554,6 +1563,7 @@ async fn auto_compact_runs_after_token_limit_hit() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1570,6 +1580,7 @@ async fn auto_compact_runs_after_token_limit_hit() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1741,6 +1752,7 @@ async fn auto_compact_emits_context_compaction_items() {
+                 }],
+                 final_output_json_schema: None,
+                 responsesapi_client_metadata: None,
++                suppress_user_prompt_submit_hook: false,
+                 thread_settings: Default::default(),
+             })
+             .await
+@@ -1822,6 +1834,7 @@ async fn auto_compact_starts_after_turn_started() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1837,6 +1850,7 @@ async fn auto_compact_starts_after_turn_started() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1852,6 +1866,7 @@ async fn auto_compact_starts_after_turn_started() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -2380,6 +2395,7 @@ async fn auto_compact_persists_rollout_entries() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -2395,6 +2411,7 @@ async fn auto_compact_persists_rollout_entries() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -2410,6 +2427,7 @@ async fn auto_compact_persists_rollout_entries() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -2499,6 +2517,7 @@ async fn manual_compact_retries_after_context_window_error() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -2603,6 +2622,7 @@ async fn manual_compact_non_context_failure_retries_then_emits_task_error() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -2698,6 +2718,7 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -2716,6 +2737,7 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -2734,6 +2756,7 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -2898,6 +2921,7 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
+                 }],
+                 final_output_json_schema: None,
+                 responsesapi_client_metadata: None,
++                suppress_user_prompt_submit_hook: false,
+                 thread_settings: Default::default(),
+             })
+             .await
+@@ -3003,6 +3027,7 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -3434,6 +3459,7 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
+                 }],
+                 final_output_json_schema: None,
+                 responsesapi_client_metadata: None,
++                suppress_user_prompt_submit_hook: false,
+                 thread_settings: Default::default(),
+             })
+             .await
+@@ -3553,6 +3579,7 @@ async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
+                 }],
+                 final_output_json_schema: None,
+                 responsesapi_client_metadata: None,
++                suppress_user_prompt_submit_hook: false,
+                 thread_settings: Default::default(),
+             })
+             .await
+@@ -3615,6 +3642,7 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
+                 }],
+                 final_output_json_schema: None,
+                 responsesapi_client_metadata: None,
++                suppress_user_prompt_submit_hook: false,
+                 thread_settings: Default::default(),
+             })
+             .await
+@@ -3647,6 +3675,7 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
+             ],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -3836,6 +3865,7 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -3851,6 +3881,7 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -3924,6 +3955,7 @@ async fn snapshot_request_shape_manual_compact_without_previous_user_messages()
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+diff --git a/codex-rs/core/tests/suite/compact_remote.rs b/codex-rs/core/tests/suite/compact_remote.rs
+index b614c09d3a..f16a56b325 100644
+--- a/codex-rs/core/tests/suite/compact_remote.rs
++++ b/codex-rs/core/tests/suite/compact_remote.rs
+@@ -110,7 +110,7 @@ fn canonical_json(value: &Value) -> Value {
+     match value {
+         Value::Object(map) => {
+             let mut entries = map.iter().collect::<Vec<_>>();
+-            entries.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
++            entries.sort_by_key(|(left_key, _)| *left_key);
+             Value::Object(
+                 entries
+                     .into_iter()
+@@ -326,6 +326,7 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -343,6 +344,7 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -518,6 +520,7 @@ async fn assert_remote_manual_compact_request_parity(
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -538,6 +541,7 @@ async fn assert_remote_manual_compact_request_parity(
+             ],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -552,6 +556,7 @@ async fn assert_remote_manual_compact_request_parity(
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -572,6 +577,7 @@ async fn assert_remote_manual_compact_request_parity(
+             ],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -586,6 +592,7 @@ async fn assert_remote_manual_compact_request_parity(
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -754,6 +761,7 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -771,6 +779,7 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -874,6 +883,7 @@ async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -891,6 +901,7 @@ async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -977,6 +988,7 @@ async fn remote_compact_v2_accepts_additional_output_items_before_compaction() -
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -994,6 +1006,7 @@ async fn remote_compact_v2_accepts_additional_output_items_before_compaction() -
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1085,6 +1098,7 @@ async fn remote_compact_filters_deferred_dynamic_tools() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1157,6 +1171,7 @@ async fn remote_compact_runs_automatically() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1238,6 +1253,7 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1252,6 +1268,7 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1370,6 +1387,7 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1384,6 +1402,7 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1404,6 +1423,7 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1504,6 +1524,7 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1518,6 +1539,7 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1612,6 +1634,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1629,6 +1652,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1720,6 +1744,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1737,6 +1762,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1808,6 +1834,7 @@ async fn remote_manual_compact_emits_context_compaction_items() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1889,6 +1916,7 @@ async fn remote_manual_compact_failure_emits_task_error_event() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1973,6 +2001,7 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()>
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2116,6 +2145,7 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2134,6 +2164,7 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2159,6 +2190,7 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2255,6 +2287,7 @@ async fn remote_compact_refreshes_stale_developer_instructions_without_resume()
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2272,6 +2305,7 @@ async fn remote_compact_refreshes_stale_developer_instructions_without_resume()
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2344,6 +2378,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_sta
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2358,6 +2393,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_sta
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2425,6 +2461,7 @@ async fn remote_request_uses_custom_experimental_realtime_start_instructions() -
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2486,6 +2523,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_end
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2502,6 +2540,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_end
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2577,6 +2616,7 @@ async fn snapshot_request_shape_remote_manual_compact_restates_realtime_start()
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2594,6 +2634,7 @@ async fn snapshot_request_shape_remote_manual_compact_restates_realtime_start()
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2677,6 +2718,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_real
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2693,6 +2735,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_real
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2784,6 +2827,7 @@ async fn snapshot_request_shape_remote_compact_resume_restates_realtime_end() ->
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2814,6 +2858,7 @@ async fn snapshot_request_shape_remote_compact_resume_restates_realtime_end() ->
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2903,6 +2948,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_including_incoming_us
+                 }],
+                 final_output_json_schema: None,
+                 responsesapi_client_metadata: None,
++                suppress_user_prompt_submit_hook: false,
+                 thread_settings: Default::default(),
+             })
+             .await?;
+@@ -2990,6 +3036,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -3012,6 +3059,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -3131,6 +3179,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_context_window_exceed
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -3145,6 +3194,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_context_window_exceed
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -3230,6 +3280,7 @@ async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Res
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -3308,6 +3359,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_summary_only_reinject
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -3394,6 +3446,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjec
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -3411,6 +3464,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjec
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -3493,6 +3547,7 @@ async fn snapshot_request_shape_remote_manual_compact_without_previous_user_mess
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+diff --git a/codex-rs/core/tests/suite/compact_remote_parity.rs b/codex-rs/core/tests/suite/compact_remote_parity.rs
+index ccbd427b1f..aed849c044 100644
+--- a/codex-rs/core/tests/suite/compact_remote_parity.rs
++++ b/codex-rs/core/tests/suite/compact_remote_parity.rs
+@@ -606,6 +606,7 @@ async fn submit_user_input(codex: &codex_core::CodexThread, items: Vec<UserInput
+             items,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+diff --git a/codex-rs/core/tests/suite/compact_resume_fork.rs b/codex-rs/core/tests/suite/compact_resume_fork.rs
+index b2b02f5e66..099e3e3968 100644
+--- a/codex-rs/core/tests/suite/compact_resume_fork.rs
++++ b/codex-rs/core/tests/suite/compact_resume_fork.rs
+@@ -783,6 +783,7 @@ async fn user_turn(conversation: &Arc<CodexThread>, text: &str) {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+diff --git a/codex-rs/core/tests/suite/exec_policy.rs b/codex-rs/core/tests/suite/exec_policy.rs
+index f1e01c22ce..f0ebf09429 100644
+--- a/codex-rs/core/tests/suite/exec_policy.rs
++++ b/codex-rs/core/tests/suite/exec_policy.rs
+@@ -54,6 +54,7 @@ async fn submit_user_turn(
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(test.cwd_path().to_path_buf()),
+                 approval_policy: Some(approval_policy),
+@@ -141,6 +142,7 @@ async fn execpolicy_blocks_shell_invocation() -> Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(test.cwd_path().to_path_buf()),
+                 approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/fork_thread.rs b/codex-rs/core/tests/suite/fork_thread.rs
+index 68a167f790..73568a4780 100644
+--- a/codex-rs/core/tests/suite/fork_thread.rs
++++ b/codex-rs/core/tests/suite/fork_thread.rs
+@@ -57,6 +57,7 @@ async fn fork_thread_twice_drops_to_first_message() {
+                 }],
+                 final_output_json_schema: None,
+                 responsesapi_client_metadata: None,
++                suppress_user_prompt_submit_hook: false,
+                 thread_settings: Default::default(),
+             })
+             .await
+@@ -181,6 +182,7 @@ async fn fork_thread_from_history_does_not_require_source_rollout_path() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+diff --git a/codex-rs/core/tests/suite/hooks.rs b/codex-rs/core/tests/suite/hooks.rs
+index ee1826ceb9..57ed0166bf 100644
+--- a/codex-rs/core/tests/suite/hooks.rs
++++ b/codex-rs/core/tests/suite/hooks.rs
+@@ -1850,6 +1850,7 @@ async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Resu
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1869,6 +1870,7 @@ async fn blocked_queued_prompt_does_not_strand_earlier_accepted_prompt() -> Resu
+                 }],
+                 final_output_json_schema: None,
+                 responsesapi_client_metadata: None,
++                suppress_user_prompt_submit_hook: false,
+                 thread_settings: Default::default(),
+             })
+             .await?;
+diff --git a/codex-rs/core/tests/suite/image_rollout.rs b/codex-rs/core/tests/suite/image_rollout.rs
+index 085ca96f37..c0c6bab602 100644
+--- a/codex-rs/core/tests/suite/image_rollout.rs
++++ b/codex-rs/core/tests/suite/image_rollout.rs
+@@ -127,6 +127,7 @@ async fn copy_paste_local_image_persists_rollout_request_shape() -> anyhow::Resu
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd.path().to_path_buf()),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -223,6 +224,7 @@ async fn drag_drop_image_persists_rollout_request_shape() -> anyhow::Result<()>
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd.path().to_path_buf()),
+                 approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/items.rs b/codex-rs/core/tests/suite/items.rs
+index 82e01e2451..5944b212e0 100644
+--- a/codex-rs/core/tests/suite/items.rs
++++ b/codex-rs/core/tests/suite/items.rs
+@@ -58,6 +58,7 @@ fn disabled_plan_turn(
+         environments: None,
+         final_output_json_schema: None,
+         responsesapi_client_metadata: None,
++        suppress_user_prompt_submit_hook: false,
+         thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+             cwd: Some(cwd),
+             approval_policy: Some(AskForApproval::Never),
+@@ -119,6 +120,7 @@ async fn user_message_item_is_emitted() -> anyhow::Result<()> {
+             items: vec![expected_input.clone()],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -178,6 +180,7 @@ async fn assistant_message_item_is_emitted() -> anyhow::Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -239,6 +242,7 @@ async fn reasoning_item_is_emitted() -> anyhow::Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -301,6 +305,7 @@ async fn web_search_item_is_emitted() -> anyhow::Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -381,6 +386,7 @@ async fn image_generation_call_event_is_emitted() -> anyhow::Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -468,6 +474,7 @@ async fn image_generation_call_event_is_emitted_when_image_save_fails() -> anyho
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -524,6 +531,7 @@ async fn agent_message_content_delta_has_item_metadata() -> anyhow::Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1108,6 +1116,7 @@ async fn reasoning_content_delta_has_item_metadata() -> anyhow::Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1163,6 +1172,7 @@ async fn reasoning_raw_content_delta_respects_flag() -> anyhow::Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+diff --git a/codex-rs/core/tests/suite/json_result.rs b/codex-rs/core/tests/suite/json_result.rs
+index e81d7aa82a..061aeee17a 100644
+--- a/codex-rs/core/tests/suite/json_result.rs
++++ b/codex-rs/core/tests/suite/json_result.rs
+@@ -83,6 +83,7 @@ async fn codex_returns_json_result(model: String) -> anyhow::Result<()> {
+             environments: None,
+             final_output_json_schema: Some(serde_json::from_str(SCHEMA)?),
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd.path().to_path_buf()),
+                 approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/mcp_turn_metadata.rs b/codex-rs/core/tests/suite/mcp_turn_metadata.rs
+index 16e6cbe37d..c7193cc6b1 100644
+--- a/codex-rs/core/tests/suite/mcp_turn_metadata.rs
++++ b/codex-rs/core/tests/suite/mcp_turn_metadata.rs
+@@ -76,6 +76,7 @@ async fn submit_user_turn(
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(test.cwd.path().to_path_buf()),
+                 approval_policy: Some(approval_policy),
+diff --git a/codex-rs/core/tests/suite/model_switching.rs b/codex-rs/core/tests/suite/model_switching.rs
+index 7e77fb79d3..a57b53debe 100644
+--- a/codex-rs/core/tests/suite/model_switching.rs
++++ b/codex-rs/core/tests/suite/model_switching.rs
+@@ -48,6 +48,7 @@ fn read_only_user_turn(test: &TestCodex, items: Vec<UserInput>, model: String) -
+         environments: None,
+         final_output_json_schema: None,
+         responsesapi_client_metadata: None,
++        suppress_user_prompt_submit_hook: false,
+         thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+             cwd: Some(test.cwd_path().to_path_buf()),
+             approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/model_visible_layout.rs b/codex-rs/core/tests/suite/model_visible_layout.rs
+index 17bc0f6703..57beed1eb2 100644
+--- a/codex-rs/core/tests/suite/model_visible_layout.rs
++++ b/codex-rs/core/tests/suite/model_visible_layout.rs
+@@ -125,6 +125,7 @@ async fn snapshot_model_visible_layout_turn_overrides() -> Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(first_turn_cwd),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -160,6 +161,7 @@ async fn snapshot_model_visible_layout_turn_overrides() -> Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(preturn_context_diff_cwd),
+                 approval_policy: Some(AskForApproval::OnRequest),
+@@ -249,6 +251,7 @@ async fn snapshot_model_visible_layout_cwd_change_does_not_refresh_agents() -> R
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd_one.clone()),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -282,6 +285,7 @@ async fn snapshot_model_visible_layout_cwd_change_does_not_refresh_agents() -> R
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd_two),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -365,6 +369,7 @@ async fn snapshot_model_visible_layout_resume_with_personality_change() -> Resul
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -406,6 +411,7 @@ async fn snapshot_model_visible_layout_resume_with_personality_change() -> Resul
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(resume_override_cwd),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -479,6 +485,7 @@ async fn snapshot_model_visible_layout_resume_override_matches_rollout_model() -
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -520,6 +527,7 @@ async fn snapshot_model_visible_layout_resume_override_matches_rollout_model() -
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+diff --git a/codex-rs/core/tests/suite/models_cache_ttl.rs b/codex-rs/core/tests/suite/models_cache_ttl.rs
+index 6d11b47cba..111133643e 100644
+--- a/codex-rs/core/tests/suite/models_cache_ttl.rs
++++ b/codex-rs/core/tests/suite/models_cache_ttl.rs
+@@ -100,6 +100,7 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(test.cwd_path().to_path_buf()),
+                 approval_policy: Some(codex_protocol::protocol::AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/models_etag_responses.rs b/codex-rs/core/tests/suite/models_etag_responses.rs
+index 49f34d8644..ea889dae66 100644
+--- a/codex-rs/core/tests/suite/models_etag_responses.rs
++++ b/codex-rs/core/tests/suite/models_etag_responses.rs
+@@ -112,6 +112,7 @@ async fn refresh_models_on_models_etag_mismatch_and_avoid_duplicate_models_fetch
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd_path),
+                 approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/otel.rs b/codex-rs/core/tests/suite/otel.rs
+index 9d2df4e60e..1a2bd33383 100644
+--- a/codex-rs/core/tests/suite/otel.rs
++++ b/codex-rs/core/tests/suite/otel.rs
+@@ -122,6 +122,7 @@ async fn responses_api_emits_api_request_event() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -168,6 +169,7 @@ async fn process_sse_emits_tracing_for_output_item() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -214,6 +216,7 @@ async fn process_sse_emits_failed_event_on_parse_error() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -261,6 +264,7 @@ async fn process_sse_records_failed_event_when_stream_closes_without_completed()
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -328,6 +332,7 @@ async fn process_sse_failed_event_records_response_error_message() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -393,6 +398,7 @@ async fn process_sse_failed_event_logs_parse_error() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -445,6 +451,7 @@ async fn process_sse_failed_event_logs_missing_error() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -506,6 +513,7 @@ async fn process_sse_failed_event_logs_response_completed_parse_error() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -561,6 +569,7 @@ async fn process_sse_emits_completed_telemetry() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -640,6 +649,7 @@ async fn turn_and_completed_response_spans_record_token_usage() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -728,6 +738,7 @@ async fn handle_responses_span_records_response_kind_and_tool_name() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -822,6 +833,7 @@ async fn record_responses_sets_span_fields_for_response_events() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -911,6 +923,7 @@ async fn handle_response_item_records_tool_result_for_custom_tool_call() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -987,6 +1000,7 @@ async fn handle_response_item_records_tool_result_for_function_call() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1064,6 +1078,7 @@ async fn handle_response_item_records_tool_result_for_shell_command_call() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1173,6 +1188,7 @@ async fn handle_shell_command_autoapprove_from_config_records_tool_decision() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1228,6 +1244,7 @@ async fn handle_shell_command_user_approved_records_tool_decision() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1298,6 +1315,7 @@ async fn handle_shell_command_user_approved_for_session_records_tool_decision()
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1368,6 +1386,7 @@ async fn handle_sandbox_error_user_approves_retry_records_tool_decision() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1438,6 +1457,7 @@ async fn handle_shell_command_user_denies_records_tool_decision() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1508,6 +1528,7 @@ async fn handle_sandbox_error_user_approves_for_session_records_tool_decision()
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -1579,6 +1600,7 @@ async fn handle_sandbox_error_user_denies_records_tool_decision() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+diff --git a/codex-rs/core/tests/suite/pending_input.rs b/codex-rs/core/tests/suite/pending_input.rs
+index b057b86171..7905271dd1 100644
+--- a/codex-rs/core/tests/suite/pending_input.rs
++++ b/codex-rs/core/tests/suite/pending_input.rs
+@@ -103,6 +103,7 @@ async fn submit_user_input(codex: &CodexThread, text: &str) {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -121,6 +122,7 @@ async fn submit_danger_full_access_user_turn(test: &TestCodex, text: &str) {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(test.config.cwd.to_path_buf()),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -291,6 +293,7 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -310,6 +313,7 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+diff --git a/codex-rs/core/tests/suite/permissions_messages.rs b/codex-rs/core/tests/suite/permissions_messages.rs
+index b77e65c0f5..e040064b84 100644
+--- a/codex-rs/core/tests/suite/permissions_messages.rs
++++ b/codex-rs/core/tests/suite/permissions_messages.rs
+@@ -58,6 +58,7 @@ async fn permissions_message_sent_once_on_start() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -98,6 +99,7 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -121,6 +123,7 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -167,6 +170,7 @@ async fn permissions_message_not_added_when_no_change() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -181,6 +185,7 @@ async fn permissions_message_not_added_when_no_change() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -227,6 +232,7 @@ async fn permissions_message_omitted_when_disabled() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -250,6 +256,7 @@ async fn permissions_message_omitted_when_disabled() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -309,6 +316,7 @@ async fn resume_replays_permissions_messages() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -333,6 +341,7 @@ async fn resume_replays_permissions_messages() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -349,6 +358,7 @@ async fn resume_replays_permissions_messages() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -409,6 +419,7 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -433,6 +444,7 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -455,6 +467,7 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -491,6 +504,7 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -552,6 +566,7 @@ async fn permissions_message_includes_writable_roots() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+diff --git a/codex-rs/core/tests/suite/personality.rs b/codex-rs/core/tests/suite/personality.rs
+index 96695769c9..53d552e653 100644
+--- a/codex-rs/core/tests/suite/personality.rs
++++ b/codex-rs/core/tests/suite/personality.rs
+@@ -68,6 +68,7 @@ fn read_only_text_turn_with_personality(
+         environments: None,
+         final_output_json_schema: None,
+         responsesapi_client_metadata: None,
++        suppress_user_prompt_submit_hook: false,
+         thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+             cwd: Some(test.cwd_path().to_path_buf()),
+             approval_policy: Some(approval_policy),
+diff --git a/codex-rs/core/tests/suite/plugins.rs b/codex-rs/core/tests/suite/plugins.rs
+index 45fdf3df07..b102d8568c 100644
+--- a/codex-rs/core/tests/suite/plugins.rs
++++ b/codex-rs/core/tests/suite/plugins.rs
+@@ -227,6 +227,7 @@ async fn capability_sections_render_in_developer_message_in_order() -> Result<()
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -306,6 +307,7 @@ async fn explicit_plugin_mentions_inject_plugin_guidance() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -388,6 +390,7 @@ async fn explicit_plugin_mentions_track_plugin_used_analytics() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+diff --git a/codex-rs/core/tests/suite/prompt_caching.rs b/codex-rs/core/tests/suite/prompt_caching.rs
+index 4ce137a557..77c17ac482 100644
+--- a/codex-rs/core/tests/suite/prompt_caching.rs
++++ b/codex-rs/core/tests/suite/prompt_caching.rs
+@@ -153,6 +153,7 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -167,6 +168,7 @@ async fn prompt_tools_are_consistent_across_requests() -> anyhow::Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -250,6 +252,7 @@ async fn gpt_5_tools_without_apply_patch_append_apply_patch_instructions() -> an
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -264,6 +267,7 @@ async fn gpt_5_tools_without_apply_patch_append_apply_patch_instructions() -> an
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -329,6 +333,7 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -343,6 +348,7 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -426,6 +432,7 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -464,6 +471,7 @@ async fn overrides_turn_context_but_keeps_cached_prefix_and_key_constant() -> an
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -545,6 +553,7 @@ async fn override_before_first_turn_emits_environment_context() -> anyhow::Resul
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -699,6 +708,7 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -724,6 +734,7 @@ async fn per_turn_overrides_keep_cached_prefix_and_key_constant() -> anyhow::Res
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(new_cwd.path().to_path_buf()),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -838,6 +849,7 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(default_cwd.to_path_buf()),
+                 approval_policy: Some(default_approval_policy),
+@@ -866,6 +878,7 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(default_cwd.to_path_buf()),
+                 approval_policy: Some(default_approval_policy),
+@@ -977,6 +990,7 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(default_cwd.to_path_buf()),
+                 approval_policy: Some(default_approval_policy),
+@@ -1007,6 +1021,7 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(default_cwd.to_path_buf()),
+                 approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/quota_exceeded.rs b/codex-rs/core/tests/suite/quota_exceeded.rs
+index 413855f641..06d26a6cc4 100644
+--- a/codex-rs/core/tests/suite/quota_exceeded.rs
++++ b/codex-rs/core/tests/suite/quota_exceeded.rs
+@@ -48,6 +48,7 @@ async fn quota_exceeded_emits_single_error_event() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+diff --git a/codex-rs/core/tests/suite/realtime_conversation.rs b/codex-rs/core/tests/suite/realtime_conversation.rs
+index 232d2380b0..089b9cef70 100644
+--- a/codex-rs/core/tests/suite/realtime_conversation.rs
++++ b/codex-rs/core/tests/suite/realtime_conversation.rs
+@@ -2168,6 +2168,7 @@ async fn conversation_user_text_turn_is_sent_to_realtime_when_active() -> Result
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -2303,6 +2304,7 @@ async fn conversation_user_text_turn_is_capped_when_mirrored_to_realtime() -> Re
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -3499,6 +3501,7 @@ async fn inbound_handoff_request_steers_active_turn() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+diff --git a/codex-rs/core/tests/suite/remote_env.rs b/codex-rs/core/tests/suite/remote_env.rs
+index 873796ff6c..59fd683fb8 100644
+--- a/codex-rs/core/tests/suite/remote_env.rs
++++ b/codex-rs/core/tests/suite/remote_env.rs
+@@ -75,6 +75,7 @@ async fn submit_turn_with_approval_and_environments(
+             environments: Some(environments),
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(test.cwd.path().to_path_buf()),
+                 approval_policy: Some(AskForApproval::OnRequest),
+diff --git a/codex-rs/core/tests/suite/remote_models.rs b/codex-rs/core/tests/suite/remote_models.rs
+index 18ebd732b7..1f28b72159 100644
+--- a/codex-rs/core/tests/suite/remote_models.rs
++++ b/codex-rs/core/tests/suite/remote_models.rs
+@@ -160,6 +160,7 @@ async fn remote_models_config_context_window_override_clamps_to_max_context_wind
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -227,6 +228,7 @@ async fn remote_models_config_override_above_max_uses_max_context_window() -> Re
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -293,6 +295,7 @@ async fn remote_models_use_context_window_when_config_override_is_absent() -> Re
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -372,6 +375,7 @@ async fn remote_models_long_model_slug_is_sent_with_high_reasoning() -> Result<(
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -422,6 +426,7 @@ async fn namespaced_model_slug_uses_catalog_metadata_without_fallback_warning()
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -575,6 +580,7 @@ async fn remote_models_remote_model_uses_unified_exec() -> Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd_path),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -798,6 +804,7 @@ async fn remote_models_apply_remote_base_instructions() -> Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd_path),
+                 approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/request_compression.rs b/codex-rs/core/tests/suite/request_compression.rs
+index 2d66389d53..f8b8f97855 100644
+--- a/codex-rs/core/tests/suite/request_compression.rs
++++ b/codex-rs/core/tests/suite/request_compression.rs
+@@ -47,6 +47,7 @@ async fn request_body_is_zstd_compressed_for_codex_backend_when_enabled() -> any
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -97,6 +98,7 @@ async fn request_body_is_not_compressed_for_api_key_auth_even_when_enabled() ->
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+diff --git a/codex-rs/core/tests/suite/request_permissions.rs b/codex-rs/core/tests/suite/request_permissions.rs
+index 9800104685..fbf6a57aa9 100644
+--- a/codex-rs/core/tests/suite/request_permissions.rs
++++ b/codex-rs/core/tests/suite/request_permissions.rs
+@@ -198,6 +198,7 @@ async fn submit_turn(
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(test.cwd.path().to_path_buf()),
+                 approval_policy: Some(approval_policy),
+diff --git a/codex-rs/core/tests/suite/request_permissions_tool.rs b/codex-rs/core/tests/suite/request_permissions_tool.rs
+index 84e101e73a..b4d048fcce 100644
+--- a/codex-rs/core/tests/suite/request_permissions_tool.rs
++++ b/codex-rs/core/tests/suite/request_permissions_tool.rs
+@@ -150,6 +150,7 @@ async fn submit_turn(
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(test.cwd.path().to_path_buf()),
+                 approval_policy: Some(approval_policy),
+diff --git a/codex-rs/core/tests/suite/request_user_input.rs b/codex-rs/core/tests/suite/request_user_input.rs
+index e0ec684797..fafa92daca 100644
+--- a/codex-rs/core/tests/suite/request_user_input.rs
++++ b/codex-rs/core/tests/suite/request_user_input.rs
+@@ -144,6 +144,7 @@ async fn request_user_input_round_trip_for_mode(mode: ModeKind) -> anyhow::Resul
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd.path().to_path_buf()),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -287,6 +288,7 @@ async fn request_user_input_interrupt_emits_deferred_token_count() -> anyhow::Re
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd.path().to_path_buf()),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -391,6 +393,7 @@ where
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd.path().to_path_buf()),
+                 approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/responses_api_proxy_headers.rs b/codex-rs/core/tests/suite/responses_api_proxy_headers.rs
+index c18b431984..488073830b 100644
+--- a/codex-rs/core/tests/suite/responses_api_proxy_headers.rs
++++ b/codex-rs/core/tests/suite/responses_api_proxy_headers.rs
+@@ -143,6 +143,7 @@ async fn submit_turn_with_timeout(test: &TestCodex, prompt: &str) -> Result<()>
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd),
+                 approval_policy: Some(AskForApproval::OnRequest),
+diff --git a/codex-rs/core/tests/suite/resume.rs b/codex-rs/core/tests/suite/resume.rs
+index fc7a23215f..92b23f8ae9 100644
+--- a/codex-rs/core/tests/suite/resume.rs
++++ b/codex-rs/core/tests/suite/resume.rs
+@@ -93,6 +93,7 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -179,6 +180,7 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()>
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -269,6 +271,7 @@ async fn resume_switches_models_preserves_base_instructions() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -312,6 +315,7 @@ async fn resume_switches_models_preserves_base_instructions() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -330,6 +334,7 @@ async fn resume_switches_models_preserves_base_instructions() -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -403,6 +408,7 @@ async fn resume_model_switch_is_not_duplicated_after_pre_turn_override() -> Resu
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -441,6 +447,7 @@ async fn resume_model_switch_is_not_duplicated_after_pre_turn_override() -> Resu
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+diff --git a/codex-rs/core/tests/suite/review.rs b/codex-rs/core/tests/suite/review.rs
+index 05ec967d09..d46d967c21 100644
+--- a/codex-rs/core/tests/suite/review.rs
++++ b/codex-rs/core/tests/suite/review.rs
+@@ -684,6 +684,7 @@ async fn review_history_surfaces_in_parent_session() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+diff --git a/codex-rs/core/tests/suite/rmcp_client.rs b/codex-rs/core/tests/suite/rmcp_client.rs
+index 864fb1e07a..8feeb0e18a 100644
+--- a/codex-rs/core/tests/suite/rmcp_client.rs
++++ b/codex-rs/core/tests/suite/rmcp_client.rs
+@@ -131,6 +131,7 @@ fn user_turn_with_permission_profile(
+         environments: None,
+         final_output_json_schema: None,
+         responsesapi_client_metadata: None,
++        suppress_user_prompt_submit_hook: false,
+         thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+             cwd: Some(cwd),
+             approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/safety_check_downgrade.rs b/codex-rs/core/tests/suite/safety_check_downgrade.rs
+index ab985ce0f7..e4c30000c4 100644
+--- a/codex-rs/core/tests/suite/safety_check_downgrade.rs
++++ b/codex-rs/core/tests/suite/safety_check_downgrade.rs
+@@ -45,6 +45,7 @@ fn disabled_text_turn(test: &TestCodex, text: &str) -> Op {
+         environments: None,
+         final_output_json_schema: None,
+         responsesapi_client_metadata: None,
++        suppress_user_prompt_submit_hook: false,
+         thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+             cwd: Some(test.cwd_path().to_path_buf()),
+             approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/search_tool.rs b/codex-rs/core/tests/suite/search_tool.rs
+index 26531e9d2c..2254ae6866 100644
+--- a/codex-rs/core/tests/suite/search_tool.rs
++++ b/codex-rs/core/tests/suite/search_tool.rs
+@@ -452,6 +452,7 @@ async fn tool_search_returns_deferred_tools_without_follow_up_tool_injection() -
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -865,6 +866,7 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1173,6 +1175,7 @@ async fn tool_search_surfaced_mcp_tool_errors_are_returned_to_model() -> Result<
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+@@ -1493,6 +1496,7 @@ async fn tool_search_matches_dynamic_tools_by_name_description_namespace_and_sch
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+diff --git a/codex-rs/core/tests/suite/shell_snapshot.rs b/codex-rs/core/tests/suite/shell_snapshot.rs
+index 14241ffafb..b240edf7e5 100644
+--- a/codex-rs/core/tests/suite/shell_snapshot.rs
++++ b/codex-rs/core/tests/suite/shell_snapshot.rs
+@@ -167,6 +167,7 @@ async fn run_snapshot_command_with_options(
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -267,6 +268,7 @@ async fn run_shell_command_snapshot_with_options(
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -347,6 +349,7 @@ async fn run_tool_turn_on_harness(
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -590,6 +593,7 @@ async fn shell_command_snapshot_still_intercepts_apply_patch() -> Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd.clone()),
+                 approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/skill_approval.rs b/codex-rs/core/tests/suite/skill_approval.rs
+index ad8ad6a91a..e97174f0dc 100644
+--- a/codex-rs/core/tests/suite/skill_approval.rs
++++ b/codex-rs/core/tests/suite/skill_approval.rs
+@@ -54,6 +54,7 @@ async fn submit_turn_with_policies(
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(test.cwd_path().to_path_buf()),
+                 approval_policy: Some(approval_policy),
+diff --git a/codex-rs/core/tests/suite/skills.rs b/codex-rs/core/tests/suite/skills.rs
+index 9173f60c4a..ae6f6ce5b2 100644
+--- a/codex-rs/core/tests/suite/skills.rs
++++ b/codex-rs/core/tests/suite/skills.rs
+@@ -88,6 +88,7 @@ async fn user_turn_includes_skill_instructions() -> Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(test.config.cwd.to_path_buf()),
+                 approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/sqlite_state.rs b/codex-rs/core/tests/suite/sqlite_state.rs
+index f5dd75670d..e28e96e74c 100644
+--- a/codex-rs/core/tests/suite/sqlite_state.rs
++++ b/codex-rs/core/tests/suite/sqlite_state.rs
+@@ -413,6 +413,7 @@ async fn mcp_call_marks_thread_memory_mode_polluted_when_configured() -> Result<
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd),
+                 approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs b/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs
+index 5709cdd12b..6955faae8f 100644
+--- a/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs
++++ b/codex-rs/core/tests/suite/stream_error_allows_next_turn.rs
+@@ -101,6 +101,7 @@ async fn continue_after_stream_error() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+@@ -123,6 +124,7 @@ async fn continue_after_stream_error() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+diff --git a/codex-rs/core/tests/suite/stream_no_completed.rs b/codex-rs/core/tests/suite/stream_no_completed.rs
+index 40763960f4..42dfe96c1e 100644
+--- a/codex-rs/core/tests/suite/stream_no_completed.rs
++++ b/codex-rs/core/tests/suite/stream_no_completed.rs
+@@ -83,6 +83,7 @@ async fn retries_on_early_close() {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+diff --git a/codex-rs/core/tests/suite/subagent_notifications.rs b/codex-rs/core/tests/suite/subagent_notifications.rs
+index d3c07a1153..37fb6f4356 100644
+--- a/codex-rs/core/tests/suite/subagent_notifications.rs
++++ b/codex-rs/core/tests/suite/subagent_notifications.rs
+@@ -771,6 +771,7 @@ async fn subagent_stop_replaces_stop_and_skips_internal_subagents() -> Result<()
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(test.config.cwd.to_path_buf()),
+                 approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/tool_harness.rs b/codex-rs/core/tests/suite/tool_harness.rs
+index 2227e5b34e..1ce0a1f71a 100644
+--- a/codex-rs/core/tests/suite/tool_harness.rs
++++ b/codex-rs/core/tests/suite/tool_harness.rs
+@@ -110,6 +110,7 @@ async fn shell_command_tool_executes_command_and_streams_output() -> anyhow::Res
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd_path),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -191,6 +192,7 @@ async fn update_plan_tool_emits_plan_update_event() -> anyhow::Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd_path),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -282,6 +284,7 @@ async fn update_plan_tool_rejects_malformed_payload() -> anyhow::Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd_path),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -383,6 +386,7 @@ async fn apply_patch_tool_executes_and_emits_patch_events() -> anyhow::Result<()
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd_path),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -521,6 +525,7 @@ async fn apply_patch_reports_parse_diagnostics() -> anyhow::Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd_path),
+                 approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/tool_parallelism.rs b/codex-rs/core/tests/suite/tool_parallelism.rs
+index 6663991e02..f215a83543 100644
+--- a/codex-rs/core/tests/suite/tool_parallelism.rs
++++ b/codex-rs/core/tests/suite/tool_parallelism.rs
+@@ -45,6 +45,7 @@ async fn run_turn(test: &TestCodex, prompt: &str) -> anyhow::Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(test.cwd.path().to_path_buf()),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -371,6 +372,7 @@ async fn shell_tools_start_before_response_completed_when_stream_delayed() -> an
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(test.cwd.path().to_path_buf()),
+                 approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/truncation.rs b/codex-rs/core/tests/suite/truncation.rs
+index b98c438f40..3afc426de2 100644
+--- a/codex-rs/core/tests/suite/truncation.rs
++++ b/codex-rs/core/tests/suite/truncation.rs
+@@ -523,6 +523,7 @@ async fn mcp_image_output_preserves_image_and_no_text_summary() -> Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(fixture.cwd.path().to_path_buf()),
+                 approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/unified_exec.rs b/codex-rs/core/tests/suite/unified_exec.rs
+index 9eb831b084..6b4b4f9f07 100644
+--- a/codex-rs/core/tests/suite/unified_exec.rs
++++ b/codex-rs/core/tests/suite/unified_exec.rs
+@@ -200,6 +200,7 @@ async fn submit_unified_exec_turn(
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(test.config.cwd.to_path_buf()),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -291,6 +292,7 @@ async fn unified_exec_intercepts_apply_patch_exec_command() -> Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -2146,6 +2148,7 @@ async fn unified_exec_keeps_long_running_session_after_turn_end() -> Result<()>
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(turn_cwd),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -2249,6 +2252,7 @@ async fn unified_exec_interrupt_preserves_long_running_session() -> Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(turn_cwd),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -2721,6 +2725,7 @@ async fn unified_exec_runs_under_sandbox() -> Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(turn_cwd),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -2843,6 +2848,7 @@ async fn unified_exec_enforces_glob_deny_read_policy() -> Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(turn_cwd),
+                 approval_policy: Some(AskForApproval::Never),
+@@ -2981,6 +2987,7 @@ async fn unified_exec_python_prompt_under_seatbelt() -> Result<()> {
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(turn_cwd),
+                 approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/user_notification.rs b/codex-rs/core/tests/suite/user_notification.rs
+index 343afd8d53..1005439051 100644
+--- a/codex-rs/core/tests/suite/user_notification.rs
++++ b/codex-rs/core/tests/suite/user_notification.rs
+@@ -64,6 +64,7 @@ mv "${tmp_path}" "${payload_path}""#,
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+diff --git a/codex-rs/core/tests/suite/user_shell_cmd.rs b/codex-rs/core/tests/suite/user_shell_cmd.rs
+index 536ee7b495..53e6c859be 100644
+--- a/codex-rs/core/tests/suite/user_shell_cmd.rs
++++ b/codex-rs/core/tests/suite/user_shell_cmd.rs
+@@ -182,6 +182,7 @@ async fn user_shell_command_does_not_replace_active_turn() -> anyhow::Result<()>
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd),
+                 approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/view_image.rs b/codex-rs/core/tests/suite/view_image.rs
+index 867ba10858..b13c796de5 100644
+--- a/codex-rs/core/tests/suite/view_image.rs
++++ b/codex-rs/core/tests/suite/view_image.rs
+@@ -77,6 +77,7 @@ fn disabled_user_turn(test: &TestCodex, items: Vec<UserInput>, model: String) ->
+         environments: None,
+         final_output_json_schema: None,
+         responsesapi_client_metadata: None,
++        suppress_user_prompt_submit_hook: false,
+         thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+             cwd: Some(test.config.cwd.to_path_buf()),
+             approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/websocket_fallback.rs b/codex-rs/core/tests/suite/websocket_fallback.rs
+index 32a6e30caf..2a5002ce96 100644
+--- a/codex-rs/core/tests/suite/websocket_fallback.rs
++++ b/codex-rs/core/tests/suite/websocket_fallback.rs
+@@ -160,6 +160,7 @@ async fn websocket_fallback_hides_first_websocket_retry_stream_error() -> Result
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                 cwd: Some(cwd.path().to_path_buf()),
+                 approval_policy: Some(AskForApproval::Never),
+diff --git a/codex-rs/core/tests/suite/window_headers.rs b/codex-rs/core/tests/suite/window_headers.rs
+index 76fcacf7a9..6e207037e1 100644
+--- a/codex-rs/core/tests/suite/window_headers.rs
++++ b/codex-rs/core/tests/suite/window_headers.rs
+@@ -112,6 +112,7 @@ async fn submit_user_turn(codex: &Arc<CodexThread>, text: &str) -> Result<()> {
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await?;
+diff --git a/codex-rs/mcp-server/src/codex_tool_runner.rs b/codex-rs/mcp-server/src/codex_tool_runner.rs
+index 167d56da5b..b6d65e95d9 100644
+--- a/codex-rs/mcp-server/src/codex_tool_runner.rs
++++ b/codex-rs/mcp-server/src/codex_tool_runner.rs
+@@ -116,6 +116,7 @@ pub async fn run_codex_tool_session(
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         },
+         trace: None,
+@@ -166,6 +167,7 @@ pub async fn run_codex_tool_session_reply(
+             }],
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+diff --git a/codex-rs/memories/write/src/runtime.rs b/codex-rs/memories/write/src/runtime.rs
+index b1ffb2d215..e1a0fae436 100644
+--- a/codex-rs/memories/write/src/runtime.rs
++++ b/codex-rs/memories/write/src/runtime.rs
+@@ -261,6 +261,7 @@ impl MemoryStartupContext {
+                 environments: None,
+                 final_output_json_schema: None,
+                 responsesapi_client_metadata: None,
++                suppress_user_prompt_submit_hook: false,
+                 thread_settings: Default::default(),
+             })
+             .await
+diff --git a/codex-rs/protocol/src/protocol.rs b/codex-rs/protocol/src/protocol.rs
+index d3b8a9e820..5ae2faab99 100644
+--- a/codex-rs/protocol/src/protocol.rs
++++ b/codex-rs/protocol/src/protocol.rs
+@@ -513,6 +513,9 @@ pub enum Op {
+         /// Optional turn-scoped Responses API `client_metadata`.
+         #[serde(default, skip_serializing_if = "Option::is_none")]
+         responsesapi_client_metadata: Option<HashMap<String, String>>,
++        /// Internal TUI flag for queued follow-up turns.
++        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
++        suppress_user_prompt_submit_hook: bool,
+ 
+         /// Persistent thread-settings overrides to apply before the input.
+         #[serde(default, flatten)]
+@@ -655,6 +658,7 @@ impl From<Vec<UserInput>> for Op {
+             items: value,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: ThreadSettingsOverrides::default(),
+         }
+     }
+@@ -4954,6 +4958,7 @@ mod tests {
+             items: Vec::new(),
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         };
+ 
+@@ -4974,6 +4979,7 @@ mod tests {
+                 items: Vec::new(),
+                 final_output_json_schema: None,
+                 responsesapi_client_metadata: None,
++                suppress_user_prompt_submit_hook: false,
+                 thread_settings: Default::default(),
+             }
+         );
+@@ -4996,6 +5002,7 @@ mod tests {
+             items: Vec::new(),
+             final_output_json_schema: Some(schema.clone()),
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         };
+ 
+@@ -5022,6 +5029,7 @@ mod tests {
+                 "fiber_run_id".to_string(),
+                 "fiber-123".to_string(),
+             )])),
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         };
+ 
+diff --git a/codex-rs/thread-manager-sample/src/main.rs b/codex-rs/thread-manager-sample/src/main.rs
+index 634327d007..851ac70cb2 100644
+--- a/codex-rs/thread-manager-sample/src/main.rs
++++ b/codex-rs/thread-manager-sample/src/main.rs
+@@ -297,6 +297,7 @@ async fn run_turn(thread: &CodexThread, thread_id: &str, prompt: String) -> anyh
+             environments: None,
+             final_output_json_schema: None,
+             responsesapi_client_metadata: None,
++            suppress_user_prompt_submit_hook: false,
+             thread_settings: Default::default(),
+         })
+         .await
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index 58623a743f..c7a8165d37 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -1097,6 +1097,48 @@ async fn replayed_interrupted_turn_restores_queued_input_to_composer() {
+     );
+ }
+ 
++#[tokio::test]
++async fn esc_does_not_submit_or_interrupt_ordinary_queued_follow_up() {
++    let (mut app, _app_event_rx, mut op_rx) = make_test_app_with_channels().await;
++    let thread_id = ThreadId::new();
++    let session = test_thread_session(thread_id, test_path_buf("/tmp/project"));
++    app.chat_widget.handle_thread_session(session);
++    app.chat_widget.handle_server_notification(
++        turn_started_notification(thread_id, "turn-1"),
++        /*replay_kind*/ None,
++    );
++    app.chat_widget.handle_server_notification(
++        agent_message_delta_notification(thread_id, "turn-1", "agent-1", "streaming"),
++        /*replay_kind*/ None,
++    );
++    while op_rx.try_recv().is_ok() {}
++
++    app.chat_widget
++        .apply_external_edit("queued follow-up".to_string());
++    app.chat_widget
++        .handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
++    assert_eq!(
++        app.chat_widget.queued_user_message_texts(),
++        vec!["queued follow-up".to_string()]
++    );
++
++    app.chat_widget
++        .handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
++    while let Ok(op) = op_rx.try_recv() {
++        match op {
++            Op::UserTurn { .. } => panic!("queued follow-up should not submit on Esc interrupt"),
++            Op::Interrupt => panic!("ordinary queued follow-up should not turn Esc into interrupt"),
++            _ => {}
++        }
++    }
++
++    assert_eq!(
++        app.chat_widget.queued_user_message_texts(),
++        vec!["queued follow-up".to_string()]
++    );
++    assert_eq!(app.chat_widget.composer_text_with_pending(), "");
++}
++
+ #[tokio::test]
+ async fn token_usage_update_refreshes_status_line_with_runtime_context_window() {
+     let mut app = make_test_app().await;
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+index cb5d4f30e3..a11cafa663 100644
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -518,6 +518,7 @@ impl App {
+                 final_output_json_schema,
+                 collaboration_mode,
+                 personality,
++                suppress_user_prompt_submit_hook,
+             } => {
+                 let mut should_start_turn = true;
+                 if let Some(turn_id) = self.active_turn_id_for_thread(thread_id).await {
+@@ -525,7 +526,12 @@ impl App {
+                     let mut retried_after_turn_mismatch = false;
+                     loop {
+                         match app_server
+-                            .turn_steer(thread_id, steer_turn_id.clone(), items.to_vec())
++                            .turn_steer(
++                                thread_id,
++                                steer_turn_id.clone(),
++                                items.to_vec(),
++                                *suppress_user_prompt_submit_hook,
++                            )
+                             .await
+                         {
+                             Ok(_) => return Ok(true),
+@@ -611,6 +617,7 @@ impl App {
+                             collaboration_mode.clone(),
+                             *personality,
+                             final_output_json_schema.clone(),
++                            *suppress_user_prompt_submit_hook,
+                         )
+                         .await?;
+                 }
+diff --git a/codex-rs/tui/src/app_command.rs b/codex-rs/tui/src/app_command.rs
+index 2ecf17f5a3..477f2379f7 100644
+--- a/codex-rs/tui/src/app_command.rs
++++ b/codex-rs/tui/src/app_command.rs
+@@ -50,6 +50,7 @@ pub(crate) enum AppCommand {
+         final_output_json_schema: Option<Value>,
+         collaboration_mode: Option<CollaborationMode>,
+         personality: Option<Personality>,
++        suppress_user_prompt_submit_hook: bool,
+     },
+     OverrideTurnContext {
+         cwd: Option<PathBuf>,
+@@ -152,6 +153,7 @@ impl AppCommand {
+         final_output_json_schema: Option<Value>,
+         collaboration_mode: Option<CollaborationMode>,
+         personality: Option<Personality>,
++        suppress_user_prompt_submit_hook: bool,
+     ) -> Self {
+         Self::UserTurn {
+             items,
+@@ -166,6 +168,7 @@ impl AppCommand {
+             final_output_json_schema,
+             collaboration_mode,
+             personality,
++            suppress_user_prompt_submit_hook,
+         }
+     }
+ 
+diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+index 59d56ca56e..11f556f9e2 100644
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -125,6 +125,7 @@ use std::collections::HashMap;
+ use std::path::PathBuf;
+ use uuid::Uuid;
+ 
++const SUPPRESS_USER_PROMPT_SUBMIT_HOOK_METADATA_KEY: &str = "codex.suppressUserPromptSubmitHook";
+ const JSONRPC_INVALID_REQUEST: i64 = -32600;
+ const JSONRPC_METHOD_NOT_FOUND: i64 = -32601;
+ const THREAD_SETTINGS_UPDATE_METHOD: &str = "thread/settings/update";
+@@ -652,6 +653,7 @@ impl AppServerSession {
+         collaboration_mode: Option<codex_protocol::config_types::CollaborationMode>,
+         personality: Option<codex_protocol::config_types::Personality>,
+         output_schema: Option<serde_json::Value>,
++        suppress_user_prompt_submit_hook: bool,
+     ) -> Result<TurnStartResponse> {
+         let request_id = self.next_request_id();
+         let (sandbox_policy, permissions) =
+@@ -662,7 +664,12 @@ impl AppServerSession {
+                 params: TurnStartParams {
+                     thread_id: thread_id.to_string(),
+                     input: items,
+-                    responsesapi_client_metadata: None,
++                    responsesapi_client_metadata: suppress_user_prompt_submit_hook.then(|| {
++                        HashMap::from([(
++                            SUPPRESS_USER_PROMPT_SUBMIT_HOOK_METADATA_KEY.to_string(),
++                            "true".to_string(),
++                        )])
++                    }),
+                     environments: None,
+                     cwd: Some(cwd),
+                     runtime_workspace_roots: Some(
+@@ -717,6 +724,7 @@ impl AppServerSession {
+         thread_id: ThreadId,
+         turn_id: String,
+         items: Vec<UserInput>,
++        suppress_user_prompt_submit_hook: bool,
+     ) -> std::result::Result<TurnSteerResponse, TypedRequestError> {
+         let request_id = self.next_request_id();
+         self.client
+@@ -725,7 +733,12 @@ impl AppServerSession {
+                 params: TurnSteerParams {
+                     thread_id: thread_id.to_string(),
+                     input: items,
+-                    responsesapi_client_metadata: None,
++                    responsesapi_client_metadata: suppress_user_prompt_submit_hook.then(|| {
++                        HashMap::from([(
++                            SUPPRESS_USER_PROMPT_SUBMIT_HOOK_METADATA_KEY.to_string(),
++                            "true".to_string(),
++                        )])
++                    }),
+                     expected_turn_id: turn_id,
+                 },
+             })
+diff --git a/codex-rs/tui/src/bottom_pane/footer.rs b/codex-rs/tui/src/bottom_pane/footer.rs
+index 8035881e8e..24aa0946ab 100644
+--- a/codex-rs/tui/src/bottom_pane/footer.rs
++++ b/codex-rs/tui/src/bottom_pane/footer.rs
+@@ -329,13 +329,15 @@ fn left_side_line(
+         SummaryHintKind::QueueMessage => {
+             if let Some(key) = key_hints.queue {
+                 line.push_span(key);
+-                line.push_span(" to queue message".dim());
++                line.push_span(" queue: ".dim());
++                line.push_span("UserPromptSubmit hook will be skipped".yellow());
+             }
+         }
+         SummaryHintKind::QueueShort => {
+             if let Some(key) = key_hints.queue {
+                 line.push_span(key);
+-                line.push_span(" to queue".dim());
++                line.push_span(" queue: ".dim());
++                line.push_span("hook skipped".yellow());
+             }
+         }
+     };
+@@ -1107,6 +1109,10 @@ impl ShortcutDescriptor {
+                     ]);
+                 }
+             }
++            ShortcutId::QueueMessageTab => {
++                line.push_span(" to queue message; ".dim());
++                line.push_span("UserPromptSubmit hook will be skipped".yellow());
++            }
+             _ => line.push_span(self.label),
+         };
+         Some(line)
+diff --git a/codex-rs/tui/src/bottom_pane/pending_input_preview.rs b/codex-rs/tui/src/bottom_pane/pending_input_preview.rs
+index 34e7d7d390..015d72dfbd 100644
+--- a/codex-rs/tui/src/bottom_pane/pending_input_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/pending_input_preview.rs
+@@ -16,10 +16,12 @@ use crate::wrapping::adaptive_wrap_lines;
+ /// resubmitted at end of turn, then ordinary queued user messages. Pending
+ /// steers explain that they will be submitted after the next tool/result
+ /// boundary unless the user presses Esc to interrupt and send them
+-/// immediately. The edit hint at the bottom only appears when there are actual
+-/// queued user inputs to pop back into the composer. Because some terminals
+-/// intercept certain modifier-key combinations, the displayed binding is
+-/// configurable via [`set_edit_binding`](Self::set_edit_binding).
++/// immediately. Pending steers and ordinary queued inputs both explain whether
++/// their later submission skips the `UserPromptSubmit` hook. The edit hint at
++/// the bottom only appears when there are actual queued user inputs to pop back
++/// into the composer. Because some terminals intercept certain modifier-key
++/// combinations, the displayed binding is configurable via
++/// [`set_edit_binding`](Self::set_edit_binding).
+ pub(crate) struct PendingInputPreview {
+     pub pending_steers: Vec<String>,
+     pub rejected_steers: Vec<String>,
+@@ -86,7 +88,9 @@ impl PendingInputPreview {
+                 width,
+                 Line::from(vec![
+                     "Messages to be submitted after next tool call".into(),
+-                    " (press ".dim(),
++                    " (".dim(),
++                    "UserPromptSubmit hook will be skipped".yellow(),
++                    "; press ".dim(),
+                     key_hint::plain(KeyCode::Esc).into(),
+                     " to interrupt and send immediately)".dim(),
+                 ]),
+@@ -110,7 +114,11 @@ impl PendingInputPreview {
+             Self::push_section_header(
+                 &mut lines,
+                 width,
+-                "Messages to be submitted at end of turn".into(),
++                Line::from(vec![
++                    "Messages to be submitted at end of turn (".into(),
++                    "UserPromptSubmit hook will be skipped".yellow(),
++                    ")".into(),
++                ]),
+             );
+ 
+             for steer in &self.rejected_steers {
+@@ -128,7 +136,15 @@ impl PendingInputPreview {
+             if !lines.is_empty() {
+                 lines.push(Line::from(""));
+             }
+-            Self::push_section_header(&mut lines, width, "Queued follow-up inputs".into());
++            Self::push_section_header(
++                &mut lines,
++                width,
++                Line::from(vec![
++                    "Queued follow-up inputs (".into(),
++                    "UserPromptSubmit hook will be skipped".yellow(),
++                    ")".into(),
++                ]),
++            );
+ 
+             for message in &self.queued_messages {
+                 let wrapped = adaptive_wrap_lines(
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 7bc2ce1109..5ae361da3a 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -421,6 +421,7 @@ use self::user_messages::QueuedUserMessage;
+ use self::user_messages::ShellEscapePolicy;
+ use self::user_messages::ThreadComposerState;
+ pub(crate) use self::user_messages::ThreadInputState;
++use self::user_messages::UserPromptSubmitHookPolicy;
+ 
+ fn instant_from_unix_timestamp_secs(started_at: i64) -> Option<Instant> {
+     let started_at = u64::try_from(started_at).ok()?;
+diff --git a/codex-rs/tui/src/chatwidget/input_flow.rs b/codex-rs/tui/src/chatwidget/input_flow.rs
+index 7dbb075602..541132a718 100644
+--- a/codex-rs/tui/src/chatwidget/input_flow.rs
++++ b/codex-rs/tui/src/chatwidget/input_flow.rs
+@@ -127,10 +127,12 @@ impl ChatWidget {
+             };
+             match queued_message.action {
+                 QueuedInputAction::Plain => {
+-                    submitted_follow_up = self.submit_user_message_with_history_record(
+-                        queued_message.into_user_message(),
+-                        history_record,
+-                    );
++                    submitted_follow_up = self
++                        .submit_user_message_with_history_record_and_hook_policy(
++                            queued_message.into_user_message(),
++                            history_record,
++                            UserPromptSubmitHookPolicy::Skip,
++                        );
+                     break;
+                 }
+                 QueuedInputAction::ParseSlash => {
+diff --git a/codex-rs/tui/src/chatwidget/input_restore.rs b/codex-rs/tui/src/chatwidget/input_restore.rs
+index 22b1191e68..3510c92c44 100644
+--- a/codex-rs/tui/src/chatwidget/input_restore.rs
++++ b/codex-rs/tui/src/chatwidget/input_restore.rs
+@@ -128,7 +128,11 @@ impl ChatWidget {
+             if !pending_steers.is_empty() {
+                 let (user_message, history_record) =
+                     merge_user_messages_with_history_record(pending_steers);
+-                self.submit_user_message_with_history_record(user_message, history_record);
++                self.submit_user_message_with_history_record_and_hook_policy(
++                    user_message,
++                    history_record,
++                    UserPromptSubmitHookPolicy::Skip,
++                );
+             } else if let Some(combined) = self.drain_pending_messages_for_restore() {
+                 self.restore_user_message_to_composer(combined);
+             }
+diff --git a/codex-rs/tui/src/chatwidget/input_submission.rs b/codex-rs/tui/src/chatwidget/input_submission.rs
+index 2c960ee3d5..b0a07d3686 100644
+--- a/codex-rs/tui/src/chatwidget/input_submission.rs
++++ b/codex-rs/tui/src/chatwidget/input_submission.rs
+@@ -73,11 +73,25 @@ impl ChatWidget {
+         &mut self,
+         user_message: UserMessage,
+         history_record: UserMessageHistoryRecord,
++    ) -> bool {
++        self.submit_user_message_with_history_record_and_hook_policy(
++            user_message,
++            history_record,
++            UserPromptSubmitHookPolicy::Run,
++        )
++    }
++
++    pub(super) fn submit_user_message_with_history_record_and_hook_policy(
++        &mut self,
++        user_message: UserMessage,
++        history_record: UserMessageHistoryRecord,
++        hook_policy: UserPromptSubmitHookPolicy,
+     ) -> bool {
+         self.submit_user_message_with_history_and_shell_escape_policy(
+             user_message,
+             history_record,
+             ShellEscapePolicy::Allow,
++            hook_policy,
+         )
+         .0
+     }
+@@ -91,6 +105,7 @@ impl ChatWidget {
+             user_message,
+             UserMessageHistoryRecord::UserMessageText,
+             shell_escape_policy,
++            UserPromptSubmitHookPolicy::Run,
+         )
+         .1
+     }
+@@ -100,6 +115,7 @@ impl ChatWidget {
+         user_message: UserMessage,
+         history_record: UserMessageHistoryRecord,
+         shell_escape_policy: ShellEscapePolicy,
++        hook_policy: UserPromptSubmitHookPolicy,
+     ) -> (bool, Option<AppCommand>) {
+         if !self.is_session_configured() {
+             tracing::warn!("cannot submit user message before session is configured; queueing");
+@@ -345,6 +361,7 @@ impl ChatWidget {
+             /*final_output_json_schema*/ None,
+             collaboration_mode,
+             personality,
++            hook_policy == UserPromptSubmitHookPolicy::Skip || !render_in_history,
+         );
+ 
+         if !self.submit_op(op.clone()) {
+diff --git a/codex-rs/tui/src/chatwidget/tests/review_mode.rs b/codex-rs/tui/src/chatwidget/tests/review_mode.rs
+index cd72735a76..6489aec5fd 100644
+--- a/codex-rs/tui/src/chatwidget/tests/review_mode.rs
++++ b/codex-rs/tui/src/chatwidget/tests/review_mode.rs
+@@ -777,13 +777,20 @@ async fn esc_interrupt_sends_all_pending_steers_immediately_and_keeps_existing_d
+         .set_composer_text("first pending steer".to_string(), Vec::new(), Vec::new());
+     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+     match next_submit_op(&mut op_rx) {
+-        Op::UserTurn { items, .. } => assert_eq!(
++        Op::UserTurn {
+             items,
+-            vec![UserInput::Text {
+-                text: "first pending steer".to_string(),
+-                text_elements: Vec::new(),
+-            }]
+-        ),
++            suppress_user_prompt_submit_hook,
++            ..
++        } => {
++            assert!(suppress_user_prompt_submit_hook);
++            assert_eq!(
++                items,
++                vec![UserInput::Text {
++                    text: "first pending steer".to_string(),
++                    text_elements: Vec::new(),
++                }]
++            );
++        }
+         other => panic!("expected Op::UserTurn, got {other:?}"),
+     }
+ 
+@@ -792,13 +799,20 @@ async fn esc_interrupt_sends_all_pending_steers_immediately_and_keeps_existing_d
+     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+ 
+     match next_submit_op(&mut op_rx) {
+-        Op::UserTurn { items, .. } => assert_eq!(
++        Op::UserTurn {
+             items,
+-            vec![UserInput::Text {
+-                text: "second pending steer".to_string(),
+-                text_elements: Vec::new(),
+-            }]
+-        ),
++            suppress_user_prompt_submit_hook,
++            ..
++        } => {
++            assert!(suppress_user_prompt_submit_hook);
++            assert_eq!(
++                items,
++                vec![UserInput::Text {
++                    text: "second pending steer".to_string(),
++                    text_elements: Vec::new(),
++                }]
++            );
++        }
+         other => panic!("expected Op::UserTurn, got {other:?}"),
+     }
+ 
+@@ -815,13 +829,20 @@ async fn esc_interrupt_sends_all_pending_steers_immediately_and_keeps_existing_d
+     chat.on_interrupted_turn(TurnAbortReason::Interrupted);
+ 
+     match next_submit_op(&mut op_rx) {
+-        Op::UserTurn { items, .. } => assert_eq!(
++        Op::UserTurn {
+             items,
+-            vec![UserInput::Text {
+-                text: "first pending steer\nsecond pending steer".to_string(),
+-                text_elements: Vec::new(),
+-            }]
+-        ),
++            suppress_user_prompt_submit_hook,
++            ..
++        } => {
++            assert!(suppress_user_prompt_submit_hook);
++            assert_eq!(
++                items,
++                vec![UserInput::Text {
++                    text: "first pending steer\nsecond pending steer".to_string(),
++                    text_elements: Vec::new(),
++                }]
++            );
++        }
+         other => panic!("expected merged pending steers to submit, got {other:?}"),
+     }
+ 
+@@ -856,7 +877,10 @@ async fn esc_with_pending_steers_overrides_agent_command_interrupt_behavior() {
+         .set_composer_text("pending steer".to_string(), Vec::new(), Vec::new());
+     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+     match next_submit_op(&mut op_rx) {
+-        Op::UserTurn { .. } => {}
++        Op::UserTurn {
++            suppress_user_prompt_submit_hook,
++            ..
++        } => assert!(suppress_user_prompt_submit_hook),
+         other => panic!("expected Op::UserTurn, got {other:?}"),
+     }
+ 
+diff --git a/codex-rs/tui/src/chatwidget/user_messages.rs b/codex-rs/tui/src/chatwidget/user_messages.rs
+index f5f1144a8f..c46e283d72 100644
+--- a/codex-rs/tui/src/chatwidget/user_messages.rs
++++ b/codex-rs/tui/src/chatwidget/user_messages.rs
+@@ -56,6 +56,12 @@ pub(super) enum ShellEscapePolicy {
+     Disallow,
+ }
+ 
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(super) enum UserPromptSubmitHookPolicy {
++    Run,
++    Skip,
++}
++
+ #[derive(Debug, Clone, PartialEq)]
+ pub(super) struct QueuedUserMessage {
+     pub(super) user_message: UserMessage,

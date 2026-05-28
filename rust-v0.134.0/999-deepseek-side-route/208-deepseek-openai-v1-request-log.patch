@@ -1,0 +1,303 @@
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index f0262d19f1..5a31cef064 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -1281,22 +1281,76 @@ impl ModelClientSession {
+         let tool_aliases = request_parts.tool_aliases;
+         let inference_trace_attempt = inference_trace.start_attempt();
+         inference_trace_attempt.record_started(&request);
++        let request_log =
++            deepseek_side_route::request_log_enabled(&codex_home).then(|| OpenAiV1RequestLog {
++                provider: OpenAiV1RequestLogProvider::DeepSeek,
++                codex_home: codex_home.to_path_buf(),
++                started_at: Instant::now(),
++                requested_model: model_info.slug.clone(),
++                api_model: request.model.clone(),
++                base_url: api_provider.base_url.clone(),
++                url: api_provider.url_for_path(CHAT_COMPLETIONS_ENDPOINT),
++            });
++        if let Some(request_log) = &request_log {
++            request_log.log(format!(
++                "start model={} api_model={} provider={} base_url={} url={} thinking={:?} reasoning_effort={:?}",
++                request_log.requested_model,
++                request_log.api_model,
++                api_provider.name,
++                request_log.base_url,
++                request_log.url,
++                request.thinking,
++                request.reasoning_effort,
++            ));
++        }
+ 
+         let client = ApiChatCompletionsClient::new(transport, api_provider, api_auth)
+             .with_telemetry(Some(request_telemetry));
+-        let stream_response = client
++        let stream_response = match client
+             .stream_request(request, ApiChatCompletionsOptions::default())
+             .await
+-            .map_err(map_api_error)?;
++        {
++            Ok(stream_response) => stream_response,
++            Err(err) => {
++                if let Some(request_log) = &request_log {
++                    request_log.log(format!(
++                        "failed model={} api_model={} base_url={} url={} elapsed_ms={} error={err}",
++                        request_log.requested_model,
++                        request_log.api_model,
++                        request_log.base_url,
++                        request_log.url,
++                        request_log.elapsed_ms(),
++                    ));
++                }
++                return Err(map_api_error(err));
++            }
++        };
++        if let Some(request_log) = &request_log {
++            let upstream_request_id = stream_response
++                .headers
++                .get("x-request-id")
++                .and_then(|value| value.to_str().ok())
++                .unwrap_or("none");
++            request_log.log(format!(
++                "response_headers model={} api_model={} base_url={} url={} elapsed_ms={} upstream_request_id={}",
++                request_log.requested_model,
++                request_log.api_model,
++                request_log.base_url,
++                request_log.url,
++                request_log.elapsed_ms(),
++                upstream_request_id,
++            ));
++        }
+         let api_stream = spawn_chat_completions_stream(
+             stream_response,
+             deepseek_side_route::STREAM_IDLE_TIMEOUT,
+             tool_aliases,
+         );
+-        let (stream, _) = map_response_stream(
++        let (stream, _) = map_response_stream_with_log(
+             api_stream,
+             session_telemetry.clone(),
+             inference_trace_attempt,
++            request_log,
+         );
+         Ok(stream)
+     }
+@@ -1991,12 +2045,16 @@ struct OpenAiV1RequestLog {
+ 
+ #[derive(Clone, Copy)]
+ enum OpenAiV1RequestLogProvider {
++    DeepSeek,
+     Mimo,
+ }
+ 
+ impl OpenAiV1RequestLog {
+     fn log(&self, message: impl AsRef<str>) {
+         match self.provider {
++            OpenAiV1RequestLogProvider::DeepSeek => {
++                deepseek_side_route::log_event(&self.codex_home, message)
++            }
+             OpenAiV1RequestLogProvider::Mimo => {
+                 mimo_side_route::log_event(&self.codex_home, message)
+             }
+diff --git a/codex-rs/core/src/deepseek_side_route.rs b/codex-rs/core/src/deepseek_side_route.rs
+index 31ac5e2ae4..ac38fb0ff7 100644
+--- a/codex-rs/core/src/deepseek_side_route.rs
++++ b/codex-rs/core/src/deepseek_side_route.rs
+@@ -24,6 +24,7 @@ const API_KEY_FILE: &str = "deepseek.toml";
+ const API_KEY_PLACEHOLDER: &str = "sk-dummy";
+ const API_KEY_FIELD: &str = "api_key";
+ const BASE_URL_FIELD: &str = "base_url";
++const REQUEST_LOG_FIELD: &str = "request_log";
+ const DEFAULT_BASE_URL: &str = "https://api.deepseek.com/v1";
+ const BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
+ pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+@@ -31,6 +32,7 @@ const EXAMPLE_API_KEY_FILE: &str = concat!(
+     "# DeepSeek side-route credentials for Codex.\n",
+     "api_key = \"sk-dummy\"\n",
+     "base_url = \"https://api.deepseek.com/v1\"\n",
++    "request_log = false\n",
+ );
+ 
+ pub fn is_deepseek_model(model: &str) -> bool {
+@@ -53,9 +55,18 @@ pub(crate) fn log_event(codex_home: &Path, message: impl AsRef<str>) {
+     let _ = writeln!(file, "[{timestamp}] {}", message.as_ref());
+ }
+ 
++pub(crate) fn request_log_enabled(codex_home: &Path) -> bool {
++    let path = codex_home.join(API_KEY_FILE);
++    fs::read_to_string(path)
++        .ok()
++        .and_then(|contents| parse_bool_field(&contents, REQUEST_LOG_FIELD))
++        .unwrap_or(false)
++}
++
+ pub(crate) fn ensure_api_key_file(codex_home: &Path) {
+     let path = codex_home.join(API_KEY_FILE);
+     if path.exists() {
++        ensure_request_log_field(&path);
+         return;
+     }
+     if fs::create_dir_all(codex_home).is_ok() {
+@@ -63,6 +74,17 @@ pub(crate) fn ensure_api_key_file(codex_home: &Path) {
+     }
+ }
+ 
++fn ensure_request_log_field(path: &Path) {
++    let Ok(contents) = fs::read_to_string(path) else {
++        return;
++    };
++    if parse_field(&contents, REQUEST_LOG_FIELD).is_some() {
++        return;
++    }
++    let separator = if contents.ends_with('\n') { "" } else { "\n" };
++    let _ = fs::write(path, format!("{contents}{separator}request_log = false\n"));
++}
++
+ pub(crate) fn provider_and_auth(codex_home: &Path) -> Result<(Provider, Arc<dyn AuthProvider>)> {
+     ensure_api_key_file(codex_home);
+     let api_key = read_required_api_key(codex_home)?;
+@@ -164,6 +186,14 @@ fn parse_field(contents: &str, field: &str) -> Option<String> {
+     })
+ }
+ 
++fn parse_bool_field(contents: &str, field: &str) -> Option<bool> {
++    parse_field(contents, field).and_then(|value| match value.to_ascii_lowercase().as_str() {
++        "true" => Some(true),
++        "false" => Some(false),
++        _ => None,
++    })
++}
++
+ fn balance_transport_error(err: reqwest::Error) -> CodexErr {
+     CodexErr::Stream(format!("DeepSeek balance request failed: {err}"), None)
+ }
+@@ -232,6 +262,36 @@ mod tests {
+         assert_eq!(None, api_key);
+     }
+ 
++    #[test]
++    fn reads_request_log_flag() {
++        let temp_home = tempfile::TempDir::new().expect("temp home");
++        fs::write(
++            temp_home.path().join(API_KEY_FILE),
++            "api_key = \"deepseek-key\"\nrequest_log = true\n",
++        )
++        .expect("write config");
++
++        assert!(request_log_enabled(temp_home.path()));
++    }
++
++    #[test]
++    fn ensure_existing_config_adds_request_log_default() {
++        let temp_home = tempfile::TempDir::new().expect("temp home");
++        fs::write(
++            temp_home.path().join(API_KEY_FILE),
++            "api_key = \"deepseek-key\"\nbase_url = \"https://example.test/v1\"\n",
++        )
++        .expect("write config");
++
++        ensure_api_key_file(temp_home.path());
++
++        let contents =
++            fs::read_to_string(temp_home.path().join(API_KEY_FILE)).expect("read config");
++        assert!(contents.contains("api_key = \"deepseek-key\""));
++        assert!(contents.contains("base_url = \"https://example.test/v1\""));
++        assert!(contents.contains("request_log = false"));
++    }
++
+     #[test]
+     fn log_event_appends_deepseek_log() {
+         let temp_home = tempfile::TempDir::new().expect("temp home");
+diff --git a/codex-rs/models-manager/src/lib.rs b/codex-rs/models-manager/src/lib.rs
+index c809af1969..bca7365a15 100644
+--- a/codex-rs/models-manager/src/lib.rs
++++ b/codex-rs/models-manager/src/lib.rs
+@@ -18,6 +18,7 @@ const DEEPSEEK_API_KEY_EXAMPLE: &str = concat!(
+     "# DeepSeek side-route credentials for Codex.\n",
+     "api_key = \"sk-dummy\"\n",
+     "base_url = \"https://api.deepseek.com/v1\"\n",
++    "request_log = false\n",
+ );
+ const MIMO_API_KEY_EXAMPLE: &str = concat!(
+     "# MiMo side-route credentials for Codex.\n",
+@@ -44,6 +45,7 @@ pub fn with_deepseek_side_route_models(mut models: Vec<ModelInfo>) -> Vec<ModelI
+ pub fn ensure_deepseek_api_key_file(codex_home: &Path) {
+     let path = codex_home.join(DEEPSEEK_API_KEY_FILE);
+     if path.exists() {
++        ensure_request_log_field(&path);
+         return;
+     }
+     if fs::create_dir_all(codex_home).is_ok() {
+@@ -54,6 +56,7 @@ pub fn ensure_deepseek_api_key_file(codex_home: &Path) {
+ pub fn ensure_mimo_api_key_file(codex_home: &Path) {
+     let path = codex_home.join(MIMO_API_KEY_FILE);
+     if path.exists() {
++        ensure_request_log_field(&path);
+         return;
+     }
+     if fs::create_dir_all(codex_home).is_ok() {
+@@ -61,6 +64,23 @@ pub fn ensure_mimo_api_key_file(codex_home: &Path) {
+     }
+ }
+ 
++fn ensure_request_log_field(path: &Path) {
++    let Ok(contents) = fs::read_to_string(path) else {
++        return;
++    };
++    if contents.lines().any(|line| {
++        let line = line.trim();
++        !line.starts_with('#')
++            && line
++                .split_once('=')
++                .is_some_and(|(key, _)| key.trim() == "request_log")
++    }) {
++        return;
++    }
++    let separator = if contents.ends_with('\n') { "" } else { "\n" };
++    let _ = fs::write(path, format!("{contents}{separator}request_log = false\n"));
++}
++
+ /// Load the bundled model catalog shipped with `codex-models-manager`.
+ pub fn bundled_models_response()
+ -> std::result::Result<codex_protocol::openai_models::ModelsResponse, serde_json::Error> {
+@@ -76,3 +96,40 @@ pub fn client_version_to_whole() -> String {
+         env!("CARGO_PKG_VERSION_PATCH")
+     )
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use pretty_assertions::assert_eq;
++
++    #[test]
++    fn ensure_existing_side_route_files_add_request_log_default() {
++        let temp_home = tempfile::TempDir::new().expect("temp home");
++        fs::write(
++            temp_home.path().join(MIMO_API_KEY_FILE),
++            "api_key = \"mimo-key\"\nbase_url = \"https://example.test/v1\"\n",
++        )
++        .expect("write mimo config");
++        fs::write(
++            temp_home.path().join(DEEPSEEK_API_KEY_FILE),
++            "api_key = \"deepseek-key\"\nbase_url = \"https://example.test/v1\"\n",
++        )
++        .expect("write deepseek config");
++
++        ensure_mimo_api_key_file(temp_home.path());
++        ensure_deepseek_api_key_file(temp_home.path());
++
++        let mimo =
++            fs::read_to_string(temp_home.path().join(MIMO_API_KEY_FILE)).expect("read mimo config");
++        let deepseek = fs::read_to_string(temp_home.path().join(DEEPSEEK_API_KEY_FILE))
++            .expect("read deepseek config");
++        assert_eq!(
++            mimo,
++            "api_key = \"mimo-key\"\nbase_url = \"https://example.test/v1\"\nrequest_log = false\n"
++        );
++        assert_eq!(
++            deepseek,
++            "api_key = \"deepseek-key\"\nbase_url = \"https://example.test/v1\"\nrequest_log = false\n"
++        );
++    }
++}

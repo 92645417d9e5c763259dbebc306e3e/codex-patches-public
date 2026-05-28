@@ -1,0 +1,551 @@
+diff --git a/codex-rs/app-server-daemon/src/client.rs b/codex-rs/app-server-daemon/src/client.rs
+index 8c771ba1f2..b14f546118 100644
+--- a/codex-rs/app-server-daemon/src/client.rs
++++ b/codex-rs/app-server-daemon/src/client.rs
+@@ -29,6 +29,8 @@ const INITIALIZE_REQUEST_ID: RequestId = RequestId::Integer(1);
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub(crate) struct ProbeInfo {
+     pub(crate) app_server_version: String,
++    pub(crate) active_client_count: usize,
++    pub(crate) running_assistant_turn_count: usize,
+ }
+ 
+ pub(crate) async fn probe(socket_path: &Path) -> Result<ProbeInfo> {
+@@ -57,6 +59,8 @@ async fn probe_inner(socket_path: &Path) -> Result<ProbeInfo> {
+ 
+     Ok(ProbeInfo {
+         app_server_version: parse_version_from_user_agent(&initialize_response.user_agent)?,
++        active_client_count: initialize_response.active_client_count,
++        running_assistant_turn_count: initialize_response.running_assistant_turn_count,
+     })
+ }
+ 
+diff --git a/codex-rs/app-server-daemon/src/lib.rs b/codex-rs/app-server-daemon/src/lib.rs
+index d68d20e247..db62cf59ee 100644
+--- a/codex-rs/app-server-daemon/src/lib.rs
++++ b/codex-rs/app-server-daemon/src/lib.rs
+@@ -288,6 +288,22 @@ impl Daemon {
+     async fn start(&self) -> Result<LifecycleOutput> {
+         let settings = self.load_settings().await?;
+         if let Ok(info) = client::probe(&self.socket_path).await {
++            if should_restart_running_backend_for_start(&info)
++                && let Some(backend) = self.running_backend_instance(&settings).await?
++            {
++                self.ensure_managed_codex_bin()?;
++                backend.stop().await?;
++                let pid = self.start_managed_backend(&settings).await?;
++                let info = self.wait_until_ready().await?;
++                return Ok(self
++                    .output(
++                        LifecycleStatus::Restarted,
++                        Some(BackendKind::Pid),
++                        pid,
++                        Some(info.app_server_version),
++                    )
++                    .await);
++            }
+             return Ok(self
+                 .output(
+                     LifecycleStatus::AlreadyRunning,
+@@ -810,6 +826,10 @@ fn should_reexec_updater(
+         && outcome == RestartIfRunningOutcome::Restarted
+ }
+ 
++fn should_restart_running_backend_for_start(info: &client::ProbeInfo) -> bool {
++    info.active_client_count == 0 && info.running_assistant_turn_count == 0
++}
++
+ #[cfg(unix)]
+ fn try_lock_file(file: &tokio::fs::File) -> Result<bool> {
+     use std::os::fd::AsRawFd;
+@@ -850,6 +870,7 @@ mod tests {
+     use super::UpdaterRefreshMode;
+     use super::restart_decision;
+     use super::should_reexec_updater;
++    use super::should_restart_running_backend_for_start;
+     use crate::client::ProbeInfo;
+ 
+     #[test]
+@@ -892,10 +913,40 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn start_restarts_running_backend_only_when_idle_without_active_clients() {
++        let idle_no_active_clients = ProbeInfo {
++            app_server_version: "0.1.0".to_string(),
++            active_client_count: 0,
++            running_assistant_turn_count: 0,
++        };
++        let detached_running_turn = ProbeInfo {
++            app_server_version: "0.1.0".to_string(),
++            active_client_count: 0,
++            running_assistant_turn_count: 1,
++        };
++        let active_clients = ProbeInfo {
++            app_server_version: "0.1.0".to_string(),
++            active_client_count: 1,
++            running_assistant_turn_count: 0,
++        };
++
++        assert_eq!(
++            [
++                should_restart_running_backend_for_start(&idle_no_active_clients),
++                should_restart_running_backend_for_start(&detached_running_turn),
++                should_restart_running_backend_for_start(&active_clients),
++            ],
++            [true, false, false]
++        );
++    }
++
+     #[test]
+     fn restart_decision_preserves_forced_refreshes() {
+         let current_info = ProbeInfo {
+             app_server_version: "0.1.0".to_string(),
++            active_client_count: 1,
++            running_assistant_turn_count: 0,
+         };
+ 
+         assert_eq!(
+diff --git a/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json b/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json
+index a738405036..67a5300c37 100644
+--- a/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json
++++ b/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json
+@@ -2818,6 +2818,12 @@
+     "InitializeResponse": {
+       "$schema": "http://json-schema.org/draft-07/schema#",
+       "properties": {
++        "activeClientCount": {
++          "default": 0,
++          "format": "uint",
++          "minimum": 0.0,
++          "type": "integer"
++        },
+         "codexHome": {
+           "allOf": [
+             {
+@@ -2834,6 +2840,12 @@
+           "description": "Operating system for the running app-server target, for example `\"macos\"`, `\"linux\"`, or `\"windows\"`.",
+           "type": "string"
+         },
++        "runningAssistantTurnCount": {
++          "default": 0,
++          "format": "uint",
++          "minimum": 0.0,
++          "type": "integer"
++        },
+         "userAgent": {
+           "type": "string"
+         }
+diff --git a/codex-rs/app-server-protocol/schema/json/v1/InitializeResponse.json b/codex-rs/app-server-protocol/schema/json/v1/InitializeResponse.json
+index 1de65f82f4..6357f729ad 100644
+--- a/codex-rs/app-server-protocol/schema/json/v1/InitializeResponse.json
++++ b/codex-rs/app-server-protocol/schema/json/v1/InitializeResponse.json
+@@ -7,6 +7,12 @@
+     }
+   },
+   "properties": {
++    "activeClientCount": {
++      "default": 0,
++      "format": "uint",
++      "minimum": 0.0,
++      "type": "integer"
++    },
+     "codexHome": {
+       "allOf": [
+         {
+@@ -23,6 +29,12 @@
+       "description": "Operating system for the running app-server target, for example `\"macos\"`, `\"linux\"`, or `\"windows\"`.",
+       "type": "string"
+     },
++    "runningAssistantTurnCount": {
++      "default": 0,
++      "format": "uint",
++      "minimum": 0.0,
++      "type": "integer"
++    },
+     "userAgent": {
+       "type": "string"
+     }
+diff --git a/codex-rs/app-server-protocol/schema/typescript/InitializeResponse.ts b/codex-rs/app-server-protocol/schema/typescript/InitializeResponse.ts
+index f1f79d173c..07fb9f8d0b 100644
+--- a/codex-rs/app-server-protocol/schema/typescript/InitializeResponse.ts
++++ b/codex-rs/app-server-protocol/schema/typescript/InitializeResponse.ts
+@@ -17,4 +17,4 @@ platformFamily: string,
+  * Operating system for the running app-server target, for example
+  * `"macos"`, `"linux"`, or `"windows"`.
+  */
+-platformOs: string, };
++platformOs: string, activeClientCount: number, runningAssistantTurnCount: number, };
+diff --git a/codex-rs/app-server-protocol/src/protocol/v1.rs b/codex-rs/app-server-protocol/src/protocol/v1.rs
+index f83674d4c3..15ee7880f2 100644
+--- a/codex-rs/app-server-protocol/src/protocol/v1.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v1.rs
+@@ -68,6 +68,10 @@ pub struct InitializeResponse {
+     /// Operating system for the running app-server target, for example
+     /// `"macos"`, `"linux"`, or `"windows"`.
+     pub platform_os: String,
++    #[serde(default)]
++    pub active_client_count: usize,
++    #[serde(default)]
++    pub running_assistant_turn_count: usize,
+ }
+ 
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+diff --git a/codex-rs/app-server/src/in_process.rs b/codex-rs/app-server/src/in_process.rs
+index f7072d0fa1..8c39795f4c 100644
+--- a/codex-rs/app-server/src/in_process.rs
++++ b/codex-rs/app-server/src/in_process.rs
+@@ -423,6 +423,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
+         let mut processor_handle = tokio::spawn(async move {
+             let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+                 outgoing: Arc::clone(&processor_outgoing),
++                active_client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                 analytics_events_client,
+                 arg0_paths: args.arg0_paths,
+                 config: args.config,
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+index 80305d2d9f..805adf3dcd 100644
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -17,6 +17,7 @@ use std::io::Result as IoResult;
+ use std::sync::Arc;
+ use std::sync::RwLock;
+ use std::sync::atomic::AtomicBool;
++use std::sync::atomic::AtomicUsize;
+ 
+ use crate::analytics_utils::analytics_events_client_from_config;
+ use crate::config_manager::ConfigManager;
+@@ -795,8 +796,10 @@ pub async fn run_main_with_transport_options(
+         ));
+         let initialize_notification_sender = outgoing_message_sender.clone();
+         let outbound_control_tx = outbound_control_tx;
++        let active_client_count = Arc::new(AtomicUsize::new(0));
+         let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+             outgoing: outgoing_message_sender,
++            active_client_count,
+             analytics_events_client,
+             arg0_paths,
+             config: Arc::new(config),
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 60e5217809..bd309f8f4a 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -3,6 +3,8 @@ use std::future::Future;
+ use std::sync::Arc;
+ use std::sync::OnceLock;
+ use std::sync::atomic::AtomicBool;
++use std::sync::atomic::AtomicUsize;
++use std::sync::atomic::Ordering;
+ 
+ use crate::attestation::app_server_attestation_provider;
+ use crate::config_manager::ConfigManager;
+@@ -189,6 +191,7 @@ pub(crate) struct MessageProcessor {
+     turn_processor: TurnRequestProcessor,
+     windows_sandbox_processor: WindowsSandboxRequestProcessor,
+     request_serialization_queues: RequestSerializationQueues,
++    active_client_count: Arc<AtomicUsize>,
+ }
+ 
+ #[derive(Debug)]
+@@ -255,6 +258,13 @@ impl ConnectionSessionState {
+             .is_some_and(|session| session.request_attestation)
+     }
+ 
++    pub(crate) fn counts_as_active_client(&self) -> bool {
++        self.initialized.get().is_some_and(|session| {
++            session.app_server_client_name != "codex_app_server_daemon"
++                && session.app_server_client_name != "codex-backend"
++        })
++    }
++
+     pub(crate) fn initialize(&self, session: InitializedConnectionSessionState) -> Result<(), ()> {
+         self.initialized.set(session).map_err(|_| ())
+     }
+@@ -262,6 +272,7 @@ impl ConnectionSessionState {
+ 
+ pub(crate) struct MessageProcessorArgs {
+     pub(crate) outgoing: Arc<OutgoingMessageSender>,
++    pub(crate) active_client_count: Arc<AtomicUsize>,
+     pub(crate) analytics_events_client: AnalyticsEventsClient,
+     pub(crate) arg0_paths: Arg0DispatchPaths,
+     pub(crate) config: Arc<Config>,
+@@ -285,6 +296,7 @@ impl MessageProcessor {
+     pub(crate) fn new(args: MessageProcessorArgs) -> Self {
+         let MessageProcessorArgs {
+             outgoing,
++            active_client_count,
+             analytics_events_client,
+             arg0_paths,
+             config,
+@@ -387,6 +399,8 @@ impl MessageProcessor {
+             Arc::clone(&config),
+             config_warnings,
+             rpc_transport,
++            Arc::clone(&active_client_count),
++            thread_watch_manager.clone(),
+         );
+         let marketplace_processor = MarketplaceRequestProcessor::new(
+             Arc::clone(&config),
+@@ -510,6 +524,7 @@ impl MessageProcessor {
+             turn_processor,
+             windows_sandbox_processor,
+             request_serialization_queues: RequestSerializationQueues::default(),
++            active_client_count,
+         }
+     }
+ 
+@@ -727,6 +742,9 @@ impl MessageProcessor {
+             .connection_closed(connection_id)
+             .await;
+         self.thread_processor.connection_closed(connection_id).await;
++        if session_state.counts_as_active_client() {
++            self.active_client_count.fetch_sub(1, Ordering::AcqRel);
++        }
+     }
+ 
+     pub(crate) fn subscribe_running_assistant_turn_count(&self) -> watch::Receiver<usize> {
+diff --git a/codex-rs/app-server/src/message_processor_tracing_tests.rs b/codex-rs/app-server/src/message_processor_tracing_tests.rs
+index ed811076ac..9a9ab2c00c 100644
+--- a/codex-rs/app-server/src/message_processor_tracing_tests.rs
++++ b/codex-rs/app-server/src/message_processor_tracing_tests.rs
+@@ -264,6 +264,7 @@ async fn build_test_processor(
+     ));
+     let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+         outgoing,
++        active_client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+         analytics_events_client,
+         arg0_paths: Arg0DispatchPaths::default(),
+         config,
+diff --git a/codex-rs/app-server/src/outgoing_message.rs b/codex-rs/app-server/src/outgoing_message.rs
+index 97ef37f742..592288188a 100644
+--- a/codex-rs/app-server/src/outgoing_message.rs
++++ b/codex-rs/app-server/src/outgoing_message.rs
+@@ -456,8 +456,8 @@ impl OutgoingMessageSender {
+     ) -> Vec<ServerRequest> {
+         let request_id_to_callback = self.request_id_to_callback.lock().await;
+         let mut requests = request_id_to_callback
+-            .iter()
+-            .filter_map(|(_, entry)| {
++            .values()
++            .filter_map(|entry| {
+                 (entry.thread_id == Some(thread_id)).then_some(entry.request.clone())
+             })
+             .collect::<Vec<_>>();
+diff --git a/codex-rs/app-server/src/request_processors/initialize_processor.rs b/codex-rs/app-server/src/request_processors/initialize_processor.rs
+index a40007db11..707197fb56 100644
+--- a/codex-rs/app-server/src/request_processors/initialize_processor.rs
++++ b/codex-rs/app-server/src/request_processors/initialize_processor.rs
+@@ -1,4 +1,5 @@
+ use std::sync::atomic::AtomicBool;
++use std::sync::atomic::AtomicUsize;
+ use std::sync::atomic::Ordering;
+ 
+ use axum::http::HeaderValue;
+@@ -12,6 +13,7 @@ use codex_login::default_client::set_default_originator;
+ use super::*;
+ use crate::message_processor::ConnectionSessionState;
+ use crate::message_processor::InitializedConnectionSessionState;
++use crate::thread_status::ThreadWatchManager;
+ 
+ const NON_ORIGINATING_CLIENT_NAMES: &[&str] = &["codex_app_server_daemon", "codex-backend"];
+ 
+@@ -22,6 +24,8 @@ pub(crate) struct InitializeRequestProcessor {
+     config: Arc<Config>,
+     config_warnings: Arc<Vec<ConfigWarningNotification>>,
+     rpc_transport: AppServerRpcTransport,
++    active_client_count: Arc<AtomicUsize>,
++    thread_watch_manager: ThreadWatchManager,
+ }
+ 
+ impl InitializeRequestProcessor {
+@@ -31,6 +35,8 @@ impl InitializeRequestProcessor {
+         config: Arc<Config>,
+         config_warnings: Vec<ConfigWarningNotification>,
+         rpc_transport: AppServerRpcTransport,
++        active_client_count: Arc<AtomicUsize>,
++        thread_watch_manager: ThreadWatchManager,
+     ) -> Self {
+         Self {
+             outgoing,
+@@ -38,6 +44,8 @@ impl InitializeRequestProcessor {
+             config,
+             config_warnings: Arc::new(config_warnings),
+             rpc_transport,
++            active_client_count,
++            thread_watch_manager,
+         }
+     }
+ 
+@@ -137,24 +145,31 @@ impl InitializeRequestProcessor {
+             *suffix = Some(user_agent_suffix);
+         }
+ 
++        let active_client_count = self.active_client_count.load(Ordering::Acquire);
++        let running_assistant_turn_count = self.thread_watch_manager.running_turn_count().await;
+         let user_agent = get_codex_user_agent();
+         let response = InitializeResponse {
+             user_agent,
+             codex_home,
+             platform_family: std::env::consts::FAMILY.to_string(),
+             platform_os: std::env::consts::OS.to_string(),
++            active_client_count,
++            running_assistant_turn_count,
+         };
+ 
+         self.outgoing
+             .send_response(connection_request_id, response)
+             .await;
+ 
++        let should_mark_connection_initialized = outbound_initialized.is_some();
+         if let Some(outbound_initialized) = outbound_initialized {
+             outbound_initialized.store(true, Ordering::Release);
+-            return Ok(true);
++        }
++        if mutates_global_identity {
++            self.active_client_count.fetch_add(1, Ordering::AcqRel);
+         }
+ 
+-        Ok(false)
++        Ok(should_mark_connection_initialized)
+     }
+ 
+     pub(crate) async fn send_initialize_notifications_to_connection(
+diff --git a/codex-rs/app-server/src/thread_status.rs b/codex-rs/app-server/src/thread_status.rs
+index 7315a13c02..14461ac9aa 100644
+--- a/codex-rs/app-server/src/thread_status.rs
++++ b/codex-rs/app-server/src/thread_status.rs
+@@ -127,7 +127,6 @@ impl ThreadWatchManager {
+             .collect()
+     }
+ 
+-    #[cfg(test)]
+     pub(crate) async fn running_turn_count(&self) -> usize {
+         self.state
+             .lock()
+diff --git a/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs b/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs
+index cf76b9d573..d74007faab 100644
+--- a/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs
++++ b/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs
+@@ -8,6 +8,7 @@ use base64::Engine;
+ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+ use codex_app_server_protocol::ClientInfo;
+ use codex_app_server_protocol::InitializeParams;
++use codex_app_server_protocol::InitializeResponse;
+ use codex_app_server_protocol::JSONRPCError;
+ use codex_app_server_protocol::JSONRPCMessage;
+ use codex_app_server_protocol::JSONRPCNotification;
+@@ -104,6 +105,63 @@ async fn websocket_transport_routes_per_connection_handshake_and_responses() ->
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn initialize_reports_daemon_restart_probe_counts() -> Result<()> {
++    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
++    let codex_home = TempDir::new()?;
++    create_config_toml(codex_home.path(), &server.uri(), "never")?;
++
++    let (mut process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
++
++    let mut daemon_probe = connect_websocket(bind_addr).await?;
++    send_initialize_request(&mut daemon_probe, /*id*/ 1, "codex_app_server_daemon").await?;
++    let daemon_init = read_initialize_response(&mut daemon_probe, /*id*/ 1).await?;
++    assert_eq!(daemon_init.active_client_count, 0);
++    assert_eq!(daemon_init.running_assistant_turn_count, 0);
++
++    let mut client = connect_websocket(bind_addr).await?;
++    send_initialize_request(&mut client, /*id*/ 2, "ws_client").await?;
++    let client_init = read_initialize_response(&mut client, /*id*/ 2).await?;
++    assert_eq!(client_init.active_client_count, 0);
++    assert_eq!(client_init.running_assistant_turn_count, 0);
++
++    let mut second_daemon_probe = connect_websocket(bind_addr).await?;
++    send_initialize_request(
++        &mut second_daemon_probe,
++        /*id*/ 3,
++        "codex_app_server_daemon",
++    )
++    .await?;
++    let second_daemon_init = read_initialize_response(&mut second_daemon_probe, /*id*/ 3).await?;
++    assert_eq!(second_daemon_init.active_client_count, 1);
++    assert_eq!(second_daemon_init.running_assistant_turn_count, 0);
++
++    client.close(None).await?;
++    let mut final_daemon_init = None;
++    for id in 4..=20 {
++        let mut final_daemon_probe = connect_websocket(bind_addr).await?;
++        send_initialize_request(&mut final_daemon_probe, id, "codex_app_server_daemon").await?;
++        let response = read_initialize_response(&mut final_daemon_probe, id).await?;
++        if response.active_client_count == 0 {
++            final_daemon_init = Some(response);
++            break;
++        }
++        sleep(Duration::from_millis(50)).await;
++    }
++    assert_eq!(
++        final_daemon_init
++            .expect("active client count returns to zero")
++            .active_client_count,
++        0
++    );
++
++    process
++        .kill()
++        .await
++        .context("failed to stop websocket app-server process")?;
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn websocket_transport_serves_health_endpoints_on_same_listener() -> Result<()> {
+     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+@@ -729,6 +787,11 @@ pub(super) async fn read_response_for_id(
+     }
+ }
+ 
++async fn read_initialize_response(stream: &mut WsClient, id: i64) -> Result<InitializeResponse> {
++    let response = read_response_for_id(stream, id).await?;
++    to_response::<InitializeResponse>(response)
++}
++
+ pub(super) async fn read_notification_for_method(
+     stream: &mut WsClient,
+     method: &str,
+diff --git a/codex-rs/app-server/tests/suite/v2/initialize.rs b/codex-rs/app-server/tests/suite/v2/initialize.rs
+index 47cacdb20e..f80fe02691 100644
+--- a/codex-rs/app-server/tests/suite/v2/initialize.rs
++++ b/codex-rs/app-server/tests/suite/v2/initialize.rs
+@@ -53,12 +53,16 @@ async fn initialize_uses_client_info_name_as_originator() -> Result<()> {
+         codex_home: response_codex_home,
+         platform_family,
+         platform_os,
++        active_client_count,
++        running_assistant_turn_count,
+     } = to_response::<InitializeResponse>(response)?;
+ 
+     assert!(user_agent.starts_with("codex_vscode/"));
+     assert_eq!(response_codex_home, expected_codex_home);
+     assert_eq!(platform_family, std::env::consts::FAMILY);
+     assert_eq!(platform_os, std::env::consts::OS);
++    assert_eq!(active_client_count, 0);
++    assert_eq!(running_assistant_turn_count, 0);
+     Ok(())
+ }
+ 
+@@ -150,12 +154,16 @@ async fn initialize_respects_originator_override_env_var() -> Result<()> {
+         codex_home: response_codex_home,
+         platform_family,
+         platform_os,
++        active_client_count,
++        running_assistant_turn_count,
+     } = to_response::<InitializeResponse>(response)?;
+ 
+     assert!(user_agent.starts_with("codex_originator_via_env_var/"));
+     assert_eq!(response_codex_home, expected_codex_home);
+     assert_eq!(platform_family, std::env::consts::FAMILY);
+     assert_eq!(platform_os, std::env::consts::OS);
++    assert_eq!(active_client_count, 0);
++    assert_eq!(running_assistant_turn_count, 0);
+     Ok(())
+ }
+ 

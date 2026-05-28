@@ -1,0 +1,157 @@
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index ea77a1cd47..698f5247fa 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -806,7 +806,6 @@ impl App {
+         let feedback_audience = bootstrap.feedback_audience;
+         let auth_mode = bootstrap.auth_mode;
+         let has_chatgpt_account = bootstrap.has_chatgpt_account;
+-        let requires_openai_auth = bootstrap.requires_openai_auth;
+         let status_account_display = bootstrap.status_account_display.clone();
+         let initial_plan_type = bootstrap.plan_type;
+         let session_telemetry = SessionTelemetry::new(
+@@ -1113,7 +1112,7 @@ See the Codex keymap documentation for supported actions and examples."
+         app.refresh_startup_skills(&app_server);
+         // Kick off a non-blocking rate-limit prefetch so the first `/status`
+         // already has data, without delaying the initial frame render.
+-        if requires_openai_auth && has_chatgpt_account {
++        if has_chatgpt_account {
+             app.refresh_rate_limits(&app_server, RateLimitRefreshOrigin::StartupPrefetch);
+         }
+ 
+diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+index f116f31b0c..d955ed3427 100644
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -153,10 +153,6 @@ pub(crate) struct AppServerBootstrap {
+     pub(crate) auth_mode: Option<TelemetryAuthMode>,
+     pub(crate) status_account_display: Option<StatusAccountDisplay>,
+     pub(crate) plan_type: Option<codex_protocol::account::PlanType>,
+-    /// Whether the configured model provider needs OpenAI-style auth. Combined
+-    /// with `has_chatgpt_account` to decide if a startup rate-limit prefetch
+-    /// should be fired.
+-    pub(crate) requires_openai_auth: bool,
+     pub(crate) default_model: String,
+     pub(crate) feedback_audience: FeedbackAudience,
+     pub(crate) has_chatgpt_account: bool,
+@@ -310,7 +306,6 @@ impl AppServerSession {
+             auth_mode,
+             status_account_display,
+             plan_type,
+-            requires_openai_auth: account.requires_openai_auth,
+             default_model,
+             feedback_audience,
+             has_chatgpt_account,
+diff --git a/codex-rs/tui/src/chatwidget/rate_limits.rs b/codex-rs/tui/src/chatwidget/rate_limits.rs
+index aab383c0a8..73e16898ca 100644
+--- a/codex-rs/tui/src/chatwidget/rate_limits.rs
++++ b/codex-rs/tui/src/chatwidget/rate_limits.rs
+@@ -253,7 +253,7 @@ impl ChatWidget {
+ 
+     #[cfg_attr(not(test), allow(dead_code))]
+     pub(super) fn should_prefetch_rate_limits(&self) -> bool {
+-        self.config.model_provider.requires_openai_auth && self.has_chatgpt_account
++        self.has_chatgpt_account
+     }
+ 
+     fn lower_cost_preset(&self) -> Option<ModelPreset> {
+diff --git a/codex-rs/tui/src/chatwidget/settings.rs b/codex-rs/tui/src/chatwidget/settings.rs
+index 0488ea6426..6509aaface 100644
+--- a/codex-rs/tui/src/chatwidget/settings.rs
++++ b/codex-rs/tui/src/chatwidget/settings.rs
+@@ -511,6 +511,9 @@ impl ChatWidget {
+         let cwd_changed = self.config.cwd != settings.cwd;
+         self.apply_thread_settings_cwd(settings.cwd.clone());
+         self.config.model_provider_id = settings.model_provider.clone();
++        if let Some(model_provider) = self.config.model_providers.get(&settings.model_provider) {
++            self.config.model_provider = model_provider.clone();
++        }
+         self.set_service_tier(settings.service_tier.clone());
+         self.set_approval_policy(settings.approval_policy);
+         self.set_approvals_reviewer(settings.approvals_reviewer.to_core());
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index 18c869a4e2..33c27f1175 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -4,6 +4,14 @@ use pretty_assertions::assert_eq;
+ fn thread_settings_for_test(
+     model: &str,
+     thread_id: ThreadId,
++) -> codex_app_server_protocol::ThreadSettingsUpdatedNotification {
++    thread_settings_for_test_with_provider(model, thread_id, "openai")
++}
++
++fn thread_settings_for_test_with_provider(
++    model: &str,
++    thread_id: ThreadId,
++    model_provider: &str,
+ ) -> codex_app_server_protocol::ThreadSettingsUpdatedNotification {
+     codex_app_server_protocol::ThreadSettingsUpdatedNotification {
+         thread_id: thread_id.to_string(),
+@@ -18,7 +26,7 @@ fn thread_settings_for_test(
+                 codex_app_server_protocol::ActivePermissionProfile::read_only(),
+             ),
+             model: model.to_string(),
+-            model_provider: "openai".to_string(),
++            model_provider: model_provider.to_string(),
+             service_tier: Some(ServiceTier::Fast.request_value().to_string()),
+             effort: Some(ReasoningEffortConfig::High),
+             summary: None,
+@@ -153,6 +161,31 @@ async fn thread_settings_updated_updates_visible_state_without_transcript() {
+     assert_eq!(chat.current_model(), "gpt-5.4");
+ }
+ 
++#[tokio::test]
++async fn thread_settings_updated_syncs_model_provider_metadata() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
++    let thread_id = ThreadId::new();
++    chat.handle_thread_session(configured_thread_session(thread_id));
++
++    let mut side_route_provider = chat.config.model_provider.clone();
++    side_route_provider.requires_openai_auth = false;
++    chat.config
++        .model_providers
++        .insert("side-route".to_string(), side_route_provider);
++
++    chat.handle_server_notification(
++        ServerNotification::ThreadSettingsUpdated(thread_settings_for_test_with_provider(
++            "deepseek-v4",
++            thread_id,
++            "side-route",
++        )),
++        /*replay_kind*/ None,
++    );
++
++    assert_eq!(chat.config_ref().model_provider_id, "side-route");
++    assert!(!chat.config_ref().model_provider.requires_openai_auth);
++}
++
+ #[tokio::test]
+ async fn thread_settings_updated_preserves_default_settings_for_plan_mode() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index 7f3529bd4a..3fbde85989 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -451,7 +451,7 @@ async fn configured_pet_load_is_deferred_until_after_construction() {
+ }
+ 
+ #[tokio::test]
+-async fn prefetch_rate_limits_is_gated_on_chatgpt_auth_provider() {
++async fn prefetch_rate_limits_is_gated_on_chatgpt_account() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+ 
+     assert!(!chat.should_prefetch_rate_limits());
+@@ -460,10 +460,10 @@ async fn prefetch_rate_limits_is_gated_on_chatgpt_auth_provider() {
+     assert!(chat.should_prefetch_rate_limits());
+ 
+     chat.config.model_provider.requires_openai_auth = false;
+-    assert!(!chat.should_prefetch_rate_limits());
++    assert!(chat.should_prefetch_rate_limits());
+ 
+     chat.prefetch_rate_limits();
+-    assert!(!chat.should_prefetch_rate_limits());
++    assert!(chat.should_prefetch_rate_limits());
+ }
+ 
+ #[tokio::test]

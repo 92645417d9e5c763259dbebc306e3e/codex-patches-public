@@ -1,0 +1,379 @@
+diff --git a/codex-rs/tui/src/external_editor.rs b/codex-rs/tui/src/external_editor.rs
+index 2818503d03..1e9c7bcc46 100644
+--- a/codex-rs/tui/src/external_editor.rs
++++ b/codex-rs/tui/src/external_editor.rs
+@@ -1,6 +1,10 @@
+ use std::env;
+ use std::fs;
++use std::path::Path;
++use std::process::Command as StdCommand;
+ use std::process::Stdio;
++use std::thread;
++use std::time::Duration;
+ 
+ use color_eyre::eyre::Report;
+ use color_eyre::eyre::Result;
+@@ -19,6 +23,35 @@ pub(crate) enum EditorError {
+     EmptyCommand,
+ }
+ 
++const LOCAL_ZED_EDITOR_SENTINEL: &str = "__codex_local_zed_external_editor__";
++const LOCAL_ZED_BIN: &str = "/usr/bin/zedit";
++const LOCAL_ZED_TMP_ROOT: &str = "/tmp/.codex/codex/external-editor";
++const LOCAL_ZED_FILE_NAME: &str = "codex-external-editor.md";
++const LOCAL_ZED_X11_ENV_VARS: &[&str] = &[
++    "DISPLAY",
++    "XAUTHORITY",
++    "XMODIFIERS",
++    "DBUS_SESSION_BUS_ADDRESS",
++    "XDG_RUNTIME_DIR",
++];
++const LOCAL_ZED_TOOLKIT_IM_ENV_VARS: &[&str] = &["GTK_IM_MODULE", "QT_IM_MODULE"];
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct MonitorGeometry {
++    width: u32,
++    height: u32,
++    x: i32,
++    y: i32,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct WindowRect {
++    width: u32,
++    height: u32,
++    x: i32,
++    y: i32,
++}
++
+ /// Tries to resolve the full path to a Windows program, respecting PATH + PATHEXT.
+ /// Falls back to the original program name if resolution fails.
+ #[cfg(windows)]
+@@ -31,9 +64,23 @@ fn resolve_windows_program(program: &str) -> std::path::PathBuf {
+ /// Resolve the editor command from environment variables.
+ /// Prefers `VISUAL` over `EDITOR`.
+ pub(crate) fn resolve_editor_command() -> std::result::Result<Vec<String>, EditorError> {
+-    let raw = env::var("VISUAL")
+-        .or_else(|_| env::var("EDITOR"))
+-        .map_err(|_| EditorError::MissingEditor)?;
++    resolve_editor_command_from_env(
++        local_zed_external_editor_available(),
++        env::var("VISUAL").ok(),
++        env::var("EDITOR").ok(),
++    )
++}
++
++fn resolve_editor_command_from_env(
++    local_zed_available: bool,
++    visual: Option<String>,
++    editor: Option<String>,
++) -> std::result::Result<Vec<String>, EditorError> {
++    if local_zed_available {
++        return Ok(vec![LOCAL_ZED_EDITOR_SENTINEL.to_string()]);
++    }
++
++    let raw = visual.or(editor).ok_or(EditorError::MissingEditor)?;
+     let parts = {
+         #[cfg(windows)]
+         {
+@@ -52,6 +99,10 @@ pub(crate) fn resolve_editor_command() -> std::result::Result<Vec<String>, Edito
+ 
+ /// Write `seed` to a temp file, launch the editor command, and return the updated content.
+ pub(crate) async fn run_editor(seed: &str, editor_cmd: &[String]) -> Result<String> {
++    if editor_cmd.len() == 1 && editor_cmd[0] == LOCAL_ZED_EDITOR_SENTINEL {
++        return run_local_zed_external_editor(seed).await;
++    }
++
+     if editor_cmd.is_empty() {
+         return Err(Report::msg("editor command is empty"));
+     }
+@@ -90,6 +141,199 @@ pub(crate) async fn run_editor(seed: &str, editor_cmd: &[String]) -> Result<Stri
+     Ok(contents)
+ }
+ 
++#[cfg(unix)]
++async fn run_local_zed_external_editor(seed: &str) -> Result<String> {
++    let root = Path::new(LOCAL_ZED_TMP_ROOT);
++    fs::create_dir_all(root)?;
++    let temp_dir = Builder::new().prefix("zed.").tempdir_in(root)?;
++    let work_path = temp_dir.path().join(LOCAL_ZED_FILE_NAME);
++    fs::write(&work_path, seed)?;
++
++    let placer = tokio::task::spawn_blocking(position_local_zed_window);
++    let mut command = Command::new(LOCAL_ZED_BIN);
++    configure_local_zed_command(&mut command);
++    let status = command
++        .arg("--wait")
++        .arg("--new")
++        .arg(&work_path)
++        .stdin(Stdio::inherit())
++        .stdout(Stdio::inherit())
++        .stderr(Stdio::inherit())
++        .status()
++        .await?;
++
++    let _ = placer.await;
++
++    if !status.success() {
++        return Err(Report::msg(format!("editor exited with status {status}")));
++    }
++
++    let contents = fs::read_to_string(&work_path)?;
++    Ok(contents)
++}
++
++#[cfg(unix)]
++fn configure_local_zed_command(command: &mut Command) {
++    command.env("WINIT_UNIX_BACKEND", "x11");
++    command.env_remove("WAYLAND_DISPLAY");
++    for key in LOCAL_ZED_X11_ENV_VARS {
++        if let Some(value) = env::var_os(key) {
++            command.env(key, value);
++        }
++    }
++    for key in LOCAL_ZED_TOOLKIT_IM_ENV_VARS {
++        command.env_remove(key);
++    }
++}
++
++#[cfg(not(unix))]
++async fn run_local_zed_external_editor(_seed: &str) -> Result<String> {
++    Err(Report::msg(
++        "local Zed external editor is only supported on Unix",
++    ))
++}
++
++#[cfg(unix)]
++fn local_zed_external_editor_available() -> bool {
++    is_executable(Path::new(LOCAL_ZED_BIN))
++        && command_exists("xrandr")
++        && command_exists("wmctrl")
++        && command_exists("xdotool")
++}
++
++#[cfg(not(unix))]
++fn local_zed_external_editor_available() -> bool {
++    false
++}
++
++#[cfg(unix)]
++fn is_executable(path: &Path) -> bool {
++    use std::os::unix::fs::PermissionsExt;
++
++    path.is_file()
++        && fs::metadata(path)
++            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
++            .unwrap_or(false)
++}
++
++#[cfg(unix)]
++fn command_exists(command: &str) -> bool {
++    let Some(path) = env::var_os("PATH") else {
++        return false;
++    };
++
++    env::split_paths(&path)
++        .map(|dir| dir.join(command))
++        .any(|path| is_executable(&path))
++}
++
++#[cfg(unix)]
++fn position_local_zed_window() {
++    let Some(window_id) = wait_for_window_by_title(LOCAL_ZED_FILE_NAME) else {
++        return;
++    };
++    let Some(monitor) = primary_monitor_geometry() else {
++        return;
++    };
++    let rect = external_editor_window_rect(monitor);
++
++    let _ = StdCommand::new("xdotool")
++        .args(["windowactivate", "--sync", &window_id])
++        .status();
++    thread::sleep(Duration::from_millis(200));
++    let _ = StdCommand::new("xdotool")
++        .args(["key", "--clearmodifiers", "alt+F7"])
++        .status();
++    thread::sleep(Duration::from_millis(200));
++
++    let _ = StdCommand::new("wmctrl")
++        .args([
++            "-i",
++            "-r",
++            &window_id,
++            "-b",
++            "remove,maximized_vert,maximized_horz",
++        ])
++        .status();
++    let _ = StdCommand::new("wmctrl")
++        .args(["-i", "-r", &window_id, "-b", "add,above"])
++        .status();
++    let geometry = format!("0,{},{},{},{}", rect.x, rect.y, rect.width, rect.height);
++    let _ = StdCommand::new("wmctrl")
++        .args(["-i", "-r", &window_id, "-e", &geometry])
++        .status();
++}
++
++#[cfg(unix)]
++fn wait_for_window_by_title(title_token: &str) -> Option<String> {
++    for _ in 0..100 {
++        let output = StdCommand::new("wmctrl").arg("-lx").output().ok()?;
++        let stdout = String::from_utf8_lossy(&output.stdout);
++        if let Some(window_id) = stdout.lines().find_map(|line| {
++            line.contains(title_token)
++                .then(|| line.split_whitespace().next().map(str::to_string))
++                .flatten()
++        }) {
++            return Some(window_id);
++        }
++        thread::sleep(Duration::from_millis(100));
++    }
++
++    None
++}
++
++#[cfg(unix)]
++fn primary_monitor_geometry() -> Option<MonitorGeometry> {
++    let output = StdCommand::new("xrandr").arg("--query").output().ok()?;
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    parse_primary_monitor_geometry(&stdout)
++}
++
++#[cfg(unix)]
++fn parse_primary_monitor_geometry(xrandr_output: &str) -> Option<MonitorGeometry> {
++    let fallback = xrandr_output
++        .lines()
++        .find(|line| line.contains(" connected "));
++    let line = xrandr_output
++        .lines()
++        .find(|line| line.contains(" connected primary "))
++        .or(fallback)?;
++    let geometry = if let Some((_, after_primary)) = line.split_once(" primary ") {
++        after_primary.split_whitespace().next()?
++    } else {
++        line.split_once(" connected ")?
++            .1
++            .split_whitespace()
++            .next()?
++    };
++    parse_monitor_geometry_token(geometry)
++}
++
++#[cfg(unix)]
++fn parse_monitor_geometry_token(token: &str) -> Option<MonitorGeometry> {
++    let (width, rest) = token.split_once('x')?;
++    let mut parts = rest.split('+');
++    let height = parts.next()?;
++    let x = parts.next()?;
++    let y = parts.next()?;
++    Some(MonitorGeometry {
++        width: width.parse().ok()?,
++        height: height.parse().ok()?,
++        x: x.parse().ok()?,
++        y: y.parse().ok()?,
++    })
++}
++
++#[cfg(unix)]
++fn external_editor_window_rect(monitor: MonitorGeometry) -> WindowRect {
++    WindowRect {
++        width: monitor.width / 2,
++        height: monitor.height / 2,
++        x: monitor.x + (monitor.width / 2) as i32,
++        y: monitor.y,
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -134,7 +378,12 @@ mod tests {
+             env::set_var("VISUAL", "vis");
+             env::set_var("EDITOR", "ed");
+         }
+-        let cmd = resolve_editor_command().unwrap();
++        let cmd = resolve_editor_command_from_env(
++            /*local_zed_available*/ false,
++            env::var("VISUAL").ok(),
++            env::var("EDITOR").ok(),
++        )
++        .unwrap();
+         assert_eq!(cmd, vec!["vis".to_string()]);
+     }
+ 
+@@ -147,11 +396,26 @@ mod tests {
+             env::remove_var("EDITOR");
+         }
+         assert!(matches!(
+-            resolve_editor_command(),
++            resolve_editor_command_from_env(
++                /*local_zed_available*/ false,
++                env::var("VISUAL").ok(),
++                env::var("EDITOR").ok()
++            ),
+             Err(EditorError::MissingEditor)
+         ));
+     }
+ 
++    #[test]
++    fn resolve_editor_prefers_local_zed_when_available() {
++        let cmd = resolve_editor_command_from_env(
++            /*local_zed_available*/ true,
++            Some("vis".to_string()),
++            Some("ed".to_string()),
++        )
++        .unwrap();
++        assert_eq!(cmd, vec![LOCAL_ZED_EDITOR_SENTINEL.to_string()]);
++    }
++
+     #[tokio::test]
+     #[cfg(unix)]
+     async fn run_editor_returns_updated_content() {
+@@ -168,4 +432,47 @@ mod tests {
+         let result = run_editor("seed", &cmd).await.unwrap();
+         assert_eq!(result, "edited".to_string());
+     }
++
++    #[test]
++    #[cfg(unix)]
++    fn parses_primary_monitor_geometry() {
++        let output = "\
++DP-1 connected 1280x720+0+0 normal\n\
++HDMI-1 connected primary 2560x1440+1280+0 normal\n";
++        assert_eq!(
++            parse_primary_monitor_geometry(output),
++            Some(MonitorGeometry {
++                width: 2560,
++                height: 1440,
++                x: 1280,
++                y: 0,
++            })
++        );
++    }
++
++    #[test]
++    #[cfg(unix)]
++    fn computes_external_editor_window_rect() {
++        assert_eq!(
++            external_editor_window_rect(MonitorGeometry {
++                width: 2560,
++                height: 1440,
++                x: 1280,
++                y: 0,
++            }),
++            WindowRect {
++                width: 1280,
++                height: 720,
++                x: 2560,
++                y: 0,
++            }
++        );
++    }
++
++    #[test]
++    fn local_zed_env_vars_do_not_include_toolkit_im_modules() {
++        assert!(LOCAL_ZED_X11_ENV_VARS.contains(&"XMODIFIERS"));
++        assert!(!LOCAL_ZED_X11_ENV_VARS.contains(&"GTK_IM_MODULE"));
++        assert!(!LOCAL_ZED_X11_ENV_VARS.contains(&"QT_IM_MODULE"));
++    }
+ }

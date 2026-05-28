@@ -1,0 +1,386 @@
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+index 2c505fbd04..17e09ad3c8 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+@@ -277,6 +277,7 @@ pub enum InputResult {
+     Submitted {
+         text: String,
+         text_elements: Vec<TextElement>,
++        hook_policy: SubmittedHookPolicy,
+     },
+     Queued {
+         text: String,
+@@ -299,6 +300,12 @@ pub enum InputResult {
+     None,
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum SubmittedHookPolicy {
++    RunUserPromptSubmit,
++    SkipUserPromptSubmit,
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum QueuedInputAction {
+     Plain,
+@@ -2795,7 +2802,18 @@ impl ChatComposer {
+     /// Common logic for handling message submission/queuing.
+     /// Returns the appropriate InputResult based on `should_queue`.
+     fn handle_submission(&mut self, should_queue: bool) -> (InputResult, bool) {
+-        let result = self.handle_submission_with_time(should_queue, Instant::now());
++        let result = self
++            .handle_submission_with_policy(should_queue, SubmittedHookPolicy::RunUserPromptSubmit);
++        self.reset_vim_mode_after_successful_dispatch(&result.0);
++        result
++    }
++
++    fn handle_submission_with_policy(
++        &mut self,
++        should_queue: bool,
++        hook_policy: SubmittedHookPolicy,
++    ) -> (InputResult, bool) {
++        let result = self.handle_submission_with_time(should_queue, hook_policy, Instant::now());
+         self.reset_vim_mode_after_successful_dispatch(&result.0);
+         result
+     }
+@@ -2816,6 +2834,7 @@ impl ChatComposer {
+     fn handle_submission_with_time(
+         &mut self,
+         should_queue: bool,
++        hook_policy: SubmittedHookPolicy,
+         now: Instant,
+     ) -> (InputResult, bool) {
+         if should_queue {
+@@ -2920,6 +2939,7 @@ impl ChatComposer {
+                     InputResult::Submitted {
+                         text,
+                         text_elements,
++                        hook_policy,
+                     },
+                     true,
+                 )
+@@ -3234,11 +3254,19 @@ impl ChatComposer {
+         if self.queue_keys.is_pressed(key_event)
+             && (self.is_task_running || self.queue_submissions || !self.is_bang_shell_command())
+         {
+-            return self.handle_submission(self.is_task_running || self.queue_submissions);
++            return self.handle_submission_with_policy(
++                self.is_task_running || self.queue_submissions,
++                SubmittedHookPolicy::SkipUserPromptSubmit,
++            );
+         }
+ 
+         if self.submit_keys.is_pressed(key_event) {
+-            return self.handle_submission(self.queue_submissions);
++            let hook_policy = if self.is_task_running || self.queue_submissions {
++                SubmittedHookPolicy::SkipUserPromptSubmit
++            } else {
++                SubmittedHookPolicy::RunUserPromptSubmit
++            };
++            return self.handle_submission_with_policy(self.queue_submissions, hook_policy);
+         }
+ 
+         if let KeyEvent {
+@@ -5774,6 +5802,7 @@ mod tests {
+             InputResult::Submitted {
+                 text,
+                 text_elements,
++                ..
+             } => {
+                 assert_eq!(text, "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 5));
+                 assert!(text_elements.is_empty());
+@@ -7052,7 +7081,11 @@ mod tests {
+         );
+         now += step;
+ 
+-        let (result, _) = composer.handle_submission_with_time(/*should_queue*/ false, now);
++        let (result, _) = composer.handle_submission_with_time(
++            /*should_queue*/ false,
++            SubmittedHookPolicy::RunUserPromptSubmit,
++            now,
++        );
+         assert!(
+             matches!(result, InputResult::None),
+             "Enter during a burst should insert newline, not submit"
+@@ -8758,6 +8791,7 @@ mod tests {
+             InputResult::Submitted {
+                 text,
+                 text_elements,
++                ..
+             } => {
+                 assert_eq!(text, format!("{large} src/main.rs"));
+                 assert!(text_elements.is_empty());
+@@ -9121,6 +9155,7 @@ mod tests {
+             InputResult::Submitted {
+                 text,
+                 text_elements,
++                ..
+             } => {
+                 assert_eq!(text, "[Image #1] hi");
+                 assert_eq!(text_elements.len(), 1);
+@@ -9615,6 +9650,7 @@ mod tests {
+             InputResult::Submitted {
+                 text,
+                 text_elements,
++                ..
+             } => {
+                 let expected = format!("{large_content} [Image #1]");
+                 assert_eq!(text, expected);
+@@ -9658,6 +9694,7 @@ mod tests {
+             InputResult::Submitted {
+                 text,
+                 text_elements,
++                ..
+             } => {
+                 let trimmed = large_content.trim().to_string();
+                 assert_eq!(text, format!("{trimmed} [Image #1]"));
+@@ -9701,6 +9738,7 @@ mod tests {
+             InputResult::Submitted {
+                 text,
+                 text_elements,
++                ..
+             } => {
+                 assert_eq!(text, "line1\nline2\n [Image #1]");
+                 assert!(!text.contains('\r'));
+@@ -9764,6 +9802,7 @@ mod tests {
+             InputResult::Submitted {
+                 text,
+                 text_elements,
++                ..
+             } => {
+                 assert_eq!(text, format!("/unknown {large_content}"));
+                 assert!(text_elements.is_empty());
+@@ -9792,6 +9831,7 @@ mod tests {
+             InputResult::Submitted {
+                 text,
+                 text_elements,
++                ..
+             } => {
+                 assert_eq!(text, "[Image #1]");
+                 assert_eq!(text_elements.len(), 1);
+diff --git a/codex-rs/tui/src/bottom_pane/mcp_server_elicitation.rs b/codex-rs/tui/src/bottom_pane/mcp_server_elicitation.rs
+index 447ab8e6c3..019c29dcec 100644
+--- a/codex-rs/tui/src/bottom_pane/mcp_server_elicitation.rs
++++ b/codex-rs/tui/src/bottom_pane/mcp_server_elicitation.rs
+@@ -1267,6 +1267,7 @@ impl McpServerElicitationOverlay {
+             InputResult::Submitted {
+                 text,
+                 text_elements,
++                ..
+             }
+             | InputResult::Queued {
+                 text,
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+index b62d225aff..d864b7517e 100644
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -180,6 +180,7 @@ pub(crate) use chat_composer::ChatComposer;
+ pub(crate) use chat_composer::ChatComposerConfig;
+ pub(crate) use chat_composer::InputResult;
+ pub(crate) use chat_composer::QueuedInputAction;
++pub(crate) use chat_composer::SubmittedHookPolicy;
+ 
+ use crate::status_indicator_widget::StatusDetailsCapitalization;
+ use crate::status_indicator_widget::StatusIndicatorWidget;
+diff --git a/codex-rs/tui/src/bottom_pane/request_user_input/mod.rs b/codex-rs/tui/src/bottom_pane/request_user_input/mod.rs
+index 13cbc34daa..d068c767b0 100644
+--- a/codex-rs/tui/src/bottom_pane/request_user_input/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/request_user_input/mod.rs
+@@ -963,6 +963,7 @@ impl RequestUserInputOverlay {
+             InputResult::Submitted {
+                 text,
+                 text_elements,
++                ..
+             }
+             | InputResult::Queued {
+                 text,
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index cc7ac45359..394850c36a 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -284,6 +284,7 @@ use crate::bottom_pane::QueuedInputAction;
+ use crate::bottom_pane::SelectionAction;
+ use crate::bottom_pane::SelectionItem;
+ use crate::bottom_pane::SelectionViewParams;
++use crate::bottom_pane::SubmittedHookPolicy;
+ use crate::bottom_pane::custom_prompt_view::CustomPromptView;
+ use crate::bottom_pane::popup_consts::standard_popup_hint_line;
+ use crate::clipboard_paste::paste_image_to_temp_png;
+diff --git a/codex-rs/tui/src/chatwidget/input_flow.rs b/codex-rs/tui/src/chatwidget/input_flow.rs
+index 8dbe8cfd10..7dbb075602 100644
+--- a/codex-rs/tui/src/chatwidget/input_flow.rs
++++ b/codex-rs/tui/src/chatwidget/input_flow.rs
+@@ -16,6 +16,7 @@ impl ChatWidget {
+             InputResult::Submitted {
+                 text,
+                 text_elements,
++                hook_policy,
+             } => {
+                 let user_message = self.user_message_from_submission(text, text_elements);
+                 if user_message.text.is_empty()
+@@ -38,7 +39,23 @@ impl ChatWidget {
+                     self.reasoning_buffer.clear();
+                     self.full_reasoning_buffer.clear();
+                     self.set_status_header(String::from("Working"));
+-                    self.submit_user_message(user_message);
++                    let hook_policy = if self.is_user_turn_pending_or_running() {
++                        UserPromptSubmitHookPolicy::Skip
++                    } else {
++                        match hook_policy {
++                            SubmittedHookPolicy::RunUserPromptSubmit => {
++                                UserPromptSubmitHookPolicy::Run
++                            }
++                            SubmittedHookPolicy::SkipUserPromptSubmit => {
++                                UserPromptSubmitHookPolicy::Skip
++                            }
++                        }
++                    };
++                    self.submit_user_message_with_history_record_and_hook_policy(
++                        user_message,
++                        UserMessageHistoryRecord::UserMessageText,
++                        hook_policy,
++                    );
+                 } else {
+                     self.queue_user_message(user_message);
+                 }
+@@ -138,7 +155,9 @@ impl ChatWidget {
+     }
+ 
+     pub(crate) fn is_user_turn_pending_or_running(&self) -> bool {
+-        self.input_queue.user_turn_pending_start || self.bottom_pane.is_task_running()
++        self.input_queue.user_turn_pending_start
++            || self.turn_lifecycle.agent_turn_running
++            || self.bottom_pane.is_task_running()
+     }
+ 
+     pub(super) fn only_user_shell_commands_running(&self) -> bool {
+diff --git a/codex-rs/tui/src/chatwidget/tests/composer_submission.rs b/codex-rs/tui/src/chatwidget/tests/composer_submission.rs
+index 1c4aec338b..99f6d6fbd9 100644
+--- a/codex-rs/tui/src/chatwidget/tests/composer_submission.rs
++++ b/codex-rs/tui/src/chatwidget/tests/composer_submission.rs
+@@ -8,6 +8,125 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
+ use pretty_assertions::assert_eq;
+ use std::collections::VecDeque;
+ 
++#[tokio::test]
++async fn idle_enter_submission_runs_user_prompt_submit_hook() {
++    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.thread_id = Some(ThreadId::new());
++
++    chat.bottom_pane
++        .set_composer_text("enter submit".to_string(), Vec::new(), Vec::new());
++    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++
++    match next_submit_op(&mut op_rx) {
++        Op::UserTurn {
++            items,
++            suppress_user_prompt_submit_hook,
++            ..
++        } => {
++            assert!(!suppress_user_prompt_submit_hook);
++            assert_eq!(
++                items,
++                vec![UserInput::Text {
++                    text: "enter submit".to_string(),
++                    text_elements: Vec::new(),
++                }]
++            );
++        }
++        other => panic!("expected Op::UserTurn, got {other:?}"),
++    }
++}
++
++#[tokio::test]
++async fn idle_tab_submission_skips_user_prompt_submit_hook() {
++    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.thread_id = Some(ThreadId::new());
++
++    chat.bottom_pane
++        .set_composer_text("tab submit".to_string(), Vec::new(), Vec::new());
++    chat.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
++
++    match next_submit_op(&mut op_rx) {
++        Op::UserTurn {
++            items,
++            suppress_user_prompt_submit_hook,
++            ..
++        } => {
++            assert!(suppress_user_prompt_submit_hook);
++            assert_eq!(
++                items,
++                vec![UserInput::Text {
++                    text: "tab submit".to_string(),
++                    text_elements: Vec::new(),
++                }]
++            );
++        }
++        other => panic!("expected Op::UserTurn, got {other:?}"),
++    }
++}
++
++#[tokio::test]
++async fn running_enter_submission_skips_user_prompt_submit_hook() {
++    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.thread_id = Some(ThreadId::new());
++    chat.bottom_pane.set_task_running(/*running*/ true);
++
++    chat.bottom_pane
++        .set_composer_text("enter while running".to_string(), Vec::new(), Vec::new());
++    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++
++    match next_submit_op(&mut op_rx) {
++        Op::UserTurn {
++            items,
++            suppress_user_prompt_submit_hook,
++            ..
++        } => {
++            assert!(suppress_user_prompt_submit_hook);
++            assert_eq!(
++                items,
++                vec![UserInput::Text {
++                    text: "enter while running".to_string(),
++                    text_elements: Vec::new(),
++                }]
++            );
++        }
++        other => panic!("expected Op::UserTurn, got {other:?}"),
++    }
++}
++
++#[tokio::test]
++async fn lifecycle_running_enter_submission_skips_user_prompt_submit_hook() {
++    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.thread_id = Some(ThreadId::new());
++    chat.turn_lifecycle
++        .restore_running(/*running*/ true, Instant::now());
++    chat.bottom_pane.set_task_running(/*running*/ false);
++
++    chat.bottom_pane.set_composer_text(
++        "enter while lifecycle running".to_string(),
++        Vec::new(),
++        Vec::new(),
++    );
++    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++
++    match next_submit_op(&mut op_rx) {
++        Op::UserTurn {
++            items,
++            suppress_user_prompt_submit_hook,
++            ..
++        } => {
++            assert!(suppress_user_prompt_submit_hook);
++            assert_eq!(
++                items,
++                vec![UserInput::Text {
++                    text: "enter while lifecycle running".to_string(),
++                    text_elements: Vec::new(),
++                }]
++            );
++        }
++        other => panic!("expected Op::UserTurn, got {other:?}"),
++    }
++}
++
+ #[tokio::test]
+ async fn submission_preserves_text_elements_and_local_images() {
+     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;

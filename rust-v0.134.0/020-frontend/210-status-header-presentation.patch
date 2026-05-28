@@ -1,0 +1,282 @@
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index ba31114d69..259bff0457 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -328,6 +328,9 @@ impl ChatWidget {
+             ThreadItem::ImageGeneration { .. } => {
+                 self.on_image_generation_begin();
+             }
++            ThreadItem::ContextCompaction { .. } => {
++                self.start_context_compaction_status();
++            }
+             ThreadItem::CollabAgentToolCall {
+                 id,
+                 tool,
+diff --git a/codex-rs/tui/src/chatwidget/replay.rs b/codex-rs/tui/src/chatwidget/replay.rs
+index 0560da7ae5..7a36730f68 100644
+--- a/codex-rs/tui/src/chatwidget/replay.rs
++++ b/codex-rs/tui/src/chatwidget/replay.rs
+@@ -174,6 +174,9 @@ impl ChatWidget {
+                     duration_ms,
+                     post_compact_context_percent,
+                 ));
++                if self.status_state.current_status.header == "Compacting" {
++                    self.set_status_header(String::from("Working"));
++                }
+                 self.request_redraw();
+             }
+             ThreadItem::HookPrompt { .. } => {}
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index c75fd4a275..18c869a4e2 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -189,6 +189,43 @@ async fn thread_settings_updated_preserves_default_settings_for_plan_mode() {
+     );
+ }
+ 
++#[tokio::test]
++async fn context_compaction_item_started_updates_status_header() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++
++    chat.handle_server_notification(
++        ServerNotification::ItemStarted(ItemStartedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            started_at_ms: 0,
++            item: AppServerThreadItem::ContextCompaction {
++                id: "compact-1".to_string(),
++                duration_ms: None,
++                post_compact_context_percent: None,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++
++    assert_eq!(chat.status_state.current_status.header, "Compacting");
++
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            completed_at_ms: 0,
++            item: AppServerThreadItem::ContextCompaction {
++                id: "compact-1".to_string(),
++                duration_ms: None,
++                post_compact_context_percent: None,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++
++    assert_eq!(chat.status_state.current_status.header, "Working");
++}
++
+ #[tokio::test]
+ async fn collab_spawn_end_shows_requested_model_and_effort() {
+     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+index 9c78b87654..d41b260240 100644
+--- a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
++++ b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+@@ -260,10 +260,19 @@ impl ChatWidget {
+             item @ ThreadItem::McpToolCall { .. } => {
+                 self.handle_mcp_tool_call_started_now(item);
+             }
++            ThreadItem::ContextCompaction { .. } => {
++                self.start_context_compaction_status();
++            }
+             _ => {}
+         }
+     }
+ 
++    pub(crate) fn start_context_compaction_status(&mut self) {
++        self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Working;
++        self.set_status_header(String::from("Compacting"));
++        self.request_redraw();
++    }
++
+     pub(crate) fn handle_queued_item_completed_now(&mut self, item: ThreadItem) {
+         match item {
+             item @ ThreadItem::CommandExecution { .. } => {
+diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
+index 16a9f9fff3..3238bd6e5a 100644
+--- a/codex-rs/tui/src/history_cell/tests.rs
++++ b/codex-rs/tui/src/history_cell/tests.rs
+@@ -2286,6 +2286,17 @@ fn deprecation_notice_renders_summary_with_details() {
+     );
+ }
+ 
++#[test]
++fn context_compacted_event_renders_metrics_suffix() {
++    let cell = new_context_compacted_event(
++        Some(/*duration_ms*/ 7_200),
++        Some(/*post_compact_context_percent*/ 13),
++    );
++    let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
++
++    insta::assert_snapshot!(rendered, @"• Context compacted · Worked 8s · 13% Used");
++}
++
+ #[test]
+ fn agent_markdown_cell_renders_source_at_different_widths() {
+     let source =
+diff --git a/codex-rs/tui/src/shimmer.rs b/codex-rs/tui/src/shimmer.rs
+index ba081e7c49..e1f5376a6e 100644
+--- a/codex-rs/tui/src/shimmer.rs
++++ b/codex-rs/tui/src/shimmer.rs
+@@ -12,6 +12,25 @@ use crate::terminal_palette::default_bg;
+ use crate::terminal_palette::default_fg;
+ 
+ static PROCESS_START: OnceLock<Instant> = OnceLock::new();
++const RAINBOW_TRUECOLOR: [(u8, u8, u8); 6] = [
++    (255, 80, 80),
++    (255, 170, 60),
++    (255, 230, 80),
++    (80, 220, 120),
++    (80, 180, 255),
++    (190, 120, 255),
++];
++const RAINBOW_ANSI: [Color; 6] = [
++    Color::Red,
++    Color::Yellow,
++    Color::Green,
++    Color::Cyan,
++    Color::Blue,
++    Color::Magenta,
++];
++const COMPACTING_TRUECOLOR: [(u8, u8, u8); 4] =
++    [(255, 60, 60), (255, 95, 95), (255, 130, 130), (190, 35, 35)];
++const COMPACTING_ANSI: [Color; 4] = [Color::Red, Color::LightRed, Color::Red, Color::LightRed];
+ 
+ fn elapsed_since_start() -> Duration {
+     let start = PROCESS_START.get_or_init(Instant::now);
+@@ -68,6 +87,55 @@ pub(crate) fn shimmer_spans(text: &str) -> Vec<Span<'static>> {
+     spans
+ }
+ 
++pub(crate) fn rainbow_spans(text: &str) -> Vec<Span<'static>> {
++    animated_color_spans(text, &RAINBOW_TRUECOLOR, &RAINBOW_ANSI)
++}
++
++pub(crate) fn compacting_spans(text: &str) -> Vec<Span<'static>> {
++    animated_color_spans(text, &COMPACTING_TRUECOLOR, &COMPACTING_ANSI)
++}
++
++fn animated_color_spans(
++    text: &str,
++    truecolor_palette: &[(u8, u8, u8)],
++    ansi_palette: &[Color],
++) -> Vec<Span<'static>> {
++    let chars: Vec<char> = text.chars().collect();
++    if chars.is_empty() {
++        return Vec::new();
++    }
++
++    let phase =
++        ((elapsed_since_start().as_millis() / 80) % truecolor_palette.len() as u128) as usize;
++    let color_level = supports_color::on_cached(supports_color::Stream::Stdout);
++    let has_color = color_level.is_some();
++    let has_true_color = color_level.map(|level| level.has_16m).unwrap_or(false);
++
++    chars
++        .into_iter()
++        .enumerate()
++        .map(|(idx, ch)| {
++            let color_idx = (idx + phase) % truecolor_palette.len();
++            let style = if has_true_color {
++                let (r, g, b) = truecolor_palette[color_idx];
++                #[allow(clippy::disallowed_methods)]
++                {
++                    Style::default()
++                        .fg(Color::Rgb(r, g, b))
++                        .add_modifier(Modifier::BOLD)
++                }
++            } else if has_color {
++                Style::default()
++                    .fg(ansi_palette[color_idx])
++                    .add_modifier(Modifier::BOLD)
++            } else {
++                Style::default().add_modifier(Modifier::BOLD)
++            };
++            Span::styled(ch.to_string(), style)
++        })
++        .collect()
++}
++
+ fn color_for_level(intensity: f32) -> Style {
+     // Tune fallback styling so the shimmer band reads even without RGB support.
+     if intensity < 0.2 {
+diff --git a/codex-rs/tui/src/status_indicator_widget.rs b/codex-rs/tui/src/status_indicator_widget.rs
+index 04beff8b71..ac5957272a 100644
+--- a/codex-rs/tui/src/status_indicator_widget.rs
++++ b/codex-rs/tui/src/status_indicator_widget.rs
+@@ -24,8 +24,9 @@ use crate::line_truncation::truncate_line_with_ellipsis_if_overflow;
+ use crate::motion::MotionMode;
+ use crate::motion::ReducedMotionIndicator;
+ use crate::motion::activity_indicator;
+-use crate::motion::shimmer_text;
+ use crate::render::renderable::Renderable;
++use crate::shimmer::compacting_spans;
++use crate::shimmer::rainbow_spans;
+ use crate::text_formatting::capitalize_first;
+ use crate::tui::FrameRequester;
+ use crate::wrapping::RtOptions;
+@@ -260,18 +261,28 @@ impl Renderable for StatusIndicatorWidget {
+             spans.push(indicator);
+             spans.push(" ".into());
+         }
+-        spans.extend(shimmer_text(&self.header, motion_mode));
++        if self.animations_enabled {
++            if self.header == "Compacting" {
++                spans.extend(compacting_spans(&self.header));
++            } else {
++                spans.extend(rainbow_spans(&self.header));
++            }
++        } else if !self.header.is_empty() {
++            spans.push(self.header.clone().into());
++        }
+         if !spans.is_empty() {
+             spans.push(" ".into());
+         }
+         if self.show_interrupt_hint {
+             spans.extend(vec![
+-                format!("({pretty_elapsed} • ").dim(),
++                "(".dim(),
++                pretty_elapsed.cyan().bold(),
++                " • ".dim(),
+                 key_hint::plain(KeyCode::Esc).into(),
+                 " to interrupt)".dim(),
+             ]);
+         } else {
+-            spans.push(format!("({pretty_elapsed})").dim());
++            spans.extend(vec!["(".dim(), pretty_elapsed.cyan().bold(), ")".dim()]);
+         }
+         if let Some(message) = &self.inline_message {
+             // Keep optional context after elapsed/interrupt text so that core
+@@ -341,6 +352,26 @@ mod tests {
+         insta::assert_snapshot!(terminal.backend());
+     }
+ 
++    #[test]
++    fn renders_with_compacting_header() {
++        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
++        let tx = AppEventSender::new(tx_raw);
++        let mut w = StatusIndicatorWidget::new(
++            tx,
++            crate::tui::FrameRequester::test_dummy(),
++            /*animations_enabled*/ false,
++        );
++        w.update_header(String::from("Compacting"));
++        w.is_paused = true;
++        w.elapsed_running = Duration::ZERO;
++
++        let mut terminal = Terminal::new(TestBackend::new(80, 1)).expect("terminal");
++        terminal
++            .draw(|f| w.render(f.area(), f.buffer_mut()))
++            .expect("draw");
++        insta::assert_snapshot!(terminal.backend());
++    }
++
+     #[test]
+     fn renders_truncated() {
+         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();

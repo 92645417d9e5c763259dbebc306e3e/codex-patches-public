@@ -1,0 +1,153 @@
+diff --git a/codex-rs/exec/src/lib.rs b/codex-rs/exec/src/lib.rs
+index 3db7a51576..9982c04443 100644
+--- a/codex-rs/exec/src/lib.rs
++++ b/codex-rs/exec/src/lib.rs
+@@ -1463,7 +1463,11 @@ fn resume_lookup_model_providers(
+     args: &crate::cli::ResumeArgs,
+ ) -> Option<Vec<String>> {
+     if args.last {
+-        Some(vec![config.model_provider_id.clone()])
++        let mut model_providers = vec![config.model_provider_id.clone()];
++        if config.model_provider_id != "openai" {
++            model_providers.push("openai".to_string());
++        }
++        Some(model_providers)
+     } else {
+         None
+     }
+diff --git a/codex-rs/exec/src/lib_tests.rs b/codex-rs/exec/src/lib_tests.rs
+index 79d07a0b76..9f77a71638 100644
+--- a/codex-rs/exec/src/lib_tests.rs
++++ b/codex-rs/exec/src/lib_tests.rs
+@@ -296,7 +296,7 @@ async fn resume_lookup_model_providers_filters_only_last_lookup() {
+ 
+     assert_eq!(
+         resume_lookup_model_providers(&config, &last_args),
+-        Some(vec!["test-provider".to_string()])
++        Some(vec!["test-provider".to_string(), "openai".to_string()])
+     );
+     assert_eq!(resume_lookup_model_providers(&config, &named_args), None);
+ }
+diff --git a/codex-rs/model-provider-info/src/lib.rs b/codex-rs/model-provider-info/src/lib.rs
+index 65f71851d6..3d29adc6ca 100644
+--- a/codex-rs/model-provider-info/src/lib.rs
++++ b/codex-rs/model-provider-info/src/lib.rs
+@@ -465,6 +465,9 @@ pub fn merge_configured_model_providers(
+                 }
+             }
+         } else {
++            if provider.name.is_empty() {
++                provider.name = OPENAI_PROVIDER_NAME.to_string();
++            }
+             model_providers.entry(key).or_insert(provider);
+         }
+     }
+diff --git a/codex-rs/model-provider-info/src/model_provider_info_tests.rs b/codex-rs/model-provider-info/src/model_provider_info_tests.rs
+index abfa40a36a..1777febad6 100644
+--- a/codex-rs/model-provider-info/src/model_provider_info_tests.rs
++++ b/codex-rs/model-provider-info/src/model_provider_info_tests.rs
+@@ -320,6 +320,31 @@ fn test_merge_configured_model_providers_adds_custom_provider() {
+     );
+ }
+ 
++#[test]
++fn test_merge_configured_model_providers_defaults_empty_custom_name_to_openai() {
++    let custom_provider = ModelProviderInfo {
++        base_url: Some("http://127.0.0.1:1080/backend-api/codex".to_string()),
++        requires_openai_auth: true,
++        supports_websockets: true,
++        ..ModelProviderInfo::default()
++    };
++    let configured_model_providers =
++        std::collections::HashMap::from([("codex".to_string(), custom_provider.clone())]);
++
++    let mut expected_provider = custom_provider;
++    expected_provider.name = "OpenAI".to_string();
++    let mut expected = built_in_model_providers(/*openai_base_url*/ None);
++    expected.insert("codex".to_string(), expected_provider);
++
++    assert_eq!(
++        merge_configured_model_providers(
++            built_in_model_providers(/*openai_base_url*/ None),
++            configured_model_providers,
++        ),
++        Ok(expected)
++    );
++}
++
+ #[test]
+ fn test_merge_configured_model_providers_applies_amazon_bedrock_profile_override() {
+     let configured_model_providers = std::collections::HashMap::from([(
+diff --git a/codex-rs/rollout/src/metadata_tests.rs b/codex-rs/rollout/src/metadata_tests.rs
+index d6afcc0de1..dfaffa1250 100644
+--- a/codex-rs/rollout/src/metadata_tests.rs
++++ b/codex-rs/rollout/src/metadata_tests.rs
+@@ -94,6 +94,7 @@ async fn extract_metadata_from_rollout_uses_last_rollout_line_timestamp_for_upda
+         originator: "cli".to_string(),
+         cli_version: "0.0.0".to_string(),
+         source: SessionSource::default(),
++        thread_source: None,
+         agent_path: None,
+         agent_nickname: None,
+         agent_role: None,
+@@ -158,6 +159,7 @@ async fn extract_metadata_from_rollout_falls_back_to_mtime_when_last_timestamp_i
+         originator: "cli".to_string(),
+         cli_version: "0.0.0".to_string(),
+         source: SessionSource::default(),
++        thread_source: None,
+         agent_path: None,
+         agent_nickname: None,
+         agent_role: None,
+diff --git a/codex-rs/rollout/src/recorder.rs b/codex-rs/rollout/src/recorder.rs
+index 03621e2e41..86fbff7383 100644
+--- a/codex-rs/rollout/src/recorder.rs
++++ b/codex-rs/rollout/src/recorder.rs
+@@ -61,6 +61,8 @@ use codex_protocol::protocol::ThreadSource;
+ use codex_state::StateRuntime;
+ use codex_utils_path as path_utils;
+ 
++const RECORDED_MODEL_PROVIDER_ID: &str = "openai";
++
+ /// Writes canonical session rollout items to JSONL.
+ ///
+ /// Rollouts are recorded as JSONL and can be inspected with tools such as:
+@@ -689,7 +691,7 @@ impl RolloutRecorder {
+                     agent_path: source.get_agent_path().map(Into::into),
+                     source,
+                     thread_source,
+-                    model_provider: Some(config.model_provider_id().to_string()),
++                    model_provider: Some(RECORDED_MODEL_PROVIDER_ID.to_string()),
+                     base_instructions: Some(base_instructions),
+                     dynamic_tools: if dynamic_tools.is_empty() {
+                         None
+diff --git a/codex-rs/rollout/src/recorder_tests.rs b/codex-rs/rollout/src/recorder_tests.rs
+index 90fe15c312..68dec41cfb 100644
+--- a/codex-rs/rollout/src/recorder_tests.rs
++++ b/codex-rs/rollout/src/recorder_tests.rs
+@@ -420,6 +420,14 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
+         text.contains("\"type\":\"session_meta\""),
+         "expected session metadata in rollout"
+     );
++    assert!(
++        text.contains("\"model_provider\":\"openai\""),
++        "session metadata should record the canonical OpenAI provider id"
++    );
++    assert!(
++        !text.contains("\"model_provider\":\"test-provider\""),
++        "session metadata should not record the configured provider id"
++    );
+     let buffered_idx = text
+         .find("buffered-event")
+         .expect("buffered event in rollout");
+diff --git a/codex-rs/rollout/src/tests.rs b/codex-rs/rollout/src/tests.rs
+index 97fffc6a36..35e18b95d6 100644
+--- a/codex-rs/rollout/src/tests.rs
++++ b/codex-rs/rollout/src/tests.rs
+@@ -1479,6 +1479,7 @@ async fn test_updated_at_uses_last_rollout_line_timestamp() -> Result<()> {
+                 originator: "test_originator".into(),
+                 cli_version: "test_version".into(),
+                 source: SessionSource::VSCode,
++                thread_source: None,
+                 agent_path: None,
+                 agent_nickname: None,
+                 agent_role: None,

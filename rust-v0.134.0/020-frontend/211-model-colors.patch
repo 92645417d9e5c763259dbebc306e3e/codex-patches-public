@@ -1,0 +1,230 @@
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+index 2a35f61949..d0d2ebf58c 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -244,6 +244,7 @@ fn soften_rgb_channel(channel: u8, luma: u16) -> u8 {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::model_color::model_style;
+     use pretty_assertions::assert_eq;
+     use ratatui::style::Modifier;
+ 
+@@ -424,6 +425,32 @@ mod tests {
+         assert_eq!(line.spans[1].style.fg, Some(Color::Yellow));
+     }
+ 
++    #[test]
++    fn status_line_preserves_model_color_without_disabling_theme_styles() {
++        let line = status_line_from_segments_with_resolver(
++            [
++                (
++                    StatusLineItem::ModelName,
++                    Line::from(Span::styled("gpt-5", model_style("gpt-5"))),
++                ),
++                (StatusLineItem::CurrentDir, Line::from("/tmp/project")),
++            ],
++            /*use_theme_colors*/ true,
++            |accent| match accent {
++                StatusLineAccent::Model => Some(Style::default().red()),
++                StatusLineAccent::Path => Some(Style::default().green()),
++                _ => None,
++            },
++        )
++        .expect("status line");
++
++        assert_eq!(line_text(&line), "gpt-5 · /tmp/project");
++        assert_eq!(line.spans[0].style.fg, Some(Color::Rgb(167, 139, 250)));
++        assert_eq!(line.spans[1].content.as_ref(), STATUS_LINE_SEPARATOR);
++        assert!(line.spans[1].style.add_modifier.contains(Modifier::DIM));
++        assert_eq!(line.spans[2].style.fg, Some(Color::Green));
++    }
++
+     #[test]
+     fn status_line_segments_return_none_when_empty() {
+         assert_eq!(
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index ee4efb5f5d..21d2811069 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -9,6 +9,7 @@ use crate::branch_summary;
+ use crate::chatwidget::limit_label_for_window;
+ use crate::chatwidget::rate_limits::get_limits_duration;
+ use crate::legacy_core::config::Config;
++use crate::model_color::model_style;
+ use crate::shimmer::rainbow_spans;
+ use crate::status::StatusAccountDisplay;
+ use crate::status::account_plan_style;
+@@ -702,6 +703,7 @@ impl ChatWidget {
+ 
+     fn status_line_line_for_item(&mut self, item: &StatusLineItem) -> Option<Line<'static>> {
+         match item {
++            StatusLineItem::ModelName => Some(self.model_display_line()),
+             StatusLineItem::ModelWithReasoning => Some(self.model_with_reasoning_display_line()),
+             StatusLineItem::FastMode => Some(self.fast_mode_display_line()),
+             StatusLineItem::Account => self.status_line_account_display_line(),
+@@ -826,6 +828,13 @@ impl ChatWidget {
+         format!("{} {label}{service_tier_label}", self.model_display_name())
+     }
+ 
++    fn model_display_line(&self) -> Line<'static> {
++        Line::from(Span::styled(
++            self.model_display_name().to_string(),
++            model_style(self.current_model()),
++        ))
++    }
++
+     fn model_with_reasoning_display_line(&self) -> Line<'static> {
+         let effort = self.effective_reasoning_effort();
+         let label = Self::status_line_reasoning_effort_label(effort);
+@@ -841,7 +850,10 @@ impl ChatWidget {
+             .map(|tier| format!(" {tier}"))
+             .unwrap_or_default();
+         let mut line = Line::from(vec![
+-            self.model_display_name().to_string().into(),
++            Span::styled(
++                self.model_display_name().to_string(),
++                model_style(self.current_model()),
++            ),
+             " ".into(),
+         ]);
+         line.extend(Self::status_line_reasoning_effort_line(label, effort).spans);
+@@ -1197,6 +1209,28 @@ mod tests {
+         }
+     }
+ 
++    #[allow(clippy::disallowed_methods)]
++    #[test]
++    fn model_status_line_style_uses_stable_model_color_without_theme_colors() {
++        let line = status_line_from_segments(
++            [(
++                StatusLineItem::ModelName,
++                Line::from(vec![Span::styled(
++                    "gpt-5.3-codex",
++                    model_style("gpt-5.3-codex"),
++                )]),
++            )],
++            /*use_theme_colors*/ false,
++        )
++        .expect("status line");
++        let model = &line.spans[0];
++
++        assert_eq!(model.content.as_ref(), "gpt-5.3-codex");
++        assert_eq!(model.style.fg, Some(Color::Rgb(167, 139, 250)));
++        assert_eq!(model.style.add_modifier.contains(Modifier::DIM), false);
++        assert_eq!(model.style.sub_modifier.contains(Modifier::DIM), false);
++    }
++
+     #[test]
+     fn xhigh_reasoning_effort_status_line_is_rainbow() {
+         let line = ChatWidget::status_line_reasoning_effort_line(
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index cd100e7126..d794ee6373 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -153,6 +153,7 @@ mod markdown_render;
+ mod markdown_stream;
+ mod mention_codec;
+ mod model_catalog;
++mod model_color;
+ mod model_migration;
+ mod motion;
+ mod multi_agents;
+diff --git a/codex-rs/tui/src/model_color.rs b/codex-rs/tui/src/model_color.rs
+new file mode 100644
+index 0000000000..e0e45742c5
+--- /dev/null
++++ b/codex-rs/tui/src/model_color.rs
+@@ -0,0 +1,62 @@
++//! Local model-name colors for TUI personalization.
++
++use ratatui::style::Color;
++use ratatui::style::Style;
++
++const MODEL_COLORS: [Color; 6] = [
++    Color::Rgb(89, 169, 255),
++    Color::Rgb(45, 212, 191),
++    Color::Rgb(74, 222, 128),
++    Color::Rgb(167, 139, 250),
++    Color::Rgb(56, 189, 248),
++    Color::Rgb(148, 163, 184),
++];
++
++pub(crate) fn model_style(model: &str) -> Style {
++    Style::default().fg(model_color(model))
++}
++
++fn model_color(model: &str) -> Color {
++    match model {
++        "gpt-5.4" => MODEL_COLORS[0],
++        "gpt-5.5" => MODEL_COLORS[1],
++        "gpt-5.4-mini" => MODEL_COLORS[2],
++        "gpt-5.3-codex" => MODEL_COLORS[3],
++        "gpt-5.3-codex-spark" => MODEL_COLORS[4],
++        "gpt-5.2" => MODEL_COLORS[5],
++        _ => {
++            let idx = model
++                .bytes()
++                .fold(0usize, |acc, byte| acc.wrapping_add(byte as usize))
++                % MODEL_COLORS.len();
++            MODEL_COLORS[idx]
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use pretty_assertions::assert_eq;
++
++    #[test]
++    fn known_models_have_stable_colors() {
++        let cases = [
++            ("gpt-5.4", MODEL_COLORS[0]),
++            ("gpt-5.5", MODEL_COLORS[1]),
++            ("gpt-5.4-mini", MODEL_COLORS[2]),
++            ("gpt-5.3-codex", MODEL_COLORS[3]),
++            ("gpt-5.3-codex-spark", MODEL_COLORS[4]),
++            ("gpt-5.2", MODEL_COLORS[5]),
++        ];
++
++        for (model, color) in cases {
++            assert_eq!(model_style(model).fg, Some(color));
++        }
++    }
++
++    #[test]
++    fn unknown_model_color_is_deterministic() {
++        assert_eq!(model_style("future-model"), model_style("future-model"));
++    }
++}
+diff --git a/codex-rs/tui/src/multi_agents.rs b/codex-rs/tui/src/multi_agents.rs
+index 609c27ff41..efbb3e1f2f 100644
+--- a/codex-rs/tui/src/multi_agents.rs
++++ b/codex-rs/tui/src/multi_agents.rs
+@@ -5,6 +5,7 @@
+ //! which thread becomes active or when a thread closes, stays in [`crate::app::App`].
+ 
+ use crate::history_cell::PlainHistoryCell;
++use crate::model_color::model_style;
+ use crate::render::line_utils::prefix_lines;
+ use crate::shimmer::rainbow_spans;
+ use crate::text_formatting::truncate_text;
+@@ -478,7 +479,7 @@ fn spawn_request_spans(spawn_request: Option<&SpawnRequestSummary>) -> Vec<Span<
+     if model.is_empty() {
+         spans.extend(reasoning_effort_spans(effort));
+     } else {
+-        spans.push(Span::from(model.to_string()).magenta());
++        spans.push(Span::styled(model.to_string(), model_style(model)));
+         spans.push(Span::from(" ").magenta());
+         spans.extend(reasoning_effort_spans(effort));
+     }
+@@ -846,7 +847,7 @@ mod tests {
+         assert_eq!(title.spans[6].content.as_ref(), "(");
+         assert_eq!(title.spans[6].style.fg, Some(Color::Magenta));
+         assert_eq!(title.spans[7].content.as_ref(), "gpt-5");
+-        assert_eq!(title.spans[7].style.fg, Some(Color::Magenta));
++        assert_eq!(title.spans[7].style.fg, Some(Color::Rgb(167, 139, 250)));
+         assert_eq!(title.spans[9].content.as_ref(), "high");
+         assert_eq!(title.spans[9].style.fg, Some(Color::Red));
+         assert!(!title.spans[9].style.add_modifier.contains(Modifier::DIM));

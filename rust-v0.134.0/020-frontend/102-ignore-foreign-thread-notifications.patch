@@ -1,0 +1,425 @@
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index 0887035a2e..0f1de45ecc 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -86,6 +86,7 @@ use codex_protocol::models::ActivePermissionProfile;
+ use codex_protocol::models::FileSystemPermissions;
+ use codex_protocol::models::NetworkPermissions;
+ use codex_protocol::models::PermissionProfile;
++use codex_protocol::protocol::SubAgentSource;
+ use codex_protocol::request_permissions::RequestPermissionProfile;
+ use codex_protocol::user_input::TextElement;
+ use codex_utils_absolute_path::AbsolutePathBuf;
+@@ -2887,7 +2888,7 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
+         ServerNotification::ThreadStarted(ThreadStartedNotification {
+             thread: Thread {
+                 id: agent_thread_id.to_string(),
+-                session_id: agent_thread_id.to_string(),
++                session_id: main_thread_id.to_string(),
+                 forked_from_id: None,
+                 preview: "agent thread".to_string(),
+                 ephemeral: false,
+@@ -2943,6 +2944,298 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn foreign_thread_started_notification_does_not_create_agent_picker_entry() -> Result<()> {
++    let mut app = make_test_app().await;
++    let main_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000401").expect("valid thread");
++    let foreign_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000402").expect("valid thread");
++    let primary_cwd = test_path_buf("/tmp/main").abs();
++    let primary_session = ThreadSessionState {
++        approval_policy: AskForApproval::OnRequest,
++        permission_profile: PermissionProfile::workspace_write(),
++        runtime_workspace_roots: vec![primary_cwd.clone()],
++        ..test_thread_session(main_thread_id, primary_cwd.to_path_buf())
++    };
++
++    app.primary_thread_id = Some(main_thread_id);
++    app.active_thread_id = Some(main_thread_id);
++    app.primary_session_configured = Some(primary_session.clone());
++    app.thread_event_channels.insert(
++        main_thread_id,
++        ThreadEventChannel::new_with_session(
++            /*capacity*/ 4,
++            primary_session.clone(),
++            Vec::new(),
++        ),
++    );
++
++    app.enqueue_thread_notification(
++        foreign_thread_id,
++        ServerNotification::ThreadStarted(ThreadStartedNotification {
++            thread: Thread {
++                id: foreign_thread_id.to_string(),
++                session_id: foreign_thread_id.to_string(),
++                forked_from_id: None,
++                preview: "foreign main thread".to_string(),
++                ephemeral: false,
++                model_provider: "agent-provider".to_string(),
++                created_at: 1,
++                updated_at: 2,
++                status: codex_app_server_protocol::ThreadStatus::Idle,
++                path: None,
++                cwd: test_path_buf("/tmp/foreign").abs(),
++                cli_version: "0.0.0".to_string(),
++                source: SessionSource::Cli,
++                thread_source: None,
++                agent_nickname: None,
++                agent_role: None,
++                git_info: None,
++                name: Some("foreign main thread".to_string()),
++                turns: Vec::new(),
++            },
++        }),
++    )
++    .await?;
++
++    assert!(!app.thread_event_channels.contains_key(&foreign_thread_id));
++    assert_eq!(app.agent_navigation.get(&foreign_thread_id), None);
++
++    Ok(())
++}
++
++#[tokio::test]
++async fn foreign_subagent_thread_started_notification_does_not_create_agent_picker_entry()
++-> Result<()> {
++    let mut app = make_test_app().await;
++    let main_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000501").expect("valid thread");
++    let foreign_parent_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000502").expect("valid thread");
++    let foreign_agent_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000503").expect("valid thread");
++    let primary_cwd = test_path_buf("/tmp/main").abs();
++    let primary_session = ThreadSessionState {
++        approval_policy: AskForApproval::OnRequest,
++        permission_profile: PermissionProfile::workspace_write(),
++        runtime_workspace_roots: vec![primary_cwd.clone()],
++        ..test_thread_session(main_thread_id, primary_cwd.to_path_buf())
++    };
++
++    app.primary_thread_id = Some(main_thread_id);
++    app.active_thread_id = Some(main_thread_id);
++    app.primary_session_configured = Some(primary_session.clone());
++    app.thread_event_channels.insert(
++        main_thread_id,
++        ThreadEventChannel::new_with_session(
++            /*capacity*/ 4,
++            primary_session.clone(),
++            Vec::new(),
++        ),
++    );
++
++    app.enqueue_thread_notification(
++        foreign_agent_thread_id,
++        ServerNotification::ThreadStarted(ThreadStartedNotification {
++            thread: Thread {
++                id: foreign_agent_thread_id.to_string(),
++                session_id: foreign_parent_thread_id.to_string(),
++                forked_from_id: None,
++                preview: "foreign sub-agent thread".to_string(),
++                ephemeral: false,
++                model_provider: "agent-provider".to_string(),
++                created_at: 1,
++                updated_at: 2,
++                status: codex_app_server_protocol::ThreadStatus::Idle,
++                path: None,
++                cwd: test_path_buf("/tmp/foreign-agent").abs(),
++                cli_version: "0.0.0".to_string(),
++                source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
++                    parent_thread_id: foreign_parent_thread_id,
++                    depth: 1,
++                    agent_path: None,
++                    agent_nickname: Some("Stray".to_string()),
++                    agent_role: Some("worker".to_string()),
++                }),
++                thread_source: None,
++                agent_nickname: Some("Stray".to_string()),
++                agent_role: Some("worker".to_string()),
++                git_info: None,
++                name: Some("foreign sub-agent thread".to_string()),
++                turns: Vec::new(),
++            },
++        }),
++    )
++    .await?;
++
++    assert!(
++        !app.thread_event_channels
++            .contains_key(&foreign_agent_thread_id)
++    );
++    assert_eq!(app.agent_navigation.get(&foreign_agent_thread_id), None);
++
++    Ok(())
++}
++
++#[tokio::test]
++async fn current_session_subagent_thread_started_notification_is_accepted_without_cached_parent()
++-> Result<()> {
++    let mut app = make_test_app().await;
++    let main_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000601").expect("valid thread");
++    let agent_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000602").expect("valid thread");
++    let parent_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000603").expect("valid thread");
++    let primary_cwd = test_path_buf("/tmp/main").abs();
++    let primary_session = ThreadSessionState {
++        approval_policy: AskForApproval::OnRequest,
++        permission_profile: PermissionProfile::workspace_write(),
++        runtime_workspace_roots: vec![primary_cwd.clone()],
++        ..test_thread_session(main_thread_id, primary_cwd.to_path_buf())
++    };
++
++    app.primary_thread_id = Some(main_thread_id);
++    app.active_thread_id = Some(main_thread_id);
++    app.primary_session_configured = Some(primary_session.clone());
++    app.thread_event_channels.insert(
++        main_thread_id,
++        ThreadEventChannel::new_with_session(
++            /*capacity*/ 4,
++            primary_session.clone(),
++            Vec::new(),
++        ),
++    );
++
++    app.enqueue_thread_notification(
++        agent_thread_id,
++        ServerNotification::ThreadStarted(ThreadStartedNotification {
++            thread: Thread {
++                id: agent_thread_id.to_string(),
++                session_id: main_thread_id.to_string(),
++                forked_from_id: None,
++                preview: "current sub-agent thread".to_string(),
++                ephemeral: false,
++                model_provider: "agent-provider".to_string(),
++                created_at: 1,
++                updated_at: 2,
++                status: codex_app_server_protocol::ThreadStatus::Idle,
++                path: None,
++                cwd: test_path_buf("/tmp/agent").abs(),
++                cli_version: "0.0.0".to_string(),
++                source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
++                    parent_thread_id,
++                    depth: 2,
++                    agent_path: None,
++                    agent_nickname: Some("Nested".to_string()),
++                    agent_role: Some("worker".to_string()),
++                }),
++                thread_source: None,
++                agent_nickname: Some("Nested".to_string()),
++                agent_role: Some("worker".to_string()),
++                git_info: None,
++                name: Some("current sub-agent thread".to_string()),
++                turns: Vec::new(),
++            },
++        }),
++    )
++    .await?;
++
++    assert_eq!(
++        app.agent_navigation.get(&agent_thread_id),
++        Some(&AgentPickerThreadEntry {
++            agent_nickname: Some("Nested".to_string()),
++            agent_role: Some("worker".to_string()),
++            is_closed: false,
++        })
++    );
++
++    Ok(())
++}
++
++#[tokio::test]
++async fn current_session_grandchild_thread_started_notification_is_accepted_by_known_parent()
++-> Result<()> {
++    let mut app = make_test_app().await;
++    let main_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000701").expect("valid thread");
++    let parent_agent_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000702").expect("valid thread");
++    let grandchild_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000703").expect("valid thread");
++    let primary_cwd = test_path_buf("/tmp/main").abs();
++    let primary_session = ThreadSessionState {
++        approval_policy: AskForApproval::OnRequest,
++        permission_profile: PermissionProfile::workspace_write(),
++        runtime_workspace_roots: vec![primary_cwd.clone()],
++        ..test_thread_session(main_thread_id, primary_cwd.to_path_buf())
++    };
++
++    app.primary_thread_id = Some(main_thread_id);
++    app.active_thread_id = Some(main_thread_id);
++    app.primary_session_configured = Some(primary_session.clone());
++    app.thread_event_channels.insert(
++        main_thread_id,
++        ThreadEventChannel::new_with_session(
++            /*capacity*/ 4,
++            primary_session.clone(),
++            Vec::new(),
++        ),
++    );
++    app.agent_navigation.upsert(
++        parent_agent_thread_id,
++        Some("Parent".to_string()),
++        Some("worker".to_string()),
++        /*is_closed*/ false,
++    );
++
++    app.enqueue_thread_notification(
++        grandchild_thread_id,
++        ServerNotification::ThreadStarted(ThreadStartedNotification {
++            thread: Thread {
++                id: grandchild_thread_id.to_string(),
++                session_id: parent_agent_thread_id.to_string(),
++                forked_from_id: None,
++                preview: "grandchild sub-agent thread".to_string(),
++                ephemeral: false,
++                model_provider: "agent-provider".to_string(),
++                created_at: 1,
++                updated_at: 2,
++                status: codex_app_server_protocol::ThreadStatus::Idle,
++                path: None,
++                cwd: test_path_buf("/tmp/grandchild").abs(),
++                cli_version: "0.0.0".to_string(),
++                source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
++                    parent_thread_id: parent_agent_thread_id,
++                    depth: 2,
++                    agent_path: None,
++                    agent_nickname: Some("Grandchild".to_string()),
++                    agent_role: Some("worker".to_string()),
++                }),
++                thread_source: None,
++                agent_nickname: Some("Grandchild".to_string()),
++                agent_role: Some("worker".to_string()),
++                git_info: None,
++                name: Some("grandchild sub-agent thread".to_string()),
++                turns: Vec::new(),
++            },
++        }),
++    )
++    .await?;
++
++    assert_eq!(
++        app.agent_navigation.get(&grandchild_thread_id),
++        Some(&AgentPickerThreadEntry {
++            agent_nickname: Some("Grandchild".to_string()),
++            agent_role: Some("worker".to_string()),
++            is_closed: false,
++        })
++    );
++
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn inactive_thread_started_notification_preserves_primary_model_when_path_missing()
+ -> Result<()> {
+@@ -2976,7 +3111,7 @@ async fn inactive_thread_started_notification_preserves_primary_model_when_path_
+         ServerNotification::ThreadStarted(ThreadStartedNotification {
+             thread: Thread {
+                 id: agent_thread_id.to_string(),
+-                session_id: agent_thread_id.to_string(),
++                session_id: main_thread_id.to_string(),
+                 forked_from_id: None,
+                 preview: "agent thread".to_string(),
+                 ephemeral: false,
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+index 0e1c8c4653..9300781d46 100644
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -829,6 +829,9 @@ impl App {
+         thread_id: ThreadId,
+         notification: ServerNotification,
+     ) -> Result<()> {
++        if !self.should_accept_thread_notification(thread_id, &notification) {
++            return Ok(());
++        }
+         if matches!(notification, ServerNotification::ThreadSettingsUpdated(_))
+             && self.primary_thread_id.is_some()
+             && self.primary_thread_id != Some(thread_id)
+@@ -884,6 +887,64 @@ impl App {
+         Ok(())
+     }
+ 
++    fn should_accept_thread_notification(
++        &self,
++        thread_id: ThreadId,
++        notification: &ServerNotification,
++    ) -> bool {
++        if self.primary_thread_id == Some(thread_id)
++            || self.thread_event_channels.contains_key(&thread_id)
++            || self.agent_navigation.get(&thread_id).is_some()
++        {
++            return true;
++        }
++
++        let ServerNotification::ThreadStarted(notification) = notification else {
++            return false;
++        };
++
++        self.thread_belongs_to_current_session_tree(&notification.thread)
++    }
++
++    fn thread_belongs_to_current_session_tree(
++        &self,
++        thread: &codex_app_server_protocol::Thread,
++    ) -> bool {
++        let Some(primary_thread_id) = self.primary_thread_id else {
++            return true;
++        };
++
++        if thread.session_id == primary_thread_id.to_string() {
++            return true;
++        }
++
++        if let Some(parent_thread_id) = thread
++            .forked_from_id
++            .as_deref()
++            .and_then(|thread_id| ThreadId::from_string(thread_id).ok())
++            && self.is_current_session_thread(parent_thread_id)
++        {
++            return true;
++        }
++
++        let codex_app_server_protocol::SessionSource::SubAgent(
++            codex_protocol::protocol::SubAgentSource::ThreadSpawn {
++                parent_thread_id, ..
++            },
++        ) = &thread.source
++        else {
++            return false;
++        };
++
++        self.is_current_session_thread(*parent_thread_id)
++    }
++
++    fn is_current_session_thread(&self, thread_id: ThreadId) -> bool {
++        self.primary_thread_id == Some(thread_id)
++            || self.thread_event_channels.contains_key(&thread_id)
++            || self.agent_navigation.get(&thread_id).is_some()
++    }
++
+     /// Locally remembers receiver threads referenced by a collab notification.
+     ///
+     /// This intentionally avoids app-server reads on the active-thread rendering path. During large
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+index a3413dd3be..2c505fbd04 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+@@ -7102,7 +7102,11 @@ mod tests {
+         }
+         assert!(composer.is_in_paste_burst());
+ 
+-        let (result, _) = composer.handle_submission_with_time(/*should_queue*/ true, now);
++        let (result, _) = composer.handle_submission_with_time(
++            /*should_queue*/ true,
++            SubmittedHookPolicy::RunUserPromptSubmit,
++            now,
++        );
+ 
+         assert_eq!(
+             result,

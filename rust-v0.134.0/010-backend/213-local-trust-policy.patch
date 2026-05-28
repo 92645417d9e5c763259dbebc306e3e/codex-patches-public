@@ -1,0 +1,652 @@
+diff --git a/codex-rs/app-server/src/config_manager.rs b/codex-rs/app-server/src/config_manager.rs
+index 25fdc5c0cb..3abe2223d0 100644
+--- a/codex-rs/app-server/src/config_manager.rs
++++ b/codex-rs/app-server/src/config_manager.rs
+@@ -73,6 +73,15 @@ impl ConfigManager {
+             .unwrap_or_default()
+     }
+ 
++    pub(crate) fn replace_cli_overrides(
++        &self,
++        cli_overrides: Vec<(String, TomlValue)>,
++    ) -> Result<(), ()> {
++        let mut current = self.cli_overrides.write().map_err(|_| ())?;
++        *current = cli_overrides;
++        Ok(())
++    }
++
+     pub(crate) fn current_cloud_requirements(&self) -> CloudRequirementsLoader {
+         self.cloud_requirements
+             .read()
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+index d0958e80ab..87e4c0a8b1 100644
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -265,7 +265,6 @@ use codex_chatgpt::workspace_settings;
+ use codex_config::CloudRequirementsLoadError;
+ use codex_config::CloudRequirementsLoadErrorCode;
+ use codex_config::ConfigLayerStack;
+-use codex_config::loader::project_trust_key;
+ use codex_config::types::McpServerTransportConfig;
+ use codex_core::CodexThread;
+ use codex_core::CodexThreadSettingsOverrides;
+@@ -282,6 +281,7 @@ use codex_core::ThreadManager;
+ use codex_core::config::Config;
+ use codex_core::config::ConfigOverrides;
+ use codex_core::config::NetworkProxyAuditMetadata;
++use codex_core::config::cli_overrides_with_project_trust;
+ use codex_core::config::edit::ConfigEdit;
+ use codex_core::config::edit::ConfigEditsBuilder;
+ use codex_core::connectors::AccessibleConnectorsStatus;
+@@ -439,7 +439,6 @@ use tokio::sync::watch;
+ use tokio_util::sync::CancellationToken;
+ use tokio_util::sync::DropGuard;
+ use tokio_util::task::TaskTracker;
+-use toml::Value as TomlValue;
+ use tracing::Instrument;
+ use tracing::error;
+ use tracing::info;
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+index 19e811cedc..31a91a3b7f 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -1019,43 +1019,21 @@ impl ThreadRequestProcessor {
+                 .await
+                 .unwrap_or_else(|| config.cwd.clone());
+             let current_cli_overrides = config_manager.current_cli_overrides();
+-            let cli_overrides_with_trust;
+-            let cli_overrides_for_reload = if let Err(err) =
+-                codex_core::config::set_project_trust_level(
+-                    &listener_task_context.codex_home,
+-                    trust_target.as_path(),
+-                    TrustLevel::Trusted,
+-                ) {
+-                warn!(
+-                    "failed to persist trusted project state for {}; continuing with in-memory trust for this thread: {err}",
+-                    trust_target.display()
+-                );
+-                let mut project = toml::map::Map::new();
+-                project.insert(
+-                    "trust_level".to_string(),
+-                    TomlValue::String("trusted".to_string()),
+-                );
+-                let mut projects = toml::map::Map::new();
+-                projects.insert(
+-                    project_trust_key(trust_target.as_path()),
+-                    TomlValue::Table(project),
+-                );
+-                cli_overrides_with_trust = current_cli_overrides
+-                    .iter()
+-                    .cloned()
+-                    .chain(std::iter::once((
+-                        "projects".to_string(),
+-                        TomlValue::Table(projects),
+-                    )))
+-                    .collect::<Vec<_>>();
+-                cli_overrides_with_trust.as_slice()
+-            } else {
+-                current_cli_overrides.as_slice()
+-            };
++            let cli_overrides_with_trust = cli_overrides_with_project_trust(
++                &current_cli_overrides,
++                trust_target.as_path(),
++                TrustLevel::Trusted,
++            );
++            if config_manager
++                .replace_cli_overrides(cli_overrides_with_trust.clone())
++                .is_err()
++            {
++                warn!("failed to persist in-memory project trust override");
++            }
+ 
+             config = config_manager
+                 .load_with_cli_overrides(
+-                    cli_overrides_for_reload,
++                    &cli_overrides_with_trust,
+                     config_overrides,
+                     typesafe_overrides,
+                     /*fallback_cwd*/ None,
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_start.rs b/codex-rs/app-server/tests/suite/v2/thread_start.rs
+index ecd8ad8e3d..c84327c91c 100644
+--- a/codex-rs/app-server/tests/suite/v2/thread_start.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_start.rs
+@@ -22,14 +22,9 @@ use codex_app_server_protocol::ThreadStartedNotification;
+ use codex_app_server_protocol::ThreadStatus;
+ use codex_app_server_protocol::ThreadStatusChangedNotification;
+ use codex_app_server_protocol::TurnEnvironmentParams;
+-use codex_config::loader::project_trust_key;
+ use codex_config::types::AuthCredentialsStoreMode;
+-use codex_core::config::set_project_trust_level;
+-use codex_exec_server::LOCAL_FS;
+-use codex_git_utils::resolve_root_git_project_for_trust;
+ use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
+ use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+-use codex_protocol::config_types::TrustLevel;
+ use codex_protocol::openai_models::ReasoningEffort;
+ use pretty_assertions::assert_eq;
+ use serde_json::Value;
+@@ -459,8 +454,6 @@ async fn thread_start_respects_project_config_from_cwd() -> Result<()> {
+ model_reasoning_effort = "high"
+ "#,
+     )?;
+-    set_project_trust_level(codex_home.path(), workspace.path(), TrustLevel::Trusted)?;
+-
+     let mut mcp = McpProcess::new(codex_home.path()).await?;
+     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+ 
+@@ -888,13 +881,8 @@ model_reasoning_effort = "high"
+     assert_eq!(reasoning_effort, Some(ReasoningEffort::High));
+ 
+     let config_toml = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+-    let workspace_abs = workspace.path().to_path_buf().abs();
+-    let trusted_root = resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &workspace_abs)
+-        .await
+-        .unwrap_or(workspace_abs);
+-    let trusted_root_key = project_trust_key(trusted_root.as_path());
+-    assert!(config_toml.contains(&trusted_root_key));
+-    assert!(config_toml.contains("trust_level = \"trusted\""));
++    assert!(!config_toml.contains("trust_level = \"trusted\""));
++    assert!(!config_toml.contains(&workspace.path().display().to_string()));
+ 
+     Ok(())
+ }
+@@ -928,14 +916,8 @@ async fn thread_start_with_nested_git_cwd_trusts_repo_root() -> Result<()> {
+     .await??;
+ 
+     let config_toml = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+-    let nested_abs = nested.abs();
+-    let trusted_root = resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &nested_abs)
+-        .await
+-        .expect("git root should resolve");
+-    let trusted_root_key = project_trust_key(trusted_root.as_path());
+-    let nested_key = project_trust_key(&nested);
+-    assert!(config_toml.contains(&trusted_root_key));
+-    assert!(!config_toml.contains(&nested_key));
++    assert!(!config_toml.contains("trust_level = \"trusted\""));
++    assert!(!config_toml.contains(&nested.display().to_string()));
+ 
+     Ok(())
+ }
+@@ -1009,55 +991,6 @@ async fn thread_start_preserves_untrusted_project_trust() -> Result<()> {
+     Ok(())
+ }
+ 
+-#[tokio::test]
+-async fn thread_start_skips_trust_write_when_project_is_already_trusted() -> Result<()> {
+-    let server = create_mock_responses_server_repeating_assistant("Done").await;
+-
+-    let codex_home = TempDir::new()?;
+-    create_config_toml_without_approval_policy(codex_home.path(), &server.uri())?;
+-
+-    let workspace = TempDir::new()?;
+-    let project_config_dir = workspace.path().join(".codex");
+-    std::fs::create_dir_all(&project_config_dir)?;
+-    std::fs::write(
+-        project_config_dir.join("config.toml"),
+-        r#"
+-model_reasoning_effort = "high"
+-"#,
+-    )?;
+-    set_project_trust_level(codex_home.path(), workspace.path(), TrustLevel::Trusted)?;
+-    let config_before = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+-
+-    let mut mcp = McpProcess::new(codex_home.path()).await?;
+-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+-
+-    let request_id = mcp
+-        .send_thread_start_request(ThreadStartParams {
+-            cwd: Some(workspace.path().display().to_string()),
+-            sandbox: Some(SandboxMode::WorkspaceWrite),
+-            ..Default::default()
+-        })
+-        .await?;
+-    let response: JSONRPCResponse = timeout(
+-        DEFAULT_READ_TIMEOUT,
+-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+-    )
+-    .await??;
+-    let ThreadStartResponse {
+-        approval_policy,
+-        reasoning_effort,
+-        ..
+-    } = to_response::<ThreadStartResponse>(response)?;
+-
+-    assert_eq!(approval_policy, AskForApproval::OnRequest);
+-    assert_eq!(reasoning_effort, Some(ReasoningEffort::High));
+-
+-    let config_after = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+-    assert_eq!(config_after, config_before);
+-
+-    Ok(())
+-}
+-
+ fn create_config_toml_without_approval_policy(
+     codex_home: &Path,
+     server_uri: &str,
+diff --git a/codex-rs/config/src/loader/mod.rs b/codex-rs/config/src/loader/mod.rs
+index e8972ce5ad..d62bc196d2 100644
+--- a/codex-rs/config/src/loader/mod.rs
++++ b/codex-rs/config/src/loader/mod.rs
+@@ -822,7 +822,7 @@ impl ProjectTrustContext {
+         }
+ 
+         ProjectTrustDecision {
+-            trust_level: None,
++            trust_level: Some(TrustLevel::Trusted),
+             trust_key: self
+                 .repo_root_key
+                 .clone()
+diff --git a/codex-rs/core/src/config/config_loader_tests.rs b/codex-rs/core/src/config/config_loader_tests.rs
+index 2682e6ef41..4be8f04ca4 100644
+--- a/codex-rs/core/src/config/config_loader_tests.rs
++++ b/codex-rs/core/src/config/config_loader_tests.rs
+@@ -2472,11 +2472,12 @@ async fn codex_home_within_project_tree_is_not_double_loaded() -> std::io::Resul
+ }
+ 
+ #[tokio::test]
+-async fn project_layers_disabled_when_untrusted_or_unknown() -> std::io::Result<()> {
++async fn project_layers_disable_only_explicitly_untrusted_projects() -> std::io::Result<()> {
+     let tmp = tempdir()?;
+     let project_root = tmp.path().join("project");
+     let nested = project_root.join("child");
+     tokio::fs::create_dir_all(nested.join(".codex")).await?;
++    tokio::fs::create_dir_all(project_root.join(".git")).await?;
+     tokio::fs::write(
+         nested.join(".codex").join(CONFIG_TOML_FILE),
+         r#"foo = "child"
+@@ -2574,8 +2575,8 @@ profile = "ignored"
+         .collect();
+     assert_eq!(project_layers_unknown.len(), 1);
+     assert!(
+-        project_layers_unknown[0].disabled_reason.is_some(),
+-        "expected unknown-trust project layer to be disabled"
++        project_layers_unknown[0].disabled_reason.is_none(),
++        "expected project layer with no trust entry to load by default"
+     );
+     assert_eq!(
+         project_layers_unknown[0].config.get("foo"),
+@@ -2587,7 +2588,7 @@ profile = "ignored"
+     );
+     assert_eq!(
+         layers_unknown.effective_config().get("foo"),
+-        Some(&TomlValue::String("user".to_string()))
++        Some(&TomlValue::String("child".to_string()))
+     );
+     assert_eq!(layers_unknown.startup_warnings(), Some(empty_warnings));
+ 
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index e9c3d77caa..45a8d5f352 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -8422,6 +8422,38 @@ async fn active_project_does_not_match_configured_alias_for_canonical_cwd() -> a
+     Ok(())
+ }
+ 
++#[test]
++fn cli_overrides_with_project_trust_merges_existing_projects_override() {
++    let project_dir = Path::new("/some/path");
++    let mut existing_project = toml::map::Map::new();
++    existing_project.insert("foo".to_string(), TomlValue::String("bar".to_string()));
++    let mut existing_projects = toml::map::Map::new();
++    existing_projects.insert(
++        project_trust_key(project_dir),
++        TomlValue::Table(existing_project),
++    );
++    let cli_overrides = vec![("projects".to_string(), TomlValue::Table(existing_projects))];
++
++    let merged = cli_overrides_with_project_trust(&cli_overrides, project_dir, TrustLevel::Trusted);
++
++    assert_eq!(merged.len(), 1);
++    let projects = merged[0]
++        .1
++        .as_table()
++        .expect("projects override should stay a table");
++    let project = projects[&project_trust_key(project_dir)]
++        .as_table()
++        .expect("project override should stay a table");
++    assert_eq!(
++        project.get("foo"),
++        Some(&TomlValue::String("bar".to_string()))
++    );
++    assert_eq!(
++        project.get("trust_level"),
++        Some(&TomlValue::String("trusted".to_string()))
++    );
++}
++
+ #[test]
+ fn test_set_default_oss_provider() -> std::io::Result<()> {
+     let temp_dir = TempDir::new()?;
+@@ -8917,6 +8949,32 @@ async fn test_untrusted_project_gets_unless_trusted_approval_policy() -> anyhow:
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn test_missing_project_entry_defaults_to_trusted() -> anyhow::Result<()> {
++    let codex_home = TempDir::new()?;
++    let test_project_dir = TempDir::new()?;
++    let test_path = test_project_dir.path();
++
++    let config = Config::load_from_base_config_with_overrides(
++        ConfigToml::default(),
++        ConfigOverrides {
++            cwd: Some(test_path.to_path_buf()),
++            ..Default::default()
++        },
++        codex_home.abs(),
++    )
++    .await?;
++
++    assert_eq!(
++        config.active_project,
++        ProjectConfig {
++            trust_level: Some(TrustLevel::Trusted),
++        }
++    );
++
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn requirements_disallowing_default_sandbox_falls_back_to_required_default()
+ -> std::io::Result<()> {
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index 7ae9138118..0c0ebd4031 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -1903,6 +1903,45 @@ pub fn set_project_trust_level(
+         .apply_blocking()
+ }
+ 
++pub fn cli_overrides_with_project_trust(
++    cli_overrides: &[(String, TomlValue)],
++    project_path: &Path,
++    trust_level: TrustLevel,
++) -> Vec<(String, TomlValue)> {
++    let mut overrides = cli_overrides.to_vec();
++    let project_key = project_trust_key(project_path);
++    let trust_level_value = TomlValue::String(trust_level.to_string());
++
++    if let Some((_, projects_value)) = overrides.iter_mut().find(|(path, _)| path == "projects")
++        && let Some(projects) = projects_value.as_table_mut()
++    {
++        match projects.get_mut(&project_key) {
++            Some(existing_project) => {
++                if let Some(existing_project_table) = existing_project.as_table_mut() {
++                    existing_project_table.insert("trust_level".to_string(), trust_level_value);
++                } else {
++                    let mut project = toml::map::Map::new();
++                    project.insert("trust_level".to_string(), trust_level_value);
++                    *existing_project = TomlValue::Table(project);
++                }
++            }
++            None => {
++                let mut project = toml::map::Map::new();
++                project.insert("trust_level".to_string(), trust_level_value);
++                projects.insert(project_key, TomlValue::Table(project));
++            }
++        }
++        return overrides;
++    }
++
++    let mut project = toml::map::Map::new();
++    project.insert("trust_level".to_string(), trust_level_value);
++    let mut projects = toml::map::Map::new();
++    projects.insert(project_key, TomlValue::Table(project));
++    overrides.push(("projects".to_string(), TomlValue::Table(projects)));
++    overrides
++}
++
+ /// Save the default OSS provider preference to config.toml
+ pub fn set_default_oss_provider(codex_home: &Path, provider: &str) -> std::io::Result<()> {
+     codex_config::config_toml::validate_oss_provider(provider)?;
+@@ -2620,7 +2659,9 @@ impl Config {
+                 resolved_cwd.as_path(),
+                 repo_root.as_ref().map(AbsolutePathBuf::as_path),
+             )
+-            .unwrap_or(ProjectConfig { trust_level: None });
++            .unwrap_or(ProjectConfig {
++                trust_level: Some(TrustLevel::Trusted),
++            });
+         let permission_config_syntax = resolve_permission_config_syntax(
+             &config_layer_stack,
+             &cfg,
+diff --git a/codex-rs/hooks/src/engine/discovery.rs b/codex-rs/hooks/src/engine/discovery.rs
+index 3ddf8f2387..4aa4e416e4 100644
+--- a/codex-rs/hooks/src/engine/discovery.rs
++++ b/codex-rs/hooks/src/engine/discovery.rs
+@@ -556,17 +556,13 @@ fn command_hook_hash(
+ 
+ fn hook_trust_status(
+     is_managed: bool,
+-    current_hash: &str,
+-    trusted_hash: Option<&str>,
++    _current_hash: &str,
++    _trusted_hash: Option<&str>,
+ ) -> HookTrustStatus {
+     if is_managed {
+         HookTrustStatus::Managed
+     } else {
+-        match trusted_hash {
+-            Some(trusted_hash) if trusted_hash == current_hash => HookTrustStatus::Trusted,
+-            Some(_) => HookTrustStatus::Modified,
+-            None => HookTrustStatus::Untrusted,
+-        }
++        HookTrustStatus::Trusted
+     }
+ }
+ 
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index 7348e3b452..684035fc91 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -7,6 +7,7 @@ use crate::legacy_core::check_execpolicy_for_warnings;
+ use crate::legacy_core::config::Config;
+ use crate::legacy_core::config::ConfigBuilder;
+ use crate::legacy_core::config::ConfigOverrides;
++use crate::legacy_core::config::cli_overrides_with_project_trust;
+ use crate::legacy_core::config::load_config_as_toml_with_cli_and_load_options;
+ use crate::legacy_core::config::resolve_oss_provider;
+ use crate::legacy_core::config::resolve_profile_v2_config_path;
+@@ -44,6 +45,8 @@ use codex_config::LoaderOverrides;
+ use codex_config::format_config_error_with_source;
+ use codex_exec_server::EnvironmentManager;
+ use codex_exec_server::ExecServerRuntimePaths;
++use codex_exec_server::LOCAL_FS;
++use codex_git_utils::resolve_root_git_project_for_trust;
+ use codex_login::AuthConfig;
+ use codex_login::default_client::originator;
+ use codex_login::default_client::set_default_client_residency_requirement;
+@@ -51,6 +54,7 @@ use codex_login::enforce_login_restrictions;
+ use codex_protocol::ThreadId;
+ use codex_protocol::config_types::AltScreenMode;
+ use codex_protocol::config_types::SandboxMode;
++use codex_protocol::config_types::TrustLevel;
+ use codex_protocol::config_types::WindowsSandboxLevel;
+ use codex_rollout::StateDbHandle;
+ use codex_rollout::state_db;
+@@ -1357,6 +1361,7 @@ async fn run_ratatui_app(
+     }
+     .with_remote_cwd_override(remote_cwd_override.clone());
+     let mut app_server = Some(app_server_session);
++    let mut effective_cli_kv_overrides = cli_kv_overrides.clone();
+ 
+     let should_show_trust_screen_flag =
+         !uses_remote_workspace && should_show_trust_screen(&initial_config);
+@@ -1406,6 +1411,19 @@ async fn run_ratatui_app(
+             });
+         }
+         trust_decision_was_made = onboarding_result.directory_trust_decision.is_some();
++        if onboarding_result.directory_trust_decision
++            == Some(onboarding::trust_directory::TrustDirectorySelection::Trust)
++        {
++            let trust_target =
++                resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &initial_config.cwd)
++                    .await
++                    .unwrap_or_else(|| initial_config.cwd.clone());
++            effective_cli_kv_overrides = cli_overrides_with_project_trust(
++                &effective_cli_kv_overrides,
++                trust_target.as_path(),
++                TrustLevel::Trusted,
++            );
++        }
+         // If this onboarding run included the login step, always refresh cloud requirements and
+         // rebuild config. This avoids missing newly available cloud requirements due to login
+         // status detection edge cases.
+@@ -1425,7 +1443,7 @@ async fn run_ratatui_app(
+             || (show_login_screen && !uses_remote_workspace)
+         {
+             load_config_or_exit(
+-                cli_kv_overrides.clone(),
++                effective_cli_kv_overrides.clone(),
+                 overrides.clone(),
+                 loader_overrides.clone(),
+                 cloud_requirements.clone(),
+@@ -1629,7 +1647,7 @@ async fn run_ratatui_app(
+     let mut config = match &session_selection {
+         resume_picker::SessionSelection::Resume(_) | resume_picker::SessionSelection::Fork(_) => {
+             load_config_or_exit_with_fallback_cwd(
+-                cli_kv_overrides.clone(),
++                effective_cli_kv_overrides.clone(),
+                 overrides.clone(),
+                 loader_overrides.clone(),
+                 cloud_requirements.clone(),
+@@ -1640,7 +1658,7 @@ async fn run_ratatui_app(
+         }
+         resume_picker::SessionSelection::StartFresh if picker_cancelled_without_selection => {
+             load_config_or_exit(
+-                cli_kv_overrides.clone(),
++                effective_cli_kv_overrides.clone(),
+                 overrides.clone(),
+                 loader_overrides.clone(),
+                 cloud_requirements.clone(),
+@@ -1683,7 +1701,7 @@ async fn run_ratatui_app(
+             &app_server_target,
+             arg0_paths,
+             config.clone(),
+-            cli_kv_overrides.clone(),
++            effective_cli_kv_overrides.clone(),
+             loader_overrides.clone(),
+             strict_config,
+             cloud_requirements.clone(),
+@@ -1716,7 +1734,7 @@ async fn run_ratatui_app(
+         &mut tui,
+         app_server,
+         config,
+-        cli_kv_overrides.clone(),
++        effective_cli_kv_overrides.clone(),
+         overrides.clone(),
+         loader_overrides.clone(),
+         prompt,
+diff --git a/codex-rs/tui/src/onboarding/mod.rs b/codex-rs/tui/src/onboarding/mod.rs
+index 016d086c54..df896bda5a 100644
+--- a/codex-rs/tui/src/onboarding/mod.rs
++++ b/codex-rs/tui/src/onboarding/mod.rs
+@@ -1,7 +1,7 @@
+ mod auth;
+ mod keys;
+ pub(crate) mod onboarding_screen;
+-mod trust_directory;
++pub(crate) mod trust_directory;
+ pub(crate) use auth::mark_underlined_hyperlink;
+ pub(crate) use auth::mark_url_hyperlink;
+ mod welcome;
+diff --git a/codex-rs/tui/src/onboarding/onboarding_screen.rs b/codex-rs/tui/src/onboarding/onboarding_screen.rs
+index 6edb6a6d86..83dcaeed70 100644
+--- a/codex-rs/tui/src/onboarding/onboarding_screen.rs
++++ b/codex-rs/tui/src/onboarding/onboarding_screen.rs
+@@ -111,7 +111,6 @@ impl OnboardingScreen {
+             config,
+         } = args;
+         let cwd = config.cwd.to_path_buf();
+-        let codex_home = config.codex_home.to_path_buf();
+         let forced_login_method = config.forced_login_method;
+         let mut steps: Vec<Step> = Vec::new();
+         steps.push(Step::Welcome(WelcomeWidget::new(
+@@ -154,7 +153,6 @@ impl OnboardingScreen {
+             steps.push(Step::TrustDirectory(TrustDirectoryWidget {
+                 cwd,
+                 trust_target,
+-                codex_home,
+                 show_windows_create_sandbox_hint,
+                 should_quit: false,
+                 selection: None,
+diff --git a/codex-rs/tui/src/onboarding/trust_directory.rs b/codex-rs/tui/src/onboarding/trust_directory.rs
+index ffc0c040a9..5a2223db33 100644
+--- a/codex-rs/tui/src/onboarding/trust_directory.rs
++++ b/codex-rs/tui/src/onboarding/trust_directory.rs
+@@ -1,7 +1,5 @@
+ use std::path::PathBuf;
+ 
+-use crate::legacy_core::config::set_project_trust_level;
+-use codex_protocol::config_types::TrustLevel;
+ use crossterm::event::KeyEvent;
+ use crossterm::event::KeyEventKind;
+ use ratatui::buffer::Buffer;
+@@ -24,7 +22,6 @@ use crate::selection_list::selection_option_row;
+ 
+ use super::onboarding_screen::StepState;
+ pub(crate) struct TrustDirectoryWidget {
+-    pub codex_home: PathBuf,
+     pub cwd: PathBuf,
+     pub trust_target: PathBuf,
+     pub show_windows_create_sandbox_hint: bool,
+@@ -166,12 +163,6 @@ impl StepStateProvider for TrustDirectoryWidget {
+ 
+ impl TrustDirectoryWidget {
+     fn handle_trust(&mut self) {
+-        let target = self.trust_target.clone();
+-        if let Err(e) = set_project_trust_level(&self.codex_home, &target, TrustLevel::Trusted) {
+-            tracing::error!("Failed to set project trusted: {e:?}");
+-            self.error = Some(format!("Failed to set trust for {}: {e}", target.display()));
+-        }
+-
+         self.selection = Some(TrustDirectorySelection::Trust);
+     }
+ 
+@@ -197,13 +188,10 @@ mod tests {
+     use pretty_assertions::assert_eq;
+     use ratatui::Terminal;
+     use std::path::PathBuf;
+-    use tempfile::TempDir;
+ 
+     #[test]
+     fn release_event_does_not_change_selection() {
+-        let codex_home = TempDir::new().expect("temp home");
+         let mut widget = TrustDirectoryWidget {
+-            codex_home: codex_home.path().to_path_buf(),
+             cwd: PathBuf::from("."),
+             trust_target: PathBuf::from("."),
+             show_windows_create_sandbox_hint: false,
+@@ -227,9 +215,7 @@ mod tests {
+ 
+     #[test]
+     fn renders_snapshot_for_git_repo() {
+-        let codex_home = TempDir::new().expect("temp home");
+         let widget = TrustDirectoryWidget {
+-            codex_home: codex_home.path().to_path_buf(),
+             cwd: PathBuf::from("/workspace/project"),
+             trust_target: PathBuf::from("/workspace/project"),
+             show_windows_create_sandbox_hint: false,
+@@ -247,4 +233,21 @@ mod tests {
+ 
+         insta::assert_snapshot!(terminal.backend());
+     }
++
++    #[test]
++    fn trust_does_not_write_config() {
++        let mut widget = TrustDirectoryWidget {
++            cwd: PathBuf::from("/workspace/project"),
++            trust_target: PathBuf::from("/workspace/project"),
++            show_windows_create_sandbox_hint: false,
++            should_quit: false,
++            selection: None,
++            highlighted: TrustDirectorySelection::Trust,
++            error: None,
++        };
++
++        widget.handle_trust();
++
++        assert_eq!(widget.selection, Some(TrustDirectorySelection::Trust));
++    }
+ }

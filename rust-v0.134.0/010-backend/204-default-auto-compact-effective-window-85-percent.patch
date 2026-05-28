@@ -1,0 +1,133 @@
+diff --git a/codex-rs/protocol/src/openai_models.rs b/codex-rs/protocol/src/openai_models.rs
+index 872509d86c..be9a40730b 100644
+--- a/codex-rs/protocol/src/openai_models.rs
++++ b/codex-rs/protocol/src/openai_models.rs
+@@ -257,6 +257,10 @@ const fn default_effective_context_window_percent() -> i64 {
+     95
+ }
+ 
++const fn default_auto_compact_context_percent() -> i64 {
++    85
++}
++
+ /// Model metadata returned by the Codex backend `/models` endpoint.
+ #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
+ pub struct ModelInfo {
+@@ -298,9 +302,9 @@ pub struct ModelInfo {
+     /// Maximum context window allowed for config overrides.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub max_context_window: Option<i64>,
+-    /// Token threshold for automatic compaction. When omitted, core derives it
+-    /// from `context_window` (90%). When provided, core clamps it to 90% of the
+-    /// context window when available.
++    /// Token threshold for automatic compaction. When omitted, core derives it from
++    /// the effective context window (85%). When provided, core clamps it to the
++    /// effective context window when available.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub auto_compact_token_limit: Option<i64>,
+     /// Percentage of the context window considered usable for inputs, after
+@@ -330,14 +334,16 @@ impl ModelInfo {
+     }
+ 
+     pub fn auto_compact_token_limit(&self) -> Option<i64> {
+-        let context_limit = self
++        let effective_context_window = self
+             .resolved_context_window()
+-            .map(|context_window| (context_window * 9) / 10);
++            .map(|context_window| (context_window * self.effective_context_window_percent) / 100);
+         let config_limit = self.auto_compact_token_limit;
+-        if let Some(context_limit) = context_limit {
+-            return Some(
+-                config_limit.map_or(context_limit, |limit| std::cmp::min(limit, context_limit)),
+-            );
++        if let Some(effective_context_window) = effective_context_window {
++            let default_limit =
++                (effective_context_window * default_auto_compact_context_percent()) / 100;
++            return Some(config_limit.map_or(default_limit, |limit| {
++                std::cmp::min(limit, effective_context_window)
++            }));
+         }
+         config_limit
+     }
+@@ -855,7 +861,56 @@ mod tests {
+         };
+ 
+         assert_eq!(model.resolved_context_window(), Some(400_000));
+-        assert_eq!(model.auto_compact_token_limit(), Some(360_000));
++        let expected_limit = (400_000 * model.effective_context_window_percent / 100)
++            * default_auto_compact_context_percent()
++            / 100;
++        assert_eq!(model.auto_compact_token_limit(), Some(expected_limit));
++    }
++
++    #[test]
++    fn default_auto_compact_token_limit_uses_effective_context_window() {
++        let context_window = 272_000;
++        let effective_context_window_percent = 95;
++        let model = ModelInfo {
++            context_window: Some(context_window),
++            effective_context_window_percent,
++            ..test_model(/*spec*/ None)
++        };
++
++        let expected_limit = (context_window * effective_context_window_percent / 100)
++            * default_auto_compact_context_percent()
++            / 100;
++        assert_eq!(model.auto_compact_token_limit(), Some(expected_limit));
++    }
++
++    #[test]
++    fn configured_auto_compact_token_limit_clamps_to_effective_context_window() {
++        let context_window = 272_000;
++        let effective_context_window_percent = 95;
++        let model = ModelInfo {
++            context_window: Some(context_window),
++            auto_compact_token_limit: Some(300_000),
++            effective_context_window_percent,
++            ..test_model(/*spec*/ None)
++        };
++
++        let effective_context_window = context_window * effective_context_window_percent / 100;
++        assert_eq!(
++            model.auto_compact_token_limit(),
++            Some(effective_context_window)
++        );
++    }
++
++    #[test]
++    fn configured_auto_compact_token_limit_below_default_limit_is_preserved() {
++        let model = ModelInfo {
++            context_window: Some(272_000),
++            auto_compact_token_limit: Some(180_000),
++            effective_context_window_percent: 95,
++            ..test_model(/*spec*/ None)
++        };
++
++        assert_eq!(model.auto_compact_token_limit(), Some(180_000));
+     }
+ 
+     #[test]
+@@ -868,7 +923,10 @@ mod tests {
+         };
+ 
+         assert_eq!(model.resolved_context_window(), Some(87_040));
+-        assert_eq!(model.auto_compact_token_limit(), Some(78_336));
++        let expected_limit = (87_040 * model.effective_context_window_percent / 100)
++            * default_auto_compact_context_percent()
++            / 100;
++        assert_eq!(model.auto_compact_token_limit(), Some(expected_limit));
+     }
+ 
+     #[test]
+@@ -881,7 +939,10 @@ mod tests {
+         };
+ 
+         assert_eq!(model.resolved_context_window(), Some(100_000));
+-        assert_eq!(model.auto_compact_token_limit(), Some(90_000));
++        let expected_limit = (100_000 * model.effective_context_window_percent / 100)
++            * default_auto_compact_context_percent()
++            / 100;
++        assert_eq!(model.auto_compact_token_limit(), Some(expected_limit));
+     }
+ 
+     #[test]

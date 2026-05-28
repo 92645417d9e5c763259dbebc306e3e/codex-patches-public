@@ -1,0 +1,588 @@
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+index 29b67d44f1..366274797c 100644
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -2037,6 +2037,7 @@ async fn run_interactive_tui(
+         .transpose()
+         .map_err(std::io::Error::other)?;
+     let mut default_local_daemon = false;
++    let mut default_local_daemon_app_server_version = None;
+     if let Some(remote_auth_token_env) = remote_auth_token_env {
+         let Some(endpoint) = remote_endpoint.as_mut() else {
+             return Ok(AppExitInfo::fatal(
+@@ -2063,6 +2064,7 @@ async fn run_interactive_tui(
+         let output = codex_app_server_daemon::run(AppServerLifecycleCommand::Start)
+             .await
+             .map_err(std::io::Error::other)?;
++        default_local_daemon_app_server_version = output.app_server_version.clone();
+         remote_endpoint = Some(codex_tui::RemoteAppServerEndpoint::UnixSocket {
+             socket_path: AbsolutePathBuf::from_absolute_path(output.socket_path)
+                 .map_err(std::io::Error::other)?,
+@@ -2076,6 +2078,7 @@ async fn run_interactive_tui(
+             codex_config::LoaderOverrides::default(),
+             remote_endpoint.clone(),
+             default_local_daemon,
++            default_local_daemon_app_server_version.clone(),
+         )
+     };
+     let mut attempted_repair = false;
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index 704a4d57a9..d6cf7e64ea 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -679,6 +679,7 @@ impl App {
+             initial_plan_type: self.chat_widget.current_plan_type(),
+             model: Some(self.chat_widget.current_model().to_string()),
+             startup_tooltip_override: None,
++            app_server_version: self.chat_widget.app_server_version().map(str::to_string),
+             status_line_invalid_items_warned: self.status_line_invalid_items_warned.clone(),
+             terminal_title_invalid_items_warned: self.terminal_title_invalid_items_warned.clone(),
+             session_telemetry: self.session_telemetry.clone(),
+@@ -702,6 +703,7 @@ impl App {
+         entered_trust_nux: bool,
+         should_prompt_windows_sandbox_nux_at_startup: bool,
+         app_server_target: AppServerTarget,
++        app_server_version: Option<String>,
+         state_db: Option<StateDbHandle>,
+         environment_manager: Arc<EnvironmentManager>,
+         startup_hooks_browser: Option<HooksListEntry>,
+@@ -857,6 +859,7 @@ impl App {
+                     initial_plan_type,
+                     model: Some(model.clone()),
+                     startup_tooltip_override,
++                    app_server_version: app_server_version.clone(),
+                     status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
+                     terminal_title_invalid_items_warned: terminal_title_invalid_items_warned
+                         .clone(),
+@@ -895,6 +898,7 @@ impl App {
+                     initial_plan_type,
+                     model: config.model.clone(),
+                     startup_tooltip_override: None,
++                    app_server_version: app_server_version.clone(),
+                     status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
+                     terminal_title_invalid_items_warned: terminal_title_invalid_items_warned
+                         .clone(),
+@@ -936,6 +940,7 @@ impl App {
+                     initial_plan_type,
+                     model: config.model.clone(),
+                     startup_tooltip_override: None,
++                    app_server_version: app_server_version.clone(),
+                     status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
+                     terminal_title_invalid_items_warned: terminal_title_invalid_items_warned
+                         .clone(),
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index 0f1de45ecc..ae002bb066 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -311,6 +311,7 @@ async fn enqueue_primary_thread_session_replays_turns_before_initial_prompt_subm
+         initial_plan_type: None,
+         model: Some(model),
+         startup_tooltip_override: None,
++        app_server_version: Some(CODEX_CLI_VERSION.to_string()),
+         status_line_invalid_items_warned: app.status_line_invalid_items_warned.clone(),
+         terminal_title_invalid_items_warned: app.terminal_title_invalid_items_warned.clone(),
+         session_telemetry: app.session_telemetry.clone(),
+@@ -5046,6 +5047,7 @@ async fn replace_chat_widget_reseeds_collab_agent_metadata_for_replay() {
+         initial_plan_type: app.chat_widget.current_plan_type(),
+         model: Some(app.chat_widget.current_model().to_string()),
+         startup_tooltip_override: None,
++        app_server_version: app.chat_widget.app_server_version().map(str::to_string),
+         status_line_invalid_items_warned: app.status_line_invalid_items_warned.clone(),
+         terminal_title_invalid_items_warned: app.terminal_title_invalid_items_warned.clone(),
+         session_telemetry: app.session_telemetry.clone(),
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+index d0d2ebf58c..6238bf04d1 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -133,6 +133,17 @@ where
+                 continue;
+             }
+         }
++        if matches!(
++            item,
++            StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit
++        ) {
++            let text = line.to_string();
++            if let Some((label, pace)) = split_limit_pace_segment(&text) {
++                spans.push(Span::styled(format!("{label} "), style));
++                spans.push(Span::styled(format!("{pace:+}%"), limit_pace_style(pace)));
++                continue;
++            }
++        }
+ 
+         for mut span in line.spans {
+             if span.style == Style::default() {
+@@ -167,6 +178,26 @@ fn parse_context_remaining_percent(text: &str) -> Option<i64> {
+     Some(percent)
+ }
+ 
++fn split_limit_pace_segment(text: &str) -> Option<(&str, i64)> {
++    let (label, pace) = text.rsplit_once(' ')?;
++    let pace = pace.strip_suffix('%')?;
++    let pace = pace.parse::<i64>().ok()?;
++    Some((label, pace))
++}
++
++fn limit_pace_style(pace: i64) -> Style {
++    let color = if pace < -15 {
++        Color::Red
++    } else if pace < 0 {
++        CONTEXT_REMAINING_ORANGE
++    } else if pace <= 15 {
++        Color::Green
++    } else {
++        Color::Cyan
++    };
++    Style::default().fg(color).add_modifier(Modifier::BOLD)
++}
++
+ pub(crate) fn context_remaining_label_spans(percent: i64, base_style: Style) -> Vec<Span<'static>> {
+     let percent = percent.clamp(0, 100);
+     vec![
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 1543897021..8d83838b72 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -502,6 +502,7 @@ pub(crate) struct ChatWidgetInit {
+     pub(crate) initial_plan_type: Option<PlanType>,
+     pub(crate) model: Option<String>,
+     pub(crate) startup_tooltip_override: Option<String>,
++    pub(crate) app_server_version: Option<String>,
+     // Shared latch so we only warn once about invalid status-line item IDs.
+     pub(crate) status_line_invalid_items_warned: Arc<AtomicBool>,
+     // Shared latch so we only warn once about invalid terminal-title item IDs.
+@@ -681,6 +682,7 @@ pub(crate) struct ChatWidget {
+     instruction_source_paths: Vec<AbsolutePathBuf>,
+     // Runtime network proxy bind addresses from SessionConfigured.
+     session_network_proxy: Option<SessionNetworkProxyRuntime>,
++    app_server_version: Option<String>,
+     // Shared latch so we only warn once about invalid status-line item IDs.
+     status_line_invalid_items_warned: Arc<AtomicBool>,
+     // Shared latch so we only warn once about invalid terminal-title item IDs.
+@@ -1861,6 +1863,10 @@ impl ChatWidget {
+         self.bottom_pane.status_line_text()
+     }
+ 
++    pub(crate) fn app_server_version(&self) -> Option<&str> {
++        self.app_server_version.as_deref()
++    }
++
+     pub(crate) fn clear_token_usage(&mut self) {
+         self.token_info = None;
+     }
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index ef90c85d4c..0baa7860ab 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -27,6 +27,7 @@ impl ChatWidget {
+             initial_plan_type,
+             model,
+             startup_tooltip_override,
++            app_server_version,
+             status_line_invalid_items_warned,
+             terminal_title_invalid_items_warned,
+             session_telemetry,
+@@ -198,6 +199,7 @@ impl ChatWidget {
+             workspace_command_runner,
+             instruction_source_paths: Vec::new(),
+             session_network_proxy: None,
++            app_server_version,
+             status_line_invalid_items_warned,
+             terminal_title_invalid_items_warned,
+             last_terminal_title: None,
+diff --git a/codex-rs/tui/src/chatwidget/status_controls.rs b/codex-rs/tui/src/chatwidget/status_controls.rs
+index b1970d48dd..9914a6c93c 100644
+--- a/codex-rs/tui/src/chatwidget/status_controls.rs
++++ b/codex-rs/tui/src/chatwidget/status_controls.rs
+@@ -377,7 +377,11 @@ impl ChatWidget {
+     ) -> Option<String> {
+         let window = window?;
+         let remaining = (100.0f64 - window.used_percent).clamp(0.0f64, 100.0f64);
+-        Some(format!("{label} {remaining:.0}%"))
++        if let Some(pace_percent) = window.pace_percent(Local::now()) {
++            Some(format!("{label} {remaining:.0}% {pace_percent:+}%"))
++        } else {
++            Some(format!("{label} {remaining:.0}%"))
++        }
+     }
+ 
+     pub(super) fn status_line_reasoning_effort_label(
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 21d2811069..e1583c8dc1 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -20,6 +20,10 @@ use codex_protocol::config_types::ApprovalsReviewer;
+ use codex_protocol::config_types::ServiceTier;
+ use codex_protocol::models::PermissionProfile;
+ use codex_utils_sandbox_summary::summarize_permission_profile;
++use ratatui::style::Color;
++use ratatui::style::Modifier;
++use ratatui::style::Style;
++use ratatui::text::Line;
+ use ratatui::text::Span;
+ 
+ use super::status_state::TerminalTitleStatusKind;
+@@ -626,7 +630,7 @@ impl ChatWidget {
+                 let label = limit_label_for_window(window.window_minutes, is_secondary);
+                 self.status_line_limit_display(Some(window), &label)
+             }
+-            StatusLineItem::CodexVersion => Some(CODEX_CLI_VERSION.to_string()),
++            StatusLineItem::CodexVersion => Some(self.status_line_version_text()),
+             StatusLineItem::ContextWindowSize => self
+                 .status_line_context_window_size()
+                 .map(|cws| format!("{} window", format_tokens_compact(cws))),
+@@ -701,12 +705,26 @@ impl ChatWidget {
+         }
+     }
+ 
++    fn status_line_version_text(&self) -> String {
++        match self.app_server_version.as_deref() {
++            Some(app_server_version) if app_server_version != CODEX_CLI_VERSION => {
++                format!("{CODEX_CLI_VERSION} {app_server_version}")
++            }
++            _ => CODEX_CLI_VERSION.to_string(),
++        }
++    }
++
++    fn status_line_version_display_line(&self) -> Line<'static> {
++        status_line_version_display_line(CODEX_CLI_VERSION, self.app_server_version.as_deref())
++    }
++
+     fn status_line_line_for_item(&mut self, item: &StatusLineItem) -> Option<Line<'static>> {
+         match item {
+             StatusLineItem::ModelName => Some(self.model_display_line()),
+             StatusLineItem::ModelWithReasoning => Some(self.model_with_reasoning_display_line()),
+             StatusLineItem::FastMode => Some(self.fast_mode_display_line()),
+             StatusLineItem::Account => self.status_line_account_display_line(),
++            StatusLineItem::CodexVersion => Some(self.status_line_version_display_line()),
+             _ => self.status_line_value_for_item(*item).map(Line::from),
+         }
+     }
+@@ -1152,6 +1170,87 @@ fn approval_mode_display(config: &Config) -> String {
+     }
+ }
+ 
++fn app_server_version_mismatch_style(cli_version: &str, app_server_version: &str) -> Style {
++    let color = match (
++        ParsedCodexVersion::parse(cli_version),
++        ParsedCodexVersion::parse(app_server_version),
++    ) {
++        (Some(cli), Some(app_server)) if cli.is_within_one_version_of(app_server) => Color::Yellow,
++        _ => Color::Red,
++    };
++    Style::default().fg(color)
++}
++
++fn status_line_version_display_line(
++    cli_version: &str,
++    app_server_version: Option<&str>,
++) -> Line<'static> {
++    let Some(app_server_version) = app_server_version else {
++        return Line::from(vec![Span::styled(
++            cli_version.to_string(),
++            Style::default().fg(Color::Green),
++        )]);
++    };
++    if app_server_version == cli_version {
++        return Line::from(vec![Span::styled(
++            cli_version.to_string(),
++            Style::default().fg(Color::Green),
++        )]);
++    }
++
++    Line::from(vec![
++        Span::styled(
++            cli_version.to_string(),
++            Style::default().add_modifier(Modifier::DIM),
++        ),
++        " ".into(),
++        Span::styled(
++            app_server_version.to_string(),
++            app_server_version_mismatch_style(cli_version, app_server_version),
++        ),
++    ])
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++struct ParsedCodexVersion {
++    major: u64,
++    minor: u64,
++    patch: u64,
++}
++
++impl ParsedCodexVersion {
++    fn parse(value: &str) -> Option<Self> {
++        let value = value.trim();
++        let value = value
++            .strip_prefix("rust-v")
++            .or_else(|| value.strip_prefix('v'))
++            .unwrap_or(value);
++        let numeric = value.split_once('-').map_or(value, |(numeric, _)| numeric);
++        let mut parts = numeric.split('.');
++        let major = parts.next()?.parse().ok()?;
++        let minor = parts.next()?.parse().ok()?;
++        let patch = parts.next()?.parse().ok()?;
++        if parts.next().is_some() {
++            return None;
++        }
++        Some(Self {
++            major,
++            minor,
++            patch,
++        })
++    }
++
++    fn is_within_one_version_of(self, other: Self) -> bool {
++        if self.major != other.major {
++            return false;
++        }
++        if self.minor == other.minor {
++            return self.patch.abs_diff(other.patch) <= 1;
++        }
++        self.minor.abs_diff(other.minor) <= 1
++    }
++}
++
+ fn parse_items_with_invalids<T>(ids: impl IntoIterator<Item = String>) -> (Vec<T>, Vec<String>)
+ where
+     T: std::str::FromStr,
+@@ -1177,6 +1276,66 @@ mod tests {
+     use super::*;
+     use pretty_assertions::assert_eq;
+ 
++    #[test]
++    fn version_status_line_uses_single_green_version_when_versions_match() {
++        let line = status_line_version_display_line("0.132.0", Some("0.132.0"));
++
++        assert_eq!(line.spans.len(), 1);
++        assert_eq!(line.spans[0].content.as_ref(), "0.132.0");
++        assert_eq!(line.spans[0].style.fg, Some(Color::Green));
++    }
++
++    #[test]
++    fn version_status_line_dims_cli_and_colors_app_server_on_mismatch() {
++        let line = status_line_version_display_line("0.132.0", Some("0.132.2"));
++
++        assert_eq!(
++            line.spans
++                .iter()
++                .map(|span| span.content.as_ref())
++                .collect::<String>(),
++            "0.132.0 0.132.2"
++        );
++        assert!(line.spans[0].style.add_modifier.contains(Modifier::DIM));
++        assert_eq!(line.spans[2].style.fg, Some(Color::Red));
++    }
++
++    #[test]
++    fn app_server_version_mismatch_style_marks_adjacent_versions_yellow() {
++        let cases = [
++            ("0.132.0", "0.132.1"),
++            ("0.132.1", "0.132.0"),
++            ("0.132.0-alpha.1", "0.132.0"),
++            ("0.132.0", "0.133.0"),
++        ];
++
++        for (cli_version, app_server_version) in cases {
++            assert_eq!(
++                app_server_version_mismatch_style(cli_version, app_server_version).fg,
++                Some(Color::Yellow),
++                "{cli_version} vs {app_server_version}"
++            );
++        }
++    }
++
++    #[test]
++    fn app_server_version_mismatch_style_marks_larger_drift_red() {
++        let cases = [
++            ("0.132.0", "0.132.2"),
++            ("0.132.0", "0.130.0"),
++            ("0.132.0", "1.132.0"),
++            ("0.132.0", "not-a-version"),
++        ];
++
++        for (cli_version, app_server_version) in cases {
++            assert_eq!(
++                app_server_version_mismatch_style(cli_version, app_server_version).fg,
++                Some(Color::Red),
++                "{cli_version} vs {app_server_version}"
++            );
++        }
++    }
++
+     #[allow(clippy::disallowed_methods)]
+     #[test]
+     fn reasoning_effort_status_line_uses_color_without_dim_override() {
+diff --git a/codex-rs/tui/src/chatwidget/tests/helpers.rs b/codex-rs/tui/src/chatwidget/tests/helpers.rs
+index 63487f18b9..560786278b 100644
+--- a/codex-rs/tui/src/chatwidget/tests/helpers.rs
++++ b/codex-rs/tui/src/chatwidget/tests/helpers.rs
+@@ -175,6 +175,7 @@ pub(super) async fn make_chatwidget_manual(
+         initial_plan_type: None,
+         model: Some(resolved_model.clone()),
+         startup_tooltip_override: None,
++        app_server_version: Some(CODEX_CLI_VERSION.to_string()),
+         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
+         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
+         session_telemetry,
+diff --git a/codex-rs/tui/src/chatwidget/tests/plan_mode.rs b/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
+index 0311ea79ca..3a953e0213 100644
+--- a/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
++++ b/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
+@@ -1508,6 +1508,7 @@ async fn make_startup_chat_with_cli_overrides(
+         initial_plan_type: None,
+         model: Some(resolved_model),
+         startup_tooltip_override: None,
++        app_server_version: Some(CODEX_CLI_VERSION.to_string()),
+         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
+         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
+         session_telemetry,
+diff --git a/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs b/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
+index 699e82a443..04265da9d5 100644
+--- a/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
++++ b/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
+@@ -86,6 +86,7 @@ async fn experimental_mode_plan_is_ignored_on_startup() {
+         initial_plan_type: None,
+         model: Some(resolved_model.clone()),
+         startup_tooltip_override: None,
++        app_server_version: Some(CODEX_CLI_VERSION.to_string()),
+         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
+         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
+         session_telemetry,
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index dfd07d059d..847f3c609b 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -428,6 +428,7 @@ async fn configured_pet_load_is_deferred_until_after_construction() {
+         initial_plan_type: None,
+         model: Some(resolved_model),
+         startup_tooltip_override: None,
++        app_server_version: Some(CODEX_CLI_VERSION.to_string()),
+         status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
+         terminal_title_invalid_items_warned: Arc::new(AtomicBool::new(false)),
+         session_telemetry,
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index 69ffe3ca82..f66b7cfaf5 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -871,6 +871,7 @@ pub async fn run_main(
+     loader_overrides: LoaderOverrides,
+     explicit_remote_endpoint: Option<RemoteAppServerEndpoint>,
+     explicit_remote_endpoint_is_default_local_daemon: bool,
++    default_local_daemon_app_server_version: Option<String>,
+ ) -> std::io::Result<AppExitInfo> {
+     let strict_config = cli.strict_config;
+     let (sandbox_mode, approval_policy) = if cli.dangerously_bypass_approvals_and_sandbox {
+@@ -940,6 +941,13 @@ pub async fn run_main(
+         default_daemon,
+         reuse_implicit_local_daemon,
+     );
++    let app_server_version = if matches!(app_server_target, AppServerTarget::Embedded) {
++        Some(env!("CARGO_PKG_VERSION").to_string())
++    } else if matches!(app_server_target, AppServerTarget::LocalDaemon { .. }) {
++        default_local_daemon_app_server_version
++    } else {
++        None
++    };
+     let remote_cwd_override = cli
+         .cwd
+         .clone()
+@@ -1277,6 +1285,7 @@ pub async fn run_main(
+         log_db,
+         state_db,
+         environment_manager,
++        app_server_version,
+     )
+     .await
+     .map_err(|err| std::io::Error::other(err.to_string()))
+@@ -1298,6 +1307,7 @@ async fn run_ratatui_app(
+     log_db: Option<log_db::LogDbLayer>,
+     state_db: Option<StateDbHandle>,
+     environment_manager: Arc<EnvironmentManager>,
++    app_server_version: Option<String>,
+ ) -> color_eyre::Result<AppExitInfo> {
+     let uses_remote_workspace = app_server_target.uses_remote_workspace();
+     color_eyre::install()?;
+@@ -1758,6 +1768,7 @@ async fn run_ratatui_app(
+         should_show_trust_screen_flag, // Preserve the startup-time trust NUX signal before onboarding
+         should_prompt_windows_sandbox_nux_at_startup,
+         app_server_target,
++        app_server_version,
+         state_db,
+         environment_manager,
+         startup_hooks_browser,
+diff --git a/codex-rs/tui/src/main.rs b/codex-rs/tui/src/main.rs
+index 10e4fd3e03..cfbe173369 100644
+--- a/codex-rs/tui/src/main.rs
++++ b/codex-rs/tui/src/main.rs
+@@ -58,6 +58,7 @@ fn main() -> anyhow::Result<()> {
+             LoaderOverrides::default(),
+             /*explicit_remote_endpoint*/ None,
+             /*explicit_remote_endpoint_is_default_local_daemon*/ false,
++            /*default_local_daemon_app_server_version*/ None,
+         )
+         .await?;
+         match exit_info.exit_reason {
+diff --git a/codex-rs/tui/src/status/rate_limits.rs b/codex-rs/tui/src/status/rate_limits.rs
+index 1146bb8a31..dad2c8e865 100644
+--- a/codex-rs/tui/src/status/rate_limits.rs
++++ b/codex-rs/tui/src/status/rate_limits.rs
+@@ -67,6 +67,8 @@ pub(crate) struct RateLimitWindowDisplay {
+     pub used_percent: f64,
+     /// Human-readable local reset time.
+     pub resets_at: Option<String>,
++    /// Local reset timestamp, used for pace calculations.
++    pub resets_at_time: Option<DateTime<Local>>,
+     /// Window length in minutes when provided by the server.
+     pub window_minutes: Option<i64>,
+ }
+@@ -82,9 +84,27 @@ impl RateLimitWindowDisplay {
+         Self {
+             used_percent: f64::from(window.used_percent),
+             resets_at,
++            resets_at_time: resets_at_utc,
+             window_minutes: window.window_duration_mins,
+         }
+     }
++
++    pub(crate) fn pace_percent(&self, captured_at: DateTime<Local>) -> Option<i64> {
++        let window_minutes = self.window_minutes?;
++        if window_minutes <= 0 {
++            return None;
++        }
++        let resets_at = self.resets_at_time?;
++        let remaining_seconds = (resets_at - captured_at).num_seconds().max(0);
++        let window_seconds = window_minutes.saturating_mul(60);
++        if window_seconds <= 0 {
++            return None;
++        }
++
++        let left_fraction = ((100.0 - self.used_percent) / 100.0).clamp(0.0, 1.0);
++        let remaining_fraction = (remaining_seconds as f64 / window_seconds as f64).clamp(0.0, 1.0);
++        Some(((left_fraction - remaining_fraction) * 100.0).round() as i64)
++    }
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -355,6 +375,7 @@ mod tests {
+         RateLimitWindowDisplay {
+             used_percent,
+             resets_at: Some("soon".to_string()),
++            resets_at_time: None,
+             window_minutes: Some(300),
+         }
+     }
+@@ -412,11 +433,13 @@ mod tests {
+             primary: Some(RateLimitWindowDisplay {
+                 used_percent: 20.0,
+                 resets_at: Some("soon".to_string()),
++                resets_at_time: None,
+                 window_minutes: Some(60),
+             }),
+             secondary: Some(RateLimitWindowDisplay {
+                 used_percent: 40.0,
+                 resets_at: Some("later".to_string()),
++                resets_at_time: None,
+                 window_minutes: Some(2 * 60),
+             }),
+             credits: None,

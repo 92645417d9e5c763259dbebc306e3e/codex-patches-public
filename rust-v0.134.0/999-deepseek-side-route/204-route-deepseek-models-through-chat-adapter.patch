@@ -1,0 +1,476 @@
+diff --git a/codex-rs/core/src/chat_completions.rs b/codex-rs/core/src/chat_completions.rs
+index 25067f3678..93066d23d7 100644
+--- a/codex-rs/core/src/chat_completions.rs
++++ b/codex-rs/core/src/chat_completions.rs
+@@ -795,6 +795,20 @@ fn chat_reasoning_effort(
+     if !supports_chat_reasoning(model_info) {
+         return None;
+     }
++    if deepseek_side_route::is_deepseek_model(&model_info.slug) {
++        return match effort.or(model_info.default_reasoning_level) {
++            Some(
++                ReasoningEffort::None
++                | ReasoningEffort::Minimal
++                | ReasoningEffort::Low
++                | ReasoningEffort::High,
++            ) => Some(ChatReasoningEffort::High),
++            Some(ReasoningEffort::Medium | ReasoningEffort::XHigh) => {
++                Some(ChatReasoningEffort::Max)
++            }
++            None => None,
++        };
++    }
+     if mimo_side_route::is_mimo_model(&model_info.slug) {
+         return match effort.or(model_info.default_reasoning_level) {
+             Some(ReasoningEffort::Low | ReasoningEffort::High) | None => {
+@@ -1646,7 +1660,7 @@ mod tests {
+     fn model_info() -> ModelInfo {
+         serde_json::from_value(serde_json::json!({
+             "slug": "deepseek-v4",
+-            "display_name": "DeepSeek V4",
++            "display_name": "DeepSeek-V4",
+             "description": null,
+             "default_reasoning_level": "high",
+             "supported_reasoning_levels": [],
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index ac2d38173b..be96e50c13 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -33,6 +33,8 @@ use std::sync::atomic::Ordering;
+ 
+ use codex_api::ApiError;
+ use codex_api::AuthProvider;
++use codex_api::ChatCompletionsClient as ApiChatCompletionsClient;
++use codex_api::ChatCompletionsOptions as ApiChatCompletionsOptions;
+ use codex_api::CompactClient as ApiCompactClient;
+ use codex_api::CompactionInput as ApiCompactionInput;
+ use codex_api::Compression;
+@@ -61,6 +63,7 @@ use codex_api::auth_header_telemetry;
+ use codex_api::build_session_headers;
+ use codex_api::create_text_param_for_request;
+ use codex_api::response_create_client_metadata;
++use codex_api::spawn_chat_completions_stream;
+ use codex_app_server_protocol::AuthMode;
+ use codex_login::AuthManager;
+ use codex_login::CodexAuth;
+@@ -111,9 +114,12 @@ use tracing::warn;
+ use crate::attestation::AttestationContext;
+ use crate::attestation::AttestationProvider;
+ use crate::attestation::X_OAI_ATTESTATION_HEADER;
++use crate::chat_completions::ChatToolStrictMode;
++use crate::chat_completions::build_chat_completions_request_parts;
+ use crate::client_common::Prompt;
+ use crate::client_common::ResponseEvent;
+ use crate::client_common::ResponseStream;
++use crate::deepseek_side_route;
+ use crate::feedback_tags;
+ use crate::mimo_side_route;
+ use crate::util::emit_feedback_auth_recovery_tags;
+@@ -149,6 +155,7 @@ const X_CODEX_WS_STREAM_REQUEST_START_MS_CLIENT_METADATA_KEY: &str =
+     "x-codex-ws-stream-request-start-ms";
+ const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
+ const RESPONSES_ENDPOINT: &str = "/responses";
++const CHAT_COMPLETIONS_ENDPOINT: &str = "/chat/completions";
+ const RESPONSES_COMPACT_ENDPOINT: &str = "/responses/compact";
+ // `/responses/compact` is unary, so the timeout covers the full response rather than one idle
+ // period between stream events.
+@@ -1224,6 +1231,75 @@ impl ModelClientSession {
+         }
+     }
+ 
++    #[allow(clippy::too_many_arguments)]
++    #[instrument(
++        name = "model_client.stream_deepseek_chat_completions",
++        level = "info",
++        skip_all,
++        fields(
++            model = %model_info.slug,
++            transport = "chat_completions_http",
++            http.method = "POST",
++            api.path = "chat/completions",
++            turn.has_metadata_header = turn_metadata_header.is_some()
++        )
++    )]
++    async fn stream_deepseek_chat_completions(
++        &self,
++        prompt: &Prompt,
++        model_info: &ModelInfo,
++        session_telemetry: &SessionTelemetry,
++        effort: Option<ReasoningEffortConfig>,
++        _summary: ReasoningSummaryConfig,
++        _service_tier: Option<String>,
++        turn_metadata_header: Option<&str>,
++        inference_trace: &InferenceTraceContext,
++    ) -> Result<ResponseStream> {
++        let codex_home = crate::config::find_codex_home()?;
++        let (api_provider, api_auth) = deepseek_side_route::provider_and_auth(&codex_home)?;
++        let transport = ReqwestTransport::new(build_reqwest_client());
++        let request_auth_context = AuthRequestTelemetryContext::new(
++            None,
++            api_auth.as_ref(),
++            PendingUnauthorizedRetry::default(),
++        );
++        let (request_telemetry, _sse_telemetry) = Self::build_streaming_telemetry(
++            session_telemetry,
++            request_auth_context,
++            RequestRouteTelemetry::for_endpoint(CHAT_COMPLETIONS_ENDPOINT),
++            self.client.state.auth_env_telemetry.clone(),
++        );
++        let request_parts = build_chat_completions_request_parts(
++            prompt,
++            model_info,
++            effort,
++            _service_tier.as_deref(),
++            ChatToolStrictMode::Enabled,
++        )?;
++        let request = request_parts.request;
++        let tool_aliases = request_parts.tool_aliases;
++        let inference_trace_attempt = inference_trace.start_attempt();
++        inference_trace_attempt.record_started(&request);
++
++        let client = ApiChatCompletionsClient::new(transport, api_provider, api_auth)
++            .with_telemetry(Some(request_telemetry));
++        let stream_response = client
++            .stream_request(request, ApiChatCompletionsOptions::default())
++            .await
++            .map_err(map_api_error)?;
++        let api_stream = spawn_chat_completions_stream(
++            stream_response,
++            Duration::from_millis(300_000),
++            tool_aliases,
++        );
++        let (stream, _) = map_response_stream(
++            api_stream,
++            session_telemetry.clone(),
++            inference_trace_attempt,
++        );
++        Ok(stream)
++    }
++
+     #[allow(clippy::too_many_arguments)]
+     #[instrument(
+         name = "model_client.stream_mimo_chat_completions",
+@@ -1616,6 +1692,7 @@ impl ModelClientSession {
+         if self.websocket_session.last_request.is_some() {
+             return Ok(());
+         }
++
+         let disabled_trace = InferenceTraceContext::disabled();
+         match self
+             .stream_responses_websocket(
+@@ -1667,6 +1744,20 @@ impl ModelClientSession {
+         turn_metadata_header: Option<&str>,
+         inference_trace: &InferenceTraceContext,
+     ) -> Result<ResponseStream> {
++        if deepseek_side_route::is_deepseek_model(&model_info.slug) {
++            return self
++                .stream_deepseek_chat_completions(
++                    prompt,
++                    model_info,
++                    session_telemetry,
++                    effort,
++                    summary,
++                    service_tier,
++                    turn_metadata_header,
++                    inference_trace,
++                )
++                .await;
++        }
+         if mimo_side_route::is_mimo_model(&model_info.slug) {
+             return self
+                 .stream_mimo_chat_completions(
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index 9b9296d6b3..b92b9630e9 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -7,8 +7,10 @@
+ 
+ mod apply_patch;
+ mod apps;
++mod chat_completions;
+ mod client;
+ mod client_common;
++mod deepseek_side_route;
+ pub mod mimo_side_route;
+ mod realtime_context;
+ mod realtime_conversation;
+diff --git a/codex-rs/core/src/tools/spec_plan.rs b/codex-rs/core/src/tools/spec_plan.rs
+index c3656f2434..efaca4cb05 100644
+--- a/codex-rs/core/src/tools/spec_plan.rs
++++ b/codex-rs/core/src/tools/spec_plan.rs
+@@ -57,6 +57,7 @@ use crate::tools::router::ToolRouterParams;
+ use codex_features::Feature;
+ use codex_login::AuthManager;
+ use codex_mcp::ToolInfo;
++use codex_model_provider::ProviderCapabilities;
+ use codex_protocol::dynamic_tools::DynamicToolSpec;
+ use codex_protocol::openai_models::ConfigShellToolType;
+ use codex_protocol::openai_models::InputModality;
+@@ -240,7 +241,7 @@ fn spec_for_model_request(
+ 
+ pub(crate) fn hosted_model_tool_specs(turn_context: &TurnContext) -> Vec<ToolSpec> {
+     let mut specs = Vec::new();
+-    let provider_capabilities = turn_context.provider.capabilities();
++    let provider_capabilities = model_tool_capabilities(turn_context);
+     let web_search_mode = provider_capabilities
+         .web_search
+         .then_some(turn_context.config.web_search_mode.value());
+@@ -263,7 +264,7 @@ pub(crate) fn hosted_model_tool_specs(turn_context: &TurnContext) -> Vec<ToolSpe
+ }
+ 
+ pub(crate) fn search_tool_enabled(turn_context: &TurnContext) -> bool {
+-    turn_context.model_info.supports_search_tool
++    model_tool_capabilities(turn_context).web_search && turn_context.model_info.supports_search_tool
+ }
+ 
+ pub(crate) fn tool_suggest_enabled(turn_context: &TurnContext) -> bool {
+@@ -274,7 +275,19 @@ pub(crate) fn tool_suggest_enabled(turn_context: &TurnContext) -> bool {
+ }
+ 
+ fn namespace_tools_enabled(turn_context: &TurnContext) -> bool {
+-    turn_context.provider.capabilities().namespace_tools
++    model_tool_capabilities(turn_context).namespace_tools
++}
++
++fn model_tool_capabilities(turn_context: &TurnContext) -> ProviderCapabilities {
++    if crate::chat_completions::is_openai_v1_side_route_model(&turn_context.model_info.slug) {
++        ProviderCapabilities {
++            namespace_tools: false,
++            image_generation: false,
++            web_search: false,
++        }
++    } else {
++        turn_context.provider.capabilities()
++    }
+ }
+ 
+ fn code_mode_enabled(turn_context: &TurnContext) -> bool {
+@@ -319,7 +332,7 @@ fn image_generation_tool_enabled(turn_context: &TurnContext) -> bool {
+         .auth_manager
+         .as_deref()
+         .is_some_and(AuthManager::current_auth_uses_codex_backend)
+-        && turn_context.provider.capabilities().image_generation
++        && model_tool_capabilities(turn_context).image_generation
+         && turn_context
+             .features
+             .get()
+@@ -671,33 +684,50 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
+         } else {
+             let agent_type_description =
+                 agent_type_description(turn_context, context.default_agent_type_description);
+-            let exposure =
+-                if search_tool_enabled(turn_context) && namespace_tools_enabled(turn_context) {
+-                    ToolExposure::Deferred
+-                } else {
+-                    ToolExposure::Direct
+-                };
+-            planned_tools.add_with_exposure(
+-                SpawnAgentHandler::new(SpawnAgentToolOptions {
+-                    available_models: turn_context.available_models.clone(),
+-                    agent_type_description,
+-                    hide_agent_type_model_reasoning: turn_context
+-                        .config
+-                        .multi_agent_v2
+-                        .hide_spawn_agent_metadata,
+-                    include_usage_hint: turn_context.config.multi_agent_v2.usage_hint_enabled,
+-                    usage_hint_text: turn_context.config.multi_agent_v2.usage_hint_text.clone(),
+-                    max_concurrent_threads_per_session: max_concurrent_threads_per_session(
+-                        turn_context,
+-                    ),
+-                }),
++            let use_namespace_tools = namespace_tools_enabled(turn_context);
++            let exposure = if search_tool_enabled(turn_context) && use_namespace_tools {
++                ToolExposure::Deferred
++            } else {
++                ToolExposure::Direct
++            };
++            planned_tools.add_arc(override_tool_exposure(
++                multi_agent_v1_handler(
++                    SpawnAgentHandler::new(SpawnAgentToolOptions {
++                        available_models: turn_context.available_models.clone(),
++                        agent_type_description,
++                        hide_agent_type_model_reasoning: turn_context
++                            .config
++                            .multi_agent_v2
++                            .hide_spawn_agent_metadata,
++                        include_usage_hint: turn_context.config.multi_agent_v2.usage_hint_enabled,
++                        usage_hint_text: turn_context.config.multi_agent_v2.usage_hint_text.clone(),
++                        max_concurrent_threads_per_session: max_concurrent_threads_per_session(
++                            turn_context,
++                        ),
++                    }),
++                    use_namespace_tools,
++                ),
+                 exposure,
+-            );
+-            planned_tools.add_with_exposure(SendInputHandler, exposure);
+-            planned_tools.add_with_exposure(ResumeAgentHandler, exposure);
+-            planned_tools
+-                .add_with_exposure(WaitAgentHandler::new(context.wait_agent_timeouts), exposure);
+-            planned_tools.add_with_exposure(CloseAgentHandler, exposure);
++            ));
++            planned_tools.add_arc(override_tool_exposure(
++                multi_agent_v1_handler(SendInputHandler, use_namespace_tools),
++                exposure,
++            ));
++            planned_tools.add_arc(override_tool_exposure(
++                multi_agent_v1_handler(ResumeAgentHandler, use_namespace_tools),
++                exposure,
++            ));
++            planned_tools.add_arc(override_tool_exposure(
++                multi_agent_v1_handler(
++                    WaitAgentHandler::new(context.wait_agent_timeouts),
++                    use_namespace_tools,
++                ),
++                exposure,
++            ));
++            planned_tools.add_arc(override_tool_exposure(
++                multi_agent_v1_handler(CloseAgentHandler, use_namespace_tools),
++                exposure,
++            ));
+         }
+     }
+ 
+@@ -837,6 +867,19 @@ fn append_extension_tool_executors(
+     }
+ }
+ 
++fn multi_agent_v1_handler(
++    handler: impl CoreToolRuntime + 'static,
++    use_namespace_tools: bool,
++) -> Arc<dyn CoreToolRuntime> {
++    if use_namespace_tools {
++        Arc::new(handler)
++    } else {
++        Arc::new(MultiAgentV1PlainFunctionOverride {
++            handler: Arc::new(handler),
++        })
++    }
++}
++
+ fn multi_agent_v2_handler(
+     handler: impl CoreToolRuntime + 'static,
+     namespace: Option<&str>,
+@@ -855,6 +898,73 @@ struct MultiAgentV2NamespaceOverride {
+     namespace: String,
+ }
+ 
++struct MultiAgentV1PlainFunctionOverride {
++    handler: Arc<dyn CoreToolRuntime>,
++}
++
++#[async_trait::async_trait]
++impl ToolExecutor<ToolInvocation> for MultiAgentV1PlainFunctionOverride {
++    fn tool_name(&self) -> ToolName {
++        ToolName::plain(self.handler.tool_name().name)
++    }
++
++    fn spec(&self) -> ToolSpec {
++        match self.handler.spec() {
++            ToolSpec::Namespace(namespace) => {
++                let tool_name = self.handler.tool_name().name;
++                namespace
++                    .tools
++                    .into_iter()
++                    .find_map(|tool| match tool {
++                        ResponsesApiNamespaceTool::Function(tool) if tool.name == tool_name => {
++                            Some(ToolSpec::Function(tool))
++                        }
++                        ResponsesApiNamespaceTool::Function(_) => None,
++                    })
++                    .unwrap_or_else(|| {
++                        ToolSpec::Namespace(ResponsesApiNamespace {
++                            name: namespace.name,
++                            description: namespace.description,
++                            tools: Vec::new(),
++                        })
++                    })
++            }
++            spec => spec,
++        }
++    }
++
++    fn exposure(&self) -> ToolExposure {
++        self.handler.exposure()
++    }
++
++    fn supports_parallel_tool_calls(&self) -> bool {
++        self.handler.supports_parallel_tool_calls()
++    }
++
++    async fn handle(
++        &self,
++        invocation: ToolInvocation,
++    ) -> Result<Box<dyn ToolOutput>, codex_tools::FunctionCallError> {
++        self.handler.handle(invocation).await
++    }
++}
++
++impl CoreToolRuntime for MultiAgentV1PlainFunctionOverride {
++    fn matches_kind(&self, payload: &crate::tools::context::ToolPayload) -> bool {
++        self.handler.matches_kind(payload)
++    }
++
++    fn search_info(&self) -> Option<crate::tools::tool_search_entry::ToolSearchInfo> {
++        self.handler.search_info()
++    }
++
++    fn create_diff_consumer(
++        &self,
++    ) -> Option<Box<dyn crate::tools::registry::ToolArgumentDiffConsumer>> {
++        self.handler.create_diff_consumer()
++    }
++}
++
+ #[async_trait::async_trait]
+ impl ToolExecutor<ToolInvocation> for MultiAgentV2NamespaceOverride {
+     fn tool_name(&self) -> ToolName {
+diff --git a/codex-rs/core/src/tools/spec_plan_tests.rs b/codex-rs/core/src/tools/spec_plan_tests.rs
+index 32913bf2e7..49632b5fce 100644
+--- a/codex-rs/core/src/tools/spec_plan_tests.rs
++++ b/codex-rs/core/src/tools/spec_plan_tests.rs
+@@ -813,6 +813,44 @@ async fn v1_multi_agent_tools_defer_when_tool_search_available() {
+     assert!(description.contains("- Multi-agent tools: Spawn and manage sub-agents."));
+ }
+ 
++#[tokio::test]
++async fn side_route_models_use_chat_compatible_tool_capabilities() {
++    for slug in ["deepseek-v4", "mimo-v2.5"] {
++        let plan = probe(|turn| {
++            turn.model_info.slug = slug.to_string();
++            turn.model_info.supports_search_tool = true;
++            set_web_search_mode(turn, WebSearchMode::Live);
++            turn.model_info.web_search_tool_type = WebSearchToolType::TextAndImage;
++            use_chatgpt_auth(turn);
++            set_feature(turn, Feature::ImageGeneration, /*enabled*/ true);
++            turn.model_info.input_modalities = vec![InputModality::Image];
++            set_feature(turn, Feature::Collab, /*enabled*/ true);
++            set_feature(turn, Feature::MultiAgentV2, /*enabled*/ false);
++            set_features(turn, &[Feature::ShellTool, Feature::UnifiedExec]);
++            turn.model_info.shell_type = ConfigShellToolType::ShellCommand;
++            turn.model_info.apply_patch_tool_type = Some(ApplyPatchToolType::Freeform);
++        })
++        .await;
++
++        plan.assert_visible_contains(&[
++            "exec_command",
++            "write_stdin",
++            "apply_patch",
++            "spawn_agent",
++            "send_input",
++            "resume_agent",
++            "wait_agent",
++            "close_agent",
++        ]);
++        plan.assert_visible_lacks(&[
++            MULTI_AGENT_V1_NAMESPACE,
++            "tool_search",
++            "web_search",
++            "image_generation",
++        ]);
++    }
++}
++
+ #[tokio::test]
+ async fn multi_agent_v2_can_use_configured_tool_namespace() {
+     let namespaced = probe(|turn| {

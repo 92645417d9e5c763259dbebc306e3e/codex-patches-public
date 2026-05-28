@@ -1,0 +1,193 @@
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index 09f17e201d..27eb0440a1 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -7641,6 +7641,75 @@ async fn model_catalog_json_loads_from_path() -> std::io::Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn model_catalog_defaults_to_models_cache_path() -> std::io::Result<()> {
++    let codex_home = TempDir::new()?;
++    let cache_path = codex_home.path().join("models_cache.json");
++    let mut catalog = bundled_models_response()
++        .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
++    catalog.models = catalog.models.into_iter().take(1).collect();
++    std::fs::write(
++        &cache_path,
++        serde_json::json!({
++            "models": catalog.models.clone(),
++        })
++        .to_string(),
++    )?;
++
++    let config = Config::load_from_base_config_with_overrides(
++        ConfigToml::default(),
++        ConfigOverrides::default(),
++        codex_home.abs(),
++    )
++    .await?;
++
++    assert_eq!(config.model_catalog, Some(catalog));
++    Ok(())
++}
++
++#[tokio::test]
++async fn explicit_model_catalog_json_overrides_models_cache_path() -> std::io::Result<()> {
++    let codex_home = TempDir::new()?;
++    let cache_path = codex_home.path().join("models_cache.json");
++    let explicit_catalog_path = codex_home.path().join("catalog.json");
++    let mut bundled = bundled_models_response()
++        .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
++    let explicit_models: Vec<_> = bundled.models.drain(..1).collect();
++    let cached_models: Vec<_> = bundled.models.drain(..1).collect();
++    let explicit_catalog = ModelsResponse {
++        models: explicit_models,
++    };
++    let cached_catalog = ModelsResponse {
++        models: cached_models,
++    };
++    std::fs::write(
++        &cache_path,
++        serde_json::json!({
++            "models": cached_catalog.models,
++        })
++        .to_string(),
++    )?;
++    std::fs::write(
++        &explicit_catalog_path,
++        serde_json::to_string(&explicit_catalog).expect("serialize explicit catalog"),
++    )?;
++
++    let cfg = ConfigToml {
++        model_catalog_json: Some(explicit_catalog_path.abs()),
++        ..Default::default()
++    };
++
++    let config = Config::load_from_base_config_with_overrides(
++        cfg,
++        ConfigOverrides::default(),
++        codex_home.abs(),
++    )
++    .await?;
++
++    assert_eq!(config.model_catalog, Some(explicit_catalog));
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn model_catalog_json_rejects_empty_catalog() -> std::io::Result<()> {
+     let codex_home = TempDir::new()?;
+@@ -7668,6 +7737,28 @@ async fn model_catalog_json_rejects_empty_catalog() -> std::io::Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn empty_models_cache_rejects_default_model_catalog() -> std::io::Result<()> {
++    let codex_home = TempDir::new()?;
++    let cache_path = codex_home.path().join("models_cache.json");
++    std::fs::write(&cache_path, r#"{"models":[]}"#)?;
++
++    let err = Config::load_from_base_config_with_overrides(
++        ConfigToml::default(),
++        ConfigOverrides::default(),
++        codex_home.abs(),
++    )
++    .await
++    .expect_err("empty default models cache should fail config load");
++
++    assert_eq!(err.kind(), ErrorKind::InvalidData);
++    assert!(
++        err.to_string().contains("must contain at least one model"),
++        "unexpected error: {err}"
++    );
++    Ok(())
++}
++
+ fn create_test_fixture() -> std::io::Result<PrecedenceTestFixture> {
+     let toml = r#"
+ model = "o3"
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index 7044b9c676..771fa7082c 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -93,6 +93,7 @@ use codex_protocol::config_types::WindowsSandboxLevel;
+ use codex_protocol::models::ActivePermissionProfile;
+ use codex_protocol::models::PermissionProfile;
+ use codex_protocol::models::SandboxEnforcement;
++use codex_protocol::openai_models::ModelInfo;
+ use codex_protocol::openai_models::ModelsResponse;
+ use codex_protocol::openai_models::ReasoningEffort;
+ use codex_protocol::permissions::FileSystemSandboxPolicy;
+@@ -131,6 +132,8 @@ use codex_network_proxy::NetworkProxyConfig;
+ use toml::Value as TomlValue;
+ use toml_edit::DocumentMut;
+ 
++const DEFAULT_MODEL_CATALOG_CACHE_FILENAME: &str = "models_cache.json";
++
+ pub(crate) mod agent_roles;
+ pub mod edit;
+ mod managed_features;
+@@ -1588,12 +1591,50 @@ fn load_catalog_json(path: &AbsolutePathBuf) -> std::io::Result<ModelsResponse>
+     Ok(catalog)
+ }
+ 
++#[derive(Deserialize)]
++struct ModelsCacheCatalog {
++    models: Vec<ModelInfo>,
++}
++
++fn load_catalog_from_models_cache(path: &AbsolutePathBuf) -> std::io::Result<ModelsResponse> {
++    let file_contents = std::fs::read_to_string(path)?;
++    let cache = serde_json::from_str::<ModelsCacheCatalog>(&file_contents).map_err(|err| {
++        std::io::Error::new(
++            ErrorKind::InvalidData,
++            format!(
++                "failed to parse models cache path `{}` as JSON: {err}",
++                path.display()
++            ),
++        )
++    })?;
++    if cache.models.is_empty() {
++        return Err(std::io::Error::new(
++            ErrorKind::InvalidData,
++            format!(
++                "models cache path `{}` must contain at least one model",
++                path.display()
++            ),
++        ));
++    }
++    Ok(ModelsResponse {
++        models: cache.models,
++    })
++}
++
+ fn load_model_catalog(
+     model_catalog_json: Option<AbsolutePathBuf>,
++    codex_home: &AbsolutePathBuf,
+ ) -> std::io::Result<Option<ModelsResponse>> {
+-    model_catalog_json
+-        .map(|path| load_catalog_json(&path))
+-        .transpose()
++    if let Some(path) = model_catalog_json {
++        return load_catalog_json(&path).map(Some);
++    }
++
++    let cache_path = codex_home.join(DEFAULT_MODEL_CATALOG_CACHE_FILENAME);
++    match std::fs::metadata(cache_path.as_path()) {
++        Ok(_) => load_catalog_from_models_cache(&cache_path).map(Some),
++        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
++        Err(err) => Err(err),
++    }
+ }
+ 
+ fn filter_mcp_servers_by_requirements(
+@@ -3204,7 +3245,7 @@ impl Config {
+         let review_model = override_review_model.or(cfg.review_model);
+ 
+         let check_for_update_on_startup = cfg.check_for_update_on_startup.unwrap_or(true);
+-        let model_catalog = load_model_catalog(cfg.model_catalog_json.clone())?;
++        let model_catalog = load_model_catalog(cfg.model_catalog_json.clone(), &codex_home)?;
+ 
+         let log_dir = cfg
+             .log_dir

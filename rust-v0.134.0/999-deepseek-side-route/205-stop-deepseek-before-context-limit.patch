@@ -1,0 +1,84 @@
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index 4d4be66055..87a8c0ce84 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -666,6 +666,18 @@ async fn auto_compact_token_status(
+     turn_context: &TurnContext,
+ ) -> AutoCompactTokenStatus {
+     let active_context_tokens = sess.get_total_token_usage().await;
++    if crate::chat_completions::is_openai_v1_side_route_model(&turn_context.model_info.slug) {
++        return AutoCompactTokenStatus {
++            active_context_tokens,
++            auto_compact_scope_tokens: active_context_tokens,
++            auto_compact_scope_limit: i64::MAX,
++            full_context_window_limit: None,
++            auto_compact_window_ordinal: None,
++            auto_compact_window_prefill_tokens: None,
++            full_context_window_limit_reached: false,
++            token_limit_reached: false,
++        };
++    }
+     let mut auto_compact_window_ordinal = None;
+     let mut auto_compact_window_prefill_tokens = None;
+     let (auto_compact_scope_tokens, auto_compact_scope_limit, full_context_window_limit) =
+@@ -718,6 +730,15 @@ async fn run_pre_sampling_compact(
+     turn_context: &Arc<TurnContext>,
+     client_session: &mut ModelClientSession,
+ ) -> CodexResult<()> {
++    if let Some(limit) =
++        crate::chat_completions::openai_v1_side_route_context_stop_limit(&turn_context.model_info)
++    {
++        if sess.get_total_token_usage().await >= limit {
++            return Err(CodexErr::ContextWindowExceeded);
++        }
++        return Ok(());
++    }
++
+     maybe_run_previous_model_inline_compact(sess, turn_context, client_session).await?;
+     let token_status = auto_compact_token_status(sess.as_ref(), turn_context.as_ref()).await;
+     // Compact if the configured auto-compaction budget or usable context window is exhausted.
+@@ -744,6 +765,9 @@ async fn maybe_run_previous_model_inline_compact(
+     turn_context: &Arc<TurnContext>,
+     client_session: &mut ModelClientSession,
+ ) -> CodexResult<()> {
++    if crate::chat_completions::is_openai_v1_side_route_model(&turn_context.model_info.slug) {
++        return Ok(());
++    }
+     let Some(previous_turn_settings) = sess.previous_turn_settings().await else {
+         return Ok(());
+     };
+@@ -799,6 +823,9 @@ async fn run_auto_compact(
+     reason: CompactionReason,
+     phase: CompactionPhase,
+ ) -> CodexResult<()> {
++    if crate::chat_completions::is_openai_v1_side_route_model(&turn_context.model_info.slug) {
++        return Err(crate::chat_completions::openai_v1_side_route_compaction_disabled_error());
++    }
+     if should_use_remote_compact_task(turn_context.provider.info()) {
+         if turn_context.features.enabled(Feature::RemoteCompactionV2) {
+             run_inline_remote_auto_compact_task_v2(
+diff --git a/codex-rs/core/src/tasks/compact.rs b/codex-rs/core/src/tasks/compact.rs
+index 77914633a2..9b854ec737 100644
+--- a/codex-rs/core/src/tasks/compact.rs
++++ b/codex-rs/core/src/tasks/compact.rs
+@@ -5,6 +5,7 @@ use super::SessionTaskContext;
+ use crate::session::TurnInput;
+ use crate::session::turn_context::TurnContext;
+ use crate::state::TaskKind;
++use codex_protocol::protocol::EventMsg;
+ use codex_protocol::user_input::UserInput;
+ use tokio_util::sync::CancellationToken;
+ 
+@@ -28,6 +29,12 @@ impl SessionTask for CompactTask {
+         _cancellation_token: CancellationToken,
+     ) -> Option<String> {
+         let session = session.clone_session();
++        if crate::chat_completions::is_openai_v1_side_route_model(&ctx.model_info.slug) {
++            let err = crate::chat_completions::openai_v1_side_route_compaction_disabled_error();
++            let event = EventMsg::Error(err.to_error_event(/*message_prefix*/ None));
++            session.send_event(&ctx, event).await;
++            return None;
++        }
+         let _ = if crate::compact::should_use_remote_compact_task(ctx.provider.info()) {
+             session.services.session_telemetry.counter(
+                 "codex.task.compact",

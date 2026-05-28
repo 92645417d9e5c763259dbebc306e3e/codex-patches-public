@@ -1,0 +1,591 @@
+diff --git a/codex-rs/codex-api/src/endpoint/chat_completions.rs b/codex-rs/codex-api/src/endpoint/chat_completions.rs
+index 38dbeb87c3..378b813c4d 100644
+--- a/codex-rs/codex-api/src/endpoint/chat_completions.rs
++++ b/codex-rs/codex-api/src/endpoint/chat_completions.rs
+@@ -202,6 +202,7 @@ pub enum ChatThinkingType {
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+ #[serde(rename_all = "lowercase")]
+ pub enum ChatReasoningEffort {
++    Medium,
+     High,
+     Max,
+ }
+diff --git a/codex-rs/core/src/chat_completions.rs b/codex-rs/core/src/chat_completions.rs
+index e987aa4869..f5d3b060b5 100644
+--- a/codex-rs/core/src/chat_completions.rs
++++ b/codex-rs/core/src/chat_completions.rs
+@@ -34,6 +34,7 @@ use std::collections::BTreeSet;
+ 
+ use crate::client_common::Prompt;
+ use crate::deepseek_side_route;
++use crate::mimo_side_route;
+ 
+ pub(crate) const APPLY_PATCH_CHAT_COMPLETIONS_INPUT_FIELD: &str = "input";
+ pub(crate) const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
+@@ -729,23 +730,54 @@ fn apply_patch_chat_arguments(input: &str) -> Result<String> {
+ }
+ 
+ fn chat_completions_model_slug(model: &ModelInfo, effort: Option<ReasoningEffort>) -> &str {
+-    if !deepseek_side_route::is_deepseek_model(&model.slug) {
+-        return &model.slug;
++    if deepseek_side_route::is_deepseek_model(&model.slug) {
++        return match effort.or(model.default_reasoning_level) {
++            Some(ReasoningEffort::Low | ReasoningEffort::Medium) | None => {
++                deepseek_side_route::DEEPSEEK_FLASH_API_MODEL
++            }
++            Some(
++                ReasoningEffort::None
++                | ReasoningEffort::Minimal
++                | ReasoningEffort::High
++                | ReasoningEffort::XHigh,
++            ) => deepseek_side_route::DEEPSEEK_PRO_API_MODEL,
++        };
+     }
++    if mimo_side_route::is_mimo_model(&model.slug) {
++        return match effort.or(model.default_reasoning_level) {
++            Some(ReasoningEffort::Low | ReasoningEffort::Medium) | None => {
++                mimo_side_route::MIMO_API_MODEL
++            }
++            Some(
++                ReasoningEffort::None
++                | ReasoningEffort::Minimal
++                | ReasoningEffort::High
++                | ReasoningEffort::XHigh,
++            ) => mimo_side_route::MIMO_PRO_API_MODEL,
++        };
++    }
++    &model.slug
++}
+ 
+-    match effort.or(model.default_reasoning_level) {
+-        Some(ReasoningEffort::Low | ReasoningEffort::Medium) | None => {
+-            deepseek_side_route::DEEPSEEK_FLASH_API_MODEL
+-        }
+-        Some(
+-            ReasoningEffort::None
+-            | ReasoningEffort::Minimal
+-            | ReasoningEffort::High
+-            | ReasoningEffort::XHigh,
+-        ) => deepseek_side_route::DEEPSEEK_PRO_API_MODEL,
++pub(crate) fn is_openai_v1_side_route_model(model: &str) -> bool {
++    deepseek_side_route::is_deepseek_model(model) || mimo_side_route::is_mimo_model(model)
++}
++
++pub(crate) fn openai_v1_side_route_context_stop_limit(model_info: &ModelInfo) -> Option<i64> {
++    if is_openai_v1_side_route_model(&model_info.slug) {
++        model_info.resolved_context_window()
++    } else {
++        None
+     }
+ }
+ 
++pub(crate) fn openai_v1_side_route_compaction_disabled_error() -> CodexErr {
++    CodexErr::UnsupportedOperation(
++        "OpenAI-v1 side-route models do not support compaction. Start a new thread or switch to a non-side-route model before compacting."
++            .to_string(),
++    )
++}
++
+ fn think(model: &ModelInfo, effort: Option<ReasoningEffort>) -> Option<ChatThinking> {
+     if !supports_chat_reasoning(model) {
+         return None;
+@@ -763,6 +795,19 @@ fn chat_reasoning_effort(
+     if !supports_chat_reasoning(model_info) {
+         return None;
+     }
++    if mimo_side_route::is_mimo_model(&model_info.slug) {
++        return match effort.or(model_info.default_reasoning_level) {
++            Some(ReasoningEffort::Low | ReasoningEffort::High) | None => {
++                Some(ChatReasoningEffort::Medium)
++            }
++            Some(
++                ReasoningEffort::None
++                | ReasoningEffort::Minimal
++                | ReasoningEffort::Medium
++                | ReasoningEffort::XHigh,
++            ) => Some(ChatReasoningEffort::High),
++        };
++    }
+     match effort.or(model_info.default_reasoning_level) {
+         Some(
+             ReasoningEffort::None
+@@ -776,8 +821,7 @@ fn chat_reasoning_effort(
+ }
+ 
+ fn supports_chat_reasoning(model_info: &ModelInfo) -> bool {
+-    model_info.supports_reasoning_summaries
+-        || deepseek_side_route::is_deepseek_model(&model_info.slug)
++    model_info.supports_reasoning_summaries || is_openai_v1_side_route_model(&model_info.slug)
+ }
+ 
+ fn unsupported_item(item: &ResponseItem) -> CodexErr {
+@@ -1214,6 +1258,88 @@ mod tests {
+         assert_eq!(request.reasoning_effort, Some(ChatReasoningEffort::Max));
+     }
+ 
++    #[test]
++    fn maps_low_mimo_reasoning_to_base_medium() {
++        let request = build_chat_completions_request(
++            &Prompt::default(),
++            &mimo_model_info(),
++            Some(ReasoningEffort::Low),
++            None,
++            ChatToolStrictMode::PreserveToolSetting,
++        )
++        .unwrap();
++
++        assert_eq!(request.model, "mimo-v2.5");
++        assert_eq!(request.thinking.unwrap().r#type, ChatThinkingType::Enabled);
++        assert_eq!(request.reasoning_effort, Some(ChatReasoningEffort::Medium));
++    }
++
++    #[test]
++    fn maps_medium_mimo_reasoning_to_base_high() {
++        let request = build_chat_completions_request(
++            &Prompt::default(),
++            &mimo_model_info(),
++            Some(ReasoningEffort::Medium),
++            None,
++            ChatToolStrictMode::PreserveToolSetting,
++        )
++        .unwrap();
++
++        assert_eq!(request.model, "mimo-v2.5");
++        assert_eq!(request.thinking.unwrap().r#type, ChatThinkingType::Enabled);
++        assert_eq!(request.reasoning_effort, Some(ChatReasoningEffort::High));
++    }
++
++    #[test]
++    fn maps_high_mimo_reasoning_to_pro_medium() {
++        let request = build_chat_completions_request(
++            &Prompt::default(),
++            &mimo_model_info(),
++            Some(ReasoningEffort::High),
++            None,
++            ChatToolStrictMode::PreserveToolSetting,
++        )
++        .unwrap();
++
++        assert_eq!(request.model, "mimo-v2.5-pro");
++        assert_eq!(request.thinking.unwrap().r#type, ChatThinkingType::Enabled);
++        assert_eq!(request.reasoning_effort, Some(ChatReasoningEffort::Medium));
++    }
++
++    #[test]
++    fn maps_xhigh_mimo_reasoning_to_pro_high() {
++        let request = build_chat_completions_request(
++            &Prompt::default(),
++            &mimo_model_info(),
++            Some(ReasoningEffort::XHigh),
++            None,
++            ChatToolStrictMode::PreserveToolSetting,
++        )
++        .unwrap();
++
++        assert_eq!(request.model, "mimo-v2.5-pro");
++        assert_eq!(request.thinking.unwrap().r#type, ChatThinkingType::Enabled);
++        assert_eq!(request.reasoning_effort, Some(ChatReasoningEffort::High));
++    }
++
++    #[test]
++    fn mimo_xhigh_request_keeps_service_tier_out_of_openai_v1_body() {
++        let request = build_chat_completions_request(
++            &Prompt::default(),
++            &mimo_model_info(),
++            Some(ReasoningEffort::XHigh),
++            Some("none"),
++            ChatToolStrictMode::PreserveToolSetting,
++        )
++        .unwrap();
++
++        let body = serde_json::to_value(&request).expect("request serializes");
++
++        assert_eq!(body["model"], "mimo-v2.5-pro");
++        assert_eq!(body["reasoning_effort"], "high");
++        assert!(body.get("service_tier").is_none());
++    }
++
+     #[test]
+     fn disables_function_strict_without_deepseek_beta() {
+         let mut tool = weather_tool();
+@@ -1562,4 +1688,32 @@ mod tests {
+         }))
+         .unwrap()
+     }
++
++    fn mimo_model_info() -> ModelInfo {
++        serde_json::from_value(serde_json::json!({
++            "slug": "mimo-v2.5",
++            "display_name": "MiMo-V2.5",
++            "description": null,
++            "default_reasoning_level": "medium",
++            "supported_reasoning_levels": [],
++            "shell_type": "shell_command",
++            "visibility": "list",
++            "supported_in_api": true,
++            "priority": 0,
++            "availability_nux": null,
++            "upgrade": null,
++            "base_instructions": "",
++            "supports_reasoning_summaries": false,
++            "support_verbosity": false,
++            "default_verbosity": null,
++            "apply_patch_tool_type": null,
++            "truncation_policy": {"mode": "bytes", "limit": 10000},
++            "supports_parallel_tool_calls": true,
++            "supports_image_detail_original": false,
++            "context_window": 128000,
++            "auto_compact_token_limit": null,
++            "experimental_supported_tools": []
++        }))
++        .unwrap()
++    }
+ }
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index e93683d4fb..ac2d38173b 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -115,6 +115,7 @@ use crate::client_common::Prompt;
+ use crate::client_common::ResponseEvent;
+ use crate::client_common::ResponseStream;
+ use crate::feedback_tags;
++use crate::mimo_side_route;
+ use crate::util::emit_feedback_auth_recovery_tags;
+ use codex_api::map_api_error;
+ use codex_feedback::FeedbackRequestTags;
+@@ -1223,6 +1224,75 @@ impl ModelClientSession {
+         }
+     }
+ 
++    #[allow(clippy::too_many_arguments)]
++    #[instrument(
++        name = "model_client.stream_mimo_chat_completions",
++        level = "info",
++        skip_all,
++        fields(
++            model = %model_info.slug,
++            transport = "chat_completions_http",
++            http.method = "POST",
++            api.path = "chat/completions",
++            turn.has_metadata_header = turn_metadata_header.is_some()
++        )
++    )]
++    async fn stream_mimo_chat_completions(
++        &self,
++        prompt: &Prompt,
++        model_info: &ModelInfo,
++        session_telemetry: &SessionTelemetry,
++        effort: Option<ReasoningEffortConfig>,
++        _summary: ReasoningSummaryConfig,
++        _service_tier: Option<String>,
++        turn_metadata_header: Option<&str>,
++        inference_trace: &InferenceTraceContext,
++    ) -> Result<ResponseStream> {
++        let codex_home = crate::config::find_codex_home()?;
++        let (api_provider, api_auth) = mimo_side_route::provider_and_auth(&codex_home)?;
++        let transport = ReqwestTransport::new(build_reqwest_client());
++        let request_auth_context = AuthRequestTelemetryContext::new(
++            None,
++            api_auth.as_ref(),
++            PendingUnauthorizedRetry::default(),
++        );
++        let (request_telemetry, _sse_telemetry) = Self::build_streaming_telemetry(
++            session_telemetry,
++            request_auth_context,
++            RequestRouteTelemetry::for_endpoint(CHAT_COMPLETIONS_ENDPOINT),
++            self.client.state.auth_env_telemetry.clone(),
++        );
++        let request_parts = build_chat_completions_request_parts(
++            prompt,
++            model_info,
++            effort,
++            _service_tier.as_deref(),
++            ChatToolStrictMode::Enabled,
++        )?;
++        let request = request_parts.request;
++        let tool_aliases = request_parts.tool_aliases;
++        let inference_trace_attempt = inference_trace.start_attempt();
++        inference_trace_attempt.record_started(&request);
++
++        let client = ApiChatCompletionsClient::new(transport, api_provider, api_auth)
++            .with_telemetry(Some(request_telemetry));
++        let stream_response = client
++            .stream_request(request, ApiChatCompletionsOptions::default())
++            .await
++            .map_err(map_api_error)?;
++        let api_stream = spawn_chat_completions_stream(
++            stream_response,
++            mimo_side_route::STREAM_IDLE_TIMEOUT,
++            tool_aliases,
++        );
++        let (stream, _) = map_response_stream(
++            api_stream,
++            session_telemetry.clone(),
++            inference_trace_attempt,
++        );
++        Ok(stream)
++    }
++
+     /// Streams a turn via the OpenAI Responses API.
+     ///
+     /// Handles reasoning summaries, verbosity, and the `text` controls used for output schemas.
+@@ -1546,7 +1616,6 @@ impl ModelClientSession {
+         if self.websocket_session.last_request.is_some() {
+             return Ok(());
+         }
+-
+         let disabled_trace = InferenceTraceContext::disabled();
+         match self
+             .stream_responses_websocket(
+@@ -1598,6 +1667,21 @@ impl ModelClientSession {
+         turn_metadata_header: Option<&str>,
+         inference_trace: &InferenceTraceContext,
+     ) -> Result<ResponseStream> {
++        if mimo_side_route::is_mimo_model(&model_info.slug) {
++            return self
++                .stream_mimo_chat_completions(
++                    prompt,
++                    model_info,
++                    session_telemetry,
++                    effort,
++                    summary,
++                    service_tier,
++                    turn_metadata_header,
++                    inference_trace,
++                )
++                .await;
++        }
++
+         let wire_api = self.client.state.provider.info().wire_api;
+         match wire_api {
+             WireApi::Responses => {
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs b/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs
+index 44b2435299..450044fce7 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs
+@@ -53,6 +53,9 @@ async fn handle_spawn_agent(
+     } = invocation;
+     let arguments = function_arguments(payload)?;
+     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
++    let message = normalize_optional_tool_string(args.message);
++    let items = args.items.filter(|items| !items.is_empty());
++    let requested_service_tier = normalize_optional_service_tier(args.service_tier);
+     let fork_context =
+         matches!(&turn.session_source, SessionSource::SubAgent(_)) && args.fork_context;
+     let role_name = args
+@@ -60,7 +63,7 @@ async fn handle_spawn_agent(
+         .as_deref()
+         .map(str::trim)
+         .filter(|role| !role.is_empty());
+-    let input_items = parse_collab_input(args.message, args.items)?;
++    let input_items = parse_collab_input(message, items)?;
+     let prompt = render_input_preview(&input_items);
+     let session_source = turn.session_source.clone();
+     let child_depth = next_thread_spawn_depth(&session_source);
+@@ -86,7 +89,7 @@ async fn handle_spawn_agent(
+         .await;
+     let mut config =
+         build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
+-    if let Some(service_tier) = args.service_tier.as_ref() {
++    if let Some(service_tier) = requested_service_tier.as_ref() {
+         config.service_tier = Some(service_tier.clone());
+     }
+     if fork_context {
+@@ -108,7 +111,7 @@ async fn handle_spawn_agent(
+         &session,
+         &mut config,
+         turn.config.service_tier.as_deref(),
+-        args.service_tier.as_deref(),
++        requested_service_tier.as_deref(),
+     )
+     .await?;
+     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+@@ -220,11 +223,16 @@ impl CoreToolRuntime for Handler {
+ 
+ #[derive(Debug, Deserialize)]
+ struct SpawnAgentArgs {
++    #[serde(default, deserialize_with = "deserialize_optional_tool_string")]
+     message: Option<String>,
+     items: Option<Vec<UserInput>>,
++    #[serde(default, deserialize_with = "deserialize_optional_tool_string")]
+     agent_type: Option<String>,
++    #[serde(default, deserialize_with = "deserialize_optional_tool_string")]
+     model: Option<String>,
++    #[serde(default, deserialize_with = "deserialize_optional_reasoning_effort")]
+     reasoning_effort: Option<ReasoningEffort>,
++    #[serde(default, deserialize_with = "deserialize_optional_tool_string")]
+     service_tier: Option<String>,
+     #[serde(default)]
+     fork_context: bool,
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_common.rs b/codex-rs/core/src/tools/handlers/multi_agents_common.rs
+index 959f995c22..ab8f4fa862 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_common.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_common.rs
+@@ -12,6 +12,7 @@ use codex_features::Feature;
+ use codex_models_manager::manager::RefreshStrategy;
+ use codex_protocol::AgentPath;
+ use codex_protocol::ThreadId;
++use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+ use codex_protocol::error::CodexErr;
+ use codex_protocol::models::BaseInstructions;
+ use codex_protocol::models::ResponseInputItem;
+@@ -23,6 +24,7 @@ use codex_protocol::protocol::Op;
+ use codex_protocol::protocol::SessionSource;
+ use codex_protocol::protocol::SubAgentSource;
+ use codex_protocol::user_input::UserInput;
++use serde::Deserialize;
+ use serde::Serialize;
+ use serde_json::Value as JsonValue;
+ use std::collections::HashMap;
+@@ -195,6 +197,42 @@ pub(crate) fn parse_collab_input(
+     }
+ }
+ 
++pub(crate) fn normalize_optional_tool_string(value: Option<String>) -> Option<String> {
++    value
++        .map(|value| value.trim().to_string())
++        .filter(|value| !value.is_empty())
++}
++
++pub(crate) fn normalize_optional_service_tier(value: Option<String>) -> Option<String> {
++    normalize_optional_tool_string(value).filter(|value| {
++        !value.eq_ignore_ascii_case("none") && value != SERVICE_TIER_DEFAULT_REQUEST_VALUE
++    })
++}
++
++pub(crate) fn deserialize_optional_tool_string<'de, D>(
++    deserializer: D,
++) -> std::result::Result<Option<String>, D::Error>
++where
++    D: serde::Deserializer<'de>,
++{
++    Ok(normalize_optional_tool_string(
++        Option::<String>::deserialize(deserializer)?,
++    ))
++}
++
++pub(crate) fn deserialize_optional_reasoning_effort<'de, D>(
++    deserializer: D,
++) -> std::result::Result<Option<ReasoningEffort>, D::Error>
++where
++    D: serde::Deserializer<'de>,
++{
++    let Some(value) = normalize_optional_tool_string(Option::<String>::deserialize(deserializer)?)
++    else {
++        return Ok(None);
++    };
++    value.parse().map(Some).map_err(serde::de::Error::custom)
++}
++
+ /// Builds the base config snapshot for a newly spawned sub-agent.
+ ///
+ /// The returned config starts from the parent's effective config and then refreshes the
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+index 8c78c5b89c..7b04a0ed8a 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+@@ -826,6 +826,60 @@ service_tier = "priority"
+     );
+ }
+ 
++#[tokio::test]
++async fn spawn_agent_treats_none_service_tier_as_unset_for_mimo_xhigh() {
++    #[derive(Debug, Deserialize)]
++    struct SpawnAgentResult {
++        agent_id: String,
++    }
++
++    let (mut session, turn) = make_session_and_context().await;
++    let turn = turn
++        .with_model("mimo-v2.5".to_string(), &session.services.models_manager)
++        .await;
++    let manager = thread_manager();
++    let root = manager
++        .start_thread((*turn.config).clone())
++        .await
++        .expect("root thread should start");
++    session.services.agent_control = manager.agent_control();
++    session.conversation_id = root.thread_id;
++
++    let output = SpawnAgentHandler::default()
++        .handle(invocation(
++            Arc::new(session),
++            Arc::new(turn),
++            "spawn_agent",
++            function_payload(json!({
++                "items": [{
++                    "type": "text",
++                    "text": "inspect this repo",
++                    "image_url": "",
++                    "name": "",
++                    "path": ""
++                }],
++                "model": "mimo-v2.5",
++                "reasoning_effort": "xhigh",
++                "service_tier": "none"
++            })),
++        ))
++        .await
++        .expect("spawn_agent should ignore a none service tier for MiMo");
++    let (content, _) = expect_text_output(output);
++    let result: SpawnAgentResult =
++        serde_json::from_str(&content).expect("spawn_agent result should be json");
++    let snapshot = manager
++        .get_thread(parse_agent_id(&result.agent_id))
++        .await
++        .expect("spawned agent thread should exist")
++        .config_snapshot()
++        .await;
++
++    assert_eq!(snapshot.model, "mimo-v2.5");
++    assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::XHigh));
++    assert_eq!(snapshot.service_tier, None);
++}
++
+ #[tokio::test]
+ async fn spawn_agent_full_history_fork_accepts_explicit_service_tier() {
+     #[derive(Debug, Deserialize)]
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs b/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
+index 9a4e39195d..433b1e8c16 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
+@@ -55,6 +55,7 @@ async fn handle_spawn_agent(
+     let arguments = function_arguments(payload)?;
+     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
+     let fork_mode = args.fork_mode()?;
++    let requested_service_tier = normalize_optional_service_tier(args.service_tier);
+     let role_name = args
+         .agent_type
+         .as_deref()
+@@ -82,7 +83,7 @@ async fn handle_spawn_agent(
+         .await;
+     let mut config =
+         build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
+-    if let Some(service_tier) = args.service_tier.as_ref() {
++    if let Some(service_tier) = requested_service_tier.as_ref() {
+         config.service_tier = Some(service_tier.clone());
+     }
+     if matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)) {
+@@ -104,7 +105,7 @@ async fn handle_spawn_agent(
+         &session,
+         &mut config,
+         turn.config.service_tier.as_deref(),
+-        args.service_tier.as_deref(),
++        requested_service_tier.as_deref(),
+     )
+     .await?;
+     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+@@ -244,9 +245,13 @@ impl CoreToolRuntime for Handler {
+ struct SpawnAgentArgs {
+     message: String,
+     task_name: String,
++    #[serde(default, deserialize_with = "deserialize_optional_tool_string")]
+     agent_type: Option<String>,
++    #[serde(default, deserialize_with = "deserialize_optional_tool_string")]
+     model: Option<String>,
++    #[serde(default, deserialize_with = "deserialize_optional_reasoning_effort")]
+     reasoning_effort: Option<ReasoningEffort>,
++    #[serde(default, deserialize_with = "deserialize_optional_tool_string")]
+     service_tier: Option<String>,
+     fork_turns: Option<String>,
+     fork_context: Option<bool>,

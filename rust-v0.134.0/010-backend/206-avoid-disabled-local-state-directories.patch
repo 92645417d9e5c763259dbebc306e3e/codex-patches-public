@@ -1,0 +1,309 @@
+diff --git a/codex-rs/app-server/tests/suite/v2/turn_start.rs b/codex-rs/app-server/tests/suite/v2/turn_start.rs
+index 236d57a0ee..9cf9287f27 100644
+--- a/codex-rs/app-server/tests/suite/v2/turn_start.rs
++++ b/codex-rs/app-server/tests/suite/v2/turn_start.rs
+@@ -1623,13 +1623,13 @@ async fn turn_start_uses_migrated_pragmatic_personality_without_override_v2() ->
+     let persisted_toml: ConfigToml = toml::from_str(&std::fs::read_to_string(
+         codex_home.path().join("config.toml"),
+     )?)?;
+-    assert_eq!(persisted_toml.personality, Some(Personality::Pragmatic));
++    assert_eq!(persisted_toml.personality, None);
+     assert!(
+-        codex_home
++        !codex_home
+             .path()
+             .join(PERSONALITY_MIGRATION_FILENAME)
+             .exists(),
+-        "expected personality migration marker to be written on startup"
++        "personality migration should stay disabled on startup"
+     );
+ 
+     let thread_req = mcp
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index d70b282b12..ffa0dd9d31 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -4570,11 +4570,15 @@ async fn sqlite_home_defaults_to_codex_home_for_workspace_write() -> std::io::Re
+ }
+ 
+ #[tokio::test]
+-async fn workspace_write_always_includes_memories_root_once() -> std::io::Result<()> {
++async fn workspace_write_includes_enabled_memories_root_once() -> std::io::Result<()> {
+     let codex_home = TempDir::new()?;
+     let memories_root = codex_home.path().join("memories");
+     let config = Config::load_from_base_config_with_overrides(
+         ConfigToml {
++            features: Some(FeaturesToml::from(BTreeMap::from([(
++                "memories".to_string(),
++                true,
++            )]))),
+             sandbox_workspace_write: Some(SandboxWorkspaceWrite {
+                 writable_roots: vec![memories_root.abs()],
+                 ..Default::default()
+@@ -4620,6 +4624,46 @@ async fn workspace_write_always_includes_memories_root_once() -> std::io::Result
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn workspace_write_skips_memories_root_when_memory_feature_disabled() -> std::io::Result<()> {
++    let codex_home = TempDir::new()?;
++    let memories_root = codex_home.path().join("memories");
++    let config = Config::load_from_base_config_with_overrides(
++        ConfigToml {
++            features: Some(FeaturesToml::from(BTreeMap::from([(
++                "memories".to_string(),
++                false,
++            )]))),
++            sandbox_workspace_write: Some(SandboxWorkspaceWrite {
++                writable_roots: vec![codex_home.path().join("workspace").abs()],
++                ..Default::default()
++            }),
++            ..Default::default()
++        },
++        ConfigOverrides {
++            sandbox_mode: Some(SandboxMode::WorkspaceWrite),
++            ..Default::default()
++        },
++        codex_home.abs(),
++    )
++    .await?;
++
++    assert!(
++        !memories_root.exists(),
++        "expected disabled memories feature not to create {}",
++        memories_root.display()
++    );
++    let expected_memories_root = memories_root.abs();
++    if let SandboxPolicy::WorkspaceWrite { writable_roots, .. } = &config.legacy_sandbox_policy() {
++        assert!(
++            !writable_roots.contains(&expected_memories_root),
++            "expected disabled memories root not to be writable"
++        );
++    }
++
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn config_defaults_to_file_cli_auth_store_mode() -> std::io::Result<()> {
+     let codex_home = TempDir::new()?;
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index e1445bf8ca..c21e45c231 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -2722,9 +2722,13 @@ impl Config {
+             Some(WindowsSandboxModeToml::Unelevated) => WindowsSandboxLevel::RestrictedToken,
+             None => WindowsSandboxLevel::from_features(&features),
+         };
+-        let memories_root = memory_root(&codex_home);
+-        std::fs::create_dir_all(&memories_root)?;
+-        let internal_writable_roots = vec![memories_root];
++        let internal_writable_roots = if features.enabled(Feature::MemoryTool) {
++            let memories_root = memory_root(&codex_home);
++            std::fs::create_dir_all(&memories_root)?;
++            vec![memories_root]
++        } else {
++            Vec::new()
++        };
+ 
+         let profiles_are_active = effective_permission_selection.profiles_are_active(
+             default_permissions_override.as_deref(),
+diff --git a/codex-rs/core/src/personality_migration.rs b/codex-rs/core/src/personality_migration.rs
+index 975aecd4af..44a4abcaad 100644
+--- a/codex-rs/core/src/personality_migration.rs
++++ b/codex-rs/core/src/personality_migration.rs
+@@ -1,16 +1,7 @@
+-use crate::config::edit::ConfigEditsBuilder;
+ use codex_config::config_toml::ConfigToml;
+-use codex_protocol::config_types::Personality;
+ use codex_rollout::state_db::StateDbHandle;
+-use codex_thread_store::ListThreadsParams;
+-use codex_thread_store::LocalThreadStore;
+-use codex_thread_store::LocalThreadStoreConfig;
+-use codex_thread_store::ThreadSortKey;
+-use codex_thread_store::ThreadStore;
+ use std::io;
+ use std::path::Path;
+-use tokio::fs::OpenOptions;
+-use tokio::io::AsyncWriteExt;
+ 
+ pub const PERSONALITY_MIGRATION_FILENAME: &str = ".personality_migration";
+ 
+@@ -23,94 +14,11 @@ pub enum PersonalityMigrationStatus {
+ }
+ 
+ pub async fn maybe_migrate_personality(
+-    codex_home: &Path,
+-    config_toml: &ConfigToml,
+-    state_db: Option<StateDbHandle>,
++    _codex_home: &Path,
++    _config_toml: &ConfigToml,
++    _state_db: Option<StateDbHandle>,
+ ) -> io::Result<PersonalityMigrationStatus> {
+-    let marker_path = codex_home.join(PERSONALITY_MIGRATION_FILENAME);
+-    if tokio::fs::try_exists(&marker_path).await? {
+-        return Ok(PersonalityMigrationStatus::SkippedMarker);
+-    }
+-
+-    let config_profile = config_toml
+-        .get_config_profile(/*override_profile*/ None)
+-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+-    if config_toml.personality.is_some() || config_profile.personality.is_some() {
+-        create_marker(&marker_path).await?;
+-        return Ok(PersonalityMigrationStatus::SkippedExplicitPersonality);
+-    }
+-
+-    let model_provider_id = config_profile
+-        .model_provider
+-        .or_else(|| config_toml.model_provider.clone())
+-        .unwrap_or_else(|| "openai".to_string());
+-
+-    if !has_recorded_sessions(codex_home, model_provider_id.as_str(), state_db).await? {
+-        create_marker(&marker_path).await?;
+-        return Ok(PersonalityMigrationStatus::SkippedNoSessions);
+-    }
+-
+-    ConfigEditsBuilder::new(codex_home)
+-        .set_personality(Some(Personality::Pragmatic))
+-        .apply()
+-        .await
+-        .map_err(|err| {
+-            io::Error::other(format!("failed to persist personality migration: {err}"))
+-        })?;
+-
+-    create_marker(&marker_path).await?;
+-    Ok(PersonalityMigrationStatus::Applied)
+-}
+-
+-async fn has_recorded_sessions(
+-    codex_home: &Path,
+-    default_provider: &str,
+-    state_db: Option<StateDbHandle>,
+-) -> io::Result<bool> {
+-    let store = LocalThreadStore::new(
+-        LocalThreadStoreConfig {
+-            codex_home: codex_home.to_path_buf(),
+-            sqlite_home: codex_home.to_path_buf(),
+-            default_model_provider_id: default_provider.to_string(),
+-        },
+-        state_db,
+-    );
+-    if has_threads(&store, /*archived*/ false).await? {
+-        return Ok(true);
+-    }
+-    has_threads(&store, /*archived*/ true).await
+-}
+-
+-async fn has_threads(store: &LocalThreadStore, archived: bool) -> io::Result<bool> {
+-    store
+-        .list_threads(ListThreadsParams {
+-            page_size: 1,
+-            cursor: None,
+-            sort_key: ThreadSortKey::CreatedAt,
+-            sort_direction: codex_thread_store::SortDirection::Desc,
+-            allowed_sources: Vec::new(),
+-            model_providers: None,
+-            cwd_filters: None,
+-            archived,
+-            search_term: None,
+-            use_state_db_only: false,
+-        })
+-        .await
+-        .map(|page| !page.items.is_empty())
+-        .map_err(io::Error::other)
+-}
+-
+-async fn create_marker(marker_path: &Path) -> io::Result<()> {
+-    match OpenOptions::new()
+-        .create_new(true)
+-        .write(true)
+-        .open(marker_path)
+-        .await
+-    {
+-        Ok(mut file) => file.write_all(b"v1\n").await,
+-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+-        Err(err) => Err(err),
+-    }
++    Ok(PersonalityMigrationStatus::SkippedNoSessions)
+ }
+ 
+ #[cfg(test)]
+diff --git a/codex-rs/core/src/personality_migration_tests.rs b/codex-rs/core/src/personality_migration_tests.rs
+index b84d6dd3eb..22708f4e79 100644
+--- a/codex-rs/core/src/personality_migration_tests.rs
++++ b/codex-rs/core/src/personality_migration_tests.rs
+@@ -1,5 +1,7 @@
+ use super::*;
++use crate::config::edit::ConfigEditsBuilder;
+ use codex_protocol::ThreadId;
++use codex_protocol::config_types::Personality;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::RolloutItem;
+ use codex_protocol::protocol::RolloutLine;
+@@ -91,11 +93,9 @@ async fn applies_when_sessions_exist_and_no_personality() -> io::Result<()> {
+     let config_toml = ConfigToml::default();
+     let status = maybe_migrate_personality(temp.path(), &config_toml, /*state_db*/ None).await?;
+ 
+-    assert_eq!(status, PersonalityMigrationStatus::Applied);
+-    assert!(temp.path().join(PERSONALITY_MIGRATION_FILENAME).exists());
+-
+-    let persisted = read_config_toml(temp.path()).await?;
+-    assert_eq!(persisted.personality, Some(Personality::Pragmatic));
++    assert_eq!(status, PersonalityMigrationStatus::SkippedNoSessions);
++    assert!(!temp.path().join(PERSONALITY_MIGRATION_FILENAME).exists());
++    assert!(!temp.path().join("config.toml").exists());
+     Ok(())
+ }
+ 
+@@ -107,23 +107,21 @@ async fn applies_when_only_archived_sessions_exist_and_no_personality() -> io::R
+     let config_toml = ConfigToml::default();
+     let status = maybe_migrate_personality(temp.path(), &config_toml, /*state_db*/ None).await?;
+ 
+-    assert_eq!(status, PersonalityMigrationStatus::Applied);
+-    assert!(temp.path().join(PERSONALITY_MIGRATION_FILENAME).exists());
+-
+-    let persisted = read_config_toml(temp.path()).await?;
+-    assert_eq!(persisted.personality, Some(Personality::Pragmatic));
++    assert_eq!(status, PersonalityMigrationStatus::SkippedNoSessions);
++    assert!(!temp.path().join(PERSONALITY_MIGRATION_FILENAME).exists());
++    assert!(!temp.path().join("config.toml").exists());
+     Ok(())
+ }
+ 
+ #[tokio::test]
+ async fn skips_when_marker_exists() -> io::Result<()> {
+     let temp = TempDir::new()?;
+-    create_marker(&temp.path().join(PERSONALITY_MIGRATION_FILENAME)).await?;
++    tokio::fs::write(temp.path().join(PERSONALITY_MIGRATION_FILENAME), b"v1\n").await?;
+ 
+     let config_toml = ConfigToml::default();
+     let status = maybe_migrate_personality(temp.path(), &config_toml, /*state_db*/ None).await?;
+ 
+-    assert_eq!(status, PersonalityMigrationStatus::SkippedMarker);
++    assert_eq!(status, PersonalityMigrationStatus::SkippedNoSessions);
+     assert!(!temp.path().join("config.toml").exists());
+     Ok(())
+ }
+@@ -140,11 +138,8 @@ async fn skips_when_personality_explicit() -> io::Result<()> {
+     let config_toml = read_config_toml(temp.path()).await?;
+     let status = maybe_migrate_personality(temp.path(), &config_toml, /*state_db*/ None).await?;
+ 
+-    assert_eq!(
+-        status,
+-        PersonalityMigrationStatus::SkippedExplicitPersonality
+-    );
+-    assert!(temp.path().join(PERSONALITY_MIGRATION_FILENAME).exists());
++    assert_eq!(status, PersonalityMigrationStatus::SkippedNoSessions);
++    assert!(!temp.path().join(PERSONALITY_MIGRATION_FILENAME).exists());
+ 
+     let persisted = read_config_toml(temp.path()).await?;
+     assert_eq!(persisted.personality, Some(Personality::Friendly));
+@@ -158,7 +153,7 @@ async fn skips_when_no_sessions() -> io::Result<()> {
+     let status = maybe_migrate_personality(temp.path(), &config_toml, /*state_db*/ None).await?;
+ 
+     assert_eq!(status, PersonalityMigrationStatus::SkippedNoSessions);
+-    assert!(temp.path().join(PERSONALITY_MIGRATION_FILENAME).exists());
++    assert!(!temp.path().join(PERSONALITY_MIGRATION_FILENAME).exists());
+     assert!(!temp.path().join("config.toml").exists());
+     Ok(())
+ }

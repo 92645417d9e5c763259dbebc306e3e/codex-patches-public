@@ -1,0 +1,408 @@
+diff --git a/codex-rs/codex-api/src/sse/chat_completions.rs b/codex-rs/codex-api/src/sse/chat_completions.rs
+index 14a4dfd4d2..2896358255 100644
+--- a/codex-rs/codex-api/src/sse/chat_completions.rs
++++ b/codex-rs/codex-api/src/sse/chat_completions.rs
+@@ -563,13 +563,43 @@ fn chat_error(data: &str) -> Result<Option<ApiError>, ApiError> {
+     {
+         return Ok(Some(ApiError::ContextWindowExceeded));
+     }
+-    Ok(Some(ApiError::Stream(message.to_string())))
++    if error_type == Some("authentication_error") {
++        return Ok(Some(ApiError::InvalidRequest {
++            message: format_chat_error_message(code, error_type, message),
++        }));
++    }
++    Ok(Some(ApiError::Retryable {
++        message: format_chat_error_message(code, error_type, message),
++        delay: None,
++    }))
+ }
+ 
+ fn is_context_window_error(value: &str) -> bool {
+     matches!(value, "context_length_exceeded" | "context_window_exceeded")
+ }
+ 
++fn format_chat_error_message(
++    code: Option<&str>,
++    error_type: Option<&str>,
++    message: &str,
++) -> String {
++    let mut parts = Vec::new();
++    if let Some(code) = code {
++        parts.push(format!("code={code}"));
++    }
++    if let Some(error_type) = error_type {
++        parts.push(format!("type={error_type}"));
++    }
++    if parts.is_empty() {
++        format!("Chat completions stream error: {message}")
++    } else {
++        format!(
++            "Chat completions stream error {}: {message}",
++            parts.join(" ")
++        )
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -1119,8 +1149,34 @@ mod tests {
+     async fn errors_on_stream_error_payload() {
+         let error = json!({
+             "error": {
+-                "message": "invalid api key",
+-                "type": "authentication_error"
++                "message": "temporary upstream failure",
++                "type": "server_error",
++                "code": "434"
++            }
++        });
++
++        let events = collect(sse_data(&error.to_string())).await;
++
++        assert_eq!(events.len(), 1);
++        match &events[0] {
++            Err(ApiError::Retryable { message, delay }) => {
++                assert_eq!(
++                    message,
++                    "Chat completions stream error code=434 type=server_error: temporary upstream failure"
++                );
++                assert_eq!(*delay, None);
++            }
++            other => panic!("unexpected event: {other:?}"),
++        }
++    }
++
++    #[tokio::test]
++    async fn authentication_stream_error_payload_is_not_retryable() {
++        let error = json!({
++            "error": {
++                "message": "Authentication Fails, Your api key: ****4425 is invalid",
++                "type": "authentication_error",
++                "code": "invalid_request_error"
+             }
+         });
+ 
+@@ -1128,7 +1184,10 @@ mod tests {
+ 
+         assert_eq!(events.len(), 1);
+         match &events[0] {
+-            Err(ApiError::Stream(message)) => assert_eq!(message, "invalid api key"),
++            Err(ApiError::InvalidRequest { message }) => assert_eq!(
++                message,
++                "Chat completions stream error code=invalid_request_error type=authentication_error: Authentication Fails, Your api key: ****4425 is invalid"
++            ),
+             other => panic!("unexpected event: {other:?}"),
+         }
+     }
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index 546c98c4ec..f0262d19f1 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -1290,7 +1290,7 @@ impl ModelClientSession {
+             .map_err(map_api_error)?;
+         let api_stream = spawn_chat_completions_stream(
+             stream_response,
+-            Duration::from_millis(300_000),
++            deepseek_side_route::STREAM_IDLE_TIMEOUT,
+             tool_aliases,
+         );
+         let (stream, _) = map_response_stream(
+diff --git a/codex-rs/core/src/deepseek_side_route.rs b/codex-rs/core/src/deepseek_side_route.rs
+index 4fe8ddb4cc..31ac5e2ae4 100644
+--- a/codex-rs/core/src/deepseek_side_route.rs
++++ b/codex-rs/core/src/deepseek_side_route.rs
+@@ -1,7 +1,10 @@
+ use std::fs;
++use std::io::Write;
+ use std::path::Path;
+ use std::sync::Arc;
+ use std::time::Duration;
++use std::time::SystemTime;
++use std::time::UNIX_EPOCH;
+ 
+ use codex_api::AuthProvider;
+ use codex_api::Provider;
+@@ -23,6 +26,7 @@ const API_KEY_FIELD: &str = "api_key";
+ const BASE_URL_FIELD: &str = "base_url";
+ const DEFAULT_BASE_URL: &str = "https://api.deepseek.com/v1";
+ const BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
++pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+ const EXAMPLE_API_KEY_FILE: &str = concat!(
+     "# DeepSeek side-route credentials for Codex.\n",
+     "api_key = \"sk-dummy\"\n",
+@@ -33,6 +37,22 @@ pub fn is_deepseek_model(model: &str) -> bool {
+     model == DEEPSEEK_MODEL
+ }
+ 
++pub(crate) fn log_event(codex_home: &Path, message: impl AsRef<str>) {
++    let log_dir = codex_home.join("log");
++    if fs::create_dir_all(&log_dir).is_err() {
++        return;
++    }
++    let path = log_dir.join("deepseek.log");
++    let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) else {
++        return;
++    };
++    let timestamp = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|duration| duration.as_secs())
++        .unwrap_or_default();
++    let _ = writeln!(file, "[{timestamp}] {}", message.as_ref());
++}
++
+ pub(crate) fn ensure_api_key_file(codex_home: &Path) {
+     let path = codex_home.join(API_KEY_FILE);
+     if path.exists() {
+@@ -52,13 +72,13 @@ pub(crate) fn provider_and_auth(codex_home: &Path) -> Result<(Provider, Arc<dyn
+         query_params: None,
+         headers: Default::default(),
+         retry: RetryConfig {
+-            max_attempts: 3,
++            max_attempts: crate::openai_v1_side_route::STREAM_MAX_RETRIES,
+             base_delay: Duration::from_millis(200),
+             retry_429: true,
+             retry_5xx: true,
+             retry_transport: true,
+         },
+-        stream_idle_timeout: Duration::from_millis(300_000),
++        stream_idle_timeout: STREAM_IDLE_TIMEOUT,
+     };
+     Ok((provider, Arc::new(BearerAuthProvider::new(api_key))))
+ }
+@@ -211,4 +231,15 @@ mod tests {
+ 
+         assert_eq!(None, api_key);
+     }
++
++    #[test]
++    fn log_event_appends_deepseek_log() {
++        let temp_home = tempfile::TempDir::new().expect("temp home");
++
++        log_event(temp_home.path(), "retrying test event");
++
++        let log = fs::read_to_string(temp_home.path().join("log").join("deepseek.log"))
++            .expect("read log");
++        assert!(log.contains("retrying test event"));
++    }
+ }
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index 211795b4b7..97d6901ee5 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -79,6 +79,7 @@ pub(crate) mod mentions {
+     pub(crate) use crate::plugins::collect_explicit_plugin_mentions;
+     pub(crate) use crate::plugins::collect_tool_mentions_from_messages;
+ }
++mod openai_v1_side_route;
+ mod sandbox_tags;
+ pub mod sandboxing;
+ mod session_prefix;
+diff --git a/codex-rs/core/src/openai_v1_side_route.rs b/codex-rs/core/src/openai_v1_side_route.rs
+new file mode 100644
+index 0000000000..02ab86f3c9
+--- /dev/null
++++ b/codex-rs/core/src/openai_v1_side_route.rs
+@@ -0,0 +1,91 @@
++use std::time::Duration;
++
++use codex_protocol::error::CodexErr;
++
++use crate::deepseek_side_route;
++use crate::mimo_side_route;
++
++pub(crate) const STREAM_MAX_RETRIES: u64 = 5;
++pub(crate) const STREAM_RETRY_BUDGET: Duration = Duration::from_secs(5 * 60);
++const STREAM_RETRY_DELAY: Duration = Duration::from_secs(60);
++
++pub(crate) fn is_openai_v1_side_route_model(model: &str) -> bool {
++    deepseek_side_route::is_deepseek_model(model) || mimo_side_route::is_mimo_model(model)
++}
++
++pub(crate) fn retry_delay(elapsed: Duration) -> Option<Duration> {
++    if elapsed >= STREAM_RETRY_BUDGET {
++        None
++    } else {
++        Some(STREAM_RETRY_DELAY.min(STREAM_RETRY_BUDGET - elapsed))
++    }
++}
++
++pub(crate) fn is_retryable_stream_error(err: &CodexErr) -> bool {
++    match err {
++        CodexErr::Stream(message, _) => {
++            let message = message.to_ascii_lowercase();
++            message.contains("chat completions stream error")
++                || message.contains("idle timeout")
++                || message.contains("stream closed")
++                || message.contains("connection reset")
++                || message.contains("connection closed")
++                || message.contains("closed connection")
++                || message.contains("connection refused")
++                || message.contains("connection aborted")
++                || message.contains("unexpected eof")
++                || message.contains("tls handshake eof")
++                || message.contains("close_notify")
++                || message.contains("failed to write whole buffer")
++                || message.contains("timed out")
++                || message.contains("timeout")
++                || message.contains("network error")
++                || message.contains("dns error")
++                || message.contains("failed to lookup")
++                || message.contains("name resolution")
++                || message.contains("temporary failure in name resolution")
++        }
++        CodexErr::Timeout | CodexErr::RequestTimeout | CodexErr::Io(_) => true,
++        _ => false,
++    }
++}
++
++pub(crate) fn log_event_for_model(model: &str, codex_home: &std::path::Path, message: String) {
++    if deepseek_side_route::is_deepseek_model(model) {
++        deepseek_side_route::log_event(codex_home, message);
++    } else if mimo_side_route::is_mimo_model(model) {
++        mimo_side_route::log_event(codex_home, message);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn retry_delay_stays_inside_budget() {
++        assert_eq!(retry_delay(Duration::ZERO), Some(STREAM_RETRY_DELAY));
++        assert_eq!(
++            retry_delay(STREAM_RETRY_BUDGET - Duration::from_secs(1)),
++            Some(Duration::from_secs(1))
++        );
++        assert_eq!(retry_delay(STREAM_RETRY_BUDGET), None);
++    }
++
++    #[test]
++    fn classifies_openai_v1_stream_errors() {
++        assert!(is_retryable_stream_error(&CodexErr::Stream(
++            "Chat completions stream error code=434 type=server_error: upstream failed".to_string(),
++            None,
++        )));
++        assert!(is_retryable_stream_error(&CodexErr::Stream(
++            "stream disconnected before completion: Transport error: network error: error decoding response body".to_string(),
++            None,
++        )));
++        assert!(is_retryable_stream_error(&CodexErr::RequestTimeout));
++        assert!(!is_retryable_stream_error(&CodexErr::TurnAborted));
++        assert!(!is_retryable_stream_error(&CodexErr::InvalidRequest(
++            "Chat completions stream error type=authentication_error: invalid api key".to_string(),
++        )));
++    }
++}
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index 87a8c0ce84..6ba8dbb89f 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -36,6 +36,7 @@ use crate::mentions::build_skill_name_counts;
+ use crate::mentions::collect_explicit_app_ids;
+ use crate::mentions::collect_explicit_plugin_mentions;
+ use crate::mentions::collect_tool_mentions_from_messages;
++use crate::openai_v1_side_route;
+ use crate::plugins::build_plugin_injections;
+ use crate::session::PreviousTurnSettings;
+ use crate::session::TurnInput;
+@@ -1017,22 +1018,73 @@ async fn run_sampling_request(
+             Err(err) => err,
+         };
+ 
+-        if !err.is_retryable() {
++        let openai_v1_stream_retry =
++            openai_v1_side_route::is_openai_v1_side_route_model(&turn_context.model_info.slug)
++                && openai_v1_side_route::is_retryable_stream_error(&err);
++
++        if !err.is_retryable() && !openai_v1_stream_retry {
++            if openai_v1_side_route::is_openai_v1_side_route_model(&turn_context.model_info.slug)
++                && let Ok(codex_home) = crate::config::find_codex_home()
++            {
++                openai_v1_side_route::log_event_for_model(
++                    &turn_context.model_info.slug,
++                    &codex_home,
++                    format!(
++                        "failed non-retryable model={} error={err:#}",
++                        turn_context.model_info.slug
++                    ),
++                );
++            }
+             return Err(err);
+         }
+ 
+-        // Use a longer fixed retry budget for WebSocket stream transport failures, and keep the
+-        // provider-specific stream retry budget for other retryable errors.
++        // Use route-specific retry budgets for stream transport failures, and keep the
++        // configured provider stream retry budget for other retryable errors.
+         let ws_stream_retry = sess.services.model_client.responses_websocket_enabled()
+             && is_ws_stream_retryable(&err);
+-        let max_retries = if ws_stream_retry {
++        let max_retries = if openai_v1_stream_retry {
++            openai_v1_side_route::STREAM_MAX_RETRIES
++        } else if ws_stream_retry {
+             WS_STREAM_MAX_RETRIES
+         } else {
+             turn_context.provider.info().stream_max_retries()
+         };
+         if retries < max_retries {
+             retries += 1;
+-            let delay = if ws_stream_retry {
++            let delay = if openai_v1_stream_retry {
++                let started_at = *ws_stream_retry_started_at.get_or_insert_with(Instant::now);
++                let elapsed = started_at.elapsed();
++                let Some(delay) = openai_v1_side_route::retry_delay(elapsed) else {
++                    if let Ok(codex_home) = crate::config::find_codex_home() {
++                        openai_v1_side_route::log_event_for_model(
++                            &turn_context.model_info.slug,
++                            &codex_home,
++                            format!(
++                                "retry budget exhausted model={} retries={retries}/{max_retries} elapsed={elapsed:?} error={err:#}",
++                                turn_context.model_info.slug
++                            ),
++                        );
++                    }
++                    return Err(err);
++                };
++                if let Ok(codex_home) = crate::config::find_codex_home() {
++                    openai_v1_side_route::log_event_for_model(
++                        &turn_context.model_info.slug,
++                        &codex_home,
++                        format!(
++                            "retrying model={} attempt={retries}/{max_retries} elapsed={elapsed:?}/{:?} next={delay:?} error={err:#}",
++                            turn_context.model_info.slug,
++                            openai_v1_side_route::STREAM_RETRY_BUDGET
++                        ),
++                    );
++                }
++                warn!(
++                    "OpenAI v1 stream failed - retrying sampling request \
++                     ({retries}/{max_retries}; {elapsed:?}/{:?}; next in {delay:?})...",
++                    openai_v1_side_route::STREAM_RETRY_BUDGET,
++                );
++                delay
++            } else if ws_stream_retry {
+                 let started_at = *ws_stream_retry_started_at.get_or_insert_with(Instant::now);
+                 let elapsed = started_at.elapsed();
+                 let Some(delay) = ws_stream_retry_delay(elapsed) else {
+@@ -1069,6 +1121,18 @@ async fn run_sampling_request(
+             }
+             tokio::time::sleep(delay).await;
+         } else {
++            if openai_v1_side_route::is_openai_v1_side_route_model(&turn_context.model_info.slug)
++                && let Ok(codex_home) = crate::config::find_codex_home()
++            {
++                openai_v1_side_route::log_event_for_model(
++                    &turn_context.model_info.slug,
++                    &codex_home,
++                    format!(
++                        "failed model={} retries={retries}/{max_retries} error={err:#}",
++                        turn_context.model_info.slug
++                    ),
++                );
++            }
+             return Err(err);
+         }
+     }

@@ -1,0 +1,157 @@
+diff --git a/codex-rs/arg0/src/lib.rs b/codex-rs/arg0/src/lib.rs
+index 2f6ae4653c..d9cc3b49db 100644
+--- a/codex-rs/arg0/src/lib.rs
++++ b/codex-rs/arg0/src/lib.rs
+@@ -7,6 +7,7 @@ use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
+ use codex_exec_server::CODEX_FS_HELPER_ARG1;
+ use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
+ use codex_utils_home_dir::find_codex_home;
++use codex_utils_home_dir::find_codex_tmp_root;
+ #[cfg(unix)]
+ use std::os::unix::fs::symlink;
+ use tempfile::TempDir;
+@@ -298,8 +299,8 @@ pub fn prepend_path_entry_for_codex_aliases() -> std::io::Result<Arg0PathEntryGu
+     }
+ 
+     std::fs::create_dir_all(&codex_home)?;
+-    // Use a CODEX_HOME-scoped temp root to avoid cluttering the top-level directory.
+-    let temp_root = codex_home.join("tmp").join("arg0");
++    // Use the system temp directory for runtime-only arg0 helpers so CODEX_HOME stays cleaner.
++    let temp_root = find_codex_tmp_root()?.join("arg0");
+     std::fs::create_dir_all(&temp_root)?;
+     #[cfg(unix)]
+     {
+diff --git a/codex-rs/core/src/config/permissions.rs b/codex-rs/core/src/config/permissions.rs
+index 3aaa7d66f8..2b08b12a9d 100644
+--- a/codex-rs/core/src/config/permissions.rs
++++ b/codex-rs/core/src/config/permissions.rs
+@@ -37,6 +37,7 @@ use codex_protocol::permissions::FileSystemSpecialPath;
+ use codex_protocol::permissions::NetworkSandboxPolicy;
+ use codex_protocol::permissions::project_roots_glob_pattern;
+ use codex_utils_absolute_path::AbsolutePathBuf;
++use codex_utils_home_dir::find_codex_tmp_root;
+ 
+ use super::ProjectConfig;
+ 
+@@ -390,11 +391,11 @@ pub(crate) fn reject_unknown_builtin_permission_profile(profile_name: &str) -> i
+ /// for Codex to function. These should always be added to the
+ /// `FileSystemSandboxPolicy` for a thread.
+ pub(crate) fn get_readable_roots_required_for_codex_runtime(
+-    codex_home: &Path,
++    _codex_home: &Path,
+     zsh_path: Option<&PathBuf>,
+     main_execve_wrapper_exe: Option<&PathBuf>,
+ ) -> Vec<AbsolutePathBuf> {
+-    let arg0_root = AbsolutePathBuf::from_absolute_path(codex_home.join("tmp").join("arg0")).ok();
++    let arg0_root = find_codex_tmp_root().ok().map(|path| path.join("arg0"));
+     let zsh_path = zsh_path.and_then(|path| AbsolutePathBuf::from_absolute_path(path).ok());
+     let execve_wrapper_root = main_execve_wrapper_exe.and_then(|path| {
+         let path = AbsolutePathBuf::from_absolute_path(path).ok()?;
+diff --git a/codex-rs/core/src/config/permissions_tests.rs b/codex-rs/core/src/config/permissions_tests.rs
+index 09aa7606aa..5ae61f2ecd 100644
+--- a/codex-rs/core/src/config/permissions_tests.rs
++++ b/codex-rs/core/src/config/permissions_tests.rs
+@@ -49,7 +49,7 @@ async fn restricted_read_implicitly_allows_helper_executables() -> std::io::Resu
+     let cwd = temp_dir.path().join("workspace");
+     let codex_home = temp_dir.path().join(".codex");
+     let zsh_path = temp_dir.path().join("runtime").join("zsh");
+-    let arg0_root = codex_home.join("tmp").join("arg0");
++    let arg0_root = std::env::temp_dir().join("codex").join("tmp").join("arg0");
+     let allowed_arg0_dir = arg0_root.join("codex-arg0-session");
+     let sibling_arg0_dir = arg0_root.join("codex-arg0-other-session");
+     let execve_wrapper = allowed_arg0_dir.join("codex-execve-wrapper");
+diff --git a/codex-rs/linux-sandbox/src/proxy_routing.rs b/codex-rs/linux-sandbox/src/proxy_routing.rs
+index d28b864666..cce3d02b9a 100644
+--- a/codex-rs/linux-sandbox/src/proxy_routing.rs
++++ b/codex-rs/linux-sandbox/src/proxy_routing.rs
+@@ -300,15 +300,17 @@ fn create_proxy_socket_dir() -> io::Result<PathBuf> {
+ }
+ 
+ fn proxy_socket_parent_dir() -> PathBuf {
+-    if let Some(codex_home) = std::env::var_os("CODEX_HOME") {
+-        let candidate = PathBuf::from(codex_home).join("tmp");
+-        if ensure_private_proxy_socket_parent_dir(candidate.as_path()).is_ok() {
+-            return candidate;
+-        }
++    let candidate = codex_runtime_tmp_root();
++    if ensure_private_proxy_socket_parent_dir(candidate.as_path()).is_ok() {
++        return candidate;
+     }
+     std::env::temp_dir()
+ }
+ 
++fn codex_runtime_tmp_root() -> PathBuf {
++    std::env::temp_dir().join("codex").join("tmp")
++}
++
+ fn ensure_private_proxy_socket_parent_dir(path: &Path) -> io::Result<()> {
+     let mut dir_builder = DirBuilder::new();
+     dir_builder.recursive(true);
+@@ -656,6 +658,7 @@ mod tests {
+     use super::ProxyRouteSpec;
+     use super::cleanup_proxy_socket_dir;
+     use super::cleanup_stale_proxy_socket_dirs_in;
++    use super::codex_runtime_tmp_root;
+     use super::default_proxy_port;
+     use super::is_proxy_env_key;
+     use super::parse_loopback_proxy_endpoint;
+@@ -735,6 +738,13 @@ mod tests {
+         assert_eq!(default_proxy_port("socks5h"), 1080);
+     }
+ 
++    #[test]
++    fn codex_runtime_tmp_root_uses_scoped_system_temp_dir() {
++        let root = codex_runtime_tmp_root();
++        let expected = std::env::temp_dir().join("codex").join("tmp");
++        assert_eq!(root, expected);
++    }
++
+     #[test]
+     fn cleanup_proxy_socket_dir_removes_bridge_artifacts() {
+         let root = tempfile::tempdir().expect("tempdir should create");
+diff --git a/codex-rs/utils/home-dir/src/lib.rs b/codex-rs/utils/home-dir/src/lib.rs
+index caa43569c7..7ae8422bb3 100644
+--- a/codex-rs/utils/home-dir/src/lib.rs
++++ b/codex-rs/utils/home-dir/src/lib.rs
+@@ -17,6 +17,20 @@ pub fn find_codex_home() -> std::io::Result<AbsolutePathBuf> {
+     find_codex_home_from_env(codex_home_env.as_deref())
+ }
+ 
++/// Returns the Codex runtime temp root under the system temp directory.
++///
++/// This uses [`std::env::temp_dir`] so it follows the platform temp directory
++/// conventions and honors environment overrides such as `TMPDIR`.
++pub fn find_codex_tmp_root() -> std::io::Result<AbsolutePathBuf> {
++    let path = std::env::temp_dir().join("codex").join("tmp");
++    AbsolutePathBuf::from_absolute_path(path).map_err(|path| {
++        std::io::Error::new(
++            std::io::ErrorKind::InvalidInput,
++            format!("system temp dir resolved to a non-absolute path: {path:?}"),
++        )
++    })
++}
++
+ fn find_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<AbsolutePathBuf> {
+     // Honor the `CODEX_HOME` environment variable when it is set to allow users
+     // (and tests) to override the default location.
+@@ -65,6 +79,7 @@ fn find_codex_home_from_env(codex_home_env: Option<&str>) -> std::io::Result<Abs
+ #[cfg(test)]
+ mod tests {
+     use super::find_codex_home_from_env;
++    use super::find_codex_tmp_root;
+     use codex_utils_absolute_path::AbsolutePathBuf;
+     use dirs::home_dir;
+     use pretty_assertions::assert_eq;
+@@ -131,4 +146,12 @@ mod tests {
+         let expected = AbsolutePathBuf::from_absolute_path(expected).expect("absolute home");
+         assert_eq!(resolved, expected);
+     }
++
++    #[test]
++    fn find_codex_tmp_root_uses_system_temp_dir() {
++        let resolved = find_codex_tmp_root().expect("tmp root");
++        let expected = std::env::temp_dir().join("codex").join("tmp");
++        let expected = AbsolutePathBuf::from_absolute_path(expected).expect("absolute temp root");
++        assert_eq!(resolved, expected);
++    }
+ }

@@ -1,0 +1,144 @@
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index 7ea724215c..dacb5126c1 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -679,17 +679,24 @@ impl ModelClient {
+         if model_info.supports_reasoning_summaries {
+             Some(Reasoning {
+                 effort: effort.or(model_info.default_reasoning_level),
+-                summary: if summary == ReasoningSummaryConfig::None {
+-                    None
+-                } else {
+-                    Some(summary)
+-                },
++                summary: Self::reasoning_summary_for_request(model_info, summary),
+             })
+         } else {
+             None
+         }
+     }
+ 
++    fn reasoning_summary_for_request(
++        model_info: &ModelInfo,
++        summary: ReasoningSummaryConfig,
++    ) -> Option<ReasoningSummaryConfig> {
++        if summary == ReasoningSummaryConfig::None || model_info.slug == "gpt-5.3-codex-spark" {
++            None
++        } else {
++            Some(summary)
++        }
++    }
++
+     fn build_responses_request(
+         &self,
+         provider: &codex_api::Provider,
+@@ -700,7 +707,7 @@ impl ModelClient {
+         service_tier: Option<String>,
+     ) -> Result<ResponsesApiRequest> {
+         let instructions = &prompt.base_instructions.text;
+-        let input = prompt.get_formatted_input();
++        let input = responses_api_input(prompt);
+         let tools = create_tools_json_for_responses_api(&prompt.tools)?;
+         let reasoning = Self::build_reasoning(model_info, effort, summary);
+         let include = if reasoning.is_some() {
+@@ -905,6 +912,34 @@ impl ModelClient {
+     }
+ }
+ 
++fn responses_api_input(prompt: &Prompt) -> Vec<ResponseItem> {
++    sanitize_responses_api_input_items(prompt.get_formatted_input())
++}
++
++fn sanitize_responses_api_input_items(input: Vec<ResponseItem>) -> Vec<ResponseItem> {
++    input
++        .into_iter()
++        .map(sanitize_responses_api_input_item)
++        .collect()
++}
++
++fn sanitize_responses_api_input_item(item: ResponseItem) -> ResponseItem {
++    match item {
++        ResponseItem::Reasoning {
++            id,
++            summary,
++            content: Some(_),
++            encrypted_content,
++        } => ResponseItem::Reasoning {
++            id,
++            summary,
++            content: Some(Vec::new()),
++            encrypted_content,
++        },
++        item => item,
++    }
++}
++
+ impl Drop for ModelClientSession {
+     fn drop(&mut self) {
+         let websocket_session = std::mem::take(&mut self.websocket_session);
+@@ -1024,7 +1059,7 @@ impl ModelClientSession {
+         request: &ResponsesApiRequest,
+     ) -> (ResponsesWsRequest, bool) {
+         let Some(last_response) = self.get_last_response() else {
+-            return (ResponsesWsRequest::ResponseCreate(payload), false);
++            return (response_create_ws_request(payload), false);
+         };
+         let previous_response_id_from_untraced_warmup =
+             self.websocket_session.last_response_from_untraced_warmup;
+@@ -1033,16 +1068,16 @@ impl ModelClientSession {
+             Some(&last_response),
+             /*allow_empty_delta*/ true,
+         ) else {
+-            return (ResponsesWsRequest::ResponseCreate(payload), false);
++            return (response_create_ws_request(payload), false);
+         };
+ 
+         if last_response.response_id.is_empty() {
+             trace!("incremental request failed, no previous response id");
+-            return (ResponsesWsRequest::ResponseCreate(payload), false);
++            return (response_create_ws_request(payload), false);
+         }
+ 
+         (
+-            ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
++            response_create_ws_request(ResponseCreateWsRequest {
+                 previous_response_id: Some(last_response.response_id),
+                 input: incremental_items,
+                 ..payload
+@@ -1593,6 +1628,11 @@ impl ModelClientSession {
+     }
+ }
+ 
++fn response_create_ws_request(mut payload: ResponseCreateWsRequest) -> ResponsesWsRequest {
++    payload.input = sanitize_responses_api_input_items(payload.input);
++    ResponsesWsRequest::ResponseCreate(payload)
++}
++
+ fn websocket_http_fallback_disabled() -> codex_protocol::error::CodexErr {
+     map_api_error(ApiError::Stream(
+         "websocket transport cannot continue and HTTP fallback is disabled".to_string(),
+diff --git a/codex-rs/core/tests/suite/client.rs b/codex-rs/core/tests/suite/client.rs
+index f6731a0ea4..948fe3779b 100644
+--- a/codex-rs/core/tests/suite/client.rs
++++ b/codex-rs/core/tests/suite/client.rs
+@@ -2351,7 +2351,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
+         content: Some(vec![ReasoningItemContent::ReasoningText {
+             text: "content".into(),
+         }]),
+-        encrypted_content: None,
++        encrypted_content: Some("encrypted".into()),
+     });
+     prompt.input.push(ResponseItem::Message {
+         id: Some("message-id".into()),
+@@ -2433,6 +2433,11 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
+     assert_eq!(body["stream"], serde_json::Value::Bool(true));
+     assert_eq!(body["input"].as_array().map(Vec::len), Some(8));
+     assert_eq!(body["input"][0]["id"].as_str(), Some("reasoning-id"));
++    assert!(body["input"][0].get("content").is_none());
++    assert_eq!(
++        body["input"][0]["encrypted_content"].as_str(),
++        Some("encrypted")
++    );
+     assert_eq!(body["input"][1]["id"].as_str(), Some("message-id"));
+     assert_eq!(body["input"][2]["id"].as_str(), Some("web-search-id"));
+     assert_eq!(body["input"][3]["id"].as_str(), Some("function-id"));

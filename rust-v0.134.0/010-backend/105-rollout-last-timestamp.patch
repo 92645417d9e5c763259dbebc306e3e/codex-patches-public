@@ -1,0 +1,519 @@
+diff --git a/codex-rs/rollout/src/list.rs b/codex-rs/rollout/src/list.rs
+index d4f0677898..76f00b4719 100644
+--- a/codex-rs/rollout/src/list.rs
++++ b/codex-rs/rollout/src/list.rs
+@@ -234,7 +234,7 @@ impl<'a> RolloutFileVisitor for FilesByCreatedAtVisitor<'a> {
+             self.more_matches_available = true;
+             return ControlFlow::Break(());
+         }
+-        let updated_at = file_modified_time(&path)
++        let updated_at = rollout_updated_time(&path)
+             .await
+             .unwrap_or(None)
+             .and_then(format_rfc3339);
+@@ -253,8 +253,8 @@ impl<'a> RolloutFileVisitor for FilesByCreatedAtVisitor<'a> {
+     }
+ }
+ 
+-/// Collects lightweight file candidates (path + id + mtime).
+-/// Sorting after mtime happens after all files are collected.
++/// Collects lightweight file candidates (path + id + updated_at).
++/// Sorting after updated_at happens after all files are collected.
+ struct FilesByUpdatedAtVisitor<'a> {
+     candidates: &'a mut Vec<ThreadCandidate>,
+ }
+@@ -268,7 +268,7 @@ impl<'a> RolloutFileVisitor for FilesByUpdatedAtVisitor<'a> {
+         path: PathBuf,
+         _scanned: usize,
+     ) -> ControlFlow<()> {
+-        let updated_at = file_modified_time(&path).await.unwrap_or(None);
++        let updated_at = rollout_updated_time(&path).await.unwrap_or(None);
+         self.candidates.push(ThreadCandidate {
+             path,
+             id,
+@@ -606,7 +606,7 @@ async fn traverse_flat_paths_created(
+             more_matches_available = true;
+             break;
+         }
+-        let updated_at = file_modified_time(&path)
++        let updated_at = rollout_updated_time(&path)
+             .await
+             .unwrap_or(None)
+             .and_then(format_rfc3339);
+@@ -995,9 +995,10 @@ async fn collect_flat_files_by_updated_at(
+         if *scanned_files > MAX_SCAN_FILES {
+             break;
+         }
+-        let updated_at = file_modified_time(&entry.path()).await.unwrap_or(None);
++        let path = entry.path();
++        let updated_at = rollout_updated_time(&path).await.unwrap_or(None);
+         candidates.push(ThreadCandidate {
+-            path: entry.path(),
++            path,
+             id,
+             updated_at,
+         });
+@@ -1260,6 +1261,77 @@ async fn file_modified_time(path: &Path) -> io::Result<Option<OffsetDateTime>> {
+     Ok(truncate_to_millis(dt))
+ }
+ 
++async fn rollout_updated_time(path: &Path) -> io::Result<Option<OffsetDateTime>> {
++    if let Some(updated_at) = rollout_last_timestamp(path).await? {
++        return Ok(Some(updated_at));
++    }
++    file_modified_time(path).await
++}
++
++async fn rollout_last_timestamp(path: &Path) -> io::Result<Option<OffsetDateTime>> {
++    let Some(line) = read_last_non_empty_line(path).await? else {
++        return Ok(None);
++    };
++    let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(line.as_str()) else {
++        return Ok(None);
++    };
++    Ok(
++        OffsetDateTime::parse(rollout_line.timestamp.as_str(), &Rfc3339)
++            .ok()
++            .and_then(truncate_to_millis),
++    )
++}
++
++async fn read_last_non_empty_line(path: &Path) -> io::Result<Option<String>> {
++    use tokio::io::AsyncReadExt;
++    use tokio::io::AsyncSeekExt;
++
++    const CHUNK_SIZE: u64 = 8192;
++
++    let mut file = tokio::fs::File::open(path).await?;
++    let mut position = file.metadata().await?.len();
++    let mut tail = Vec::new();
++    while position > 0 {
++        let read_len = position.min(CHUNK_SIZE) as usize;
++        position = position.saturating_sub(read_len as u64);
++        file.seek(std::io::SeekFrom::Start(position)).await?;
++        let mut chunk = vec![0; read_len];
++        file.read_exact(&mut chunk).await?;
++        chunk.extend_from_slice(tail.as_slice());
++        tail = chunk;
++        if let Some(line) = last_complete_non_empty_line(tail.as_slice(), position == 0) {
++            return Ok(Some(line));
++        }
++    }
++    Ok(None)
++}
++
++fn last_complete_non_empty_line(buffer: &[u8], at_start: bool) -> Option<String> {
++    let mut end = buffer.len();
++    loop {
++        while end > 0 && matches!(buffer[end - 1], b'\n' | b'\r') {
++            end -= 1;
++        }
++        if end == 0 {
++            return None;
++        }
++
++        let start = match buffer[..end].iter().rposition(|byte| *byte == b'\n') {
++            Some(index) => index.saturating_add(1),
++            None if at_start => 0,
++            None => return None,
++        };
++        let line = &buffer[start..end];
++        if !line.iter().all(u8::is_ascii_whitespace) {
++            return Some(String::from_utf8_lossy(line).trim().to_string());
++        }
++        if start == 0 {
++            return None;
++        }
++        end = start.saturating_sub(1);
++    }
++}
++
+ fn format_rfc3339(dt: OffsetDateTime) -> Option<String> {
+     dt.format(&Rfc3339).ok()
+ }
+diff --git a/codex-rs/rollout/src/metadata.rs b/codex-rs/rollout/src/metadata.rs
+index 2dd2df3a41..2f517cd4d6 100644
+--- a/codex-rs/rollout/src/metadata.rs
++++ b/codex-rs/rollout/src/metadata.rs
+@@ -98,8 +98,8 @@ pub async fn extract_metadata_from_rollout(
+     rollout_path: &Path,
+     default_provider: &str,
+ ) -> anyhow::Result<ExtractionOutcome> {
+-    let (items, _thread_id, parse_errors) =
+-        RolloutRecorder::load_rollout_items(rollout_path).await?;
++    let loaded = RolloutRecorder::load_rollout_items_with_metadata(rollout_path).await?;
++    let items = loaded.items;
+     if items.is_empty() {
+         return Err(anyhow::anyhow!(
+             "empty session file: {}",
+@@ -119,6 +119,13 @@ pub async fn extract_metadata_from_rollout(
+     if let Some(updated_at) = file_modified_time_utc(rollout_path).await {
+         metadata.updated_at = updated_at;
+     }
++    if let Some(updated_at) = loaded
++        .last_timestamp
++        .as_deref()
++        .and_then(parse_timestamp_to_utc)
++    {
++        metadata.updated_at = updated_at;
++    }
+     Ok(ExtractionOutcome {
+         metadata,
+         memory_mode: items.iter().rev().find_map(|item| match item {
+@@ -128,7 +135,7 @@ pub async fn extract_metadata_from_rollout(
+             | RolloutItem::TurnContext(_)
+             | RolloutItem::EventMsg(_) => None,
+         }),
+-        parse_errors,
++        parse_errors: loaded.parse_errors,
+     })
+ }
+ 
+diff --git a/codex-rs/rollout/src/metadata_tests.rs b/codex-rs/rollout/src/metadata_tests.rs
+index 45db758c65..d6afcc0de1 100644
+--- a/codex-rs/rollout/src/metadata_tests.rs
++++ b/codex-rs/rollout/src/metadata_tests.rs
+@@ -17,6 +17,7 @@ use codex_state::BackfillStatus;
+ use codex_state::ThreadMetadataBuilder;
+ use pretty_assertions::assert_eq;
+ use std::fs::File;
++use std::fs::FileTimes;
+ use std::io::Write;
+ use std::path::Path;
+ use std::path::PathBuf;
+@@ -68,13 +69,128 @@ async fn extract_metadata_from_rollout_uses_session_meta() {
+     let builder = builder_from_session_meta(&session_meta_line, path.as_path()).expect("builder");
+     let mut expected = builder.build("openai");
+     apply_rollout_item(&mut expected, &rollout_line.item, "openai");
+-    expected.updated_at = file_modified_time_utc(&path).await.expect("mtime");
++    expected.updated_at =
++        parse_timestamp_to_utc(rollout_line.timestamp.as_str()).expect("timestamp");
+ 
+     assert_eq!(outcome.metadata, expected);
+     assert_eq!(outcome.memory_mode, None);
+     assert_eq!(outcome.parse_errors, 0);
+ }
+ 
++#[tokio::test]
++async fn extract_metadata_from_rollout_uses_last_rollout_line_timestamp_for_updated_at() {
++    let dir = tempdir().expect("tempdir");
++    let uuid = Uuid::new_v4();
++    let id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
++    let path = dir
++        .path()
++        .join(format!("rollout-2026-01-27T12-34-56-{uuid}.jsonl"));
++
++    let session_meta = SessionMeta {
++        id,
++        forked_from_id: None,
++        timestamp: "2026-01-27T12:34:56Z".to_string(),
++        cwd: dir.path().to_path_buf(),
++        originator: "cli".to_string(),
++        cli_version: "0.0.0".to_string(),
++        source: SessionSource::default(),
++        agent_path: None,
++        agent_nickname: None,
++        agent_role: None,
++        model_provider: Some("openai".to_string()),
++        base_instructions: None,
++        dynamic_tools: None,
++        memory_mode: None,
++    };
++    let lines = vec![
++        RolloutLine {
++            timestamp: "2026-01-27T12:34:56Z".to_string(),
++            item: RolloutItem::SessionMeta(SessionMetaLine {
++                meta: session_meta,
++                git: None,
++            }),
++        },
++        RolloutLine {
++            timestamp: "2026-01-27T12:40:00Z".to_string(),
++            item: RolloutItem::Compacted(CompactedItem {
++                message: "compacted".to_string(),
++                replacement_history: None,
++            }),
++        },
++    ];
++    let mut file = File::create(&path).expect("create rollout");
++    for line in &lines {
++        writeln!(
++            file,
++            "{}",
++            serde_json::to_string(line).expect("serialize rollout line")
++        )
++        .expect("write rollout line");
++    }
++    let newer_mtime = parse_timestamp_to_utc("2026-01-28T00:00:00Z").expect("newer timestamp");
++    file.set_times(FileTimes::new().set_modified(newer_mtime.into()))
++        .expect("set mtime");
++
++    let outcome = extract_metadata_from_rollout(&path, "openai")
++        .await
++        .expect("extract");
++
++    assert_eq!(
++        outcome.metadata.updated_at,
++        parse_timestamp_to_utc("2026-01-27T12:40:00Z").expect("last timestamp")
++    );
++}
++
++#[tokio::test]
++async fn extract_metadata_from_rollout_falls_back_to_mtime_when_last_timestamp_is_invalid() {
++    let dir = tempdir().expect("tempdir");
++    let uuid = Uuid::new_v4();
++    let id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
++    let path = dir
++        .path()
++        .join(format!("rollout-2026-01-27T12-34-56-{uuid}.jsonl"));
++
++    let session_meta = SessionMeta {
++        id,
++        forked_from_id: None,
++        timestamp: "2026-01-27T12:34:56Z".to_string(),
++        cwd: dir.path().to_path_buf(),
++        originator: "cli".to_string(),
++        cli_version: "0.0.0".to_string(),
++        source: SessionSource::default(),
++        agent_path: None,
++        agent_nickname: None,
++        agent_role: None,
++        model_provider: Some("openai".to_string()),
++        base_instructions: None,
++        dynamic_tools: None,
++        memory_mode: None,
++    };
++    let rollout_line = RolloutLine {
++        timestamp: "not-a-timestamp".to_string(),
++        item: RolloutItem::SessionMeta(SessionMetaLine {
++            meta: session_meta,
++            git: None,
++        }),
++    };
++    let mut file = File::create(&path).expect("create rollout");
++    writeln!(
++        file,
++        "{}",
++        serde_json::to_string(&rollout_line).expect("serialize rollout line")
++    )
++    .expect("write rollout line");
++    let mtime = parse_timestamp_to_utc("2026-01-28T00:00:00Z").expect("mtime");
++    file.set_times(FileTimes::new().set_modified(mtime.into()))
++        .expect("set mtime");
++
++    let outcome = extract_metadata_from_rollout(&path, "openai")
++        .await
++        .expect("extract");
++
++    assert_eq!(outcome.metadata.updated_at, mtime);
++}
++
+ #[tokio::test]
+ async fn extract_metadata_from_rollout_returns_latest_memory_mode() {
+     let dir = tempdir().expect("tempdir");
+diff --git a/codex-rs/rollout/src/recorder.rs b/codex-rs/rollout/src/recorder.rs
+index 23b05b9def..03621e2e41 100644
+--- a/codex-rs/rollout/src/recorder.rs
++++ b/codex-rs/rollout/src/recorder.rs
+@@ -188,6 +188,13 @@ enum ThreadListRepairMode {
+     StateDbOnly,
+ }
+ 
++pub(crate) struct LoadedRolloutItems {
++    pub(crate) items: Vec<RolloutItem>,
++    pub(crate) thread_id: Option<ThreadId>,
++    pub(crate) parse_errors: usize,
++    pub(crate) last_timestamp: Option<String>,
++}
++
+ impl RolloutRecorder {
+     /// List threads (rollout files) under the provided Codex home directory.
+     #[allow(clippy::too_many_arguments)]
+@@ -812,6 +819,13 @@ impl RolloutRecorder {
+     pub async fn load_rollout_items(
+         path: &Path,
+     ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
++        let loaded = Self::load_rollout_items_with_metadata(path).await?;
++        Ok((loaded.items, loaded.thread_id, loaded.parse_errors))
++    }
++
++    pub(crate) async fn load_rollout_items_with_metadata(
++        path: &Path,
++    ) -> std::io::Result<LoadedRolloutItems> {
+         trace!("Resuming rollout from {path:?}");
+         let text = tokio::fs::read_to_string(path).await?;
+         if text.trim().is_empty() {
+@@ -821,6 +835,7 @@ impl RolloutRecorder {
+         let mut items: Vec<RolloutItem> = Vec::new();
+         let mut thread_id: Option<ThreadId> = None;
+         let mut parse_errors = 0usize;
++        let mut last_timestamp = None;
+         for line in text.lines() {
+             if line.trim().is_empty() {
+                 continue;
+@@ -840,28 +855,31 @@ impl RolloutRecorder {
+ 
+             // Parse the rollout line structure
+             match serde_json::from_value::<RolloutLine>(v.clone()) {
+-                Ok(rollout_line) => match rollout_line.item {
+-                    RolloutItem::SessionMeta(session_meta_line) => {
+-                        // Use the FIRST SessionMeta encountered in the file as the canonical
+-                        // thread id and main session information. Keep all items intact.
+-                        if thread_id.is_none() {
+-                            thread_id = Some(session_meta_line.meta.id);
++                Ok(rollout_line) => {
++                    last_timestamp = Some(rollout_line.timestamp);
++                    match rollout_line.item {
++                        RolloutItem::SessionMeta(session_meta_line) => {
++                            // Use the FIRST SessionMeta encountered in the file as the canonical
++                            // thread id and main session information. Keep all items intact.
++                            if thread_id.is_none() {
++                                thread_id = Some(session_meta_line.meta.id);
++                            }
++                            items.push(RolloutItem::SessionMeta(session_meta_line));
++                        }
++                        RolloutItem::ResponseItem(item) => {
++                            items.push(RolloutItem::ResponseItem(item));
++                        }
++                        RolloutItem::Compacted(item) => {
++                            items.push(RolloutItem::Compacted(item));
++                        }
++                        RolloutItem::TurnContext(item) => {
++                            items.push(RolloutItem::TurnContext(item));
++                        }
++                        RolloutItem::EventMsg(_ev) => {
++                            items.push(RolloutItem::EventMsg(_ev));
+                         }
+-                        items.push(RolloutItem::SessionMeta(session_meta_line));
+-                    }
+-                    RolloutItem::ResponseItem(item) => {
+-                        items.push(RolloutItem::ResponseItem(item));
+-                    }
+-                    RolloutItem::Compacted(item) => {
+-                        items.push(RolloutItem::Compacted(item));
+-                    }
+-                    RolloutItem::TurnContext(item) => {
+-                        items.push(RolloutItem::TurnContext(item));
+-                    }
+-                    RolloutItem::EventMsg(_ev) => {
+-                        items.push(RolloutItem::EventMsg(_ev));
+                     }
+-                },
++                }
+                 Err(e) => {
+                     trace!("failed to parse rollout line: {e}");
+                     parse_errors = parse_errors.saturating_add(1);
+@@ -875,7 +893,12 @@ impl RolloutRecorder {
+             thread_id,
+             parse_errors,
+         );
+-        Ok((items, thread_id, parse_errors))
++        Ok(LoadedRolloutItems {
++            items,
++            thread_id,
++            parse_errors,
++            last_timestamp,
++        })
+     }
+ 
+     pub async fn get_rollout_history(path: &Path) -> std::io::Result<InitialHistory> {
+diff --git a/codex-rs/rollout/src/tests.rs b/codex-rs/rollout/src/tests.rs
+index bcd395d820..97fffc6a36 100644
+--- a/codex-rs/rollout/src/tests.rs
++++ b/codex-rs/rollout/src/tests.rs
+@@ -1453,6 +1453,95 @@ async fn test_updated_at_uses_file_mtime() -> Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn test_updated_at_uses_last_rollout_line_timestamp() -> Result<()> {
++    let temp = TempDir::new().unwrap();
++    let home = temp.path();
++
++    let filename_ts = "2025-06-01T08-00-00";
++    let created_ts = "2025-06-01T08:00:00Z";
++    let updated_ts = "2025-06-01T11:00:00Z";
++    let uuid = Uuid::from_u128(44);
++    let day_dir = home.join("sessions").join("2025").join("06").join("01");
++    fs::create_dir_all(&day_dir)?;
++    let file_path = day_dir.join(format!("rollout-{filename_ts}-{uuid}.jsonl"));
++    let mut file = File::create(&file_path)?;
++
++    let conversation_id = ThreadId::from_string(&uuid.to_string())?;
++    let meta_line = RolloutLine {
++        timestamp: created_ts.to_string(),
++        item: RolloutItem::SessionMeta(SessionMetaLine {
++            meta: SessionMeta {
++                id: conversation_id,
++                forked_from_id: None,
++                timestamp: created_ts.to_string(),
++                cwd: ".".into(),
++                originator: "test_originator".into(),
++                cli_version: "test_version".into(),
++                source: SessionSource::VSCode,
++                agent_path: None,
++                agent_nickname: None,
++                agent_role: None,
++                model_provider: Some("test-provider".into()),
++                base_instructions: None,
++                dynamic_tools: None,
++                memory_mode: None,
++            },
++            git: None,
++        }),
++    };
++    writeln!(file, "{}", serde_json::to_string(&meta_line)?)?;
++
++    let user_event_line = RolloutLine {
++        timestamp: "2025-06-01T08:01:00Z".to_string(),
++        item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
++            message: "hello".into(),
++            images: None,
++            image_details: Vec::new(),
++            text_elements: Vec::new(),
++            local_images: Vec::new(),
++            local_image_details: Vec::new(),
++        })),
++    };
++    writeln!(file, "{}", serde_json::to_string(&user_event_line)?)?;
++
++    let response_line = RolloutLine {
++        timestamp: updated_ts.to_string(),
++        item: RolloutItem::ResponseItem(ResponseItem::Message {
++            id: None,
++            role: "assistant".into(),
++            content: vec![ContentItem::OutputText {
++                text: "reply".to_string(),
++            }],
++            phase: None,
++        }),
++    };
++    writeln!(file, "{}", serde_json::to_string(&response_line)?)?;
++    let newer_mtime =
++        chrono::DateTime::parse_from_rfc3339("2026-05-03T14:01:12Z")?.with_timezone(&chrono::Utc);
++    file.set_times(FileTimes::new().set_modified(newer_mtime.into()))?;
++    drop(file);
++
++    let provider_filter = provider_vec(&[TEST_PROVIDER]);
++    let page = get_threads(
++        home,
++        /*page_size*/ 1,
++        /*cursor*/ None,
++        ThreadSortKey::UpdatedAt,
++        INTERACTIVE_SESSION_SOURCES.as_slice(),
++        Some(provider_filter.as_slice()),
++        /*cwd_filters*/ None,
++        TEST_PROVIDER,
++    )
++    .await?;
++    let item = page.items.first().expect("conversation item");
++
++    assert_eq!(item.created_at.as_deref(), Some(created_ts));
++    assert_eq!(item.updated_at.as_deref(), Some(updated_ts));
++
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn test_timestamp_only_cursor_skips_same_second_filesystem_ties() {
+     let temp = TempDir::new().unwrap();

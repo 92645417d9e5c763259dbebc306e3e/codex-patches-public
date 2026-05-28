@@ -1,0 +1,331 @@
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 0e1f019de9..60e5217809 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -62,6 +62,10 @@ use codex_app_server_protocol::JSONRPCNotification;
+ use codex_app_server_protocol::JSONRPCRequest;
+ use codex_app_server_protocol::JSONRPCResponse;
+ use codex_app_server_protocol::ServerRequestPayload;
++use codex_app_server_protocol::SortDirection;
++use codex_app_server_protocol::ThreadListParams;
++use codex_app_server_protocol::ThreadSortKey;
++use codex_app_server_protocol::ThreadSourceKind;
+ use codex_app_server_protocol::experimental_required_message;
+ use codex_arg0::Arg0DispatchPaths;
+ use codex_chatgpt::workspace_settings;
+@@ -89,6 +93,8 @@ use tokio_util::sync::CancellationToken;
+ use tracing::Instrument;
+ 
+ const EXTERNAL_AUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
++const NON_TUI_THREAD_LIST_LIMIT: u32 = 5;
++const TUI_CLIENT_NAME: &str = "codex-tui";
+ 
+ #[derive(Clone)]
+ struct ExternalAuthRefreshBridge {
+@@ -812,6 +818,8 @@ impl MessageProcessor {
+         let serialization_scope = codex_request.serialization_scope();
+         let app_server_client_name = session.app_server_client_name().map(str::to_string);
+         let client_version = session.client_version().map(str::to_string);
++        let limit_thread_list_for_client =
++            should_limit_thread_list_for_client(session.app_server_client_name());
+         let error_request_id = connection_request_id.clone();
+         let rpc_gate = Arc::clone(&session.rpc_gate);
+         let processor = Arc::clone(self);
+@@ -827,6 +835,7 @@ impl MessageProcessor {
+                         request_context,
+                         app_server_client_name,
+                         client_version,
++                        limit_thread_list_for_client,
+                     )
+                     .await;
+                 if let Err(error) = result {
+@@ -856,6 +865,7 @@ impl MessageProcessor {
+         request_context: RequestContext,
+         app_server_client_name: Option<String>,
+         client_version: Option<String>,
++        limit_thread_list_for_client: bool,
+     ) -> Result<(), JSONRPCErrorError> {
+         let connection_id = connection_request_id.connection_id;
+         let request_id = ConnectionRequestId {
+@@ -863,6 +873,7 @@ impl MessageProcessor {
+             request_id: codex_request.id().clone(),
+         };
+ 
++        let mut limit_thread_list_response = false;
+         let result: Result<Option<ClientResponsePayload>, JSONRPCErrorError> = match codex_request {
+             ClientRequest::Initialize { .. } => {
+                 panic!("Initialize should be handled before initialized request dispatch");
+@@ -1069,7 +1080,13 @@ impl MessageProcessor {
+                     .thread_rollback(&request_id, params)
+                     .await
+             }
+-            ClientRequest::ThreadList { params, .. } => {
++            ClientRequest::ThreadList { mut params, .. } => {
++                let limit_thread_list =
++                    limit_thread_list_for_client && should_limit_thread_list_params(&params);
++                if limit_thread_list {
++                    apply_non_tui_thread_list_limit(&mut params);
++                    limit_thread_list_response = true;
++                }
+                 self.thread_processor.thread_list(params).await
+             }
+             ClientRequest::ThreadSearch { params, .. } => {
+@@ -1345,6 +1362,11 @@ impl MessageProcessor {
+ 
+         match result {
+             Ok(Some(response)) => {
++                let response = if limit_thread_list_response {
++                    limit_non_tui_response(response)
++                } else {
++                    response
++                };
+                 self.outgoing
+                     .send_response_as(request_id.clone(), response)
+                     .await;
+@@ -1358,6 +1380,116 @@ impl MessageProcessor {
+     }
+ }
+ 
++fn should_limit_thread_list_for_client(client_name: Option<&str>) -> bool {
++    client_name != Some(TUI_CLIENT_NAME)
++}
++
++fn should_limit_thread_list_params(params: &ThreadListParams) -> bool {
++    !params.source_kinds.as_deref().is_some_and(|source_kinds| {
++        source_kinds.iter().any(|source_kind| {
++            matches!(
++                source_kind,
++                ThreadSourceKind::SubAgent
++                    | ThreadSourceKind::SubAgentReview
++                    | ThreadSourceKind::SubAgentCompact
++                    | ThreadSourceKind::SubAgentThreadSpawn
++                    | ThreadSourceKind::SubAgentOther
++            )
++        })
++    })
++}
++
++fn apply_non_tui_thread_list_limit(params: &mut ThreadListParams) {
++    params.cursor = None;
++    params.limit = Some(NON_TUI_THREAD_LIST_LIMIT);
++    params.sort_key = Some(ThreadSortKey::UpdatedAt);
++    params.sort_direction = Some(SortDirection::Desc);
++}
++
++fn limit_non_tui_response(response: ClientResponsePayload) -> ClientResponsePayload {
++    match response {
++        ClientResponsePayload::ThreadList(mut response) => {
++            response.next_cursor = None;
++            response.backwards_cursor = None;
++            ClientResponsePayload::ThreadList(response)
++        }
++        other => other,
++    }
++}
++
++#[cfg(test)]
++mod non_tui_thread_list_tests {
++    use super::*;
++    use codex_app_server_protocol::ThreadListResponse;
++
++    #[test]
++    fn only_tui_thread_list_requests_are_unlimited() {
++        assert!(!should_limit_thread_list_for_client(Some("codex-tui")));
++        assert!(should_limit_thread_list_for_client(Some("codex-backend")));
++        assert!(should_limit_thread_list_for_client(Some(
++            "codex_app_server_daemon"
++        )));
++        assert!(should_limit_thread_list_for_client(None));
++    }
++
++    #[test]
++    fn non_tui_thread_list_request_is_forced_to_recent_five() {
++        let mut params = ThreadListParams {
++            cursor: Some("client-cursor".to_string()),
++            limit: Some(100),
++            sort_key: Some(ThreadSortKey::CreatedAt),
++            sort_direction: Some(SortDirection::Asc),
++            model_providers: None,
++            source_kinds: None,
++            archived: None,
++            cwd: None,
++            use_state_db_only: false,
++            search_term: None,
++        };
++
++        apply_non_tui_thread_list_limit(&mut params);
++
++        assert_eq!(params.cursor, None);
++        assert_eq!(params.limit, Some(NON_TUI_THREAD_LIST_LIMIT));
++        assert_eq!(params.sort_key, Some(ThreadSortKey::UpdatedAt));
++        assert_eq!(params.sort_direction, Some(SortDirection::Desc));
++    }
++
++    #[test]
++    fn non_tui_subagent_thread_list_request_keeps_client_pagination() {
++        let params = ThreadListParams {
++            cursor: Some("client-cursor".to_string()),
++            limit: Some(100),
++            sort_key: Some(ThreadSortKey::CreatedAt),
++            sort_direction: Some(SortDirection::Asc),
++            model_providers: None,
++            source_kinds: Some(vec![ThreadSourceKind::SubAgentThreadSpawn]),
++            archived: None,
++            cwd: None,
++            use_state_db_only: false,
++            search_term: None,
++        };
++
++        assert!(!should_limit_thread_list_params(&params));
++    }
++
++    #[test]
++    fn non_tui_thread_list_response_hides_pagination() {
++        let response = ClientResponsePayload::ThreadList(ThreadListResponse {
++            data: Vec::new(),
++            next_cursor: Some("next".to_string()),
++            backwards_cursor: Some("back".to_string()),
++        });
++
++        let ClientResponsePayload::ThreadList(response) = limit_non_tui_response(response) else {
++            panic!("expected thread list response");
++        };
++
++        assert_eq!(response.next_cursor, None);
++        assert_eq!(response.backwards_cursor, None);
++    }
++}
++
+ #[cfg(test)]
+ #[path = "message_processor_tracing_tests.rs"]
+ mod message_processor_tracing_tests;
+diff --git a/codex-rs/app-server/src/message_processor_tracing_tests.rs b/codex-rs/app-server/src/message_processor_tracing_tests.rs
+index a9625d3086..ed811076ac 100644
+--- a/codex-rs/app-server/src/message_processor_tracing_tests.rs
++++ b/codex-rs/app-server/src/message_processor_tracing_tests.rs
+@@ -30,6 +30,7 @@ use codex_core::config::ConfigBuilder;
+ use codex_exec_server::EnvironmentManager;
+ use codex_feedback::CodexFeedback;
+ use codex_login::AuthManager;
++use codex_protocol::ThreadId;
+ use codex_protocol::protocol::SessionSource;
+ use codex_protocol::protocol::W3cTraceContext;
+ use opentelemetry::global;
+@@ -207,6 +208,17 @@ impl TracingHarness {
+         read_thread_started_notification(&mut self.outgoing_rx).await;
+         response
+     }
++
++    async fn expect_thread_started_after_attach(&mut self, thread_id: &str) {
++        self.processor
++            .try_attach_thread_listener(
++                ThreadId::from_string(thread_id).expect("valid thread id"),
++                vec![TEST_CONNECTION_ID],
++            )
++            .await;
++        let notification = read_thread_started_notification(&mut self.outgoing_rx).await;
++        assert_eq!(notification.thread.id, thread_id);
++    }
+ }
+ 
+ async fn build_test_config(codex_home: &Path, server_uri: &str) -> Result<Config> {
+@@ -456,7 +468,7 @@ async fn read_response<T: serde::de::DeserializeOwned>(
+ 
+ async fn read_thread_started_notification(
+     outgoing_rx: &mut mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
+-) {
++) -> codex_app_server_protocol::ThreadStartedNotification {
+     loop {
+         let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), outgoing_rx.recv())
+             .await
+@@ -476,11 +488,10 @@ async fn read_thread_started_notification(
+                 else {
+                     continue;
+                 };
+-                if matches!(
+-                    notification,
+-                    codex_app_server_protocol::ServerNotification::ThreadStarted(_)
+-                ) {
+-                    return;
++                if let codex_app_server_protocol::ServerNotification::ThreadStarted(notification) =
++                    notification
++                {
++                    return notification;
+                 }
+             }
+             crate::outgoing_message::OutgoingEnvelope::Broadcast { message } => {
+@@ -489,11 +500,10 @@ async fn read_thread_started_notification(
+                 else {
+                     continue;
+                 };
+-                if matches!(
+-                    notification,
+-                    codex_app_server_protocol::ServerNotification::ThreadStarted(_)
+-                ) {
+-                    return;
++                if let codex_app_server_protocol::ServerNotification::ThreadStarted(notification) =
++                    notification
++                {
++                    return notification;
+                 }
+             }
+         }
+@@ -540,6 +550,20 @@ where
+     spans.into_iter().skip(baseline_len).collect()
+ }
+ 
++#[tokio::test(flavor = "current_thread")]
++#[serial(app_server_tracing)]
++async fn auto_attached_thread_emits_thread_started_notification() -> Result<()> {
++    let mut harness = TracingHarness::new().await?;
++    let thread_start_response = harness.start_thread(/*request_id*/ 2, /*trace*/ None).await;
++
++    harness
++        .expect_thread_started_after_attach(&thread_start_response.thread.id)
++        .await;
++    harness.shutdown().await;
++
++    Ok(())
++}
++
+ #[test]
+ #[serial(app_server_tracing)]
+ fn thread_start_jsonrpc_span_exports_server_span_and_parents_children() -> Result<()> {
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+index 31a91a3b7f..e8005cbc7d 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -2398,13 +2398,31 @@ impl ThreadRequestProcessor {
+     ) {
+         if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
+             let config_snapshot = thread.config_snapshot().await;
+-            let loaded_thread = build_thread_from_snapshot(
++            let mut loaded_thread = build_thread_from_snapshot(
+                 thread_id,
+                 thread.session_configured().session_id.to_string(),
+                 &config_snapshot,
+                 thread.rollout_path(),
+             );
+-            self.thread_watch_manager.upsert_thread(loaded_thread).await;
++            self.thread_watch_manager
++                .upsert_thread(loaded_thread.clone())
++                .await;
++            loaded_thread.status = resolve_thread_status(
++                self.thread_watch_manager
++                    .loaded_status_for_thread(&loaded_thread.id)
++                    .await,
++                /*has_in_progress_turn*/ false,
++            );
++            if !connection_ids.is_empty() {
++                self.outgoing
++                    .send_server_notification_to_connections(
++                        &connection_ids,
++                        ServerNotification::ThreadStarted(thread_started_notification(
++                            loaded_thread,
++                        )),
++                    )
++                    .await;
++            }
+         }
+ 
+         for connection_id in connection_ids {
