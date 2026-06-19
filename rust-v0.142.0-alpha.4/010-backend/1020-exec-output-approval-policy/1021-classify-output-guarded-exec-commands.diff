@@ -1,0 +1,253 @@
+diff --git a/codex-rs/core/src/tools/handlers/shell_spec.rs b/codex-rs/core/src/tools/handlers/shell_spec.rs
+index 3fb563b8d9..db24035b56 100644
+--- a/codex-rs/core/src/tools/handlers/shell_spec.rs
++++ b/codex-rs/core/src/tools/handlers/shell_spec.rs
+@@ -89,12 +89,15 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
+         name: "exec_command".to_string(),
+         description: if cfg!(windows) {
+             format!(
+-                "Runs a command in a PTY, returning output or a session ID for ongoing interaction.\n\n{}",
++                "Runs a command in a PTY, returning output or a session ID for ongoing interaction.\n{}\n\n{}",
++                output_guard_guidance(),
+                 windows_shell_guidance()
+             )
+         } else {
+-            "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
+-                .to_string()
++            format!(
++                "Runs a command in a PTY, returning output or a session ID for ongoing interaction.\n{}",
++                output_guard_guidance()
++            )
+         },
+         strict: false,
+         defer_loading: None,
+@@ -198,13 +201,19 @@ Examples of valid command strings:
+ - setting an env var: "$env:FOO='bar'; echo $env:FOO"
+ - running an inline Python script: "@'\\nprint('Hello, world!')\\n'@ | python -"
+ 
++{}
++
+ {}"#,
+-            windows_shell_guidance()
++            windows_shell_guidance(),
++            output_guard_guidance()
+         )
+     } else {
+-        r#"Runs a shell command and returns its output.
+-- Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary."#
+-            .to_string()
++        format!(
++            r#"Runs a shell command and returns its output.
++- Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary.
++{}"#,
++            output_guard_guidance()
++        )
+     };
+ 
+     ToolSpec::Function(ResponsesApiTool {
+@@ -221,6 +230,10 @@ Examples of valid command strings:
+     })
+ }
+ 
++fn output_guard_guidance() -> &'static str {
++    "- Protect the UI from accidental output floods with a command-side limit before output reaches the tool. Choose the limiter by intent: use `sed -n '1,200p' file` for a specific file range, `head -n 40 file` for a small file prefix, `cmd | head -n 200` for line-oriented search/list output, and `cmd | head -c 12000` when line width is unknown or output may contain very long lines. `max_output_tokens` only limits the tool response returned to the model; it is not a substitute for capping command output in the shell. If you need a complete file, do not read only the first lines as a shortcut; first confirm the file is small enough or read it in bounded chunks."
++}
++
+ pub fn create_request_permissions_tool(description: String) -> ToolSpec {
+     let properties = BTreeMap::from([
+         (
+diff --git a/codex-rs/core/src/tools/handlers/shell_spec_tests.rs b/codex-rs/core/src/tools/handlers/shell_spec_tests.rs
+index b7bbfa54a1..4f73885c65 100644
+--- a/codex-rs/core/src/tools/handlers/shell_spec_tests.rs
++++ b/codex-rs/core/src/tools/handlers/shell_spec_tests.rs
+@@ -6,6 +6,10 @@ fn windows_shell_guidance_description() -> String {
+     format!("\n\n{}", windows_shell_guidance())
+ }
+ 
++fn output_guard_guidance_description() -> String {
++    format!("\n{}", output_guard_guidance())
++}
++
+ fn has_parameter(tool: &ToolSpec, parameter_name: &str) -> bool {
+     serde_json::to_value(tool)
+         .expect("tool spec should serialize")
+@@ -22,12 +26,15 @@ fn exec_command_tool_matches_expected_spec() {
+ 
+     let description = if cfg!(windows) {
+         format!(
+-            "Runs a command in a PTY, returning output or a session ID for ongoing interaction.{}",
++            "Runs a command in a PTY, returning output or a session ID for ongoing interaction.{}{}",
++            output_guard_guidance_description(),
+             windows_shell_guidance_description()
+         )
+     } else {
+-        "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
+-            .to_string()
++        format!(
++            "Runs a command in a PTY, returning output or a session ID for ongoing interaction.{}",
++            output_guard_guidance_description()
++        )
+     };
+ 
+     let mut properties = BTreeMap::from([
+@@ -223,6 +230,7 @@ Examples of valid command strings:
+         r#"Runs a shell command and returns its output.
+ - Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary."#
+             .to_string()
++            + &output_guard_guidance_description()
+     };
+ 
+     let mut properties = BTreeMap::from([
+diff --git a/codex-rs/shell-command/src/parse_command.rs b/codex-rs/shell-command/src/parse_command.rs
+index 72e1aca67d..bcc3b12a74 100644
+--- a/codex-rs/shell-command/src/parse_command.rs
++++ b/codex-rs/shell-command/src/parse_command.rs
+@@ -228,6 +228,38 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn guarded_pipeline_keeps_primary_search_summary() {
++        let command = shlex_split_safe("rg needle src/lib.rs 2>&1 | head -c 12000");
++        assert_parsed(
++            &command,
++            vec![ParsedCommand::Search {
++                cmd: "rg needle src/lib.rs '2>&1'".to_string(),
++                query: Some("needle".to_string()),
++                path: Some("lib.rs".to_string()),
++            }],
++        );
++    }
++
++    #[test]
++    fn guarded_shell_pipeline_keeps_primary_read_summary() {
++        let inner = "cat README.md 2>&1 | head -c 12000";
++        assert_parsed(
++            &vec_str(&["bash", "-lc", inner]),
++            vec![ParsedCommand::Read {
++                cmd: "cat README.md '2>&1'".to_string(),
++                name: "README.md".to_string(),
++                path: PathBuf::from("README.md"),
++            }],
++        );
++    }
++
++    #[test]
++    fn output_guard_count_rejects_unbounded_tail_start() {
++        assert_eq!(output_cap_count("12000"), true);
++        assert_eq!(output_cap_count("+10"), false);
++    }
++
+     #[test]
+     fn collapses_plain_pipeline_when_any_stage_is_unknown() {
+         let command = shlex_split_safe(
+@@ -1284,12 +1316,22 @@ pub fn parse_command_impl(command: &[String]) -> Vec<ParsedCommand> {
+     }
+ 
+     let normalized = normalize_tokens(command);
++    let had_connectors = contains_connectors(&normalized);
++    let normalized_cmd = shlex_join(&normalized);
+ 
+-    let parts = if contains_connectors(&normalized) {
++    let mut parts = if had_connectors {
+         split_on_connectors(&normalized)
+     } else {
+         vec![normalized]
+     };
++    if had_connectors {
++        parts = drop_small_formatting_commands(parts);
++        if parts.is_empty() {
++            return vec![ParsedCommand::Unknown {
++                cmd: normalized_cmd,
++            }];
++        }
++    }
+ 
+     // Preserve left-to-right execution order for all commands, including bash -c/-lc
+     // so summaries reflect the order they will run.
+@@ -1487,6 +1529,36 @@ fn contains_connectors(tokens: &[String]) -> bool {
+         .any(|t| t == "&&" || t == "||" || t == "|" || t == ";")
+ }
+ 
++fn has_consumer_side_output_guard_pipeline(tokens: &[String]) -> bool {
++    tokens.windows(4).any(|window| {
++        window[0] == "|"
++            && matches!(window[1].as_str(), "head" | "tail")
++            && matches!(window[2].as_str(), "-c" | "-n")
++            && output_cap_count(&window[3])
++    }) || tokens.windows(3).any(|window| {
++        window[0] == "|"
++            && matches!(window[1].as_str(), "head" | "tail")
++            && window[2]
++                .strip_prefix("-c")
++                .or_else(|| window[2].strip_prefix("-n"))
++                .is_some_and(output_cap_count)
++    })
++}
++
++fn output_cap_count(value: &str) -> bool {
++    !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
++}
++
++fn supports_guarded_shell_fallback(tokens: &[String]) -> bool {
++    has_consumer_side_output_guard_pipeline(tokens) && supports_safe_redirect_shell_fallback(tokens)
++}
++
++fn supports_safe_redirect_shell_fallback(tokens: &[String]) -> bool {
++    tokens.iter().all(|token| {
++        is_safe_output_redirect(token) || (!token.contains('>') && !token.contains('<'))
++    })
++}
++
+ fn split_on_connectors(tokens: &[String]) -> Vec<Vec<String>> {
+     let mut out: Vec<Vec<String>> = Vec::new();
+     let mut cur: Vec<String> = Vec::new();
+@@ -1543,10 +1615,15 @@ fn skip_flag_values<'a>(args: &'a [String], flags_with_vals: &[&str]) -> Vec<&'a
+         if a == "--" {
+             // From here on, everything is positional operands; push the rest and break.
+             for rest in &args[i + 1..] {
+-                out.push(rest);
++                if !is_safe_output_redirect(rest) {
++                    out.push(rest);
++                }
+             }
+             break;
+         }
++        if is_safe_output_redirect(a) {
++            continue;
++        }
+         if a.starts_with("--") && a.contains('=') {
+             // --flag=value form: treat as a flag taking a value; skip entirely.
+             continue;
+@@ -1592,6 +1669,9 @@ fn positional_operands<'a>(args: &'a [String], flags_with_vals: &[&str]) -> Vec<
+             out.push(arg);
+             continue;
+         }
++        if is_safe_output_redirect(arg) {
++            continue;
++        }
+         if arg == "--" {
+             after_double_dash = true;
+             continue;
+@@ -1613,6 +1693,10 @@ fn positional_operands<'a>(args: &'a [String], flags_with_vals: &[&str]) -> Vec<
+     out
+ }
+ 
++fn is_safe_output_redirect(arg: &str) -> bool {
++    matches!(arg, "2>&1" | "2>/dev/null" | ">/dev/null")
++}
++
+ fn parse_grep_like(main_cmd: &[String], args: &[String]) -> ParsedCommand {
+     let args_no_connector = trim_at_connector(args);
+     let mut operands = Vec::new();
+@@ -1945,6 +2029,10 @@ pub fn parse_shell_script(script: &str) -> Vec<ParsedCommand> {
+         }
+         return commands;
+     }
++    let script_tokens = shlex_split(script).unwrap_or_else(|| vec![script.to_string()]);
++    if supports_guarded_shell_fallback(&script_tokens) {
++        return parse_command_impl(&script_tokens);
++    }
+     vec![ParsedCommand::Unknown {
+         cmd: script.to_string(),
+     }]

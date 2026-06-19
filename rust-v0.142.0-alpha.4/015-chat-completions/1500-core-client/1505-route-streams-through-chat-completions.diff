@@ -1,0 +1,223 @@
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index 429a3800bf..9762487ce4 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -30,6 +30,8 @@ use std::sync::OnceLock;
+ 
+ use codex_api::ApiError;
+ use codex_api::AuthProvider;
++use codex_api::ChatCompletionsClient as ApiChatCompletionsClient;
++use codex_api::ChatCompletionsOptions as ApiChatCompletionsOptions;
+ use codex_api::CompactClient as ApiCompactClient;
+ use codex_api::CompactionInput as ApiCompactionInput;
+ use codex_api::Compression;
+@@ -59,6 +61,7 @@ use codex_api::auth_header_telemetry;
+ use codex_api::build_session_headers;
+ use codex_api::create_text_param_for_request;
+ use codex_api::response_create_client_metadata;
++use codex_api::spawn_chat_completions_stream;
+ use codex_app_server_protocol::AuthMode;
+ use codex_login::AuthManager;
+ use codex_login::CodexAuth;
+@@ -103,6 +106,9 @@ use tracing::warn;
+ use crate::attestation::AttestationContext;
+ use crate::attestation::AttestationProvider;
+ use crate::attestation::X_OAI_ATTESTATION_HEADER;
++use crate::chat_completions::ChatToolStrictMode;
++use crate::chat_completions::build_chat_completions_request_parts;
++use crate::chat_completions_config;
+ use crate::client_common::Prompt;
+ use crate::client_common::ResponseEvent;
+ use crate::client_common::ResponseStream;
+@@ -145,6 +151,7 @@ const WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY: &str =
+ const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
+ const X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER: &str =
+     "x-openai-internal-codex-responses-lite";
++const CHAT_COMPLETIONS_ENDPOINT: &str = chat_completions_config::CHAT_COMPLETIONS_ENDPOINT;
+ const RESPONSES_ENDPOINT: &str = "/responses";
+ const RESPONSES_COMPACT_ENDPOINT: &str = "/responses/compact";
+ // `/responses/compact` is unary, so the timeout covers the full response rather than one idle
+@@ -754,7 +761,9 @@ impl ModelClient {
+         responses_metadata: &CodexResponsesMetadata,
+     ) -> Result<ResponsesApiRequest> {
+         let instructions = &prompt.base_instructions.text;
+-        let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
++        let mut input = responses_api_input_view(
++            prompt.get_formatted_input_for_request(model_info.use_responses_lite),
++        );
+         if !self.state.provider.info().is_openai() {
+             input.iter_mut().for_each(ResponseItem::clear_metadata);
+         }
+@@ -955,6 +964,15 @@ impl ModelClient {
+     }
+ }
+ 
++fn responses_api_input_view(mut input: Vec<ResponseItem>) -> Vec<ResponseItem> {
++    for item in &mut input {
++        if let ResponseItem::Reasoning { content, .. } = item {
++            *content = None;
++        }
++    }
++    input
++}
++
+ impl Drop for ModelClientSession {
+     fn drop(&mut self) {
+         let websocket_session = std::mem::take(&mut self.websocket_session);
+@@ -1219,6 +1237,76 @@ impl ModelClientSession {
+         }
+     }
+ 
++    #[allow(clippy::too_many_arguments)]
++    #[instrument(
++        name = "model_client.stream_chat_completions",
++        level = "info",
++        skip_all,
++        fields(
++            model = %model_info.slug,
++            transport = "chat_completions_http",
++            http.method = "POST",
++            api.path = "chat/completions"
++        )
++    )]
++    async fn stream_chat_completions(
++        &self,
++        prompt: &Prompt,
++        model_info: &ModelInfo,
++        session_telemetry: &SessionTelemetry,
++        effort: Option<ReasoningEffortConfig>,
++        service_tier: Option<String>,
++        inference_trace: &InferenceTraceContext,
++        provider_id: chat_completions_config::ProviderId,
++    ) -> Result<ResponseStream> {
++        let codex_home = crate::config::find_codex_home()?;
++        let (api_provider, api_auth) =
++            chat_completions_config::provider_and_auth(&codex_home, provider_id)?;
++        let transport = ReqwestTransport::new(build_reqwest_client());
++        let request_auth_context = AuthRequestTelemetryContext::new(
++            None,
++            api_auth.as_ref(),
++            PendingUnauthorizedRetry::default(),
++        );
++        let (request_telemetry, _sse_telemetry) = Self::build_streaming_telemetry(
++            session_telemetry,
++            request_auth_context,
++            RequestRouteTelemetry::for_endpoint(CHAT_COMPLETIONS_ENDPOINT),
++            self.client.state.auth_env_telemetry.clone(),
++        );
++        let request_parts = build_chat_completions_request_parts(
++            prompt,
++            model_info,
++            effort,
++            service_tier.as_deref(),
++            ChatToolStrictMode::Enabled,
++        )?;
++        let request = request_parts.request;
++        let tool_aliases = request_parts.tool_aliases;
++        let inference_trace_attempt = inference_trace.start_attempt();
++        inference_trace_attempt.record_started(&request);
++        let client = ApiChatCompletionsClient::new(transport, api_provider, api_auth)
++            .with_telemetry(Some(request_telemetry));
++        let stream_result = client
++            .stream_request(request, ApiChatCompletionsOptions::default())
++            .await;
++        let stream_response = match stream_result {
++            Ok(stream_response) => stream_response,
++            Err(err) => return Err(map_api_error(err)),
++        };
++        let api_stream = spawn_chat_completions_stream(
++            stream_response,
++            chat_completions_config::STREAM_IDLE_TIMEOUT,
++            tool_aliases,
++        );
++        let (stream, _) = map_response_stream(
++            api_stream,
++            session_telemetry.clone(),
++            inference_trace_attempt,
++        );
++        Ok(stream)
++    }
++
+     /// Streams a turn via the OpenAI Responses API.
+     ///
+     /// Handles reasoning summaries, verbosity, and the `text` controls used for output schemas.
+@@ -1613,6 +1701,20 @@ impl ModelClientSession {
+         responses_metadata: &CodexResponsesMetadata,
+         inference_trace: &InferenceTraceContext,
+     ) -> Result<ResponseStream> {
++        if let Some(provider_id) = chat_completions_config::provider_for_model(&model_info.slug) {
++            return self
++                .stream_chat_completions(
++                    prompt,
++                    model_info,
++                    session_telemetry,
++                    effort,
++                    service_tier,
++                    inference_trace,
++                    provider_id,
++                )
++                .await;
++        }
++
+         let wire_api = self.client.state.provider.info().wire_api;
+         match wire_api {
+             WireApi::Responses => {
+diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.rs
+index ac489458f1..bb2773ef79 100644
+--- a/codex-rs/core/src/client_tests.rs
++++ b/codex-rs/core/src/client_tests.rs
+@@ -27,6 +27,8 @@ use codex_otel::SessionTelemetry;
+ use codex_protocol::ThreadId;
+ use codex_protocol::config_types::ReasoningSummary;
+ use codex_protocol::models::ContentItem;
++use codex_protocol::models::ReasoningItemContent;
++use codex_protocol::models::ReasoningItemReasoningSummary;
+ use codex_protocol::models::ResponseItem;
+ use codex_protocol::openai_models::ModelInfo;
+ use codex_protocol::protocol::InternalSessionSource;
+@@ -247,6 +249,45 @@ fn output_message(id: &str, text: &str) -> ResponseItem {
+     }
+ }
+ 
++#[test]
++fn responses_api_input_view_drops_reasoning_content() {
++    let input = vec![
++        ResponseItem::Reasoning {
++            id: Some("rs_1".to_string()),
++            summary: vec![ReasoningItemReasoningSummary::SummaryText {
++                text: "summary".to_string(),
++            }],
++            content: Some(vec![ReasoningItemContent::ReasoningText {
++                text: "raw reasoning".to_string(),
++            }]),
++            encrypted_content: None,
++            metadata: None,
++        },
++        output_message("msg_1", "done"),
++    ];
++
++    let request_input = super::responses_api_input_view(input.clone());
++
++    assert_eq!(input[0], {
++        ResponseItem::Reasoning {
++            id: Some("rs_1".to_string()),
++            summary: vec![ReasoningItemReasoningSummary::SummaryText {
++                text: "summary".to_string(),
++            }],
++            content: Some(vec![ReasoningItemContent::ReasoningText {
++                text: "raw reasoning".to_string(),
++            }]),
++            encrypted_content: None,
++            metadata: None,
++        }
++    });
++    let ResponseItem::Reasoning { content, .. } = &request_input[0] else {
++        panic!("expected reasoning item");
++    };
++    assert_eq!(content, &None);
++    assert_eq!(request_input[1], input[1]);
++}
++
+ async fn replay_until_cancelled(temp: &TempDir) -> anyhow::Result<RolloutTrace> {
+     let mut rollout = replay_bundle(temp.path())?;
+     for _ in 0..50 {

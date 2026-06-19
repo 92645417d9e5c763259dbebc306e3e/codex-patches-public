@@ -1,0 +1,244 @@
+diff --git a/codex-rs/core/src/agent/control.rs b/codex-rs/core/src/agent/control.rs
+index 2f8d035435..ffa690fc12 100644
+--- a/codex-rs/core/src/agent/control.rs
++++ b/codex-rs/core/src/agent/control.rs
+@@ -270,6 +270,13 @@ impl AgentControl {
+         Ok(thread_ids)
+     }
+ 
++    pub(crate) async fn retained_thread_spawn_count(
++        &self,
++        parent_thread_id: ThreadId,
++    ) -> CodexResult<usize> {
++        Ok(self.state.retained_thread_spawn_count(parent_thread_id))
++    }
++
+     pub(crate) async fn get_agent_config_snapshot(
+         &self,
+         agent_id: ThreadId,
+@@ -530,6 +537,7 @@ impl AgentControl {
+         });
+         let agent_metadata = AgentMetadata {
+             agent_id: None,
++            parent_thread_id: Some(parent_thread_id),
+             agent_path,
+             agent_nickname,
+             agent_role,
+diff --git a/codex-rs/core/src/agent/registry.rs b/codex-rs/core/src/agent/registry.rs
+index 43aca201bf..ab81239fad 100644
+--- a/codex-rs/core/src/agent/registry.rs
++++ b/codex-rs/core/src/agent/registry.rs
+@@ -28,6 +28,7 @@ pub(crate) struct AgentRegistry {
+ #[derive(Default)]
+ struct ActiveAgents {
+     agent_tree: HashMap<String, AgentMetadata>,
++    retained_thread_spawn_children: HashMap<ThreadId, HashSet<ThreadId>>,
+     used_agent_nicknames: HashSet<String>,
+     nickname_reset_count: usize,
+ }
+@@ -35,6 +36,7 @@ struct ActiveAgents {
+ #[derive(Clone, Debug, Default)]
+ pub(crate) struct AgentMetadata {
+     pub(crate) agent_id: Option<ThreadId>,
++    pub(crate) parent_thread_id: Option<ThreadId>,
+     pub(crate) agent_path: Option<AgentPath>,
+     pub(crate) agent_nickname: Option<String>,
+     pub(crate) agent_role: Option<String>,
+@@ -166,6 +168,15 @@ impl AgentRegistry {
+             .collect()
+     }
+ 
++    pub(crate) fn retained_thread_spawn_count(&self, parent_thread_id: ThreadId) -> usize {
++        self.active_agents
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .retained_thread_spawn_children
++            .get(&parent_thread_id)
++            .map_or(0, HashSet::len)
++    }
++
+     pub(crate) fn update_last_task_message(&self, thread_id: ThreadId, last_task_message: String) {
+         let mut active_agents = self
+             .active_agents
+@@ -210,6 +221,13 @@ impl AgentRegistry {
+         if let Some(agent_nickname) = agent_metadata.agent_nickname.clone() {
+             active_agents.used_agent_nicknames.insert(agent_nickname);
+         }
++        if let Some(parent_thread_id) = agent_metadata.parent_thread_id {
++            active_agents
++                .retained_thread_spawn_children
++                .entry(parent_thread_id)
++                .or_default()
++                .insert(thread_id);
++        }
+         active_agents.agent_tree.insert(key, agent_metadata);
+     }
+ 
+diff --git a/codex-rs/core/src/agent/registry_tests.rs b/codex-rs/core/src/agent/registry_tests.rs
+index fc172fb336..d69fdb4956 100644
+--- a/codex-rs/core/src/agent/registry_tests.rs
++++ b/codex-rs/core/src/agent/registry_tests.rs
+@@ -159,6 +159,26 @@ fn release_is_idempotent_for_registered_threads() {
+     drop(reservation);
+ }
+ 
++#[test]
++fn retained_thread_spawn_count_survives_release() {
++    let registry = Arc::new(AgentRegistry::default());
++    let parent_id = ThreadId::new();
++    let child_id = ThreadId::new();
++    let reservation = registry
++        .reserve_spawn_slot(/*max_threads*/ None)
++        .expect("reserve slot");
++    reservation.commit(AgentMetadata {
++        agent_id: Some(child_id),
++        parent_thread_id: Some(parent_id),
++        ..Default::default()
++    });
++
++    assert_eq!(registry.retained_thread_spawn_count(parent_id), 1);
++
++    registry.release_spawned_thread(child_id);
++    assert_eq!(registry.retained_thread_spawn_count(parent_id), 1);
++}
++
+ #[test]
+ fn failed_spawn_keeps_nickname_marked_used() {
+     let registry = Arc::new(AgentRegistry::default());
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents/wait.rs b/codex-rs/core/src/tools/handlers/multi_agents/wait.rs
+index ee6bcf8fb8..21601f176f 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents/wait.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents/wait.rs
+@@ -184,6 +184,12 @@ impl Handler {
+                 })
+                 .collect(),
+             timed_out,
++            retained_agent_count: session
++                .services
++                .agent_control
++                .retained_thread_spawn_count(session.thread_id)
++                .await
++                .map_err(collab_spawn_error)?,
+         };
+ 
+         session
+@@ -234,6 +240,7 @@ fn resolve_wait_timeout_ms(
+ pub(crate) struct WaitAgentResult {
+     pub(crate) status: HashMap<String, AgentStatus>,
+     pub(crate) timed_out: bool,
++    pub(crate) retained_agent_count: usize,
+ }
+ 
+ impl ToolOutput for WaitAgentResult {
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_spec.rs b/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
+index c265a74b2c..740cde92d0 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
+@@ -478,9 +478,14 @@ fn wait_output_schema_v1() -> Value {
+             "timed_out": {
+                 "type": "boolean",
+                 "description": "Whether the wait call returned due to timeout before any agent reached a final status."
++            },
++            "retained_agent_count": {
++                "type": "integer",
++                "description": "Sub-agents retained for the current main session in this runtime, including closed agents.",
++                "minimum": 0
+             }
+         },
+-        "required": ["status", "timed_out"],
++        "required": ["status", "timed_out", "retained_agent_count"],
+         "additionalProperties": false
+     })
+ }
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs b/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs
+index 669127d6ee..6a5c4a6b9f 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs
+@@ -165,6 +165,30 @@ fn spawn_agent_tool_v1_omits_legacy_fork_context_field() {
+     );
+ }
+ 
++#[test]
++fn wait_agent_tool_v1_reports_retained_agent_count_in_output_schema() {
++    let tool = create_wait_agent_tool_v1(WaitAgentTimeoutOptions::default());
++
++    let ToolSpec::Namespace(namespace) = tool else {
++        panic!("wait_agent v1 should be a namespace tool");
++    };
++    let Some(ResponsesApiNamespaceTool::Function(ResponsesApiTool { output_schema, .. })) =
++        namespace.tools.first()
++    else {
++        panic!("wait_agent should be a namespace function tool");
++    };
++    let output_schema = output_schema.as_ref().expect("wait_agent output schema");
++
++    assert_eq!(
++        output_schema["required"],
++        json!(["status", "timed_out", "retained_agent_count"])
++    );
++    assert_eq!(
++        output_schema["properties"]["retained_agent_count"]["type"],
++        "integer"
++    );
++}
++
+ #[test]
+ fn spawn_agent_tool_caps_visible_model_summaries() {
+     let tool = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+index 243b18e910..44a6de9b05 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+@@ -3329,7 +3329,8 @@ async fn wait_agent_returns_not_found_for_missing_agents() {
+                 (id_a.to_string(), AgentStatus::NotFound),
+                 (id_b.to_string(), AgentStatus::NotFound),
+             ]),
+-            timed_out: false
++            timed_out: false,
++            retained_agent_count: 0,
+         }
+     );
+     assert_eq!(success, None);
+@@ -3370,7 +3371,8 @@ async fn wait_agent_times_out_when_status_is_not_final() {
+         result,
+         wait::WaitAgentResult {
+             status: HashMap::new(),
+-            timed_out: true
++            timed_out: true,
++            retained_agent_count: 0,
+         }
+     );
+     assert_eq!(success, None);
+@@ -3466,7 +3468,8 @@ async fn wait_agent_returns_final_status_without_timeout() {
+         result,
+         wait::WaitAgentResult {
+             status: HashMap::from([(agent_id.to_string(), AgentStatus::Shutdown)]),
+-            timed_out: false
++            timed_out: false,
++            retained_agent_count: 0,
+         }
+     );
+     assert_eq!(success, None);
+@@ -4368,6 +4371,22 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
+             .await,
+         AgentStatus::NotFound
+     );
++    let wait_after_close_output = WaitAgentHandler::default()
++        .handle(invocation(
++            parent_session.clone(),
++            parent_session.new_default_turn().await,
++            "wait_agent",
++            function_payload(json!({
++                "targets": [child_thread_id.to_string()],
++                "timeout_ms": 10_000
++            })),
++        ))
++        .await
++        .expect("wait_agent should report retained child count");
++    let (wait_after_close_content, _) = expect_text_output(wait_after_close_output);
++    let wait_after_close_result: wait::WaitAgentResult =
++        serde_json::from_str(&wait_after_close_content).expect("wait result should be json");
++    assert_eq!(wait_after_close_result.retained_agent_count, 1);
+ 
+     let child_resume_output = ResumeAgentHandler
+         .handle(invocation(

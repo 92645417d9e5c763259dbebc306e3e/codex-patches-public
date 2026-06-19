@@ -1,0 +1,120 @@
+diff --git a/codex-rs/tui/src/codex_socket.rs b/codex-rs/tui/src/codex_socket.rs
+new file mode 100644
+index 0000000000..371ae09314
+--- /dev/null
++++ b/codex-rs/tui/src/codex_socket.rs
+@@ -0,0 +1,102 @@
++use serde::Deserialize;
++use serde::Serialize;
++use std::io::Read;
++use std::io::Write;
++use std::path::Path;
++use std::path::PathBuf;
++use std::time::Duration;
++
++#[cfg(unix)]
++use std::os::unix::net::UnixStream;
++
++const SOCKET_IO_TIMEOUT: Duration = Duration::from_millis(500);
++
++#[derive(Debug, Deserialize)]
++struct CodexSocketResponse {
++    #[serde(rename = "OK")]
++    ok: bool,
++    #[serde(rename = "Error")]
++    error: Option<String>,
++    #[serde(rename = "Content")]
++    content: Option<String>,
++}
++
++fn codex_socket_path() -> PathBuf {
++    std::env::temp_dir().join("cxh").join("codex.sock")
++}
++
++fn send_payload_to_path<T: Serialize>(
++    payload: &T,
++    path: &Path,
++) -> Result<CodexSocketResponse, String> {
++    send_payload_to_path_with_read_timeout(payload, path, Some(SOCKET_IO_TIMEOUT))
++}
++
++fn send_payload_to_path_with_read_timeout<T: Serialize>(
++    payload: &T,
++    path: &Path,
++    read_timeout: Option<Duration>,
++) -> Result<CodexSocketResponse, String> {
++    send_payload_to_path_impl(payload, path, read_timeout)
++}
++
++#[cfg(unix)]
++fn send_payload_to_path_impl<T: Serialize>(
++    payload: &T,
++    path: &Path,
++    read_timeout: Option<Duration>,
++) -> Result<CodexSocketResponse, String> {
++    let mut stream = UnixStream::connect(path).map_err(|err| err.to_string())?;
++    stream
++        .set_read_timeout(read_timeout)
++        .map_err(|err| err.to_string())?;
++    stream
++        .set_write_timeout(Some(SOCKET_IO_TIMEOUT))
++        .map_err(|err| err.to_string())?;
++
++    let request = serde_json::to_vec(payload).map_err(|err| err.to_string())?;
++    stream.write_all(&request).map_err(|err| err.to_string())?;
++    stream
++        .shutdown(std::net::Shutdown::Write)
++        .map_err(|err| err.to_string())?;
++
++    let mut response = String::new();
++    stream
++        .read_to_string(&mut response)
++        .map_err(|err| err.to_string())?;
++    let response: CodexSocketResponse =
++        serde_json::from_str(&response).map_err(|err| err.to_string())?;
++    if response.ok {
++        Ok(response)
++    } else {
++        Err(response
++            .error
++            .unwrap_or_else(|| "codex helper returned OK=false".to_string()))
++    }
++}
++
++#[cfg(not(unix))]
++fn send_payload_to_path_impl<T: Serialize>(
++    _payload: &T,
++    _path: &Path,
++    _read_timeout: Option<Duration>,
++) -> Result<CodexSocketResponse, String> {
++    Err("codex helper socket is only supported on Unix".to_string())
++}
++
++fn is_helper_unavailable(err: &str) -> bool {
++    err.contains("No such file or directory")
++        || err.contains("Connection refused")
++        || err.contains("codex helper socket is only supported on Unix")
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn socket_path_uses_system_temp_root() {
++        let path = codex_socket_path();
++        assert!(path.ends_with(Path::new("cxh").join("codex.sock")));
++    }
++}
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index 15bb014af0..4ea81c532a 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -108,6 +108,7 @@ mod chatwidget;
+ mod cli;
+ mod clipboard_copy;
+ mod clipboard_paste;
++mod codex_socket;
+ mod collaboration_modes;
+ mod color;
+ mod config_update;

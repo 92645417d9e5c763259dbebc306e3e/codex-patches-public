@@ -1,0 +1,998 @@
+diff --git a/codex-rs/cli/src/doctor.rs b/codex-rs/cli/src/doctor.rs
+index 5e5a1e94be..97b1df0458 100644
+--- a/codex-rs/cli/src/doctor.rs
++++ b/codex-rs/cli/src/doctor.rs
+@@ -2438,7 +2438,8 @@ fn websocket_error_detail(err: &ApiError) -> String {
+         | ApiError::RateLimit(_)
+         | ApiError::InvalidRequest { .. }
+         | ApiError::CyberPolicy { .. }
+-        | ApiError::ServerOverloaded => format!("handshake error: {err}"),
++        | ApiError::ServerOverloaded
++        | ApiError::ResponseStreamDisconnected { .. } => format!("handshake error: {err}"),
+     }
+ }
+ 
+diff --git a/codex-rs/codex-api/src/api_bridge.rs b/codex-rs/codex-api/src/api_bridge.rs
+index 1c34d8bbf2..a528b09eff 100644
+--- a/codex-rs/codex-api/src/api_bridge.rs
++++ b/codex-rs/codex-api/src/api_bridge.rs
+@@ -21,6 +21,7 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
+         ApiError::QuotaExceeded => CodexErr::QuotaExceeded,
+         ApiError::UsageNotIncluded => CodexErr::UsageNotIncluded,
+         ApiError::Retryable { message, delay } => CodexErr::Stream(message, delay),
++        ApiError::ResponseStreamDisconnected { message, delay } => CodexErr::Stream(message, delay),
+         ApiError::Stream(msg) => CodexErr::Stream(msg, None),
+         ApiError::ServerOverloaded => CodexErr::ServerOverloaded,
+         ApiError::Api { status, message } => CodexErr::UnexpectedStatus(UnexpectedResponseError {
+diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+index 4ea564f139..d0f42727dd 100644
+--- a/codex-rs/codex-api/src/endpoint/responses_websocket.rs
++++ b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+@@ -7,6 +7,7 @@ use crate::provider::Provider;
+ use crate::rate_limits::parse_rate_limit_event;
+ use crate::sse::ResponsesStreamEvent;
+ use crate::sse::process_responses_event;
++use crate::sse::response_stream_disconnected;
+ use crate::telemetry::WebsocketTelemetry;
+ use codex_client::TransportError;
+ use codex_client::maybe_build_rustls_client_config_with_custom_ca;
+@@ -471,8 +472,14 @@ async fn connect_websocket(
+             (stream, response)
+         }
+         Err(err) => {
+-            error!("failed to connect to websocket: {err}, url: {url}");
+-            return Err(map_ws_error(err, &url));
++            let err_text = err.to_string();
++            let api_error = map_ws_error(err, &url);
++            if matches!(api_error, ApiError::ResponseStreamDisconnected { .. }) {
++                debug!("failed to connect to websocket: {err_text}, url: {url}");
++            } else {
++                error!("failed to connect to websocket: {err_text}, url: {url}");
++            }
++            return Err(api_error);
+         }
+     };
+ 
+@@ -532,7 +539,7 @@ fn map_ws_error(err: WsError, url: &Url) -> ApiError {
+         WsError::ConnectionClosed | WsError::AlreadyClosed => {
+             ApiError::Stream("websocket closed".to_string())
+         }
+-        WsError::Io(err) => ApiError::Transport(TransportError::Network(err.to_string())),
++        WsError::Io(err) => response_stream_disconnected(err.to_string()),
+         other => ApiError::Transport(TransportError::Network(other.to_string())),
+     }
+ }
+@@ -578,7 +585,7 @@ fn map_wrapped_websocket_error_event(
+         && let Some(code) = error.code.as_deref()
+         && code == WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE
+     {
+-        return Some(ApiError::Retryable {
++        return Some(ApiError::ResponseStreamDisconnected {
+             message: error
+                 .message
+                 .clone()
+@@ -647,18 +654,18 @@ async fn run_websocket_response_stream(
+         let poll_start = Instant::now();
+         let response = tokio::time::timeout(idle_timeout, ws_stream.next())
+             .await
+-            .map_err(|_| ApiError::Stream("idle timeout waiting for websocket".into()));
++            .map_err(|_| response_stream_disconnected("idle timeout waiting for websocket"));
+         if let Some(t) = telemetry.as_ref() {
+             t.on_ws_event(&response, poll_start.elapsed());
+         }
+         let message = match response {
+             Ok(Some(Ok(msg))) => msg,
+             Ok(Some(Err(err))) => {
+-                return Err(ApiError::Stream(err.to_string()));
++                return Err(response_stream_disconnected(err.to_string()));
+             }
+             Ok(None) => {
+-                return Err(ApiError::Stream(
+-                    "stream closed before response.completed".into(),
++                return Err(response_stream_disconnected(
++                    "stream closed before response.completed",
+                 ));
+             }
+             Err(err) => {
+@@ -742,8 +749,8 @@ async fn run_websocket_response_stream(
+                 return Err(ApiError::Stream("unexpected binary websocket event".into()));
+             }
+             Message::Close(_) => {
+-                return Err(ApiError::Stream(
+-                    "websocket closed by server before response.completed".into(),
++                return Err(response_stream_disconnected(
++                    "websocket closed by server before response.completed",
+                 ));
+             }
+             Message::Frame(_) => {}
+@@ -853,6 +860,22 @@ mod tests {
+         assert!(config.extensions.permessage_deflate.is_some());
+     }
+ 
++    #[test]
++    fn map_ws_error_io_eof_maps_retryable_disconnect() {
++        let url = Url::parse("wss://chatgpt.com/backend-api/codex/responses").expect("valid URL");
++        let error = WsError::Io(std::io::Error::new(
++            std::io::ErrorKind::UnexpectedEof,
++            "tls handshake eof",
++        ));
++
++        let api_error = map_ws_error(error, &url);
++        let ApiError::ResponseStreamDisconnected { message, delay } = api_error else {
++            panic!("expected retryable response stream disconnect");
++        };
++        assert!(message.contains("tls handshake eof"));
++        assert_eq!(delay, None);
++    }
++
+     #[test]
+     fn parse_wrapped_websocket_error_event_maps_to_transport_http() {
+         let payload = json!({
+@@ -961,8 +984,8 @@ mod tests {
+             .expect("expected websocket error payload to be parsed");
+         let api_error = map_wrapped_websocket_error_event(wrapped_error, payload)
+             .expect("expected websocket error payload to map to ApiError");
+-        let ApiError::Retryable { message, delay } = api_error else {
+-            panic!("expected ApiError::Retryable");
++        let ApiError::ResponseStreamDisconnected { message, delay } = api_error else {
++            panic!("expected ApiError::ResponseStreamDisconnected");
+         };
+         assert_eq!(message, WEBSOCKET_CONNECTION_LIMIT_REACHED_MESSAGE);
+         assert_eq!(delay, None);
+diff --git a/codex-rs/codex-api/src/error.rs b/codex-rs/codex-api/src/error.rs
+index c6cb5fd405..8cd2c0b3a3 100644
+--- a/codex-rs/codex-api/src/error.rs
++++ b/codex-rs/codex-api/src/error.rs
+@@ -12,6 +12,11 @@ pub enum ApiError {
+     Api { status: StatusCode, message: String },
+     #[error("stream error: {0}")]
+     Stream(String),
++    #[error("response stream disconnected before completion: {message}")]
++    ResponseStreamDisconnected {
++        message: String,
++        delay: Option<Duration>,
++    },
+     #[error("context window exceeded")]
+     ContextWindowExceeded,
+     #[error("quota exceeded")]
+diff --git a/codex-rs/codex-api/src/sse/mod.rs b/codex-rs/codex-api/src/sse/mod.rs
+index 441078bdcb..4ac1b1e6e3 100644
+--- a/codex-rs/codex-api/src/sse/mod.rs
++++ b/codex-rs/codex-api/src/sse/mod.rs
+@@ -2,4 +2,5 @@ pub(crate) mod responses;
+ 
+ pub(crate) use responses::ResponsesStreamEvent;
+ pub(crate) use responses::process_responses_event;
++pub(crate) use responses::response_stream_disconnected;
+ pub use responses::spawn_response_stream;
+diff --git a/codex-rs/codex-api/src/sse/responses.rs b/codex-rs/codex-api/src/sse/responses.rs
+index a451f67af0..d8fccaa926 100644
+--- a/codex-rs/codex-api/src/sse/responses.rs
++++ b/codex-rs/codex-api/src/sse/responses.rs
+@@ -431,6 +431,13 @@ pub fn process_responses_event(
+     Ok(None)
+ }
+ 
++pub(crate) fn response_stream_disconnected(message: impl Into<String>) -> ApiError {
++    ApiError::ResponseStreamDisconnected {
++        message: message.into(),
++        delay: None,
++    }
++}
++
+ pub async fn process_sse(
+     stream: ByteStream,
+     tx_event: mpsc::Sender<Result<ResponseEvent, ApiError>>,
+@@ -451,19 +458,23 @@ pub async fn process_sse(
+             Ok(Some(Ok(sse))) => sse,
+             Ok(Some(Err(e))) => {
+                 debug!("SSE Error: {e:#}");
+-                let _ = tx_event.send(Err(ApiError::Stream(e.to_string()))).await;
++                let _ = tx_event
++                    .send(Err(response_stream_disconnected(e.to_string())))
++                    .await;
+                 return;
+             }
+             Ok(None) => {
+-                let error = response_error.unwrap_or(ApiError::Stream(
+-                    "stream closed before response.completed".into(),
+-                ));
++                let error = response_error.unwrap_or_else(|| {
++                    response_stream_disconnected("stream closed before response.completed")
++                });
+                 let _ = tx_event.send(Err(error)).await;
+                 return;
+             }
+             Err(_) => {
+                 let _ = tx_event
+-                    .send(Err(ApiError::Stream("idle timeout waiting for SSE".into())))
++                    .send(Err(response_stream_disconnected(
++                        "idle timeout waiting for SSE",
++                    )))
+                     .await;
+                 return;
+             }
+@@ -763,8 +774,9 @@ mod tests {
+         assert_matches!(events[0], Ok(ResponseEvent::OutputItemDone(_)));
+ 
+         match &events[1] {
+-            Err(ApiError::Stream(msg)) => {
+-                assert_eq!(msg, "stream closed before response.completed")
++            Err(ApiError::ResponseStreamDisconnected { message, delay }) => {
++                assert_eq!(message, "stream closed before response.completed");
++                assert_eq!(*delay, None);
+             }
+             other => panic!("unexpected second event: {other:?}"),
+         }
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index 73d7398a3d..180eee5a78 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -2,7 +2,7 @@
+ //!
+ //! `ModelClient` is intended to live for the lifetime of a Codex session and holds the stable
+ //! configuration and state needed to talk to a provider (auth, provider selection, conversation id,
+-//! and transport fallback state).
++//! and WebSocket state).
+ //!
+ //! Per-turn settings (model selection, reasoning controls, telemetry context, and turn metadata)
+ //! are passed explicitly to streaming and unary methods so that the turn lifetime is visible at the
+@@ -21,14 +21,12 @@
+ //! ## Retry-Budget Tradeoff
+ //!
+ //! WebSocket prewarm is treated as the first websocket connection attempt for a turn. If it
+-//! fails, normal stream retry/fallback logic handles recovery on the same turn.
++//! fails, normal stream retry logic handles recovery on the same turn.
+ 
+ use std::collections::HashMap;
+ use std::sync::Arc;
+ use std::sync::Mutex as StdMutex;
+ use std::sync::OnceLock;
+-use std::sync::atomic::AtomicBool;
+-use std::sync::atomic::Ordering;
+ 
+ use codex_api::ApiError;
+ use codex_api::AuthProvider;
+@@ -156,6 +154,7 @@ const MEMORIES_SUMMARIZE_ENDPOINT: &str = "/memories/trace_summarize";
+ #[cfg(test)]
+ pub(crate) const WEBSOCKET_CONNECT_TIMEOUT: Duration =
+     Duration::from_millis(DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS);
++pub(crate) const WEBSOCKET_PREWARM_COMPLETION_TIMEOUT: Duration = Duration::from_secs(3);
+ 
+ pub(crate) struct CompactConversationRequestSettings {
+     pub(crate) effort: Option<ReasoningEffortConfig>,
+@@ -180,7 +179,6 @@ struct ModelClientState {
+     item_ids_enabled: bool,
+     include_attestation: bool,
+     attestation_provider: Option<Arc<dyn AttestationProvider>>,
+-    disable_websockets: AtomicBool,
+     cached_websocket_session: StdMutex<WebsocketSession>,
+ }
+ 
+@@ -208,10 +206,7 @@ impl RequestRouteTelemetry {
+ /// A session-scoped client for model-provider API calls.
+ ///
+ /// This holds configuration and state that should be shared across turns within a Codex session
+-/// (auth, provider selection, thread id, and transport fallback state).
+-///
+-/// WebSocket fallback is session-scoped: once a turn activates the HTTP fallback, subsequent turns
+-/// will also use HTTP for the remainder of the session.
++/// (auth, provider selection, thread id, and WebSocket state).
+ ///
+ /// Turn-scoped settings (model selection, reasoning controls, telemetry context, and turn
+ /// metadata) are passed explicitly to the relevant methods to keep turn lifetime visible at the
+@@ -402,7 +397,6 @@ impl ModelClient {
+                 item_ids_enabled,
+                 include_attestation,
+                 attestation_provider,
+-                disable_websockets: AtomicBool::new(false),
+                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
+             }),
+             prompt_cache_key_override: None,
+@@ -456,27 +450,6 @@ impl ModelClient {
+             .unwrap_or_else(std::sync::PoisonError::into_inner) = websocket_session;
+     }
+ 
+-    pub(crate) fn force_http_fallback(
+-        &self,
+-        session_telemetry: &SessionTelemetry,
+-        _model_info: &ModelInfo,
+-    ) -> bool {
+-        let websocket_enabled = self.responses_websocket_enabled();
+-        let activated =
+-            websocket_enabled && !self.state.disable_websockets.swap(true, Ordering::Relaxed);
+-        if activated {
+-            warn!("falling back to HTTP");
+-            session_telemetry.counter(
+-                "codex.transport.fallback_to_http",
+-                /*inc*/ 1,
+-                &[("from_wire_api", "responses_websocket")],
+-            );
+-        }
+-
+-        self.store_cached_websocket_session(WebsocketSession::default());
+-        activated
+-    }
+-
+     /// Compacts the current conversation history using the Compact endpoint.
+     ///
+     /// This is a unary call (no streaming) that returns a new list of
+@@ -839,15 +812,9 @@ impl ModelClient {
+ 
+     /// Returns whether the Responses-over-WebSocket transport is active for this session.
+     ///
+-    /// WebSocket use is controlled by provider capability and session-scoped fallback state.
++    /// WebSocket use is controlled by provider capability.
+     pub fn responses_websocket_enabled(&self) -> bool {
+-        if !self.state.provider.info().supports_websockets
+-            || self.state.disable_websockets.load(Ordering::Relaxed)
+-        {
+-            return false;
+-        }
+-
+-        true
++        self.state.provider.info().supports_websockets
+     }
+ 
+     /// Returns auth + provider configuration resolved from the current session auth state.
+@@ -1604,19 +1571,23 @@ impl ModelClientSession {
+         {
+             Ok(WebsocketStreamOutcome::Stream(mut stream)) => {
+                 // Wait for the v2 warmup request to complete before sending the first turn request.
+-                while let Some(event) = stream.next().await {
+-                    match event {
+-                        Ok(ResponseEvent::Completed { .. }) => break,
+-                        Err(err) => return Err(err),
+-                        _ => {}
++                loop {
++                    match tokio::time::timeout(WEBSOCKET_PREWARM_COMPLETION_TIMEOUT, stream.next())
++                        .await
++                    {
++                        Ok(Some(Ok(ResponseEvent::Completed { .. }))) => break,
++                        Ok(Some(Ok(_))) => {}
++                        Ok(Some(Err(err))) => return Err(err),
++                        Ok(None) => break,
++                        Err(_) => {
++                            self.reset_websocket_session();
++                            break;
++                        }
+                     }
+                 }
+                 Ok(())
+             }
+-            Ok(WebsocketStreamOutcome::FallbackToHttp) => {
+-                self.try_switch_fallback_transport(session_telemetry, model_info);
+-                Ok(())
+-            }
++            Ok(WebsocketStreamOutcome::FallbackToHttp) => Err(websocket_http_fallback_disabled()),
+             Err(err) => Err(err),
+         }
+     }
+@@ -1626,9 +1597,8 @@ impl ModelClientSession {
+     ///
+     /// The caller is responsible for passing per-turn settings explicitly (model selection,
+     /// reasoning settings, telemetry context, and turn metadata). This method will prefer the
+-    /// Responses WebSocket transport when the provider supports it and it remains healthy, and will
+-    /// fall back to the HTTP Responses API transport otherwise. The trace context may be enabled or
+-    /// disabled, but is always explicit so transport paths do not need separate trace/no-trace
++    /// Responses WebSocket transport when the provider supports it. The trace context may be enabled
++    /// or disabled, but is always explicit so transport paths do not need separate trace/no-trace
+     /// branches.
+     pub async fn stream(
+         &mut self,
+@@ -1663,7 +1633,7 @@ impl ModelClientSession {
+                     {
+                         WebsocketStreamOutcome::Stream(stream) => return Ok(stream),
+                         WebsocketStreamOutcome::FallbackToHttp => {
+-                            self.try_switch_fallback_transport(session_telemetry, model_info);
++                            return Err(websocket_http_fallback_disabled());
+                         }
+                     }
+                 }
+@@ -1682,24 +1652,13 @@ impl ModelClientSession {
+             }
+         }
+     }
++}
+ 
+-    /// Permanently disables WebSockets for this Codex session and resets WebSocket state.
+-    ///
+-    /// This is used after exhausting the provider retry budget, to force subsequent requests onto
+-    /// the HTTP transport.
+-    ///
+-    /// Returns `true` if this call activated fallback, or `false` if fallback was already active.
+-    pub(crate) fn try_switch_fallback_transport(
+-        &mut self,
+-        session_telemetry: &SessionTelemetry,
+-        model_info: &ModelInfo,
+-    ) -> bool {
+-        let activated = self
+-            .client
+-            .force_http_fallback(session_telemetry, model_info);
+-        self.websocket_session = WebsocketSession::default();
+-        activated
+-    }
++fn websocket_http_fallback_disabled() -> CodexErr {
++    CodexErr::Stream(
++        "Responses WebSocket requested HTTP fallback, but HTTP fallback is disabled".to_string(),
++        None,
++    )
+ }
+ 
+ /// Stamp a ResponsesWsRequest with the current time.
+diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_remote_v2.rs
+index d941388b07..eae25eaa62 100644
+--- a/codex-rs/core/src/compact_remote_v2.rs
++++ b/codex-rs/core/src/compact_remote_v2.rs
+@@ -370,7 +370,6 @@ async fn run_remote_compaction_request_v2(
+                     &mut retries,
+                     max_retries,
+                     err,
+-                    client_session,
+                     sess,
+                     turn_context,
+                     ResponsesStreamRequest::RemoteCompactionV2,
+diff --git a/codex-rs/core/src/responses_retry.rs b/codex-rs/core/src/responses_retry.rs
+index 9a55fc8114..f19f4212c1 100644
+--- a/codex-rs/core/src/responses_retry.rs
++++ b/codex-rs/core/src/responses_retry.rs
+@@ -1,14 +1,11 @@
+-//! Shared retry and transport fallback decisions for Responses requests.
++//! Shared retry decisions for Responses requests.
+ 
+ use std::time::Duration;
+ 
+-use crate::client::ModelClientSession;
+ use crate::session::session::Session;
+ use crate::session::turn_context::TurnContext;
+ use crate::util::backoff;
+ use codex_protocol::error::CodexErr;
+-use codex_protocol::protocol::EventMsg;
+-use codex_protocol::protocol::WarningEvent;
+ use tracing::warn;
+ 
+ #[derive(Debug, Clone, Copy)]
+@@ -23,28 +20,10 @@ pub(crate) async fn handle_retryable_response_stream_error(
+     retries: &mut u64,
+     max_retries: u64,
+     err: CodexErr,
+-    client_session: &mut ModelClientSession,
+     sess: &Session,
+     turn_context: &TurnContext,
+     request: ResponsesStreamRequest,
+ ) -> Result<(), CodexErr> {
+-    if *retries >= max_retries
+-        && client_session.try_switch_fallback_transport(
+-            &turn_context.session_telemetry,
+-            &turn_context.model_info,
+-        )
+-    {
+-        sess.send_event(
+-            turn_context,
+-            EventMsg::Warning(WarningEvent {
+-                message: format!("Falling back from WebSockets to HTTPS transport. {err:#}"),
+-            }),
+-        )
+-        .await;
+-        *retries = 0;
+-        return Ok(());
+-    }
+-
+     if *retries < max_retries {
+         *retries += 1;
+         let retry_count = *retries;
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index 25e4e1a6af..a2164316bb 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -1155,7 +1155,6 @@ async fn run_sampling_request(
+             &mut retries,
+             max_retries,
+             err,
+-            client_session,
+             &sess,
+             &turn_context,
+             ResponsesStreamRequest::Sampling,
+diff --git a/codex-rs/core/src/session_startup_prewarm.rs b/codex-rs/core/src/session_startup_prewarm.rs
+index 0474eb8704..170b7e7edd 100644
+--- a/codex-rs/core/src/session_startup_prewarm.rs
++++ b/codex-rs/core/src/session_startup_prewarm.rs
+@@ -10,6 +10,7 @@ use tracing::instrument;
+ use tracing::warn;
+ 
+ use crate::client::ModelClientSession;
++use crate::client::WEBSOCKET_PREWARM_COMPLETION_TIMEOUT;
+ use crate::responses_metadata::CodexResponsesRequestKind;
+ use crate::session::INITIAL_SUBMIT_ID;
+ use crate::session::session::Session;
+@@ -186,7 +187,11 @@ impl Session {
+         }
+ 
+         let session_telemetry = self.services.session_telemetry.clone();
+-        let websocket_connect_timeout = self.provider().await.websocket_connect_timeout();
++        let websocket_prewarm_timeout = self
++            .provider()
++            .await
++            .websocket_connect_timeout()
++            .min(WEBSOCKET_PREWARM_COMPLETION_TIMEOUT);
+         let started_at = Instant::now();
+         let startup_prewarm_session = Arc::clone(self);
+         let startup_prewarm = tokio::spawn(async move {
+@@ -208,7 +213,7 @@ impl Session {
+         self.set_session_startup_prewarm(SessionStartupPrewarmHandle::new(
+             startup_prewarm,
+             started_at,
+-            websocket_connect_timeout,
++            websocket_prewarm_timeout,
+         ))
+         .await;
+     }
+diff --git a/codex-rs/core/tests/suite/cli_stream.rs b/codex-rs/core/tests/suite/cli_stream.rs
+index d2eac6fb3c..bcf04274f7 100644
+--- a/codex-rs/core/tests/suite/cli_stream.rs
++++ b/codex-rs/core/tests/suite/cli_stream.rs
+@@ -32,7 +32,11 @@ const CLOUD_CONFIG_BUNDLE_PATH: &str = "/backend-api/wham/config/bundle";
+ const CLI_TIMEOUT: Duration = Duration::from_secs(30);
+ 
+ fn repo_root() -> std::path::PathBuf {
+-    codex_utils_cargo_bin::repo_root().expect("failed to resolve repo root")
++    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++        .ancestors()
++        .find(|path| path.join(".git").exists())
++        .map(std::path::Path::to_path_buf)
++        .unwrap_or_else(|| codex_utils_cargo_bin::repo_root().expect("failed to resolve repo root"))
+ }
+ 
+ fn cli_sse_response() -> String {
+@@ -69,11 +73,15 @@ async fn mount_personal_access_token_startup(server: &MockServer) {
+ #[expect(clippy::unwrap_used)]
+ fn personal_access_token_exec_command(server: &MockServer, home: &TempDir) -> Command {
+     let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
++    let provider_override = format!(
++        "model_providers.openai={{ base_url = \"{}/api/codex\", stream_max_retries = 0, supports_websockets = false }}",
++        server.uri()
++    );
+     let mut cmd = Command::new(bin);
+     cmd.arg("exec")
+         .arg("--skip-git-repo-check")
+         .arg("-c")
+-        .arg(format!("openai_base_url=\"{}/api/codex\"", server.uri()))
++        .arg(&provider_override)
+         .arg("-c")
+         .arg(format!("chatgpt_base_url=\"{}/backend-api\"", server.uri()))
+         .arg("-C")
+@@ -224,7 +232,7 @@ async fn responses_mode_stream_cli() {
+ 
+     let home = TempDir::new().unwrap();
+     let provider_override = format!(
+-        "model_providers.mock={{ name = \"mock\", base_url = \"{}/v1\", env_key = \"PATH\", wire_api = \"responses\" }}",
++        "model_providers.mock={{ name = \"mock\", base_url = \"{}/v1\", env_key = \"PATH\", wire_api = \"responses\", supports_websockets = false }}",
+         server.uri()
+     );
+     let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
+@@ -254,7 +262,7 @@ async fn responses_mode_stream_cli() {
+     assert_eq!(request.path(), "/v1/responses");
+ }
+ 
+-/// Ensures `openai_base_url` config override routes built-in openai provider requests.
++/// Ensures a configured Responses provider routes CLI requests to the mock server.
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn responses_mode_stream_cli_supports_openai_base_url_config_override() {
+     skip_if_no_network!();
+@@ -269,12 +277,18 @@ async fn responses_mode_stream_cli_supports_openai_base_url_config_override() {
+     let resp_mock = responses::mount_sse_once(&server, sse).await;
+ 
+     let home = TempDir::new().unwrap();
++    let provider_override = format!(
++        "model_providers.mock={{ name = \"mock\", base_url = \"{}/v1\", env_key = \"PATH\", wire_api = \"responses\", supports_websockets = false }}",
++        server.uri()
++    );
+     let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
+     let mut cmd = Command::new(bin);
+     cmd.arg("exec")
+         .arg("--skip-git-repo-check")
+         .arg("-c")
+-        .arg(format!("openai_base_url=\"{}/v1\"", server.uri()))
++        .arg(&provider_override)
++        .arg("-c")
++        .arg("model_provider=\"mock\"")
+         .arg("-C")
+         .arg(&repo_root)
+         .arg("hello?");
+@@ -315,7 +329,7 @@ async fn exec_cli_applies_model_instructions_file() {
+     // Build a provider override that points at the mock server and instructs
+     // Codex to use the Responses API with the dummy env var.
+     let provider_override = format!(
+-        "model_providers.mock={{ name = \"mock\", base_url = \"{}/v1\", env_key = \"PATH\", wire_api = \"responses\" }}",
++        "model_providers.mock={{ name = \"mock\", base_url = \"{}/v1\", env_key = \"PATH\", wire_api = \"responses\", supports_websockets = false }}",
+         server.uri()
+     );
+ 
+@@ -379,7 +393,7 @@ async fn exec_cli_profile_applies_model_instructions_file() {
+     let custom_path_str = custom_path.to_string_lossy().replace('\\', "/");
+ 
+     let provider_override = format!(
+-        "model_providers.mock={{ name = \"mock\", base_url = \"{}/v1\", env_key = \"PATH\", wire_api = \"responses\" }}",
++        "model_providers.mock={{ name = \"mock\", base_url = \"{}/v1\", env_key = \"PATH\", wire_api = \"responses\", supports_websockets = false }}",
+         server.uri()
+     );
+ 
+@@ -434,6 +448,10 @@ async fn responses_api_stream_cli() {
+     let server = MockServer::start().await;
+     let resp_mock = responses::mount_sse_once(&server, cli_sse_response()).await;
+     let repo_root = repo_root();
++    let provider_override = format!(
++        "model_providers.mock={{ name = \"mock\", base_url = \"{}/v1\", env_key = \"PATH\", wire_api = \"responses\", supports_websockets = false }}",
++        server.uri()
++    );
+ 
+     let home = TempDir::new().unwrap();
+     let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
+@@ -441,7 +459,9 @@ async fn responses_api_stream_cli() {
+     cmd.arg("exec")
+         .arg("--skip-git-repo-check")
+         .arg("-c")
+-        .arg(format!("openai_base_url=\"{}/v1\"", server.uri()))
++        .arg(&provider_override)
++        .arg("-c")
++        .arg("model_provider=\"mock\"")
+         .arg("-C")
+         .arg(&repo_root)
+         .arg("hello?");
+@@ -475,6 +495,10 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
+     let resp_mock =
+         responses::mount_sse_sequence(&server, vec![cli_sse_response(), cli_sse_response()]).await;
+     let repo_root = repo_root();
++    let provider_override = format!(
++        "model_providers.mock={{ name = \"mock\", base_url = \"{}/v1\", env_key = \"PATH\", wire_api = \"responses\", supports_websockets = false }}",
++        server.uri()
++    );
+ 
+     // 4. Run the codex CLI and invoke `exec`, which is what records a session.
+     let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
+@@ -482,7 +506,9 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
+     cmd.arg("exec")
+         .arg("--skip-git-repo-check")
+         .arg("-c")
+-        .arg(format!("openai_base_url=\"{}/v1\"", server.uri()))
++        .arg(&provider_override)
++        .arg("-c")
++        .arg("model_provider=\"mock\"")
+         .arg("-C")
+         .arg(&repo_root)
+         .arg(&prompt);
+@@ -598,7 +624,9 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
+     cmd2.arg("exec")
+         .arg("--skip-git-repo-check")
+         .arg("-c")
+-        .arg(format!("openai_base_url=\"{}/v1\"", server.uri()))
++        .arg(&provider_override)
++        .arg("-c")
++        .arg("model_provider=\"mock\"")
+         .arg("-C")
+         .arg(&repo_root)
+         .arg(&prompt2)
+diff --git a/codex-rs/core/tests/suite/realtime_conversation.rs b/codex-rs/core/tests/suite/realtime_conversation.rs
+index dd97e5a5d3..9bb256cbdd 100644
+--- a/codex-rs/core/tests/suite/realtime_conversation.rs
++++ b/codex-rs/core/tests/suite/realtime_conversation.rs
+@@ -1232,6 +1232,11 @@ async fn conversation_start_uses_openai_env_key_fallback_with_chatgpt_auth() ->
+             voice: None,
+         }))
+         .await?;
++    assert!(
++        server
++            .wait_for_handshakes(/*expected*/ 1, Duration::from_secs(2))
++            .await
++    );
+ 
+     let started = wait_for_event_match(&test.codex, |msg| match msg {
+         EventMsg::RealtimeConversationStarted(started) => Some(Ok(started.clone())),
+diff --git a/codex-rs/core/tests/suite/websocket_fallback.rs b/codex-rs/core/tests/suite/websocket_fallback.rs
+index cdf77694c2..232465dd52 100644
+--- a/codex-rs/core/tests/suite/websocket_fallback.rs
++++ b/codex-rs/core/tests/suite/websocket_fallback.rs
+@@ -1,4 +1,5 @@
+ use anyhow::Result;
++use anyhow::bail;
+ use codex_model_provider_info::WireApi;
+ use codex_protocol::models::PermissionProfile;
+ use codex_protocol::protocol::AskForApproval;
+@@ -7,11 +8,6 @@ use codex_protocol::protocol::Op;
+ use codex_protocol::user_input::UserInput;
+ use core_test_support::TempDirExt;
+ use core_test_support::responses;
+-use core_test_support::responses::ev_completed;
+-use core_test_support::responses::ev_response_created;
+-use core_test_support::responses::mount_sse_once;
+-use core_test_support::responses::mount_sse_sequence;
+-use core_test_support::responses::sse;
+ use core_test_support::skip_if_no_network;
+ use core_test_support::test_codex::TestCodex;
+ use core_test_support::test_codex::local_selections;
+@@ -27,7 +23,7 @@ use wiremock::matchers::method;
+ use wiremock::matchers::path_regex;
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn websocket_fallback_switches_to_http_on_upgrade_required_connect() -> Result<()> {
++async fn websocket_upgrade_required_does_not_fallback_to_http() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+     let server = responses::start_mock_server().await;
+@@ -37,27 +33,23 @@ async fn websocket_fallback_switches_to_http_on_upgrade_required_connect() -> Re
+         .mount(&server)
+         .await;
+ 
+-    let response_mock = mount_sse_once(
+-        &server,
+-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+-    )
+-    .await;
+-
+     let mut builder = test_codex().with_config({
+         let base_url = format!("{}/v1", server.uri());
+         move |config| {
+             config.model_provider.base_url = Some(base_url);
+             config.model_provider.wire_api = WireApi::Responses;
+             config.model_provider.supports_websockets = true;
+-            // If we don't treat 426 specially, the sampling loop would retry the WebSocket
+-            // handshake before switching to the HTTP transport.
+             config.model_provider.stream_max_retries = Some(2);
+             config.model_provider.request_max_retries = Some(0);
+         }
+     });
+     let test = builder.build(&server).await?;
+ 
+-    test.submit_turn("hello").await?;
++    let (_, error_message) = submit_turn_until_error(&test, "hello").await?;
++    assert!(
++        error_message.contains("HTTP fallback is disabled"),
++        "unexpected error message: {error_message}"
++    );
+ 
+     let requests = server.received_requests().await.unwrap_or_default();
+     let websocket_attempts = requests
+@@ -69,26 +61,17 @@ async fn websocket_fallback_switches_to_http_on_upgrade_required_connect() -> Re
+         .filter(|req| req.method == Method::POST && req.url.path().ends_with("/responses"))
+         .count();
+ 
+-    // The startup prewarm request sees 426 and immediately switches the session to HTTP fallback,
+-    // so the first turn goes straight to HTTP with no additional websocket connect attempt.
+-    assert_eq!(websocket_attempts, 1);
+-    assert_eq!(http_attempts, 1);
+-    assert_eq!(response_mock.requests().len(), 1);
++    assert_eq!(websocket_attempts, 4);
++    assert_eq!(http_attempts, 0);
+ 
+     Ok(())
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result<()> {
++async fn websocket_retry_exhaustion_does_not_fallback_to_http() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+     let server = responses::start_mock_server().await;
+-    let response_mock = mount_sse_once(
+-        &server,
+-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+-    )
+-    .await;
+-
+     let mut builder = test_codex().with_config({
+         let base_url = format!("{}/v1", server.uri());
+         move |config| {
+@@ -101,7 +84,7 @@ async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result
+     });
+     let test = builder.build(&server).await?;
+ 
+-    test.submit_turn("hello").await?;
++    submit_turn_until_error(&test, "hello").await?;
+ 
+     let requests = server.received_requests().await.unwrap_or_default();
+     let websocket_attempts = requests
+@@ -113,12 +96,8 @@ async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result
+         .filter(|req| req.method == Method::POST && req.url.path().ends_with("/responses"))
+         .count();
+ 
+-    // Deferred request prewarm is attempted at startup.
+-    // The first turn then makes 3 websocket stream attempts (initial try + 2 retries),
+-    // after which fallback activates and the request is replayed over HTTP.
+     assert_eq!(websocket_attempts, 4);
+-    assert_eq!(http_attempts, 1);
+-    assert_eq!(response_mock.requests().len(), 1);
++    assert_eq!(http_attempts, 0);
+ 
+     Ok(())
+ }
+@@ -128,12 +107,6 @@ async fn websocket_fallback_hides_first_websocket_retry_stream_error() -> Result
+     skip_if_no_network!(Ok(()));
+ 
+     let server = responses::start_mock_server().await;
+-    let response_mock = mount_sse_once(
+-        &server,
+-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+-    )
+-    .await;
+-
+     let mut builder = test_codex().with_config({
+         let base_url = format!("{}/v1", server.uri());
+         move |config| {
+@@ -144,55 +117,8 @@ async fn websocket_fallback_hides_first_websocket_retry_stream_error() -> Result
+             config.model_provider.request_max_retries = Some(0);
+         }
+     });
+-    let TestCodex {
+-        codex,
+-        session_configured,
+-        cwd,
+-        ..
+-    } = builder.build(&server).await?;
+-    let (sandbox_policy, permission_profile) =
+-        turn_permission_fields(PermissionProfile::Disabled, cwd.path());
+-
+-    codex
+-        .submit(Op::UserInput {
+-            items: vec![UserInput::Text {
+-                text: "hello".into(),
+-                text_elements: Vec::new(),
+-            }],
+-            final_output_json_schema: None,
+-            responsesapi_client_metadata: None,
+-            additional_context: Default::default(),
+-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+-                environments: Some(local_selections(cwd.abs())),
+-                approval_policy: Some(AskForApproval::Never),
+-                sandbox_policy: Some(sandbox_policy),
+-                permission_profile,
+-                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+-                    mode: codex_protocol::config_types::ModeKind::Default,
+-                    settings: codex_protocol::config_types::Settings {
+-                        model: session_configured.model.clone(),
+-                        reasoning_effort: None,
+-                        developer_instructions: None,
+-                    },
+-                }),
+-                ..Default::default()
+-            },
+-        })
+-        .await?;
+-
+-    let mut stream_error_messages = Vec::new();
+-    loop {
+-        let event = timeout(Duration::from_secs(10), codex.next_event())
+-            .await
+-            .expect("timeout waiting for event")
+-            .expect("event stream ended unexpectedly")
+-            .msg;
+-        match event {
+-            EventMsg::StreamError(e) => stream_error_messages.push(e.message),
+-            EventMsg::TurnComplete(_) => break,
+-            _ => {}
+-        }
+-    }
++    let test = builder.build(&server).await?;
++    let (stream_error_messages, _) = submit_turn_until_error(&test, "hello").await?;
+ 
+     let expected_stream_errors = if cfg!(debug_assertions) {
+         vec!["Reconnecting... 1/2", "Reconnecting... 2/2"]
+@@ -200,25 +126,15 @@ async fn websocket_fallback_hides_first_websocket_retry_stream_error() -> Result
+         vec!["Reconnecting... 2/2"]
+     };
+     assert_eq!(stream_error_messages, expected_stream_errors);
+-    assert_eq!(response_mock.requests().len(), 1);
+ 
+     Ok(())
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn websocket_fallback_is_sticky_across_turns() -> Result<()> {
++async fn failed_websocket_turns_do_not_activate_sticky_http_fallback() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+     let server = responses::start_mock_server().await;
+-    let response_mock = mount_sse_sequence(
+-        &server,
+-        vec![
+-            sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+-            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+-        ],
+-    )
+-    .await;
+-
+     let mut builder = test_codex().with_config({
+         let base_url = format!("{}/v1", server.uri());
+         move |config| {
+@@ -231,8 +147,8 @@ async fn websocket_fallback_is_sticky_across_turns() -> Result<()> {
+     });
+     let test = builder.build(&server).await?;
+ 
+-    test.submit_turn("first").await?;
+-    test.submit_turn("second").await?;
++    submit_turn_until_error(&test, "first").await?;
++    submit_turn_until_error(&test, "second").await?;
+ 
+     let requests = server.received_requests().await.unwrap_or_default();
+     let websocket_attempts = requests
+@@ -244,13 +160,62 @@ async fn websocket_fallback_is_sticky_across_turns() -> Result<()> {
+         .filter(|req| req.method == Method::POST && req.url.path().ends_with("/responses"))
+         .count();
+ 
+-    // WebSocket attempts all happen on the first turn:
+-    // 1 deferred request prewarm attempt (startup) + 3 stream attempts
+-    // (initial try + 2 retries) before fallback.
+-    // Fallback is sticky, so the second turn stays on HTTP and adds no websocket attempts.
+-    assert_eq!(websocket_attempts, 4);
+-    assert_eq!(http_attempts, 2);
+-    assert_eq!(response_mock.requests().len(), 2);
++    assert_eq!(websocket_attempts, 7);
++    assert_eq!(http_attempts, 0);
+ 
+     Ok(())
+ }
++
++async fn submit_turn_until_error(test: &TestCodex, prompt: &str) -> Result<(Vec<String>, String)> {
++    let (sandbox_policy, permission_profile) =
++        turn_permission_fields(PermissionProfile::Disabled, test.cwd.path());
++
++    test.codex
++        .submit(Op::UserInput {
++            items: vec![UserInput::Text {
++                text: prompt.into(),
++                text_elements: Vec::new(),
++            }],
++            final_output_json_schema: None,
++            responsesapi_client_metadata: None,
++            additional_context: Default::default(),
++            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
++                environments: Some(local_selections(test.cwd.abs())),
++                approval_policy: Some(AskForApproval::Never),
++                sandbox_policy: Some(sandbox_policy),
++                permission_profile,
++                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
++                    mode: codex_protocol::config_types::ModeKind::Default,
++                    settings: codex_protocol::config_types::Settings {
++                        model: test.session_configured.model.clone(),
++                        reasoning_effort: None,
++                        developer_instructions: None,
++                    },
++                }),
++                ..Default::default()
++            },
++        })
++        .await?;
++
++    let mut stream_error_messages = Vec::new();
++    let mut turn_id: Option<String> = None;
++    loop {
++        let event = timeout(Duration::from_secs(10), test.codex.next_event()).await??;
++        let event_id = event.id.clone();
++        match event.msg {
++            EventMsg::TurnStarted(e) => {
++                turn_id = Some(e.turn_id);
++            }
++            EventMsg::StreamError(e) if turn_id.as_deref() == Some(event_id.as_str()) => {
++                stream_error_messages.push(e.message);
++            }
++            EventMsg::Error(e) if turn_id.as_deref() == Some(event_id.as_str()) => {
++                return Ok((stream_error_messages, e.message));
++            }
++            EventMsg::TurnComplete(_) if turn_id.as_deref() == Some(event_id.as_str()) => {
++                bail!("turn completed unexpectedly");
++            }
++            _ => {}
++        }
++    }
++}
+diff --git a/codex-rs/response-debug-context/src/lib.rs b/codex-rs/response-debug-context/src/lib.rs
+index d9c186e02e..b64045bd58 100644
+--- a/codex-rs/response-debug-context/src/lib.rs
++++ b/codex-rs/response-debug-context/src/lib.rs
+@@ -75,6 +75,7 @@ pub fn telemetry_api_error_message(error: &ApiError) -> String {
+         ApiError::Transport(transport) => telemetry_transport_error_message(transport),
+         ApiError::Api { status, .. } => format!("api error {}", status.as_u16()),
+         ApiError::Stream(err) => err.to_string(),
++        ApiError::ResponseStreamDisconnected { message, .. } => message.to_string(),
+         ApiError::ContextWindowExceeded => "context window exceeded".to_string(),
+         ApiError::QuotaExceeded => "quota exceeded".to_string(),
+         ApiError::UsageNotIncluded => "usage not included".to_string(),

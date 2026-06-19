@@ -1,0 +1,371 @@
+diff --git a/codex-rs/app-server-daemon/src/backend/mod.rs b/codex-rs/app-server-daemon/src/backend/mod.rs
+index d40df07a0e..33f1bd0812 100644
+--- a/codex-rs/app-server-daemon/src/backend/mod.rs
++++ b/codex-rs/app-server-daemon/src/backend/mod.rs
+@@ -33,6 +33,24 @@ pub(crate) fn pid_update_loop_backend(paths: BackendPaths) -> PidBackend {
+     PidBackend::new_update_loop(paths.codex_bin, paths.update_pid_file)
+ }
+ 
++#[cfg(unix)]
++pub(crate) fn pid_exists(pid: u32) -> bool {
++    pid::process_exists(pid)
++}
++
++#[cfg(not(unix))]
++pub(crate) fn pid_exists(_pid: u32) -> bool {
++    false
++}
++
++pub(crate) fn terminate_pid(pid: u32) -> anyhow::Result<()> {
++    pid::terminate_process(pid)
++}
++
++pub(crate) fn force_terminate_pid(pid: u32) -> anyhow::Result<()> {
++    pid::force_terminate_process(pid)
++}
++
+ pub(crate) async fn append_stderr_log_tail_context(pid_file: &Path, context: &mut String) {
+     match pid::read_stderr_log_tail(pid_file).await {
+         Ok(Some(tail)) => tail.append_to_context(context),
+diff --git a/codex-rs/app-server-daemon/src/backend/pid.rs b/codex-rs/app-server-daemon/src/backend/pid.rs
+index 9a465b3186..85df79ed29 100644
+--- a/codex-rs/app-server-daemon/src/backend/pid.rs
++++ b/codex-rs/app-server-daemon/src/backend/pid.rs
+@@ -495,7 +495,7 @@ async fn read_log_tail(path: &Path, byte_limit: u64) -> Result<Option<String>> {
+ }
+ 
+ #[cfg(unix)]
+-fn process_exists(pid: u32) -> bool {
++pub(crate) fn process_exists(pid: u32) -> bool {
+     let Ok(pid) = libc::pid_t::try_from(pid) else {
+         return false;
+     };
+@@ -504,7 +504,7 @@ fn process_exists(pid: u32) -> bool {
+ }
+ 
+ #[cfg(unix)]
+-fn terminate_process(pid: u32) -> Result<()> {
++pub(crate) fn terminate_process(pid: u32) -> Result<()> {
+     let raw_pid = libc::pid_t::try_from(pid)
+         .with_context(|| format!("pid-managed app server pid {pid} is out of range"))?;
+     let result = unsafe { libc::kill(raw_pid, libc::SIGTERM) };
+@@ -519,7 +519,7 @@ fn terminate_process(pid: u32) -> Result<()> {
+ }
+ 
+ #[cfg(unix)]
+-fn force_terminate_process(pid: u32) -> Result<()> {
++pub(crate) fn force_terminate_process(pid: u32) -> Result<()> {
+     let raw_pid = libc::pid_t::try_from(pid)
+         .with_context(|| format!("pid-managed app server pid {pid} is out of range"))?;
+     let result = unsafe { libc::kill(raw_pid, libc::SIGKILL) };
+@@ -549,12 +549,12 @@ fn force_terminate_process_group(pid: u32) -> Result<()> {
+ }
+ 
+ #[cfg(not(unix))]
+-fn terminate_process(_pid: u32) -> Result<()> {
++pub(crate) fn terminate_process(_pid: u32) -> Result<()> {
+     bail!("pid-managed app-server shutdown is unsupported on this platform")
+ }
+ 
+ #[cfg(not(unix))]
+-fn force_terminate_process(_pid: u32) -> Result<()> {
++pub(crate) fn force_terminate_process(_pid: u32) -> Result<()> {
+     bail!("pid-managed app-server shutdown is unsupported on this platform")
+ }
+ 
+diff --git a/codex-rs/app-server-daemon/src/client.rs b/codex-rs/app-server-daemon/src/client.rs
+index a0cdcf6171..b926780f8d 100644
+--- a/codex-rs/app-server-daemon/src/client.rs
++++ b/codex-rs/app-server-daemon/src/client.rs
+@@ -57,7 +57,12 @@ async fn probe_inner(socket_path: &Path) -> Result<ProbeInfo> {
+     send_message(&mut websocket, &initialized)
+         .await
+         .context("failed to send initialized notification")?;
+-    let status = daemon_status(&mut websocket).await?;
++    let status = daemon_status(&mut websocket)
++        .await
++        .unwrap_or(DaemonStatusResponse {
++            active_client_count: 0,
++            running_assistant_turn_count: 0,
++        });
+     websocket.close(None).await.ok();
+ 
+     Ok(ProbeInfo {
+diff --git a/codex-rs/app-server-daemon/src/lib.rs b/codex-rs/app-server-daemon/src/lib.rs
+index 8e9041f9ea..862b46919f 100644
+--- a/codex-rs/app-server-daemon/src/lib.rs
++++ b/codex-rs/app-server-daemon/src/lib.rs
+@@ -12,6 +12,7 @@ use std::time::Duration;
+ use anyhow::Context;
+ use anyhow::Result;
+ use anyhow::anyhow;
++use anyhow::bail;
+ pub use backend::BackendKind;
+ use backend::BackendPaths;
+ use codex_app_server_protocol::RemoteControlConnectionStatus;
+@@ -298,23 +299,47 @@ impl Daemon {
+     async fn start(&self) -> Result<LifecycleOutput> {
+         let settings = self.load_settings().await?;
+         if let Ok(info) = client::probe(&self.socket_path).await {
+-            if should_restart_running_backend_for_start(&info)
+-                && let Some(backend) = self.running_backend_instance(&settings).await?
+-            {
+-                self.ensure_managed_codex_bin()?;
+-                backend.stop().await?;
+-                let pid = self.start_managed_backend(&settings).await?;
+-                let info = self.wait_until_ready().await?;
+-                return Ok(self
+-                    .output(
+-                        LifecycleStatus::Restarted,
+-                        Some(BackendKind::Pid),
+-                        pid,
+-                        Some(info.app_server_version),
+-                        Some(info.active_client_count),
+-                        Some(info.running_assistant_turn_count),
+-                    )
+-                    .await);
++            let backend = self.running_backend_instance(&settings).await?;
++            let managed_version = self.managed_codex_version_best_effort().await;
++            if let Some(backend) = backend {
++                // Restartable managed backends are cleaned up before any stale
++                // version attach check; same-version installs may still have
++                // replaced the binary on disk.
++                if should_restart_running_backend_for_start(&info) {
++                    self.ensure_managed_codex_bin()?;
++                    backend.stop().await?;
++                    let pid = self.start_managed_backend(&settings).await?;
++                    let info = self.wait_until_ready().await?;
++                    return Ok(self
++                        .output(
++                            LifecycleStatus::Restarted,
++                            Some(BackendKind::Pid),
++                            pid,
++                            Some(info.app_server_version),
++                            Some(info.active_client_count),
++                            Some(info.running_assistant_turn_count),
++                        )
++                        .await);
++                }
++                ensure_running_version_is_current_for_attach(&info, managed_version.as_deref())?;
++            } else {
++                if should_restart_running_backend_for_start(&info) {
++                    self.ensure_managed_codex_bin()?;
++                    terminate_unmanaged_socket_owner(&self.socket_path).await?;
++                    let pid = self.start_managed_backend(&settings).await?;
++                    let info = self.wait_until_ready().await?;
++                    return Ok(self
++                        .output(
++                            LifecycleStatus::Restarted,
++                            Some(BackendKind::Pid),
++                            pid,
++                            Some(info.app_server_version),
++                            Some(info.active_client_count),
++                            Some(info.running_assistant_turn_count),
++                        )
++                        .await);
++                }
++                ensure_running_version_is_current_for_attach(&info, managed_version.as_deref())?;
+             }
+             return Ok(self
+                 .output(
+@@ -871,6 +896,128 @@ fn should_restart_running_backend_for_start(info: &client::ProbeInfo) -> bool {
+     info.active_client_count == 0 && info.running_assistant_turn_count == 0
+ }
+ 
++fn ensure_running_version_is_current_for_attach(
++    info: &client::ProbeInfo,
++    managed_version: Option<&str>,
++) -> Result<()> {
++    if running_version_is_stale(info, managed_version) {
++        let managed_version = managed_version.unwrap_or("unknown");
++        bail!(
++            "app server {} is still active but managed Codex is {}; refusing to attach to stale daemon",
++            info.app_server_version,
++            managed_version
++        );
++    }
++    Ok(())
++}
++
++fn running_version_is_stale(info: &client::ProbeInfo, managed_version: Option<&str>) -> bool {
++    managed_version.is_some_and(|managed_version| info.app_server_version != managed_version)
++}
++
++#[cfg(target_os = "linux")]
++async fn terminate_unmanaged_socket_owner(socket_path: &Path) -> Result<()> {
++    let inode = linux_unix_socket_inode(socket_path).await?.ok_or_else(|| {
++        anyhow!(
++            "app server is idle but no socket owner was found for {}",
++            socket_path.display()
++        )
++    })?;
++    let pid = linux_pid_for_socket_inode(&inode).await?.ok_or_else(|| {
++        anyhow!(
++            "app server is idle but no process owns socket inode {inode} for {}",
++            socket_path.display()
++        )
++    })?;
++    backend::terminate_pid(pid)?;
++    wait_for_unmanaged_socket_owner_exit(pid, socket_path).await
++}
++
++#[cfg(all(unix, not(target_os = "linux")))]
++async fn terminate_unmanaged_socket_owner(socket_path: &Path) -> Result<()> {
++    bail!(
++        "app server is idle but unmanaged socket cleanup is unsupported for {}",
++        socket_path.display()
++    )
++}
++
++#[cfg(target_os = "linux")]
++async fn wait_for_unmanaged_socket_owner_exit(pid: u32, socket_path: &Path) -> Result<()> {
++    let deadline = tokio::time::Instant::now() + START_TIMEOUT;
++    loop {
++        if !backend::pid_exists(pid) {
++            let _ = tokio::fs::remove_file(socket_path).await;
++            return Ok(());
++        }
++        if tokio::time::Instant::now() >= deadline {
++            backend::force_terminate_pid(pid)?;
++            let _ = tokio::fs::remove_file(socket_path).await;
++            return Ok(());
++        }
++        sleep(START_POLL_INTERVAL).await;
++    }
++}
++
++#[cfg(target_os = "linux")]
++async fn linux_unix_socket_inode(socket_path: &Path) -> Result<Option<String>> {
++    let proc_net_unix = tokio::fs::read_to_string("/proc/net/unix")
++        .await
++        .context("failed to read /proc/net/unix")?;
++    let socket_path = socket_path.to_string_lossy();
++    Ok(proc_net_unix
++        .lines()
++        .find_map(|line| linux_unix_socket_inode_from_line(line, &socket_path)))
++}
++
++#[cfg(target_os = "linux")]
++fn linux_unix_socket_inode_from_line(line: &str, socket_path: &str) -> Option<String> {
++    let mut fields = line.split_whitespace();
++    let _num = fields.next()?;
++    let _ref_count = fields.next()?;
++    let _protocol = fields.next()?;
++    let _flags = fields.next()?;
++    let _type = fields.next()?;
++    let _state = fields.next()?;
++    let inode = fields.next()?;
++    let path = fields.next()?;
++    (path == socket_path).then(|| inode.to_string())
++}
++
++#[cfg(target_os = "linux")]
++async fn linux_pid_for_socket_inode(inode: &str) -> Result<Option<u32>> {
++    let socket_link = format!("socket:[{inode}]");
++    let mut proc_entries = tokio::fs::read_dir("/proc")
++        .await
++        .context("failed to read /proc")?;
++    while let Some(entry) = proc_entries
++        .next_entry()
++        .await
++        .context("failed to read /proc entry")?
++    {
++        let file_name = entry.file_name();
++        let Some(pid) = file_name.to_string_lossy().parse::<u32>().ok() else {
++            continue;
++        };
++        let fd_dir = entry.path().join("fd");
++        let Ok(mut fd_entries) = tokio::fs::read_dir(fd_dir).await else {
++            continue;
++        };
++        while let Some(fd_entry) = fd_entries
++            .next_entry()
++            .await
++            .context("failed to read /proc fd entry")?
++        {
++            let Ok(target) = tokio::fs::read_link(fd_entry.path()).await else {
++                continue;
++            };
++            if target.to_string_lossy() == socket_link {
++                return Ok(Some(pid));
++            }
++        }
++    }
++    Ok(None)
++}
++
+ #[cfg(unix)]
+ fn try_lock_file(file: &tokio::fs::File) -> Result<bool> {
+     use std::os::fd::AsRawFd;
+@@ -909,6 +1056,9 @@ mod tests {
+     use super::RestartIfRunningOutcome;
+     use super::RestartMode;
+     use super::UpdaterRefreshMode;
++    use super::ensure_running_version_is_current_for_attach;
++    #[cfg(target_os = "linux")]
++    use super::linux_unix_socket_inode_from_line;
+     use super::restart_decision;
+     use super::should_reexec_updater;
+     use super::should_restart_running_backend_for_start;
+@@ -1018,6 +1168,61 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn start_restarts_idle_backend_before_stale_attach_check() {
++        let idle_stale = ProbeInfo {
++            app_server_version: "0.1.0".to_string(),
++            active_client_count: 0,
++            running_assistant_turn_count: 0,
++        };
++
++        assert!(
++            should_restart_running_backend_for_start(&idle_stale),
++            "managed idle backends must be restarted before stale attach rejection"
++        );
++    }
++
++    #[cfg(target_os = "linux")]
++    #[test]
++    fn linux_unix_socket_inode_parser_matches_exact_path() {
++        let line = "0000000000000000: 00000002 00000000 00010000 0001 01 12345 /tmp/codex.sock";
++
++        assert_eq!(
++            linux_unix_socket_inode_from_line(line, "/tmp/codex.sock"),
++            Some("12345".to_string())
++        );
++        assert_eq!(
++            linux_unix_socket_inode_from_line(line, "/tmp/other.sock"),
++            None
++        );
++    }
++
++    #[test]
++    fn start_refuses_active_stale_backend() {
++        let active_stale = ProbeInfo {
++            app_server_version: "0.1.0".to_string(),
++            active_client_count: 1,
++            running_assistant_turn_count: 0,
++        };
++
++        let err = ensure_running_version_is_current_for_attach(&active_stale, Some("0.2.0"))
++            .expect_err("active stale daemon should be rejected");
++        assert!(err.to_string().contains("refusing to attach"));
++    }
++
++    #[test]
++    fn start_refuses_stale_backend_with_running_turn() {
++        let running_turn_stale = ProbeInfo {
++            app_server_version: "0.1.0".to_string(),
++            active_client_count: 0,
++            running_assistant_turn_count: 1,
++        };
++
++        let err = ensure_running_version_is_current_for_attach(&running_turn_stale, Some("0.2.0"))
++            .expect_err("stale daemon with running turn should be rejected");
++        assert!(err.to_string().contains("refusing to attach"));
++    }
++
+     #[test]
+     fn remote_control_start_output_serializes_inner_output_without_tag() {
+         let lifecycle_output = LifecycleOutput {
