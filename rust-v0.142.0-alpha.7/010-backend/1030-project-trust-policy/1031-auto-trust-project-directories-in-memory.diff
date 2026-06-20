@@ -1,0 +1,412 @@
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_start.rs b/codex-rs/app-server/tests/suite/v2/thread_start.rs
+index dcfeb4fa94..3455f97efe 100644
+--- a/codex-rs/app-server/tests/suite/v2/thread_start.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_start.rs
+@@ -24,11 +24,8 @@ use codex_app_server_protocol::ThreadStatusChangedNotification;
+ use codex_app_server_protocol::TurnEnvironmentParams;
+ use codex_app_server_protocol::TurnStartParams;
+ use codex_app_server_protocol::UserInput as V2UserInput;
+-use codex_config::loader::project_trust_key;
+ use codex_config::types::AuthCredentialsStoreMode;
+ use codex_core::config::set_project_trust_level;
+-use codex_exec_server::LOCAL_FS;
+-use codex_git_utils::resolve_root_git_project_for_trust;
+ use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
+ use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+ use codex_protocol::config_types::TrustLevel;
+@@ -963,7 +960,7 @@ async fn thread_start_surfaces_cloud_config_bundle_load_errors() -> Result<()> {
+ }
+ 
+ #[tokio::test]
+-async fn thread_start_with_elevated_sandbox_trusts_project_and_followup_loads_project_config()
++async fn thread_start_with_workspace_sandbox_loads_project_config_without_persisting_trust()
+ -> Result<()> {
+     let server = create_mock_responses_server_repeating_assistant("Done").await;
+ 
+@@ -1017,19 +1014,14 @@ model_reasoning_effort = "high"
+     assert_eq!(reasoning_effort, Some(ReasoningEffort::High));
+ 
+     let config_toml = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+-    let workspace_abs = workspace.path().to_path_buf().abs();
+-    let trusted_root = resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &workspace_abs)
+-        .await
+-        .unwrap_or(workspace_abs);
+-    let trusted_root_key = project_trust_key(trusted_root.as_path());
+-    assert!(config_toml.contains(&trusted_root_key));
+-    assert!(config_toml.contains("trust_level = \"trusted\""));
++    assert!(!config_toml.contains("[projects."));
++    assert!(!config_toml.contains("trust_level = \"trusted\""));
+ 
+     Ok(())
+ }
+ 
+ #[tokio::test]
+-async fn thread_start_with_nested_git_cwd_trusts_repo_root() -> Result<()> {
++async fn thread_start_with_nested_git_cwd_uses_repo_root_without_persisting_trust() -> Result<()> {
+     let server = create_mock_responses_server_repeating_assistant("Done").await;
+ 
+     let codex_home = TempDir::new()?;
+@@ -1057,14 +1049,8 @@ async fn thread_start_with_nested_git_cwd_trusts_repo_root() -> Result<()> {
+     .await??;
+ 
+     let config_toml = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+-    let nested_abs = nested.abs();
+-    let trusted_root = resolve_root_git_project_for_trust(LOCAL_FS.as_ref(), &nested_abs)
+-        .await
+-        .expect("git root should resolve");
+-    let trusted_root_key = project_trust_key(trusted_root.as_path());
+-    let nested_key = project_trust_key(&nested);
+-    assert!(config_toml.contains(&trusted_root_key));
+-    assert!(!config_toml.contains(&nested_key));
++    assert!(!config_toml.contains("[projects."));
++    assert!(!config_toml.contains("trust_level = \"trusted\""));
+ 
+     Ok(())
+ }
+diff --git a/codex-rs/config/src/loader/mod.rs b/codex-rs/config/src/loader/mod.rs
+index e3c7ee1128..7700e495de 100644
+--- a/codex-rs/config/src/loader/mod.rs
++++ b/codex-rs/config/src/loader/mod.rs
+@@ -877,7 +877,7 @@ impl ProjectTrustContext {
+         }
+ 
+         ProjectTrustDecision {
+-            trust_level: None,
++            trust_level: Some(TrustLevel::Trusted),
+             trust_key: self
+                 .repo_root_key
+                 .clone()
+diff --git a/codex-rs/core/src/config/config_loader_tests.rs b/codex-rs/core/src/config/config_loader_tests.rs
+index c01c555519..2fac1fd897 100644
+--- a/codex-rs/core/src/config/config_loader_tests.rs
++++ b/codex-rs/core/src/config/config_loader_tests.rs
+@@ -2788,11 +2788,12 @@ async fn codex_home_within_project_tree_is_not_double_loaded() -> std::io::Resul
+ }
+ 
+ #[tokio::test]
+-async fn project_layers_disabled_when_untrusted_or_unknown() -> std::io::Result<()> {
++async fn project_layers_disabled_only_when_explicitly_untrusted() -> std::io::Result<()> {
+     let tmp = tempdir()?;
+     let project_root = tmp.path().join("project");
+     let nested = project_root.join("child");
+     tokio::fs::create_dir_all(nested.join(".codex")).await?;
++    tokio::fs::write(project_root.join(".git"), "gitdir: here").await?;
+     tokio::fs::write(
+         nested.join(".codex").join(CONFIG_TOML_FILE),
+         r#"foo = "child"
+@@ -2888,8 +2889,8 @@ profile = "ignored"
+         .collect();
+     assert_eq!(project_layers_unknown.len(), 1);
+     assert!(
+-        project_layers_unknown[0].disabled_reason.is_some(),
+-        "expected unknown-trust project layer to be disabled"
++        project_layers_unknown[0].disabled_reason.is_none(),
++        "expected unknown-trust project layer to load by default"
+     );
+     assert_eq!(
+         project_layers_unknown[0].config.get("foo"),
+@@ -2897,13 +2898,21 @@ profile = "ignored"
+     );
+     assert!(
+         project_layers_unknown[0].config.get("profile").is_none(),
+-        "expected unsupported project config keys to be ignored even when the layer is disabled"
++        "expected unsupported project config keys to be ignored"
+     );
+     assert_eq!(
+         layers_unknown.effective_config().get("foo"),
+-        Some(&TomlValue::String("user".to_string()))
++        Some(&TomlValue::String("child".to_string()))
++    );
++    let warnings = layers_unknown
++        .startup_warnings()
++        .expect("loaded unknown project should warn about ignored keys");
++    assert_eq!(warnings.len(), 1);
++    assert!(
++        warnings[0].contains("Ignored unsupported project-local config keys")
++            && warnings[0].contains("profile"),
++        "{warnings:?}"
+     );
+-    assert_eq!(layers_unknown.startup_warnings(), Some(empty_warnings));
+ 
+     Ok(())
+ }
+@@ -3031,7 +3040,7 @@ wire_api = "responses"
+ 
+ #[cfg(unix)]
+ #[tokio::test]
+-async fn project_trust_does_not_match_configured_alias_for_canonical_cwd() -> std::io::Result<()> {
++async fn project_trust_alias_mismatch_defaults_canonical_cwd_to_trusted() -> std::io::Result<()> {
+     let tmp = tempdir()?;
+     let project_root = tmp.path().join("project");
+     let alias_root = tmp.path().join("project_alias");
+@@ -3082,10 +3091,13 @@ async fn project_trust_does_not_match_configured_alias_for_canonical_cwd() -> st
+         .collect();
+     assert_eq!(project_layers.len(), 1);
+     assert!(
+-        project_layers[0].disabled_reason.is_some(),
+-        "configured aliases must not collapse into the canonical project key"
++        project_layers[0].disabled_reason.is_none(),
++        "canonical project key should default to trusted without matching the configured alias"
++    );
++    assert_eq!(
++        layers.effective_config().get("foo"),
++        Some(&TomlValue::String("project".to_string()))
+     );
+-    assert_eq!(layers.effective_config().get("foo"), None);
+ 
+     Ok(())
+ }
+@@ -3140,7 +3152,7 @@ enabled = false
+ }
+ 
+ #[tokio::test]
+-async fn cli_override_for_disabled_project_local_mcp_server_returns_invalid_transport()
++async fn cli_override_for_disabled_project_local_mcp_server_loads_when_unknown_project_is_trusted()
+ -> std::io::Result<()> {
+     let tmp = tempdir()?;
+     let project_root = tmp.path().join("project");
+@@ -3161,7 +3173,7 @@ enabled = false
+     )
+     .await?;
+ 
+-    let err = ConfigBuilder::default()
++    let config = ConfigBuilder::default()
+         .codex_home(codex_home)
+         .cli_overrides(vec![(
+             "mcp_servers.sentry.enabled".to_string(),
+@@ -3170,19 +3182,20 @@ enabled = false
+         .fallback_cwd(Some(nested))
+         .build()
+         .await
+-        .expect_err("untrusted project layer should not provide MCP transport");
++        .expect("unknown project layer should load by default");
+ 
+-    assert!(
+-        err.to_string().contains("invalid transport")
+-            && err.to_string().contains("mcp_servers.sentry"),
+-        "unexpected error: {err}"
+-    );
++    let server = config
++        .mcp_servers
++        .get()
++        .get("sentry")
++        .expect("project MCP server should load");
++    assert!(server.enabled);
+ 
+     Ok(())
+ }
+ 
+ #[tokio::test]
+-async fn invalid_project_config_ignored_when_untrusted_or_unknown() -> std::io::Result<()> {
++async fn invalid_project_config_ignored_when_explicitly_untrusted() -> std::io::Result<()> {
+     let tmp = tempdir()?;
+     let project_root = tmp.path().join("project");
+     let nested = project_root.join("child");
+@@ -3191,41 +3204,29 @@ async fn invalid_project_config_ignored_when_untrusted_or_unknown() -> std::io::
+     tokio::fs::write(nested.join(".codex").join(CONFIG_TOML_FILE), "foo =").await?;
+ 
+     let cwd = AbsolutePathBuf::from_absolute_path(&nested)?;
+-    let cases = [
+-        ("untrusted", Some(TrustLevel::Untrusted)),
+-        ("unknown", None),
+-    ];
++    let cases = [("untrusted", TrustLevel::Untrusted)];
+ 
+     for (name, trust_level) in cases {
+         let codex_home = tmp.path().join(format!("home_{name}"));
+         tokio::fs::create_dir_all(&codex_home).await?;
+         let config_path = codex_home.join(CONFIG_TOML_FILE);
+ 
+-        if let Some(trust_level) = trust_level {
+-            make_config_for_test(
+-                &codex_home,
+-                &project_root,
+-                trust_level,
+-                /*project_root_markers*/ None,
+-            )
+-            .await?;
+-            let config_contents = tokio::fs::read_to_string(&config_path).await?;
+-            tokio::fs::write(
+-                &config_path,
+-                format!(
+-                    r#"foo = "user"
+-{config_contents}"#
+-                ),
+-            )
+-            .await?;
+-        } else {
+-            tokio::fs::write(
+-                &config_path,
++        make_config_for_test(
++            &codex_home,
++            &project_root,
++            trust_level,
++            /*project_root_markers*/ None,
++        )
++        .await?;
++        let config_contents = tokio::fs::read_to_string(&config_path).await?;
++        tokio::fs::write(
++            &config_path,
++            format!(
+                 r#"foo = "user"
+-"#,
+-            )
+-            .await?;
+-        }
++{config_contents}"#
++            ),
++        )
++        .await?;
+ 
+         let layers = load_config_layers_state(
+             LOCAL_FS.as_ref(),
+@@ -3267,7 +3268,7 @@ async fn invalid_project_config_ignored_when_untrusted_or_unknown() -> std::io::
+ }
+ 
+ #[tokio::test]
+-async fn project_layer_without_config_toml_is_disabled_when_untrusted_or_unknown()
++async fn project_layer_without_config_toml_is_disabled_when_explicitly_untrusted()
+ -> std::io::Result<()> {
+     let tmp = tempdir()?;
+     let project_root = tmp.path().join("project");
+@@ -3278,7 +3279,7 @@ async fn project_layer_without_config_toml_is_disabled_when_untrusted_or_unknown
+     let cwd = AbsolutePathBuf::from_absolute_path(&nested)?;
+     let cases = [
+         ("untrusted", Some(TrustLevel::Untrusted), true),
+-        ("unknown", None, true),
++        ("unknown", None, false),
+         ("trusted", Some(TrustLevel::Trusted), false),
+     ];
+ 
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index 2159ced452..5becb77cb5 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -2919,15 +2919,14 @@ async fn implicit_builtin_workspace_profile_preserves_add_dir_metadata_carveouts
+ }
+ 
+ #[tokio::test]
+-async fn empty_config_defaults_to_builtin_read_only_without_trust_decision() -> std::io::Result<()>
+-{
++async fn empty_config_defaults_to_builtin_profile_without_project_entry() -> std::io::Result<()> {
+     let codex_home = TempDir::new()?;
+-    let cwd = TempDir::new()?;
++    let cwd = test_absolute_path("/workspace/default-trusted");
+ 
+     let config = Config::load_from_base_config_with_overrides(
+         ConfigToml::default(),
+         ConfigOverrides {
+-            cwd: Some(cwd.path().to_path_buf()),
++            cwd: Some(cwd.to_path_buf()),
+             ..Default::default()
+         },
+         codex_home.abs(),
+@@ -2936,13 +2935,20 @@ async fn empty_config_defaults_to_builtin_read_only_without_trust_decision() ->
+ 
+     let policy = config.permissions.file_system_sandbox_policy();
+     assert!(
+-        policy.can_read_path_with_cwd(cwd.path(), cwd.path()),
+-        "expected :read-only to allow reads, policy: {policy:?}"
+-    );
+-    assert!(
+-        !policy.can_write_path_with_cwd(cwd.path(), cwd.path()),
+-        "expected :read-only to deny writes, policy: {policy:?}"
++        policy.can_read_path_with_cwd(cwd.as_path(), cwd.as_path()),
++        "expected default profile to allow reads, policy: {policy:?}"
+     );
++    if cfg!(target_os = "windows") {
++        assert!(
++            !policy.can_write_path_with_cwd(cwd.as_path(), cwd.as_path()),
++            "expected trusted fallback to stay read-only without Windows sandbox support, policy: {policy:?}"
++        );
++    } else {
++        assert!(
++            policy.can_write_path_with_cwd(cwd.as_path(), cwd.as_path()),
++            "expected default trusted project fallback to use :workspace, policy: {policy:?}"
++        );
++    }
+     Ok(())
+ }
+ 
+@@ -9264,6 +9270,35 @@ async fn test_untrusted_project_gets_unless_trusted_approval_policy() -> anyhow:
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn missing_project_entry_defaults_to_trusted_without_writing_config() -> anyhow::Result<()> {
++    let codex_home = TempDir::new()?;
++    let test_project_dir = TempDir::new()?;
++
++    let config = Config::load_from_base_config_with_overrides(
++        ConfigToml::default(),
++        ConfigOverrides {
++            cwd: Some(test_project_dir.path().to_path_buf()),
++            ..Default::default()
++        },
++        codex_home.abs(),
++    )
++    .await?;
++
++    assert_eq!(
++        config.active_project,
++        ProjectConfig {
++            trust_level: Some(TrustLevel::Trusted),
++        }
++    );
++    assert!(
++        !codex_home.path().join(CONFIG_TOML_FILE).exists(),
++        "default trust must stay in memory and not create config.toml"
++    );
++
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn requirements_disallowing_default_sandbox_falls_back_to_required_default()
+ -> std::io::Result<()> {
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index 6bdcffa04b..49c486f9fc 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -2999,7 +2999,9 @@ impl Config {
+                 resolved_cwd.as_path(),
+                 repo_root.as_ref().map(AbsolutePathBuf::as_path),
+             )
+-            .unwrap_or(ProjectConfig { trust_level: None });
++            .unwrap_or(ProjectConfig {
++                trust_level: Some(TrustLevel::Trusted),
++            });
+         let permission_config_syntax = resolve_permission_config_syntax(
+             &config_layer_stack,
+             &cfg,
+diff --git a/codex-rs/core/src/exec_policy_tests.rs b/codex-rs/core/src/exec_policy_tests.rs
+index a74cd5d2dd..bf594ee669 100644
+--- a/codex-rs/core/src/exec_policy_tests.rs
++++ b/codex-rs/core/src/exec_policy_tests.rs
+@@ -2221,7 +2221,7 @@ async fn exec_policies_only_load_from_trusted_project_layers() -> std::io::Resul
+         policy
+             .check_multiple([vec!["rm".to_string()]].iter(), &|_| Decision::Allow)
+             .decision,
+-        Decision::Allow,
++        Decision::Forbidden,
+     );
+     assert_eq!(
+         policy
+@@ -2251,7 +2251,7 @@ async fn exec_policies_require_project_trust_without_config_toml() -> std::io::R
+         (
+             "unknown",
+             Vec::<(&Path, TrustLevel)>::new(),
+-            Decision::Allow,
++            Decision::Forbidden,
+         ),
+         (
+             "untrusted",
+@@ -2304,7 +2304,7 @@ async fn exec_policy_warnings_ignore_untrusted_project_rules_without_config_toml
+     fs::write(rules_dir.join("broken.rules"), "prefix_rule(")?;
+ 
+     let cases = [
+-        ("unknown", Vec::<(&Path, TrustLevel)>::new(), false),
++        ("unknown", Vec::<(&Path, TrustLevel)>::new(), true),
+         (
+             "untrusted",
+             vec![(&project_root as &Path, TrustLevel::Untrusted)],
