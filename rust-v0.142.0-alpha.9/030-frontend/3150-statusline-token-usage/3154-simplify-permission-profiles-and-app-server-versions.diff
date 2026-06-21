@@ -1,4 +1,4 @@
-From 04047eac953270ef9c02ddd8e231e60752e34441 Mon Sep 17 00:00:00 2001
+From bb2080798cdfcfd5d2e48276245991e504017fde Mon Sep 17 00:00:00 2001
 From: nobody <nobody@nobody>
 Date: Mon, 22 Jun 2026 02:37:40 +0800
 Subject: [PATCH] frontend 3154: simplify permission profiles and app-server
@@ -8,6 +8,9 @@ Subject: [PATCH] frontend 3154: simplify permission profiles and app-server
  codex-rs/app-server-daemon/src/client.rs      |  15 +-
  codex-rs/app-server-daemon/src/lib.rs         |  73 ++++---
  codex-rs/tui/src/app.rs                       |  13 +-
+ codex-rs/tui/src/app/config_persistence.rs    |  60 ++++++
+ codex-rs/tui/src/app/event_dispatch.rs        |   8 +-
+ codex-rs/tui/src/app/tests.rs                 |  36 ++++
  .../tui/src/bottom_pane/status_line_setup.rs  |  26 +--
  .../tui/src/bottom_pane/status_line_style.rs  |   1 -
  .../src/bottom_pane/status_surface_preview.rs |   5 +-
@@ -20,7 +23,7 @@ Subject: [PATCH] frontend 3154: simplify permission profiles and app-server
  .../tui/src/chatwidget/tests/permissions.rs   |   6 +-
  .../src/chatwidget/tests/status_and_layout.rs |  31 ++-
  codex-rs/tui/src/lib.rs                       |  37 +++-
- 15 files changed, 243 insertions(+), 255 deletions(-)
+ 18 files changed, 346 insertions(+), 256 deletions(-)
 
 diff --git a/codex-rs/app-server-daemon/src/client.rs b/codex-rs/app-server-daemon/src/client.rs
 index b926780f8d..ddc398e9e4 100644
@@ -264,6 +267,151 @@ index 1d3b7bad0e..67472e85bf 100644
          let exit_info = handle_model_migration_prompt_if_needed(
              tui,
              &mut config,
+diff --git a/codex-rs/tui/src/app/config_persistence.rs b/codex-rs/tui/src/app/config_persistence.rs
+index 784fc6b348..4b2c970259 100644
+--- a/codex-rs/tui/src/app/config_persistence.rs
++++ b/codex-rs/tui/src/app/config_persistence.rs
+@@ -25,7 +25,67 @@ async fn build_config_on_runtime_worker(
+     }
+ }
+ 
++pub(super) fn permission_profile_selection_config_edits(
++    selection: &PermissionProfileSelection,
++) -> Vec<codex_app_server_protocol::ConfigEdit> {
++    let mut edits = vec![crate::config_update::replace_config_value(
++        "default_permissions",
++        serde_json::json!(selection.profile_id),
++    )];
++    if let Some(policy) = selection.approval_policy {
++        edits.push(crate::config_update::replace_config_value(
++            "approval_policy",
++            serde_json::to_value(policy)
++                .unwrap_or_else(|err| panic!("approval policy should serialize: {err}")),
++        ));
++    }
++    if let Some(reviewer) = selection.approvals_reviewer {
++        edits.push(crate::config_update::replace_config_value(
++            "approvals_reviewer",
++            serde_json::json!(reviewer.to_string()),
++        ));
++    }
++    edits
++}
++
+ impl App {
++    pub(super) async fn persist_permission_profile_selection(
++        &mut self,
++        app_server: &mut AppServerSession,
++        selection: &PermissionProfileSelection,
++    ) -> bool {
++        let edits = permission_profile_selection_config_edits(selection);
++
++        let write_response = match crate::config_update::write_config_batch(
++            app_server.request_handle(),
++            edits,
++        )
++        .await
++        {
++            Ok(response) => response,
++            Err(err) => {
++                let error = crate::config_update::format_config_error(&err);
++                tracing::error!(error = %error, "failed to persist permission profile selection");
++                self.chat_widget
++                    .add_error_message(format!("Failed to save permission profile: {error}"));
++                return false;
++            }
++        };
++        if write_response.status == WriteStatus::OkOverridden {
++            let message = overridden_write_message(&write_response);
++            tracing::warn!(
++                message,
++                "permission profile config write was overridden by effective config"
++            );
++            self.chat_widget.add_error_message(format!(
++                "Permission profile was saved but not applied: {message}"
++            ));
++            return false;
++        }
++
++        true
++    }
++
+     pub(super) async fn rebuild_config_for_cwd(&self, cwd: PathBuf) -> Result<Config> {
+         let mut overrides = self.harness_overrides.clone();
+         overrides.cwd = Some(cwd.clone());
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index 8047491b4e..1abece1b4d 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -1651,7 +1651,13 @@ impl App {
+                 }
+             }
+             AppEvent::SelectPermissionProfile(selection) => {
+-                if self.apply_permission_profile_selection(selection).await {
++                if self
++                    .apply_permission_profile_selection(selection.clone())
++                    .await
++                {
++                    let _ = self
++                        .persist_permission_profile_selection(app_server, &selection)
++                        .await;
+                     self.chat_widget.submit_initial_user_message_if_pending();
+                 }
+             }
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index 6cea81a634..bdcb42ba84 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -5,6 +5,7 @@ mod session_summary;
+ mod startup;
+ 
+ use super::*;
++use crate::app::config_persistence::permission_profile_selection_config_edits;
+ use crate::app_backtrack::BacktrackSelection;
+ use crate::app_backtrack::BacktrackState;
+ use crate::app_backtrack::user_count;
+@@ -1946,6 +1947,41 @@ default_permissions = "locked-down"
+     Ok(())
+ }
+ 
++#[test]
++fn permission_profile_selection_config_edits_include_reviewer_and_policy() {
++    let selection = PermissionProfileSelection {
++        profile_id: codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS
++            .to_string(),
++        approval_policy: Some(AskForApproval::OnRequest),
++        approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
++        display_label: "Full Access + Agent Review".to_string(),
++    };
++
++    let edits = permission_profile_selection_config_edits(&selection);
++
++    assert_eq!(
++        edits
++            .iter()
++            .find(|edit| edit.key_path == "default_permissions")
++            .map(|edit| &edit.value),
++        Some(&serde_json::json!(":danger-full-access"))
++    );
++    assert_eq!(
++        edits
++            .iter()
++            .find(|edit| edit.key_path == "approval_policy")
++            .map(|edit| &edit.value),
++        Some(&serde_json::json!("on-request"))
++    );
++    assert_eq!(
++        edits
++            .iter()
++            .find(|edit| edit.key_path == "approvals_reviewer")
++            .map(|edit| &edit.value),
++        Some(&serde_json::json!("auto_review"))
++    );
++}
++
+ #[tokio::test]
+ async fn update_feature_flags_enabling_guardian_selects_auto_review() -> Result<()> {
+     let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
 diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
 index 9f949c4fb9..66fc2df1f4 100644
 --- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
