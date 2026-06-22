@@ -1,0 +1,381 @@
+diff --git a/codex-rs/tui/src/app/config_persistence.rs b/codex-rs/tui/src/app/config_persistence.rs
+index 80ed84d01e..784fc6b348 100644
+--- a/codex-rs/tui/src/app/config_persistence.rs
++++ b/codex-rs/tui/src/app/config_persistence.rs
+@@ -715,20 +715,6 @@ impl App {
+             .add_info_message("Reset local memories.".to_string(), /*hint*/ None);
+     }
+ 
+-    pub(super) fn reasoning_label(reasoning_effort: Option<&ReasoningEffortConfig>) -> String {
+-        match reasoning_effort {
+-            None | Some(ReasoningEffortConfig::None) => "default".to_string(),
+-            Some(reasoning_effort) => reasoning_effort.as_str().to_string(),
+-        }
+-    }
+-
+-    pub(super) fn reasoning_label_for(
+-        model: &str,
+-        reasoning_effort: Option<&ReasoningEffortConfig>,
+-    ) -> Option<String> {
+-        (!model.starts_with("codex-auto-")).then(|| Self::reasoning_label(reasoning_effort))
+-    }
+-
+     pub(crate) fn token_usage(&self) -> crate::token_usage::TokenUsage {
+         self.chat_widget.token_usage()
+     }
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index be2b60327e..1237bbd4ed 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -11,6 +11,7 @@ use crate::external_agent_config_migration_flow::ExternalAgentConfigMigrationFlo
+ use codex_config::types::WindowsSandboxModeToml;
+ 
+ const SHUTDOWN_FIRST_EXIT_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 2);
++const MODEL_SELECTION_FLASH_DURATION: Duration = Duration::from_secs(/*secs*/ 2);
+ 
+ impl App {
+     pub(super) async fn handle_event(
+@@ -1475,7 +1476,11 @@ impl App {
+                     let _ = (preset, mode, profile_selection);
+                 }
+             }
+-            AppEvent::PersistModelSelection { model, effort } => {
++            AppEvent::PersistModelSelection {
++                model,
++                effort,
++                show_footer_flash,
++            } => {
+                 match crate::config_update::write_config_batch(
+                     app_server.request_handle(),
+                     crate::config_update::build_model_selection_edits(
+@@ -1491,12 +1496,12 @@ impl App {
+                             .map(std::string::ToString::to_string)
+                             .unwrap_or_else(|| "default".to_string());
+                         tracing::info!("Selected model: {model}, Selected effort: {effort_label}");
+-                        let mut message = format!("Model changed to {model}");
+-                        if let Some(label) = Self::reasoning_label_for(&model, effort.as_ref()) {
+-                            message.push(' ');
+-                            message.push_str(&label);
++                        if show_footer_flash {
++                            self.chat_widget.show_footer_flash(
++                                self.chat_widget.model_with_reasoning_display_line(),
++                                MODEL_SELECTION_FLASH_DURATION,
++                            );
+                         }
+-                        self.chat_widget.add_info_message(message, /*hint*/ None);
+                     }
+                     Err(err) => {
+                         let error = format_config_error(&err);
+diff --git a/codex-rs/tui/src/app/startup_prompts.rs b/codex-rs/tui/src/app/startup_prompts.rs
+index d3760d5bd4..c6aa038cb9 100644
+--- a/codex-rs/tui/src/app/startup_prompts.rs
++++ b/codex-rs/tui/src/app/startup_prompts.rs
+@@ -199,6 +199,7 @@ pub(super) fn apply_accepted_model_migration(
+     app_event_tx.send(AppEvent::PersistModelSelection {
+         model: target_model,
+         effort: Some(target_default_effort),
++        show_footer_flash: true,
+     });
+ }
+ 
+diff --git a/codex-rs/tui/src/app/tests/model_catalog.rs b/codex-rs/tui/src/app/tests/model_catalog.rs
+index ac4a50af8f..641b49b0c0 100644
+--- a/codex-rs/tui/src/app/tests/model_catalog.rs
++++ b/codex-rs/tui/src/app/tests/model_catalog.rs
+@@ -264,7 +264,7 @@ async fn accepted_model_migration_persists_target_default_reasoning_effort() {
+     let persist_selection = rx.try_recv().expect("persist model selection event");
+     assert_matches!(
+         persist_selection,
+-        AppEvent::PersistModelSelection { model, effort }
++        AppEvent::PersistModelSelection { model, effort, .. }
+             if model == "gpt-5.4" && effort == Some(ReasoningEffortConfig::Medium)
+     );
+ }
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+index c2ce9fcc09..2b5032ca26 100644
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -724,6 +724,7 @@ pub(crate) enum AppEvent {
+     PersistModelSelection {
+         model: String,
+         effort: Option<ReasoningEffort>,
++        show_footer_flash: bool,
+     },
+ 
+     /// Persist the selected personality to the appropriate config.
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+index 9d85848739..a4fc6cb6f0 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+@@ -1185,7 +1185,6 @@ impl ChatComposer {
+         urls
+     }
+ 
+-    #[cfg(test)]
+     pub(crate) fn show_footer_flash(&mut self, line: Line<'static>, duration: Duration) {
+         self.footer.show_flash(line, duration);
+     }
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs b/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
+index eea6f22b93..a000590e46 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
+@@ -3,13 +3,12 @@
+ use std::time::Instant;
+ 
+ use ratatui::text::Line;
++use std::time::Duration;
+ 
+ use crate::bottom_pane::footer::CollaborationModeIndicator;
+ use crate::bottom_pane::footer::FooterMode;
+ use crate::bottom_pane::footer::GoalStatusIndicator;
+ use crate::key_hint::KeyBinding;
+-#[cfg(test)]
+-use std::time::Duration;
+ 
+ pub(super) struct FooterState {
+     pub(super) quit_shortcut_expires_at: Option<Instant>,
+@@ -54,7 +53,6 @@ impl FooterState {
+             .is_some_and(|flash| Instant::now() < flash.expires_at)
+     }
+ 
+-    #[cfg(test)]
+     pub(super) fn show_flash(&mut self, line: Line<'static>, duration: Duration) {
+         let expires_at = Instant::now()
+             .checked_add(duration)
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+index ee176dc3b9..950d245ebe 100644
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -873,6 +873,11 @@ impl BottomPane {
+         self.request_redraw();
+     }
+ 
++    pub(crate) fn show_footer_flash(&mut self, line: Line<'static>, duration: Duration) {
++        self.composer.show_footer_flash(line, duration);
++        self.request_redraw();
++    }
++
+     /// Applies the externally decided Plan-mode nudge visibility to the footer presentation.
+     pub(crate) fn set_plan_mode_nudge_visible(&mut self, visible: bool) {
+         if self.composer.set_plan_mode_nudge_visible(visible) {
+diff --git a/codex-rs/tui/src/chatwidget/interaction.rs b/codex-rs/tui/src/chatwidget/interaction.rs
+index 0eebfb1ea3..b132ecf118 100644
+--- a/codex-rs/tui/src/chatwidget/interaction.rs
++++ b/codex-rs/tui/src/chatwidget/interaction.rs
+@@ -3,6 +3,10 @@
+ use super::*;
+ 
+ impl ChatWidget {
++    pub(crate) fn show_footer_flash(&mut self, line: Line<'static>, duration: Duration) {
++        self.bottom_pane.show_footer_flash(line, duration);
++    }
++
+     pub(crate) fn handle_key_event(&mut self, key_event: KeyEvent) {
+         if self.bottom_pane.has_active_view()
+             && !matches!(
+diff --git a/codex-rs/tui/src/chatwidget/model_popups.rs b/codex-rs/tui/src/chatwidget/model_popups.rs
+index ad9e7b6d93..6dde2b6882 100644
+--- a/codex-rs/tui/src/chatwidget/model_popups.rs
++++ b/codex-rs/tui/src/chatwidget/model_popups.rs
+@@ -232,6 +232,7 @@ impl ChatWidget {
+             tx.send(AppEvent::PersistModelSelection {
+                 model: model_for_action.clone(),
+                 effort: effort_for_action.clone(),
++                show_footer_flash: true,
+             });
+         })]
+     }
+@@ -317,6 +318,7 @@ impl ChatWidget {
+             tx.send(AppEvent::PersistModelSelection {
+                 model: model.clone(),
+                 effort: effort.clone(),
++                show_footer_flash: true,
+             });
+         })];
+ 
+@@ -472,6 +474,7 @@ impl ChatWidget {
+                     tx.send(AppEvent::PersistModelSelection {
+                         model: model_for_action.clone(),
+                         effort: choice_effort.clone(),
++                        show_footer_flash: true,
+                     });
+                 }
+             })];
+@@ -532,7 +535,10 @@ impl ChatWidget {
+ 
+     fn apply_model_and_effort(&self, model: String, effort: Option<ReasoningEffortConfig>) {
+         self.apply_model_and_effort_without_persist(model.clone(), effort.clone());
+-        self.app_event_tx
+-            .send(AppEvent::PersistModelSelection { model, effort });
++        self.app_event_tx.send(AppEvent::PersistModelSelection {
++            model,
++            effort,
++            show_footer_flash: true,
++        });
+     }
+ }
+diff --git a/codex-rs/tui/src/chatwidget/model_shortcuts.rs b/codex-rs/tui/src/chatwidget/model_shortcuts.rs
+index 2718eb6b3b..55fd34c8d1 100644
+--- a/codex-rs/tui/src/chatwidget/model_shortcuts.rs
++++ b/codex-rs/tui/src/chatwidget/model_shortcuts.rs
+@@ -44,6 +44,7 @@ impl ChatWidget {
+         self.app_event_tx.send(AppEvent::PersistModelSelection {
+             model: next_preset.model,
+             effort: Some(next_preset.default_reasoning_effort),
++            show_footer_flash: false,
+         });
+ 
+         true
+diff --git a/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs b/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs
+index 404bf87029..fd8d8525da 100644
+--- a/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs
++++ b/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs
+@@ -16,11 +16,16 @@ use codex_protocol::config_types::ModeKind;
+ use codex_protocol::openai_models::ModelPreset;
+ use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+ use crossterm::event::KeyEvent;
++use ratatui::style::Stylize;
++use ratatui::text::Line;
++use std::time::Duration;
+ 
+ use super::ChatWidget;
+ use crate::app_event::AppEvent;
+ use crate::key_hint::KeyBindingListExt;
+ 
++const REASONING_BOUNDARY_FLASH_DURATION: Duration = Duration::from_secs(/*secs*/ 2);
++
+ /// Direction requested by a reasoning-level shortcut.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub(super) enum ReasoningShortcutDirection {
+@@ -105,7 +110,7 @@ impl ChatWidget {
+         let Some(next_effort) =
+             next_reasoning_effort(&choices, Some(current_effort.clone()), direction)
+         else {
+-            self.add_info_message(direction.bound_message(&current_effort), /*hint*/ None);
++            self.show_reasoning_boundary_flash(direction, &current_effort);
+             return true;
+         };
+ 
+@@ -127,6 +132,20 @@ impl ChatWidget {
+             .into_iter()
+             .find(|preset| preset.model == current_model)
+     }
++
++    fn show_reasoning_boundary_flash(
++        &mut self,
++        direction: ReasoningShortcutDirection,
++        current_effort: &ReasoningEffortConfig,
++    ) {
++        let reasoning_label = Self::status_line_reasoning_effort_label(Some(current_effort));
++        let mut line = Line::from(format!("{} {reasoning_label}", self.model_display_name()));
++        line.spans.push(" · ".dim());
++        line.spans
++            .push(direction.bound_message(current_effort).yellow());
++        self.bottom_pane
++            .show_footer_flash(line, REASONING_BOUNDARY_FLASH_DURATION);
++    }
+ }
+ 
+ fn reasoning_choices(preset: &ModelPreset) -> Vec<ReasoningEffortConfig> {
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 64b7f8f992..47621fb0a2 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -899,6 +899,10 @@ impl ChatWidget {
+         format!("{} {label}{service_tier_label}", self.model_display_name())
+     }
+ 
++    pub(crate) fn model_with_reasoning_display_line(&self) -> Line<'static> {
++        Line::from(self.model_with_reasoning_display_name())
++    }
++
+     /// Computes the compact runtime status label used by word-based status items.
+     ///
+     /// Startup takes precedence over normal task states, and idle state renders
+diff --git a/codex-rs/tui/src/chatwidget/tests/plan_mode.rs b/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
+index 57cc42f863..156cf3a1a2 100644
+--- a/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
++++ b/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
+@@ -513,7 +513,11 @@ async fn plan_reasoning_scope_popup_all_modes_persists_global_and_plan_override(
+     assert!(
+         events.iter().any(|event| matches!(
+             event,
+-            AppEvent::PersistModelSelection { model, effort: Some(ReasoningEffortConfig::High) }
++            AppEvent::PersistModelSelection {
++                model,
++                effort: Some(ReasoningEffortConfig::High),
++                ..
++            }
+                 if model == "gpt-5.4"
+         )),
+         "expected global model reasoning selection persistence; events: {events:?}"
+diff --git a/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs b/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
+index 33fb4dee63..8e1098f65c 100644
+--- a/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
++++ b/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
+@@ -2936,7 +2936,7 @@ async fn model_reasoning_selection_popup_applies_custom_effort() {
+     let selected_effort_events = std::iter::from_fn(|| rx.try_recv().ok())
+         .filter_map(|event| match event {
+             AppEvent::UpdateReasoningEffort(effort) => Some((None, effort)),
+-            AppEvent::PersistModelSelection { model, effort } => Some((Some(model), effort)),
++            AppEvent::PersistModelSelection { model, effort, .. } => Some((Some(model), effort)),
+             _ => None,
+         })
+         .collect::<Vec<_>>();
+@@ -3026,6 +3026,40 @@ async fn reasoning_down_shortcuts_lower_reasoning_effort() {
+     .await;
+ }
+ 
++#[tokio::test]
++async fn reasoning_shortcut_boundary_uses_footer_flash_without_update_event() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
++    chat.thread_id = Some(ThreadId::new());
++    chat.set_reasoning_effort(Some(ReasoningEffortConfig::Low));
++
++    chat.handle_key_event(KeyEvent::new(KeyCode::Char(','), KeyModifiers::ALT));
++
++    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
++    assert!(
++        events
++            .iter()
++            .all(|event| !matches!(event, AppEvent::UpdateReasoningEffort(_))),
++        "did not expect reasoning update at boundary; events: {events:?}"
++    );
++    assert!(
++        events
++            .iter()
++            .all(|event| !matches!(event, AppEvent::PersistModelSelection { .. })),
++        "did not expect model persistence at boundary; events: {events:?}"
++    );
++    let width = 80;
++    let height = chat.desired_height(width);
++    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
++        .expect("create terminal");
++    terminal
++        .draw(|frame| chat.render(frame.area(), frame.buffer_mut()))
++        .expect("draw chat");
++    assert!(
++        normalized_backend_snapshot(terminal.backend())
++            .contains("gpt-5.4 low · Reasoning is already at the lowest level (low).")
++    );
++}
++
+ #[tokio::test]
+ async fn reasoning_shortcut_clears_armed_quit_shortcut() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+@@ -3099,6 +3133,7 @@ async fn alt_apostrophe_selects_next_model_without_submitting_prompt() {
+             AppEvent::PersistModelSelection {
+                 model,
+                 effort: Some(ReasoningEffortConfig::Medium),
++                show_footer_flash: false,
+             } if model == "gpt-5.3-codex"
+         )),
+         "expected model persistence event; events: {events:?}"
+@@ -3127,6 +3162,7 @@ async fn alt_semicolon_selects_previous_model_with_wraparound() {
+             AppEvent::PersistModelSelection {
+                 model,
+                 effort: Some(ReasoningEffortConfig::Medium),
++                show_footer_flash: false,
+             } if model == "gpt-5.3-codex"
+         )),
+         "expected model persistence event; events: {events:?}"

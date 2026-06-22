@@ -1,0 +1,355 @@
+diff --git a/codex-rs/tui/src/resume_picker.rs b/codex-rs/tui/src/resume_picker.rs
+index fcc9190aeb..ad279990c8 100644
+--- a/codex-rs/tui/src/resume_picker.rs
++++ b/codex-rs/tui/src/resume_picker.rs
+@@ -33,11 +33,13 @@ use crate::wrapping::RtOptions;
+ use crate::wrapping::adaptive_wrap_lines;
+ use chrono::DateTime;
+ use chrono::Utc;
++use codex_app_server_protocol::SessionSource;
+ use codex_app_server_protocol::Thread;
+ use codex_app_server_protocol::ThreadItem;
+ use codex_app_server_protocol::ThreadListCwdFilter;
+ use codex_app_server_protocol::ThreadListParams;
+ use codex_app_server_protocol::ThreadSortKey;
++use codex_app_server_protocol::ThreadSourceKind;
+ use codex_app_server_protocol::ThreadStatus;
+ use codex_config::types::SessionPickerViewMode;
+ use codex_protocol::ThreadId;
+@@ -58,6 +60,7 @@ use ratatui::text::Line;
+ use ratatui::text::Span;
+ use ratatui::widgets::Clear;
+ use ratatui::widgets::Widget;
++use serde::Deserialize;
+ use tokio::sync::mpsc;
+ use tokio_stream::StreamExt;
+ use tokio_stream::wrappers::UnboundedReceiverStream;
+@@ -78,6 +81,8 @@ const FOOTER_HINT_LEFT_PADDING: usize = 1;
+ const FOOTER_HINT_GAP: usize = 3;
+ const PICKER_CHROME_HEIGHT: u16 = 8;
+ const PICKER_LIST_HORIZONTAL_INSET: u16 = 4;
++const PINNED_RENAMED_SESSION_LIMIT: usize = PAGE_SIZE;
++const SESSION_INDEX_FILE: &str = "session_index.jsonl";
+ 
+ #[derive(Debug, Clone)]
+ pub struct SessionTarget {
+@@ -156,6 +161,7 @@ struct PageLoadRequest {
+     cwd_filter: Option<PathBuf>,
+     provider_filter: ProviderFilter,
+     sort_key: ThreadSortKey,
++    pinned_renamed_codex_home: Option<PathBuf>,
+ }
+ 
+ enum PickerLoadRequest {
+@@ -579,6 +585,7 @@ fn spawn_app_server_page_loader(
+                         request.provider_filter,
+                         request.sort_key,
+                         include_non_interactive,
++                        request.pinned_renamed_codex_home.as_deref(),
+                     )
+                     .await;
+                     let _ = bg_tx.send(BackgroundEvent::Page {
+@@ -660,6 +667,7 @@ struct PickerState {
+     view_rows: Option<usize>,
+     view_width: Option<u16>,
+     provider_filter: ProviderFilter,
++    show_all: bool,
+     filter_mode: SessionFilterMode,
+     filter_cwd: Option<PathBuf>,
+     local_filter_cwd: Option<PathBuf>,
+@@ -748,31 +756,150 @@ async fn load_app_server_page(
+     provider_filter: ProviderFilter,
+     sort_key: ThreadSortKey,
+     include_non_interactive: bool,
++    pinned_renamed_codex_home: Option<&Path>,
+ ) -> std::io::Result<PickerPage> {
++    let mut rows = if cursor.is_none()
++        && cwd_filter.is_none()
++        && let Some(codex_home) = pinned_renamed_codex_home
++    {
++        load_pinned_renamed_rows(
++            app_server,
++            codex_home,
++            &provider_filter,
++            include_non_interactive,
++        )
++        .await
++    } else {
++        Vec::new()
++    };
++
+     let response = app_server
+         .thread_list(thread_list_params(
+             cursor,
+             cwd_filter,
+-            provider_filter,
++            provider_filter.clone(),
+             sort_key,
+             include_non_interactive,
+         ))
+         .await
+         .map_err(std::io::Error::other)?;
+     let num_scanned_files = response.data.len();
+-
+-    Ok(PickerPage {
+-        rows: response
++    rows.extend(
++        response
+             .data
+             .into_iter()
+-            .filter_map(row_from_app_server_thread)
+-            .collect(),
++            .filter_map(row_from_app_server_thread),
++    );
++
++    Ok(PickerPage {
++        rows,
+         next_cursor: response.next_cursor.map(PageCursor::AppServer),
+         num_scanned_files,
+         reached_scan_cap: false,
+     })
+ }
+ 
++#[derive(Deserialize)]
++struct PinnedRenamedSessionEntry {
++    id: ThreadId,
++    thread_name: String,
++    updated_at: String,
++}
++
++async fn load_pinned_renamed_rows(
++    app_server: &mut AppServerSession,
++    codex_home: &Path,
++    provider_filter: &ProviderFilter,
++    include_non_interactive: bool,
++) -> Vec<Row> {
++    let entries = load_pinned_renamed_entries(codex_home).await;
++    let mut rows = Vec::with_capacity(entries.len());
++    for (thread_id, _) in entries {
++        let Ok(thread) = app_server
++            .thread_read(thread_id, /*include_turns*/ false)
++            .await
++        else {
++            continue;
++        };
++        if !thread_matches_provider_filter(&thread, provider_filter)
++            || !thread_matches_resume_source_filter(&thread, include_non_interactive)
++        {
++            continue;
++        }
++        if let Some(row) = row_from_app_server_thread(thread) {
++            rows.push(row);
++        }
++    }
++    rows
++}
++
++async fn load_pinned_renamed_entries(codex_home: &Path) -> Vec<(ThreadId, DateTime<Utc>)> {
++    let path = codex_home.join(SESSION_INDEX_FILE);
++    let Ok(contents) = tokio::fs::read_to_string(path).await else {
++        return Vec::new();
++    };
++    let mut latest_by_id: HashMap<ThreadId, DateTime<Utc>> = HashMap::new();
++    for line in contents.lines() {
++        let trimmed = line.trim();
++        if trimmed.is_empty() {
++            continue;
++        }
++        let Ok(entry) = serde_json::from_str::<PinnedRenamedSessionEntry>(trimmed) else {
++            continue;
++        };
++        if entry.thread_name.trim().is_empty() {
++            continue;
++        }
++        let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&entry.updated_at) else {
++            continue;
++        };
++        let updated_at = updated_at.with_timezone(&Utc);
++        latest_by_id
++            .entry(entry.id)
++            .and_modify(|current| {
++                if updated_at > *current {
++                    *current = updated_at;
++                }
++            })
++            .or_insert(updated_at);
++    }
++
++    let mut entries = latest_by_id.into_iter().collect::<Vec<_>>();
++    entries.sort_by(|(_, left), (_, right)| right.cmp(left));
++    entries.truncate(PINNED_RENAMED_SESSION_LIMIT);
++    entries
++}
++
++fn thread_matches_provider_filter(thread: &Thread, provider_filter: &ProviderFilter) -> bool {
++    match provider_filter {
++        ProviderFilter::Any => true,
++        ProviderFilter::MatchDefault(default_provider) => {
++            thread.model_provider == *default_provider
++        }
++    }
++}
++
++fn thread_matches_resume_source_filter(thread: &Thread, include_non_interactive: bool) -> bool {
++    crate::resume_source_kinds(include_non_interactive)
++        .iter()
++        .any(|kind| thread_source_matches_kind(&thread.source, *kind))
++}
++
++fn thread_source_matches_kind(source: &SessionSource, kind: ThreadSourceKind) -> bool {
++    match kind {
++        ThreadSourceKind::Cli => matches!(source, SessionSource::Cli),
++        ThreadSourceKind::VsCode => matches!(source, SessionSource::VsCode),
++        ThreadSourceKind::Exec => matches!(source, SessionSource::Exec),
++        ThreadSourceKind::AppServer => matches!(source, SessionSource::AppServer),
++        ThreadSourceKind::SubAgent => matches!(source, SessionSource::SubAgent(_)),
++        ThreadSourceKind::SubAgentReview
++        | ThreadSourceKind::SubAgentCompact
++        | ThreadSourceKind::SubAgentThreadSpawn
++        | ThreadSourceKind::SubAgentOther => false,
++        ThreadSourceKind::Unknown => matches!(source, SessionSource::Unknown),
++    }
++}
++
+ async fn load_transcript_preview(
+     app_server: &mut AppServerSession,
+     thread_id: ThreadId,
+@@ -935,6 +1062,7 @@ impl PickerState {
+             view_rows: None,
+             view_width: None,
+             provider_filter,
++            show_all,
+             filter_mode: SessionFilterMode::from_show_all(show_all, filter_cwd.as_deref()),
+             local_filter_cwd: filter_cwd.clone(),
+             filter_cwd,
+@@ -1292,9 +1420,20 @@ impl PickerState {
+             cwd_filter: self.active_cwd_filter(),
+             provider_filter: self.provider_filter.clone(),
+             sort_key: self.sort_key,
++            pinned_renamed_codex_home: self.pinned_renamed_codex_home_for_initial_load(),
+         }));
+     }
+ 
++    fn pinned_renamed_codex_home_for_initial_load(&self) -> Option<PathBuf> {
++        if self.show_all && matches!(self.action, SessionPickerAction::Resume) {
++            return self
++                .view_persistence
++                .as_ref()
++                .map(|persistence| persistence.codex_home.clone());
++        }
++        None
++    }
++
+     async fn handle_background_event(&mut self, event: BackgroundEvent) -> Result<()> {
+         match event {
+             BackgroundEvent::Page {
+@@ -1602,6 +1741,7 @@ impl PickerState {
+             cwd_filter: self.active_cwd_filter(),
+             provider_filter: self.provider_filter.clone(),
+             sort_key: self.sort_key,
++            pinned_renamed_codex_home: None,
+         }));
+     }
+ 
+@@ -3253,6 +3393,15 @@ mod tests {
+         })
+     }
+ 
++    fn recorded_page_loader() -> (PickerLoader, Arc<Mutex<Vec<PageLoadRequest>>>) {
++        let recorded_requests: Arc<Mutex<Vec<PageLoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
++        let request_sink = recorded_requests.clone();
++        let loader = page_only_loader(move |req: PageLoadRequest| {
++            request_sink.lock().unwrap().push(req);
++        });
++        (loader, recorded_requests)
++    }
++
+     fn make_row(path: &str, ts: &str, preview: &str) -> Row {
+         let timestamp = parse_timestamp_str(ts).expect("timestamp should parse");
+         Row {
+@@ -3268,6 +3417,85 @@ mod tests {
+         }
+     }
+ 
++    fn test_thread_id(suffix: u128) -> ThreadId {
++        ThreadId::from_string(&format!("00000000-0000-4000-8000-{suffix:012x}"))
++            .expect("valid thread id")
++    }
++
++    #[test]
++    fn initial_resume_all_load_requests_pinned_renamed_sessions() {
++        let codex_home = PathBuf::from("/tmp/codex-home");
++        let (loader, recorded_requests) = recorded_page_loader();
++        let mut state = PickerState::new(
++            FrameRequester::test_dummy(),
++            loader,
++            ProviderFilter::MatchDefault(String::from("openai")),
++            /*show_all*/ true,
++            /*filter_cwd*/ None,
++            SessionPickerAction::Resume,
++        );
++        state.view_persistence = Some(SessionPickerViewPersistence {
++            codex_home: codex_home.clone(),
++        });
++
++        state.start_initial_load();
++
++        let requests = recorded_requests.lock().unwrap();
++        assert_eq!(requests.len(), 1);
++        assert_eq!(
++            requests[0].pinned_renamed_codex_home.as_deref(),
++            Some(codex_home.as_path())
++        );
++    }
++
++    #[test]
++    fn initial_cwd_scoped_resume_does_not_request_pinned_renamed_sessions() {
++        let (loader, recorded_requests) = recorded_page_loader();
++        let mut state = PickerState::new(
++            FrameRequester::test_dummy(),
++            loader,
++            ProviderFilter::MatchDefault(String::from("openai")),
++            /*show_all*/ false,
++            Some(PathBuf::from("/tmp/project")),
++            SessionPickerAction::Resume,
++        );
++        state.view_persistence = Some(SessionPickerViewPersistence {
++            codex_home: PathBuf::from("/tmp/codex-home"),
++        });
++
++        state.start_initial_load();
++
++        let requests = recorded_requests.lock().unwrap();
++        assert_eq!(requests.len(), 1);
++        assert_eq!(requests[0].pinned_renamed_codex_home, None);
++    }
++
++    #[tokio::test]
++    async fn pinned_renamed_entries_keep_latest_name_per_thread() {
++        let home = tempdir().expect("tempdir");
++        let oldest = test_thread_id(1);
++        let renamed = test_thread_id(2);
++        let newest = test_thread_id(3);
++        std::fs::write(
++            home.path().join(SESSION_INDEX_FILE),
++            format!(
++                "{{\"id\":\"{renamed}\",\"thread_name\":\"old\",\"updated_at\":\"2026-06-21T00:00:00Z\"}}\n\
++                 {{\"id\":\"{oldest}\",\"thread_name\":\"oldest\",\"updated_at\":\"2026-06-20T00:00:00Z\"}}\n\
++                 {{\"id\":\"{newest}\",\"thread_name\":\"newest\",\"updated_at\":\"2026-06-23T00:00:00Z\"}}\n\
++                 {{\"id\":\"{renamed}\",\"thread_name\":\"renamed\",\"updated_at\":\"2026-06-22T00:00:00Z\"}}\n"
++            ),
++        )
++        .expect("write index");
++
++        let entries = load_pinned_renamed_entries(home.path()).await;
++        let ids = entries
++            .into_iter()
++            .map(|(thread_id, _)| thread_id)
++            .collect::<Vec<_>>();
++
++        assert_eq!(ids, vec![newest, renamed, oldest]);
++    }
++
+     fn footer_lines_text(state: &PickerState, width: u16) -> String {
+         footer_hint_lines(state, width)
+             .into_iter()
