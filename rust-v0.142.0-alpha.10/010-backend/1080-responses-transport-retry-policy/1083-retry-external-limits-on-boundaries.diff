@@ -70,15 +70,18 @@ index 32319eec34..0c41e48277 100644
      assert_eq!(request_log.requests().len(), 2);
      Ok(())
 diff --git a/codex-rs/core/src/responses_retry.rs b/codex-rs/core/src/responses_retry.rs
-index f19f4212c1..7f698f1809 100644
+index f19f4212c1..ba818e7369 100644
 --- a/codex-rs/core/src/responses_retry.rs
 +++ b/codex-rs/core/src/responses_retry.rs
-@@ -1,11 +1,15 @@
+@@ -1,11 +1,18 @@
  //! Shared retry decisions for Responses requests.
  
  use std::time::Duration;
 +use std::time::SystemTime;
 +use std::time::UNIX_EPOCH;
++
++use chrono::DateTime;
++use chrono::Local;
  
  use crate::session::session::Session;
  use crate::session::turn_context::TurnContext;
@@ -89,12 +92,12 @@ index f19f4212c1..7f698f1809 100644
  use tracing::warn;
  
  #[derive(Debug, Clone, Copy)]
-@@ -14,6 +18,76 @@ pub(crate) enum ResponsesStreamRequest {
+@@ -14,6 +21,83 @@ pub(crate) enum ResponsesStreamRequest {
      RemoteCompactionV2,
  }
  
 +const EXTERNAL_LIMIT_CAPACITY_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
-+const EXTERNAL_LIMIT_ACCOUNT_QUOTA_RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
++const EXTERNAL_LIMIT_ACCOUNT_QUOTA_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
 +
 +#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 +pub(crate) enum ExternalLimitRetryKind {
@@ -106,6 +109,7 @@ index f19f4212c1..7f698f1809 100644
 +pub(crate) struct ExternalLimitRetry {
 +    pub(crate) kind: ExternalLimitRetryKind,
 +    pub(crate) delay: Duration,
++    pub(crate) retry_at: SystemTime,
 +}
 +
 +pub(crate) fn external_limit_retry_delay(err: &CodexErr) -> Option<Duration> {
@@ -129,9 +133,11 @@ index f19f4212c1..7f698f1809 100644
 +        _ => return None,
 +    };
 +
++    let delay = delay_until_next_boundary(now, interval);
 +    Some(ExternalLimitRetry {
 +        kind,
-+        delay: delay_until_next_boundary(now, interval),
++        delay,
++        retry_at: now + delay,
 +    })
 +}
 +
@@ -150,15 +156,19 @@ index f19f4212c1..7f698f1809 100644
 +    Duration::from_millis(delay_ms.try_into().unwrap_or(u64::MAX))
 +}
 +
++fn format_retry_at_local_time(retry_at: SystemTime) -> String {
++    let retry_at: DateTime<Local> = retry_at.into();
++    retry_at.format("%H:%M").to_string()
++}
++
 +fn external_limit_retry_warning(retry: ExternalLimitRetry) -> String {
++    let retry_at = format_retry_at_local_time(retry.retry_at);
 +    match retry.kind {
 +        ExternalLimitRetryKind::Capacity => format!(
-+            "External capacity limit reached. Retrying in {}s at the next 5-minute boundary.",
-+            retry.delay.as_secs()
++            "External capacity limit reached. Retrying at {retry_at} (next 5-minute boundary)."
 +        ),
 +        ExternalLimitRetryKind::AccountQuota => format!(
-+            "Account quota limit reached. Retrying in {}s at the next hourly boundary.",
-+            retry.delay.as_secs()
++            "Account quota limit reached. Retrying at {retry_at} (next 30-minute boundary)."
 +        ),
 +    }
 +}
@@ -166,7 +176,7 @@ index f19f4212c1..7f698f1809 100644
  /// Handles a retryable stream error and returns `Ok(())` when the caller should
  /// retry the request loop.
  pub(crate) async fn handle_retryable_response_stream_error(
-@@ -24,6 +98,21 @@ pub(crate) async fn handle_retryable_response_stream_error(
+@@ -24,6 +108,21 @@ pub(crate) async fn handle_retryable_response_stream_error(
      turn_context: &TurnContext,
      request: ResponsesStreamRequest,
  ) -> Result<(), CodexErr> {
@@ -188,7 +198,7 @@ index f19f4212c1..7f698f1809 100644
      if *retries < max_retries {
          *retries += 1;
          let retry_count = *retries;
-@@ -57,6 +146,33 @@ pub(crate) async fn handle_retryable_response_stream_error(
+@@ -57,6 +156,33 @@ pub(crate) async fn handle_retryable_response_stream_error(
      Err(err)
  }
  
@@ -222,7 +232,7 @@ index f19f4212c1..7f698f1809 100644
  fn log_retry(
      request: ResponsesStreamRequest,
      turn_context: &TurnContext,
-@@ -82,3 +198,82 @@ fn log_retry(
+@@ -82,3 +208,91 @@ fn log_retry(
          }
      }
  }
@@ -251,20 +261,23 @@ index f19f4212c1..7f698f1809 100644
 +            Some(ExternalLimitRetry {
 +                kind: ExternalLimitRetryKind::Capacity,
 +                delay: Duration::from_secs(3 * 60 + 50),
++                retry_at: now + Duration::from_secs(3 * 60 + 50),
 +            })
 +        );
 +        assert_eq!(
 +            external_limit_retry_at(&CodexErr::QuotaExceeded, now),
 +            Some(ExternalLimitRetry {
 +                kind: ExternalLimitRetryKind::AccountQuota,
-+                delay: Duration::from_secs(38 * 60 + 50),
++                delay: Duration::from_secs(8 * 60 + 50),
++                retry_at: now + Duration::from_secs(8 * 60 + 50),
 +            })
 +        );
 +        assert_eq!(
 +            external_limit_retry_at(&usage_limit_reached_error(), now),
 +            Some(ExternalLimitRetry {
 +                kind: ExternalLimitRetryKind::AccountQuota,
-+                delay: Duration::from_secs(38 * 60 + 50),
++                delay: Duration::from_secs(8 * 60 + 50),
++                retry_at: now + Duration::from_secs(8 * 60 + 50),
 +            })
 +        );
 +        assert_eq!(
@@ -291,17 +304,23 @@ index f19f4212c1..7f698f1809 100644
 +        let capacity = external_limit_retry_warning(ExternalLimitRetry {
 +            kind: ExternalLimitRetryKind::Capacity,
 +            delay: Duration::from_secs(230),
++            retry_at: SystemTime::now() + Duration::from_secs(230),
 +        });
 +        assert!(capacity.contains("External capacity limit reached"));
++        assert!(capacity.contains("Retrying at "));
 +        assert!(capacity.contains("next 5-minute boundary"));
++        assert!(!capacity.contains("Retrying in"));
 +        assert!(!capacity.contains("capacity or quota"));
 +
 +        let quota = external_limit_retry_warning(ExternalLimitRetry {
 +            kind: ExternalLimitRetryKind::AccountQuota,
-+            delay: Duration::from_secs(2330),
++            delay: Duration::from_secs(530),
++            retry_at: SystemTime::now() + Duration::from_secs(530),
 +        });
 +        assert!(quota.contains("Account quota limit reached"));
-+        assert!(quota.contains("next hourly boundary"));
++        assert!(quota.contains("Retrying at "));
++        assert!(quota.contains("next 30-minute boundary"));
++        assert!(!quota.contains("Retrying in"));
 +        assert!(!quota.contains("capacity or quota"));
 +    }
 +}
