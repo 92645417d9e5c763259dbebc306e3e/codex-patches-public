@@ -1,279 +1,74 @@
-diff --git a/codex-rs/tui/src/history_cell/messages.rs b/codex-rs/tui/src/history_cell/messages.rs
-index 2ca7414833..e3691d836d 100644
---- a/codex-rs/tui/src/history_cell/messages.rs
-+++ b/codex-rs/tui/src/history_cell/messages.rs
-@@ -91,16 +91,60 @@ fn trim_trailing_blank_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>
-     lines
- }
- 
-+fn line_visible_width(line: &Line<'_>) -> usize {
-+    line.spans
-+        .iter()
-+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-+        .sum()
-+}
-+
-+fn border_line(
-+    left: &'static str,
-+    fill: &'static str,
-+    right: &'static str,
-+    width: u16,
-+) -> Line<'static> {
-+    let border_style = user_message_border_style();
-+    let inner_width = usize::from(width.saturating_sub(2));
-+    Line::from(vec![
-+        Span::styled(left, border_style),
-+        Span::styled(fill.repeat(inner_width), border_style),
-+        Span::styled(right, border_style),
-+    ])
-+}
-+
-+fn framed_user_message_lines(
-+    lines: Vec<Line<'static>>,
-+    width: u16,
-+    style: Style,
-+) -> Vec<Line<'static>> {
-+    let border_style = user_message_border_style();
-+    let box_width = width.max(2);
-+    let content_width = usize::from(box_width.saturating_sub(4)).max(1);
-+    let mut out = vec![border_line("┌", "─", "┐", box_width)];
-+
-+    for mut line in lines {
-+        line.style = style;
-+        let padding = content_width.saturating_sub(line_visible_width(&line));
-+        let mut spans = vec![Span::styled("│", border_style), Span::styled(" ", style)];
-+        spans.extend(line.spans);
-+        if padding > 0 {
-+            spans.push(Span::styled(" ".repeat(padding), style));
+diff --git a/codex-rs/tui/src/chatwidget/settings.rs b/codex-rs/tui/src/chatwidget/settings.rs
+index b41d0f4cf5..eb5ce33fd7 100644
+--- a/codex-rs/tui/src/chatwidget/settings.rs
++++ b/codex-rs/tui/src/chatwidget/settings.rs
+@@ -489,6 +489,9 @@ impl ChatWidget {
+         let cwd_changed = self.config.cwd != settings.cwd;
+         self.apply_thread_settings_cwd(settings.cwd.clone());
+         self.config.model_provider_id = settings.model_provider.clone();
++        if let Some(model_provider) = self.config.model_providers.get(&settings.model_provider) {
++            self.config.model_provider = model_provider.clone();
 +        }
-+        spans.extend([Span::styled(" ", style), Span::styled("│", border_style)]);
-+        out.push(Line::from(spans).style(style));
-+    }
-+
-+    out.push(border_line("└", "─", "┘", box_width));
-+    out
+         self.set_service_tier(settings.service_tier.clone());
+         self.set_approval_policy(settings.approval_policy);
+         self.set_approvals_reviewer(settings.approvals_reviewer.to_core());
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index 7d2c266372..27350468d4 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -4,6 +4,14 @@ use pretty_assertions::assert_eq;
+ fn thread_settings_for_test(
+     model: &str,
+     thread_id: ThreadId,
++) -> codex_app_server_protocol::ThreadSettingsUpdatedNotification {
++    thread_settings_for_test_with_provider(model, thread_id, "openai")
 +}
 +
- impl HistoryCell for UserHistoryCell {
-     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
--        let wrap_width = width
--            .saturating_sub(
--                LIVE_PREFIX_COLS + 1, /* keep a one-column right margin for wrapping */
--            )
--            .max(1);
--
-         let style = user_input_style();
-         let element_style = style.fg(Color::Cyan);
-+        let content_width = width.saturating_sub(4).max(1);
-+        let message_wrap_width = content_width.saturating_sub(LIVE_PREFIX_COLS).max(1);
- 
-         let wrapped_remote_images = if self.remote_image_urls.is_empty() {
-             None
-@@ -112,7 +156,7 @@ impl HistoryCell for UserHistoryCell {
-                     .map(|(idx, _url)| {
-                         remote_image_display_line(element_style, idx.saturating_add(1))
-                     }),
--                RtOptions::new(usize::from(wrap_width))
-+                RtOptions::new(usize::from(content_width))
-                     .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
-             ))
-         };
-@@ -126,7 +170,7 @@ impl HistoryCell for UserHistoryCell {
-                     .split('\n')
-                     .map(|line| Line::from(line).style(style)),
-                 // Wrap algorithm matches textarea.rs.
--                RtOptions::new(usize::from(wrap_width))
-+                RtOptions::new(usize::from(message_wrap_width))
-                     .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
-             );
-             let wrapped = trim_trailing_blank_lines(wrapped);
-@@ -140,7 +184,7 @@ impl HistoryCell for UserHistoryCell {
-             );
-             let wrapped = adaptive_wrap_lines(
-                 raw_lines,
--                RtOptions::new(usize::from(wrap_width))
-+                RtOptions::new(usize::from(message_wrap_width))
-                     .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
-             );
-             let wrapped = trim_trailing_blank_lines(wrapped);
-@@ -151,29 +195,20 @@ impl HistoryCell for UserHistoryCell {
-             return Vec::new();
-         }
- 
--        let mut lines: Vec<Line<'static>> = vec![Line::from("").style(style)];
-+        let mut lines: Vec<Line<'static>> = Vec::new();
- 
-         if let Some(wrapped_remote_images) = wrapped_remote_images {
--            lines.extend(prefix_lines(
--                wrapped_remote_images,
--                "  ".into(),
--                "  ".into(),
--            ));
-+            lines.extend(wrapped_remote_images);
-             if wrapped_message.is_some() {
-                 lines.push(Line::from("").style(style));
-             }
-         }
- 
-         if let Some(wrapped_message) = wrapped_message {
--            lines.extend(prefix_lines(
--                wrapped_message,
--                "› ".bold().dim(),
--                "  ".into(),
--            ));
-+            lines.extend(prefix_lines(wrapped_message, Span::from(""), "".into()));
-         }
- 
--        lines.push(Line::from("").style(style));
--        lines
-+        framed_user_message_lines(lines, width, style)
-     }
- 
-     fn raw_lines(&self) -> Vec<Line<'static>> {
-diff --git a/codex-rs/tui/src/history_cell/mod.rs b/codex-rs/tui/src/history_cell/mod.rs
-index 43390c5271..ad5204e86c 100644
---- a/codex-rs/tui/src/history_cell/mod.rs
-+++ b/codex-rs/tui/src/history_cell/mod.rs
-@@ -32,6 +32,7 @@ use crate::render::renderable::Renderable;
- use crate::session_state::ThreadSessionState;
- use crate::style::proposed_plan_style;
- use crate::style::user_input_style;
-+use crate::style::user_message_border_style;
- use crate::terminal_hyperlinks::HyperlinkLine;
- use crate::terminal_hyperlinks::mark_buffer_hyperlinks;
- use crate::terminal_hyperlinks::plain_hyperlink_lines;
-diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__raw_mode_toggle_transcript.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__raw_mode_toggle_transcript.snap
-index 993ae36ae5..1ce9944fbb 100644
---- a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__raw_mode_toggle_transcript.snap
-+++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__raw_mode_toggle_transcript.snap
-@@ -3,10 +3,10 @@ source: tui/src/history_cell/tests.rs
- expression: rendered
- ---
- rich before:
--
--› Please format this
--  for copying
--
-+┌──────────────────────────────────────┐
-+│ Please format this                   │
-+│ for copying                          │
-+└──────────────────────────────────────┘
- ■ - first item
-   - second item
-   
-@@ -39,10 +39,10 @@ structured output
- second line
- 
- rich after:
--
--› Please format this
--  for copying
--
-+┌──────────────────────────────────────┐
-+│ Please format this                   │
-+│ for copying                          │
-+└──────────────────────────────────────┘
- ■ - first item
-   - second item
-   
-diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_numbers_multiple_remote_images.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_numbers_multiple_remote_images.snap
-index 076df8fffb..f15bd7257b 100644
---- a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_numbers_multiple_remote_images.snap
-+++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_numbers_multiple_remote_images.snap
-@@ -1,9 +1,10 @@
- ---
--source: tui/src/history_cell.rs
-+source: tui/src/history_cell/tests.rs
- expression: rendered
- ---
--
--  [Image #1]
--  [Image #2]
--
--› describe both
-+┌──────────────────────────────────────────────────────────────────────────────┐
-+│ [Image #1]                                                                   │
-+│ [Image #2]                                                                   │
-+│                                                                              │
-+│ describe both                                                                │
-+└──────────────────────────────────────────────────────────────────────────────┘
-diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_renders_remote_image_urls.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_renders_remote_image_urls.snap
-index 923ee953ab..aa21865f4b 100644
---- a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_renders_remote_image_urls.snap
-+++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_renders_remote_image_urls.snap
-@@ -1,8 +1,9 @@
- ---
--source: tui/src/history_cell.rs
-+source: tui/src/history_cell/tests.rs
- expression: rendered
- ---
--
--  [Image #1]
--
--› describe these
-+┌──────────────────────────────────────────────────────────────────────────────┐
-+│ [Image #1]                                                                   │
-+│                                                                              │
-+│ describe these                                                               │
-+└──────────────────────────────────────────────────────────────────────────────┘
-diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_wraps_and_prefixes_each_line_snapshot.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_wraps_and_prefixes_each_line_snapshot.snap
-index 51ce9e312f..bb6757eefc 100644
---- a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_wraps_and_prefixes_each_line_snapshot.snap
-+++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_wraps_and_prefixes_each_line_snapshot.snap
-@@ -1,9 +1,13 @@
- ---
--source: tui/src/history_cell.rs
-+source: tui/src/history_cell/tests.rs
- expression: rendered
- ---
--
--› one two
--  three
--  four five
--  six seven
-+┌──────────┐
-+│ one      │
-+│ two      │
-+│ three    │
-+│ four     │
-+│ five     │
-+│ six      │
-+│ seven    │
-+└──────────┘
-diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
-index d277201ba9..337c2884ab 100644
---- a/codex-rs/tui/src/history_cell/tests.rs
-+++ b/codex-rs/tui/src/history_cell/tests.rs
-@@ -2085,7 +2085,7 @@ fn user_history_cell_trims_trailing_blank_message_lines() {
-         .rev()
-         .take_while(|line| line.trim().is_empty())
-         .count();
--    assert_eq!(trailing_blank_count, 1);
-+    assert_eq!(trailing_blank_count, 0);
-     assert!(rendered.iter().any(|line| line.contains("line one")));
++fn thread_settings_for_test_with_provider(
++    model: &str,
++    thread_id: ThreadId,
++    model_provider: &str,
+ ) -> codex_app_server_protocol::ThreadSettingsUpdatedNotification {
+     codex_app_server_protocol::ThreadSettingsUpdatedNotification {
+         thread_id: thread_id.to_string(),
+@@ -18,7 +26,7 @@ fn thread_settings_for_test(
+                 codex_app_server_protocol::ActivePermissionProfile::read_only(),
+             ),
+             model: model.to_string(),
+-            model_provider: "openai".to_string(),
++            model_provider: model_provider.to_string(),
+             service_tier: Some(ServiceTier::Fast.request_value().to_string()),
+             effort: Some(ReasoningEffortConfig::High),
+             summary: None,
+@@ -154,6 +162,31 @@ async fn thread_settings_updated_updates_visible_state_without_transcript() {
+     assert_eq!(chat.current_model(), "gpt-5.4");
  }
  
-@@ -2108,7 +2108,7 @@ fn user_history_cell_trims_trailing_blank_message_lines_with_text_elements() {
-         .rev()
-         .take_while(|line| line.trim().is_empty())
-         .count();
--    assert_eq!(trailing_blank_count, 1);
-+    assert_eq!(trailing_blank_count, 0);
-     assert!(rendered.iter().any(|line| line.contains("tokenized")));
- }
- 
-diff --git a/codex-rs/tui/src/style.rs b/codex-rs/tui/src/style.rs
-index 1ddf0fcf51..c15278ecd7 100644
---- a/codex-rs/tui/src/style.rs
-+++ b/codex-rs/tui/src/style.rs
-@@ -43,6 +43,10 @@ pub(crate) fn stable_dim_style() -> Style {
-     Style::default().fg(STABLE_DIM_FG)
- }
- 
-+pub(crate) fn user_message_border_style() -> Style {
-+    user_input_style().fg(Color::Yellow)
++#[tokio::test]
++async fn thread_settings_updated_syncs_model_provider_metadata() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;
++    let thread_id = ThreadId::new();
++    chat.handle_thread_session(configured_thread_session(thread_id));
++
++    let mut side_route_provider = chat.config.model_provider.clone();
++    side_route_provider.requires_openai_auth = false;
++    chat.config
++        .model_providers
++        .insert("side-route".to_string(), side_route_provider);
++
++    chat.handle_server_notification(
++        ServerNotification::ThreadSettingsUpdated(thread_settings_for_test_with_provider(
++            "gpt-5",
++            thread_id,
++            "side-route",
++        )),
++        /*replay_kind*/ None,
++    );
++
++    assert_eq!(chat.config_ref().model_provider_id, "side-route");
++    assert!(!chat.config_ref().model_provider.requires_openai_auth);
 +}
 +
- /// Returns the style for a user-authored message using the provided terminal background.
- pub fn user_message_style_for(terminal_bg: Option<(u8, u8, u8)>) -> Style {
-     terminal_bg
+ #[tokio::test]
+ async fn thread_settings_updated_preserves_default_settings_for_plan_mode() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.3-codex")).await;

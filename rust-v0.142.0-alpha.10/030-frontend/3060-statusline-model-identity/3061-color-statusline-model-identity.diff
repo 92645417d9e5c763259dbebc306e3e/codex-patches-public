@@ -1,452 +1,500 @@
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+index 950d245ebe..b08ff30c86 100644
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -73,6 +73,7 @@ pub(crate) use mcp_server_elicitation::McpServerElicitationFormRequest;
+ pub(crate) use mcp_server_elicitation::McpServerElicitationOverlay;
+ pub(crate) use request_user_input::RequestUserInputOverlay;
+ pub(crate) use status_line_style::status_line_from_segments;
++pub(crate) use status_line_style::status_line_style_for_item;
+ mod bottom_pane_view;
+ 
+ #[derive(Clone, Debug, PartialEq, Eq)]
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+index cb7fc9eeb4..db078af68f 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -195,7 +195,7 @@ impl StatusLineItem {
+             StatusLineItem::FastMode => "Whether Fast mode is currently active",
+             StatusLineItem::RawOutput => "Whether raw scrollback mode is active",
+             StatusLineItem::ThreadTitle => {
+-                "Current thread title, or thread identifier when unnamed"
++                "Current thread title with thread identifier when named; identifier only when unnamed"
+             }
+             StatusLineItem::TaskProgress => {
+                 "Latest task progress from update_plan (omitted until available)"
 diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
-index 255fab10d1..86da82debb 100644
+index 86da82debb..dc28ffe733 100644
 --- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
 +++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
-@@ -2,10 +2,8 @@
- 
- use ratatui::prelude::Stylize;
- use ratatui::style::Color;
--use ratatui::style::Modifier;
- use ratatui::style::Style;
- use ratatui::text::Line;
--use ratatui::text::Span;
- 
- use super::status_line_setup::StatusLineItem;
- use crate::render::highlight::foreground_style_for_scopes;
-@@ -79,29 +77,31 @@ impl StatusLineAccent {
-     }
- }
- 
--pub(crate) fn status_line_from_segments<I>(
-+pub(crate) fn status_line_from_segments<I, T>(
-     segments: I,
-     use_theme_colors: bool,
- ) -> Option<Line<'static>>
- where
--    I: IntoIterator<Item = (StatusLineItem, String)>,
-+    I: IntoIterator<Item = (StatusLineItem, T)>,
-+    T: Into<Line<'static>>,
- {
-     status_line_from_segments_with_resolver(segments, use_theme_colors, |accent| {
-         foreground_style_for_scopes(accent.scopes())
+@@ -90,6 +90,35 @@ where
      })
  }
  
--fn status_line_from_segments_with_resolver<I, F>(
-+fn status_line_from_segments_with_resolver<I, T, F>(
++pub(crate) fn status_line_style_for_item(item: StatusLineItem, use_theme_colors: bool) -> Style {
++    status_line_style_for_item_with_resolver(item, use_theme_colors, |accent| {
++        foreground_style_for_scopes(accent.scopes())
++    })
++}
++
++fn status_line_style_for_item_with_resolver<F>(
++    item: StatusLineItem,
++    use_theme_colors: bool,
++    theme_style_for_accent: F,
++) -> Style
++where
++    F: Fn(StatusLineAccent) -> Option<Style>,
++{
++    let accent = StatusLineAccent::for_item(item);
++    let style = if use_theme_colors {
++        soften_status_line_style(
++            theme_style_for_accent(accent).unwrap_or_else(|| accent.fallback_style()),
++        )
++    } else {
++        Style::default().dim()
++    };
++    if item == StatusLineItem::PullRequestNumber {
++        style.underlined()
++    } else {
++        style
++    }
++}
++
+ fn status_line_from_segments_with_resolver<I, T, F>(
      segments: I,
      use_theme_colors: bool,
-     theme_style_for_accent: F,
- ) -> Option<Line<'static>>
- where
--    I: IntoIterator<Item = (StatusLineItem, String)>,
-+    I: IntoIterator<Item = (StatusLineItem, T)>,
-+    T: Into<Line<'static>>,
-     F: Fn(StatusLineAccent) -> Option<Style>,
- {
-     let mut spans = Vec::new();
--    for (item, text) in segments {
-+    for (item, segment) in segments {
+@@ -105,20 +134,12 @@ where
          if !spans.is_empty() {
              spans.push(STATUS_LINE_SEPARATOR.dim());
          }
-@@ -118,14 +118,22 @@ where
-         } else {
-             style
-         };
-+        let line = segment.into();
-+        let text: String = line
-+            .spans
-+            .iter()
-+            .map(|span| span.content.as_ref())
-+            .collect();
-         if item == StatusLineItem::ResponsesStreamConnection && text == "X" {
--            spans.push(Span::styled(
--                "X".to_string(),
--                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
--            ));
-+            spans.push("X".red().bold());
-             continue;
-         }
--        spans.push(Span::styled(text, style));
-+        for mut span in line.spans {
-+            if span.style == Style::default() {
-+                span.style = style;
+-        let style = if use_theme_colors {
+-            let accent = StatusLineAccent::for_item(item);
+-            soften_status_line_style(
+-                theme_style_for_accent(accent).unwrap_or_else(|| accent.fallback_style()),
+-            )
+-        } else {
+-            Style::default().dim()
+-        };
+-        let style = if item == StatusLineItem::PullRequestNumber {
+-            style.underlined()
+-        } else {
+-            style
+-        };
+-        let line = segment.into();
++        let style = status_line_style_for_item_with_resolver(
++            item,
++            use_theme_colors,
++            &theme_style_for_accent,
++        );
++        let line: Line<'static> = segment.into();
+         let text: String = line
+             .spans
+             .iter()
+diff --git a/codex-rs/tui/src/bottom_pane/title_setup.rs b/codex-rs/tui/src/bottom_pane/title_setup.rs
+index 1a3993c1cd..21eacaf166 100644
+--- a/codex-rs/tui/src/bottom_pane/title_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/title_setup.rs
+@@ -100,7 +100,9 @@ impl TerminalTitleItem {
+             TerminalTitleItem::Status => {
+                 "Compact session run-state text (Ready, Working, Thinking)"
+             }
+-            TerminalTitleItem::Thread => "Current thread title, or thread identifier when unnamed",
++            TerminalTitleItem::Thread => {
++                "Current thread title with thread identifier when named; identifier only when unnamed"
 +            }
-+            spans.push(span);
-+        }
-     }
+             TerminalTitleItem::GitBranch => "Current Git branch (omitted when unavailable)",
+             TerminalTitleItem::ContextRemaining => {
+                 "Percentage of context window remaining (omitted when unknown)"
+@@ -393,7 +395,7 @@ mod tests {
+                         line.push_str(symbol);
+                     }
+                 }
+-                line
++                line.trim_end().to_string()
+             })
+             .collect();
+         lines.join("\n")
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__renamed_thread_footer_title.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__renamed_thread_footer_title.snap
+index 05cf835c76..f366c6108f 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__renamed_thread_footer_title.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__renamed_thread_footer_title.snap
+@@ -1,9 +1,10 @@
+ ---
+ source: tui/src/chatwidget/tests/status_and_layout.rs
++assertion_line: 2592
+ expression: normalized_backend_snapshot(terminal.backend())
+ ---
+ "                                                                                "
+ "┌──────────────────────────────────────────────────────────────────────────────┐"
+ "› Ask Codex to do anything                                                     │"
+ "└──────────────────────────────────────────────────────────────────────────────┘"
+-"  gpt-5.3-codex high · Roadmap cleanup                                          "
++"  gpt-5.3-codex high · Roadmap cleanup 019ec648-02b1-73d3-8320-4851d6a19952     "
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_setup_popup_hardcoded_only.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_setup_popup_hardcoded_only.snap
+index 2a91d27c1b..2aca71e478 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_setup_popup_hardcoded_only.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_setup_popup_hardcoded_only.snap
+@@ -1,5 +1,6 @@
+ ---
+ source: tui/src/chatwidget/tests/status_surface_previews.rs
++assertion_line: 203
+ expression: status_line_popup_snapshot(&mut chat)
+ ---
+   Configure Status Line
+@@ -11,7 +12,7 @@ expression: status_line_popup_snapshot(&mut chat)
+   ───────────────────────
+   [x] project-name          Project name (omitted when unavailable)
+   [x] git-branch            Current Git branch (omitted when unavailable)
+-  [x] thread-title          Current thread title, or thread identifier when unnamed
++  [x] thread-title          Current thread title with thread identifier when named; identifier on…
+   [ ] model                 Current model name
+   [ ] model-with-reasoning  Current model name with reasoning level
+   [ ] reasoning             Current reasoning level
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_setup_popup_live_only.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_setup_popup_live_only.snap
+index 709f7734df..5ad1a7839b 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_setup_popup_live_only.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_setup_popup_live_only.snap
+@@ -1,5 +1,6 @@
+ ---
+ source: tui/src/chatwidget/tests/status_surface_previews.rs
++assertion_line: 130
+ expression: status_line_popup_snapshot(&mut chat)
+ ---
+   Configure Status Line
+@@ -11,7 +12,7 @@ expression: status_line_popup_snapshot(&mut chat)
+   ───────────────────────
+   [x] project-name          Project name (omitted when unavailable)
+   [x] git-branch            Current Git branch (omitted when unavailable)
+-  [x] thread-title          Current thread title, or thread identifier when unnamed
++  [x] thread-title          Current thread title with thread identifier when named; identifier on…
+   [ ] model                 Current model name
+   [ ] model-with-reasoning  Current model name with reasoning level
+   [ ] reasoning             Current reasoning level
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_setup_popup_mixed.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_setup_popup_mixed.snap
+index b0e29ea479..64ddcdc734 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_setup_popup_mixed.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_setup_popup_mixed.snap
+@@ -1,5 +1,6 @@
+ ---
+ source: tui/src/chatwidget/tests/status_surface_previews.rs
++assertion_line: 319
+ expression: status_line_popup_snapshot(&mut chat)
+ ---
+   Configure Status Line
+@@ -11,7 +12,7 @@ expression: status_line_popup_snapshot(&mut chat)
+   ───────────────────────
+   [x] project-name          Project name (omitted when unavailable)
+   [x] git-branch            Current Git branch (omitted when unavailable)
+-  [x] thread-title          Current thread title, or thread identifier when unnamed
++  [x] thread-title          Current thread title with thread identifier when named; identifier on…
+   [ ] model                 Current model name
+   [ ] model-with-reasoning  Current model name with reasoning level
+   [ ] reasoning             Current reasoning level
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_hardcoded_only.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_hardcoded_only.snap
+index 8ff4227504..27a77ab6e4 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_hardcoded_only.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_hardcoded_only.snap
+@@ -1,5 +1,6 @@
+ ---
+ source: tui/src/chatwidget/tests/status_surface_previews.rs
++assertion_line: 354
+ expression: terminal_title_popup_snapshot(&mut chat)
+ ---
+   Configure Terminal Title
+@@ -7,7 +8,7 @@ expression: terminal_title_popup_snapshot(&mut chat)
  
-     (!spans.is_empty()).then(|| Line::from(spans))
-@@ -187,8 +195,10 @@ fn soften_rgb_channel(channel: u8, luma: u16) -> u8 {
- #[cfg(test)]
- mod tests {
-     use super::*;
-+    use crate::model_color::model_style;
-     use pretty_assertions::assert_eq;
-     use ratatui::style::Modifier;
-+    use ratatui::text::Span;
+   Type to search
+   >
+-› [x] thread-title   Current thread title, or thread identifier when unnamed
++› [x] thread-title   Current thread title with thread identifier when named; identifier only when…
+   [x] git-branch     Current Git branch (omitted when unavailable)
+   [x] task-progress  Latest task progress from update_plan (omitted until available)
+   [ ] app-name       Codex app name
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_live_only.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_live_only.snap
+index 8c149b8cc9..fa14ec3b41 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_live_only.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_live_only.snap
+@@ -1,5 +1,6 @@
+ ---
+ source: tui/src/chatwidget/tests/status_surface_previews.rs
++assertion_line: 339
+ expression: terminal_title_popup_snapshot(&mut chat)
+ ---
+   Configure Terminal Title
+@@ -8,7 +9,7 @@ expression: terminal_title_popup_snapshot(&mut chat)
+   Type to search
+   >
+ › [x] project-name   Project name (falls back to current directory name)
+-  [x] thread-title   Current thread title, or thread identifier when unnamed
++  [x] thread-title   Current thread title with thread identifier when named; identifier only when…
+   [x] git-branch     Current Git branch (omitted when unavailable)
+   [x] task-progress  Latest task progress from update_plan (omitted until available)
+   [ ] app-name       Codex app name
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_mixed.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_mixed.snap
+index b04e07bd9b..750af65b43 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_mixed.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_mixed.snap
+@@ -1,5 +1,6 @@
+ ---
+ source: tui/src/chatwidget/tests/status_surface_previews.rs
++assertion_line: 371
+ expression: terminal_title_popup_snapshot(&mut chat)
+ ---
+   Configure Terminal Title
+@@ -8,7 +9,7 @@ expression: terminal_title_popup_snapshot(&mut chat)
+   Type to search
+   >
+ › [x] project-name   Project name (falls back to current directory name)
+-  [x] thread-title   Current thread title, or thread identifier when unnamed
++  [x] thread-title   Current thread title with thread identifier when named; identifier only when…
+   [x] task-progress  Latest task progress from update_plan (omitted until available)
+   [ ] app-name       Codex app name
+   [ ] current-dir    Current working directory
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_rate_limits.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_rate_limits.snap
+index c821ddce93..a5923c7e96 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_rate_limits.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_rate_limits.snap
+@@ -1,5 +1,6 @@
+ ---
+ source: tui/src/chatwidget/tests/status_surface_previews.rs
++assertion_line: 386
+ expression: terminal_title_popup_snapshot(&mut chat)
+ ---
+   Configure Terminal Title
+@@ -14,7 +15,7 @@ expression: terminal_title_popup_snapshot(&mut chat)
+   [ ] current-dir    Current working directory
+   [ ] activity       Spinner while working, action-required message while blocked.
+   [ ] run-state      Compact session run-state text (Ready, Working, Thinking)
+-  [ ] thread-title   Current thread title, or thread identifier when unnamed
++  [ ] thread-title   Current thread title with thread identifier when named; identifier only when…
  
-     fn line_text(line: &Line<'static>) -> String {
-         line.spans
-@@ -255,6 +265,24 @@ mod tests {
-         assert!(!line.spans[0].style.add_modifier.contains(Modifier::DIM));
-     }
- 
-+    #[test]
-+    fn status_line_segments_preserve_explicit_span_styles() {
-+        let line = status_line_from_segments_with_resolver(
-+            [(
-+                StatusLineItem::ModelWithReasoning,
-+                Line::from(vec!["gpt-5 ".into(), "high".red()]),
-+            )],
-+            /*use_theme_colors*/ true,
-+            |_| None,
-+        )
-+        .expect("status line");
-+
-+        assert_eq!(line_text(&line), "gpt-5 high");
-+        assert_eq!(line.spans[0].style.fg, Some(Color::Cyan));
-+        assert_eq!(line.spans[1].style.fg, Some(Color::Red));
-+        assert!(!line.spans[1].style.add_modifier.contains(Modifier::DIM));
-+    }
-+
-     #[test]
-     fn status_line_segments_can_disable_theme_colors() {
-         let line = status_line_from_segments_with_resolver(
-@@ -307,6 +335,33 @@ mod tests {
-         assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
-     }
- 
-+    #[test]
-+    #[allow(clippy::disallowed_methods)]
-+    fn status_line_preserves_model_color_without_disabling_theme_styles() {
-+        let line = status_line_from_segments_with_resolver(
-+            [
-+                (
-+                    StatusLineItem::ModelName,
-+                    Line::from(Span::styled("gpt-5", model_style("gpt-5"))),
-+                ),
-+                (StatusLineItem::CurrentDir, Line::from("/tmp/project")),
-+            ],
-+            /*use_theme_colors*/ true,
-+            |accent| match accent {
-+                StatusLineAccent::Model => Some(Style::default().red()),
-+                StatusLineAccent::Path => Some(Style::default().green()),
-+                _ => None,
-+            },
-+        )
-+        .expect("status line");
-+
-+        assert_eq!(line_text(&line), "gpt-5 · /tmp/project");
-+        assert_eq!(line.spans[0].style.fg, model_style("gpt-5").fg);
-+        assert_eq!(line.spans[1].content.as_ref(), STATUS_LINE_SEPARATOR);
-+        assert!(line.spans[1].style.add_modifier.contains(Modifier::DIM));
-+        assert_eq!(line.spans[2].style.fg, Some(Color::Green));
-+    }
-+
-     #[test]
-     fn status_line_segments_return_none_when_empty() {
-         assert_eq!(
+   monthly 65% left | weekly 50% left
+   Press space to toggle; ←/→ to move; enter to confirm and close; esc to close
 diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
-index 5769d5bd32..c39fd7f47d 100644
+index c39fd7f47d..28ae9ea468 100644
 --- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
 +++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
-@@ -9,12 +9,14 @@ use crate::branch_summary;
+@@ -5,6 +5,7 @@
+ 
+ use super::*;
+ use crate::bottom_pane::status_line_from_segments;
++use crate::bottom_pane::status_line_style_for_item;
+ use crate::branch_summary;
  use crate::chatwidget::limit_label_for_window;
  use crate::chatwidget::rate_limits::get_limits_duration;
- use crate::legacy_core::config::Config;
-+use crate::model_color::model_style;
- use crate::status::format_tokens_compact;
- use codex_app_server_protocol::AskForApproval;
- use codex_protocol::config_types::ApprovalsReviewer;
- use codex_protocol::config_types::ServiceTier;
- use codex_protocol::models::PermissionProfile;
- use codex_utils_sandbox_summary::summarize_permission_profile;
-+use ratatui::text::Span;
+@@ -38,6 +39,13 @@ const TERMINAL_TITLE_ACTION_REQUIRED_INTERVAL: Duration = Duration::from_secs(1)
+ const TERMINAL_TITLE_ACTION_REQUIRED_PREFIX: &str = "[ ! ] Action Required";
+ const TERMINAL_TITLE_ACTION_REQUIRED_PREFIX_HIDDEN: &str = "[ . ] Action Required";
  
- use super::status_state::TerminalTitleStatusKind;
- 
-@@ -170,7 +172,7 @@ impl ChatWidget {
- 
-         let mut segments = Vec::new();
-         for item in &selections.status_line_items {
--            if let Some(value) = self.status_line_value_for_item(*item) {
-+            if let Some(value) = self.status_line_line_for_item(item) {
-                 segments.push((*item, value));
-             }
++fn line_plain_text(line: Line<'static>) -> String {
++    line.spans
++        .into_iter()
++        .map(|span| span.content.into_owned())
++        .collect()
++}
++
+ #[derive(Debug)]
+ /// Parsed status-surface configuration for one refresh pass.
+ ///
+@@ -674,10 +682,35 @@ impl ChatWidget {
+             StatusLineItem::ModelName => Some(self.model_display_line()),
+             StatusLineItem::ModelWithReasoning => Some(self.model_with_reasoning_display_line()),
+             StatusLineItem::FastMode => Some(self.fast_mode_display_line()),
++            StatusLineItem::ThreadTitle => self.status_line_thread_title_display_line(),
+             _ => self.status_line_value_for_item(*item).map(Line::from),
          }
-@@ -667,6 +669,15 @@ impl ChatWidget {
-             .map(|pull_request| pull_request.url.clone())
      }
  
-+    fn status_line_line_for_item(&mut self, item: &StatusLineItem) -> Option<Line<'static>> {
-+        match item {
-+            StatusLineItem::ModelName => Some(self.model_display_line()),
-+            StatusLineItem::ModelWithReasoning => Some(self.model_with_reasoning_display_line()),
-+            StatusLineItem::FastMode => Some(self.fast_mode_display_line()),
-+            _ => self.status_line_value_for_item(*item).map(Line::from),
++    fn status_line_thread_title_display_line(&self) -> Option<Line<'static>> {
++        let name = self
++            .thread_name
++            .as_ref()
++            .map(|name| name.trim())
++            .filter(|name| !name.is_empty());
++        match (name, self.thread_id) {
++            (Some(name), Some(thread_id)) => Some(Line::from(vec![
++                Span::from(name.to_string()),
++                Span::from(" "),
++                Span::styled(
++                    thread_id.to_string(),
++                    status_line_style_for_item(
++                        StatusLineItem::SessionId,
++                        self.config.tui_status_line_use_colors,
++                    ),
++                ),
++            ])),
++            (Some(name), None) => Some(Line::from(name.to_string())),
++            (None, Some(thread_id)) => Some(Line::from(thread_id.to_string())),
++            (None, None) => None,
 +        }
 +    }
 +
      pub(super) fn status_surface_preview_value_for_item(
          &mut self,
          item: StatusSurfacePreviewItem,
-@@ -789,7 +800,12 @@ impl ChatWidget {
-     }
- 
-     fn model_with_reasoning_display_name(&self) -> String {
--        let label = self.reasoning_display_name();
-+        let (model, reasoning_effort) = self
-+            .active_turn_model_context
-+            .as_ref()
-+            .map(|context| (context.model.as_str(), context.reasoning_effort.clone()))
-+            .unwrap_or_else(|| (self.model_display_name(), self.effective_reasoning_effort()));
-+        let label = Self::status_line_reasoning_effort_label(reasoning_effort.as_ref());
-         let service_tier_label = self
-             .current_service_tier()
-             .and_then(|service_tier| {
-@@ -801,11 +817,109 @@ impl ChatWidget {
-             .filter(|_| self.has_chatgpt_account)
-             .map(|tier| format!(" {tier}"))
-             .unwrap_or_default();
--        format!("{} {label}{service_tier_label}", self.model_display_name())
-+        format!("{model} {label}{service_tier_label}")
-+    }
-+
-+    fn model_display_line(&self) -> Line<'static> {
-+        let model = self
-+            .active_turn_model_context
-+            .as_ref()
-+            .map(|context| context.model.as_str())
-+            .unwrap_or_else(|| self.model_display_name());
-+        Line::from(Span::styled(model.to_string(), model_style(model)))
-     }
- 
-     pub(crate) fn model_with_reasoning_display_line(&self) -> Line<'static> {
--        Line::from(self.model_with_reasoning_display_name())
-+        let fallback_effort;
-+        let (model, effort) = if let Some(context) = self.active_turn_model_context.as_ref() {
-+            (context.model.as_str(), context.reasoning_effort.as_ref())
-+        } else {
-+            fallback_effort = self.effective_reasoning_effort();
-+            (self.model_display_name(), fallback_effort.as_ref())
-+        };
-+        let label = Self::status_line_reasoning_effort_label(effort);
-+        let service_tier_label = self
-+            .current_service_tier()
-+            .and_then(|service_tier| {
-+                self.current_model_service_tier_commands()
-+                    .into_iter()
-+                    .find(|tier| tier.id == service_tier)
-+                    .map(|tier| tier.name)
-+            })
-+            .filter(|_| self.has_chatgpt_account)
-+            .map(|tier| format!(" {tier}"))
-+            .unwrap_or_default();
-+        let mut line = Line::from(vec![
-+            Span::styled(model.to_string(), model_style(model)),
-+            " ".into(),
-+        ]);
-+        line.extend(Self::status_line_reasoning_effort_line(label, effort).spans);
-+        line.spans.push(Span::from(service_tier_label));
-+        line
-+    }
-+
-+    fn status_line_reasoning_effort_line(
-+        label: String,
-+        effort: Option<&ReasoningEffortConfig>,
-+    ) -> Line<'static> {
-+        let span = Span::from(label.clone());
-+        match effort {
-+            Some(ReasoningEffortConfig::Minimal) | Some(ReasoningEffortConfig::Low) => {
-+                Line::from(span.yellow())
+@@ -689,7 +722,6 @@ impl ChatWidget {
+             StatusSurfacePreviewItem::Status => return Some(self.run_state_status_text()),
+             StatusSurfacePreviewItem::TaskProgress => return self.terminal_title_task_progress(),
+             StatusSurfacePreviewItem::CurrentDir => StatusLineItem::CurrentDir,
+-            StatusSurfacePreviewItem::ThreadTitle => StatusLineItem::ThreadTitle,
+             StatusSurfacePreviewItem::GitBranch => StatusLineItem::GitBranch,
+             StatusSurfacePreviewItem::PullRequestNumber => StatusLineItem::PullRequestNumber,
+             StatusSurfacePreviewItem::BranchChanges => StatusLineItem::BranchChanges,
+@@ -698,6 +730,11 @@ impl ChatWidget {
+             StatusSurfacePreviewItem::ResponsesStreamConnection => {
+                 StatusLineItem::ResponsesStreamConnection
+             }
++            StatusSurfacePreviewItem::ThreadTitle => {
++                return self
++                    .status_line_thread_title_display_line()
++                    .map(line_plain_text);
 +            }
-+            #[allow(clippy::disallowed_methods)]
-+            Some(ReasoningEffortConfig::Medium) => Line::from(span.fg(Color::Rgb(255, 128, 0))),
-+            Some(ReasoningEffortConfig::High) => Line::from(span.red()),
-+            Some(ReasoningEffortConfig::XHigh) => Line::from(
-+                span.content
-+                    .chars()
-+                    .zip(
-+                        [
-+                            Color::Red,
-+                            Color::Yellow,
-+                            Color::Green,
-+                            Color::Cyan,
-+                            Color::Blue,
-+                            Color::Magenta,
-+                        ]
-+                        .into_iter()
-+                        .cycle(),
-+                    )
-+                    .map(|(ch, color)| Span::from(ch.to_string()).fg(color))
-+                    .collect::<Vec<_>>(),
-+            ),
-+            None | Some(ReasoningEffortConfig::None) | Some(ReasoningEffortConfig::Custom(_)) => {
-+                Line::from(span)
-+            }
-+        }
-+    }
-+
-+    fn fast_mode_display_line(&self) -> Line<'static> {
-+        if self.current_service_tier() == Some(ServiceTier::Fast.request_value()) {
-+            Line::from(vec!["Fast ".into(), "on".red()])
-+        } else {
-+            Line::from("Fast off")
-+        }
-+    }
-+
-+    #[cfg(test)]
-+    fn status_line_reasoning_effort_span(
-+        label: String,
-+        effort: Option<&ReasoningEffortConfig>,
-+    ) -> Span<'static> {
-+        let span = Span::from(label);
-+        match effort {
-+            Some(ReasoningEffortConfig::Minimal) | Some(ReasoningEffortConfig::Low) => {
-+                span.yellow()
-+            }
-+            #[allow(clippy::disallowed_methods)]
-+            Some(ReasoningEffortConfig::Medium) => span.fg(Color::Rgb(255, 128, 0)),
-+            Some(ReasoningEffortConfig::High) => span.red(),
-+            Some(ReasoningEffortConfig::XHigh)
-+            | None
-+            | Some(ReasoningEffortConfig::None)
-+            | Some(ReasoningEffortConfig::Custom(_)) => span,
-+        }
-     }
- 
-     /// Computes the compact runtime status label used by word-based status items.
-@@ -1074,3 +1188,102 @@ where
-     }
-     (items, invalid)
- }
-+
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+    use pretty_assertions::assert_eq;
-+
-+    #[allow(clippy::disallowed_methods)]
-+    #[test]
-+    fn reasoning_effort_status_line_uses_color_without_dim_override() {
-+        let cases = [
-+            (Some(ReasoningEffortConfig::Minimal), Some(Color::Yellow)),
-+            (Some(ReasoningEffortConfig::Low), Some(Color::Yellow)),
-+            (
-+                Some(ReasoningEffortConfig::Medium),
-+                Some(Color::Rgb(255, 128, 0)),
-+            ),
-+            (Some(ReasoningEffortConfig::High), Some(Color::Red)),
-+            (Some(ReasoningEffortConfig::None), None),
-+            (None, None),
-+        ];
-+
-+        for (effort, expected_color) in cases {
-+            let label = ChatWidget::status_line_reasoning_effort_label(effort.as_ref());
-+            let span = ChatWidget::status_line_reasoning_effort_span(label, effort.as_ref());
-+            assert_eq!(span.style.fg, expected_color, "effort: {effort:?}");
-+            assert_eq!(
-+                span.style.add_modifier.contains(Modifier::DIM),
-+                false,
-+                "effort: {effort:?}"
-+            );
-+            assert_eq!(
-+                span.style.sub_modifier.contains(Modifier::DIM),
-+                false,
-+                "effort: {effort:?}"
-+            );
-+        }
-+    }
-+
-+    #[test]
-+    fn xhigh_reasoning_effort_status_line_is_multicolor() {
-+        let line = ChatWidget::status_line_reasoning_effort_line(
-+            "xhigh".to_string(),
-+            Some(&ReasoningEffortConfig::XHigh),
-+        );
-+
-+        assert_eq!(
-+            line.spans
-+                .iter()
-+                .map(|span| span.content.as_ref())
-+                .collect::<String>(),
-+            "xhigh"
-+        );
-+        assert_eq!(line.spans.len(), 5);
-+        assert!(
-+            line.spans
-+                .iter()
-+                .all(|span| !span.style.add_modifier.contains(Modifier::DIM))
-+        );
-+        assert!(
-+            line.spans
-+                .iter()
-+                .all(|span| !span.style.sub_modifier.contains(Modifier::DIM))
-+        );
-+        assert!(line.spans.iter().any(|span| span.style.fg.is_some()));
-+    }
-+
-+    #[test]
-+    fn fast_mode_on_status_line_is_red_without_dim_override() {
-+        let line = Line::from(vec!["Fast ".into(), "on".red()]);
-+        let on = &line.spans[1];
-+
-+        assert_eq!(on.content.as_ref(), "on");
-+        assert_eq!(on.style.fg, Some(Color::Red));
-+        assert_eq!(on.style.add_modifier.contains(Modifier::DIM), false);
-+        assert_eq!(on.style.sub_modifier.contains(Modifier::DIM), false);
-+    }
-+
-+    #[test]
-+    #[allow(clippy::disallowed_methods)]
-+    fn model_status_line_style_uses_stable_model_color_without_theme_colors() {
-+        let line = status_line_from_segments(
-+            [(
-+                StatusLineItem::ModelName,
-+                Line::from(vec![Span::styled(
-+                    "gpt-5.3-codex",
-+                    model_style("gpt-5.3-codex"),
-+                )]),
-+            )],
-+            /*use_theme_colors*/ false,
-+        )
-+        .expect("status line");
-+        let model = &line.spans[0];
-+
-+        assert_eq!(model.content.as_ref(), "gpt-5.3-codex");
-+        assert_eq!(model.style.fg, Some(Color::Rgb(167, 139, 250)));
-+        assert_eq!(model.style.add_modifier.contains(Modifier::DIM), false);
-+        assert_eq!(model.style.sub_modifier.contains(Modifier::DIM), false);
-+    }
-+}
+             StatusSurfacePreviewItem::ContextRemaining => StatusLineItem::ContextRemaining,
+             StatusSurfacePreviewItem::ContextUsed => StatusLineItem::ContextUsed,
+             StatusSurfacePreviewItem::FiveHourLimit => StatusLineItem::FiveHourLimit,
 diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
-index 234676e52c..7a480df5ef 100644
+index 7a480df5ef..696f0b716f 100644
 --- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
 +++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
-@@ -2511,6 +2511,24 @@ async fn status_line_model_with_reasoning_updates_on_mode_switch_without_manual_
+@@ -2570,7 +2570,8 @@ async fn renamed_thread_footer_title_snapshot() {
+     chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
+     chat.refresh_status_line();
+ 
+-    let thread_id = ThreadId::new();
++    let thread_id =
++        ThreadId::from_string("019ec648-02b1-73d3-8320-4851d6a19952").expect("valid thread id");
+     chat.thread_id = Some(thread_id);
+     chat.handle_server_notification(
+         ServerNotification::ThreadNameUpdated(
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs b/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
+index 8654b37d24..f4aae6d7c5 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
+@@ -61,6 +61,13 @@ fn cache_project_root(chat: &mut ChatWidget, root_name: &str) {
+     });
+ }
+ 
++fn cache_missing_project_root(chat: &mut ChatWidget) {
++    chat.status_line_project_root_name_cache = Some(CachedProjectRootName {
++        cwd: chat.config.cwd.to_path_buf(),
++        root_name: None,
++    });
++}
++
+ fn cache_rate_limit_snapshot(chat: &mut ChatWidget) {
+     chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
+         limit_id: None,
+@@ -129,6 +136,7 @@ async fn status_line_setup_popup_live_only_snapshot() {
+ #[tokio::test]
+ async fn status_surface_preview_lines_hardcoded_only_snapshot() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    cache_project_root(&mut chat, "my-project");
+ 
+     let snapshot = combined_preview_snapshot(
+         &mut chat,
+@@ -165,9 +173,27 @@ async fn thread_title_falls_back_to_thread_id_when_unnamed() {
      );
  }
  
 +#[tokio::test]
-+async fn status_line_model_with_reasoning_uses_submitted_turn_context_while_pending() {
-+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
-+    chat.thread_id = Some(ThreadId::new());
-+    chat.config.tui_status_line = Some(vec!["model-with-reasoning".to_string()]);
-+    chat.set_reasoning_effort(Some(ReasoningEffortConfig::High));
++async fn status_line_thread_title_includes_thread_id_when_named() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    let thread_id = ThreadId::new();
++    chat.thread_id = Some(thread_id);
++    chat.thread_name = Some(" Roadmap cleanup ".to_string());
 +
-+    chat.submit_user_message(UserMessage::from("run with gpt-5"));
-+    chat.set_model("gpt-5.4");
-+    chat.set_reasoning_effort(Some(ReasoningEffortConfig::Low));
-+
-+    assert_eq!(status_line_text(&chat), Some("gpt-5 high".to_string()));
-+
-+    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
-+
-+    assert_eq!(status_line_text(&chat), Some("gpt-5.4 low".to_string()));
++    assert_eq!(
++        status_preview_line(&mut chat, &[StatusLineItem::ThreadTitle]),
++        format!("Roadmap cleanup {thread_id}")
++    );
++    assert_eq!(
++        title_preview_line(&mut chat, &[TerminalTitleItem::Thread]),
++        "Roadmap cleanup"
++    );
 +}
 +
  #[tokio::test]
- async fn status_line_model_with_reasoning_plan_mode_footer_snapshot() {
-     use ratatui::Terminal;
+ async fn status_line_setup_popup_hardcoded_only_snapshot() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    cache_project_root(&mut chat, "my-project");
+     chat.config.tui_status_line = Some(vec![
+         "project-name".to_string(),
+         "git-branch".to_string(),
+@@ -183,6 +209,7 @@ async fn status_line_setup_popup_hardcoded_only_snapshot() {
+ #[tokio::test]
+ async fn status_surface_preview_lines_mixed_snapshot() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    cache_missing_project_root(&mut chat);
+     chat.status_line_branch = Some("feature/mixed-preview".to_string());
+     chat.thread_name = Some("Mixed preview thread".to_string());
+ 
+@@ -280,6 +307,7 @@ async fn status_line_setup_popup_rate_limits_snapshot() {
+ #[tokio::test]
+ async fn status_line_setup_popup_mixed_snapshot() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    cache_project_root(&mut chat, "my-project");
+     chat.status_line_branch = Some("feature/mixed-preview".to_string());
+     chat.thread_name = Some("Mixed preview thread".to_string());
+     chat.config.tui_status_line = Some(vec![
+@@ -332,6 +360,7 @@ async fn terminal_title_setup_popup_hardcoded_only_snapshot() {
+ #[tokio::test]
+ async fn terminal_title_setup_popup_mixed_snapshot() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    cache_missing_project_root(&mut chat);
+     chat.thread_name = Some("Mixed preview thread".to_string());
+     chat.config.tui_terminal_title = Some(vec![
+         "project-name".to_string(),
+@@ -363,6 +392,7 @@ async fn terminal_title_setup_popup_rate_limits_snapshot() {
+ #[tokio::test]
+ async fn missing_project_root_uses_different_status_and_title_preview_sources() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    cache_missing_project_root(&mut chat);
+ 
+     let status_preview = status_preview_line(&mut chat, &[StatusLineItem::ProjectRoot]);
+     let title_preview = title_preview_line(&mut chat, &[TerminalTitleItem::Project]);
+diff --git a/codex-rs/tui/src/chatwidget/tests/terminal_title.rs b/codex-rs/tui/src/chatwidget/tests/terminal_title.rs
+index 7445162759..5c01974d4e 100644
+--- a/codex-rs/tui/src/chatwidget/tests/terminal_title.rs
++++ b/codex-rs/tui/src/chatwidget/tests/terminal_title.rs
+@@ -3,9 +3,17 @@
+ use super::*;
+ use pretty_assertions::assert_eq;
+ 
++fn cache_missing_project_root(chat: &mut ChatWidget) {
++    chat.status_line_project_root_name_cache = Some(CachedProjectRootName {
++        cwd: chat.config.cwd.to_path_buf(),
++        root_name: None,
++    });
++}
++
+ #[tokio::test]
+ async fn terminal_title_shows_action_required_while_exec_approval_is_pending() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    cache_missing_project_root(&mut chat);
+     chat.bottom_pane.set_task_running(/*running*/ true);
+     chat.refresh_terminal_title();
+ 
+@@ -48,6 +56,7 @@ async fn terminal_title_shows_action_required_while_exec_approval_is_pending() {
+ #[tokio::test]
+ async fn terminal_title_action_required_respects_spinner_setting() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    cache_missing_project_root(&mut chat);
+     chat.config.tui_terminal_title = Some(vec!["project".to_string()]);
+     chat.bottom_pane.set_task_running(/*running*/ true);
+     chat.refresh_terminal_title();
+@@ -77,6 +86,7 @@ async fn terminal_title_action_required_respects_spinner_setting() {
+ #[tokio::test]
+ async fn terminal_title_action_required_blinks_when_animations_are_enabled() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    cache_missing_project_root(&mut chat);
+     chat.bottom_pane.set_task_running(/*running*/ true);
+     chat.terminal_title_animation_origin = Instant::now() - std::time::Duration::from_millis(1500);
+     chat.refresh_terminal_title();
+@@ -109,6 +119,7 @@ async fn terminal_title_action_required_blinks_when_animations_are_enabled() {
+ #[tokio::test]
+ async fn terminal_title_activity_indicators_do_not_animate_when_animations_are_disabled() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    cache_missing_project_root(&mut chat);
+     chat.config.animations = false;
+     chat.bottom_pane.set_task_running(/*running*/ true);
+     chat.terminal_title_animation_origin = Instant::now() - std::time::Duration::from_millis(1500);

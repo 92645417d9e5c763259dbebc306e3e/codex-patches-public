@@ -1,438 +1,519 @@
-diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
-index bf90b1c475..932a81ebf3 100644
---- a/codex-rs/cli/src/main.rs
-+++ b/codex-rs/cli/src/main.rs
-@@ -706,6 +706,7 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
-         token_usage,
-         thread_id: conversation_id,
-         resume_hint,
-+        exit_reason,
-         ..
-     } = exit_info;
- 
-@@ -720,7 +721,14 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
-         } else {
-             resume_cmd
-         };
--        lines.push(format!("To continue this session, run {command}"));
-+        if matches!(exit_reason, ExitReason::Detached) {
-+            if let Some(conversation_id) = conversation_id {
-+                lines.push(format!("Detached session: {conversation_id}"));
-+            }
-+            lines.push(format!("Reattach with: {command}"));
-+        } else {
-+            lines.push(format!("To continue this session, run {command}"));
-+        }
-     } else if is_fatal && let Some(conversation_id) = conversation_id {
-         lines.push(format!("Session ID: {conversation_id}"));
-     }
-@@ -735,7 +743,7 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
-             eprintln!("ERROR: {message}");
-             true
-         }
--        ExitReason::UserRequested => false,
-+        ExitReason::UserRequested | ExitReason::Detached => false,
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index 678ece0080..9b3db6ac2a 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -5302,6 +5302,7 @@ fn session_start_error_surfaces_archived_guidance_without_rollout_path() {
+             "/Users/me/.codex/archived_sessions/rollout.jsonl",
+         )),
+         thread_id,
++        status: None,
      };
+     let expected = format!(
+         "session {thread_id} is archived. Run `codex unarchive {thread_id}` to unarchive it first."
+diff --git a/codex-rs/tui/src/app/tests/startup.rs b/codex-rs/tui/src/app/tests/startup.rs
+index 3d9b199d78..87ad6d454a 100644
+--- a/codex-rs/tui/src/app/tests/startup.rs
++++ b/codex-rs/tui/src/app/tests/startup.rs
+@@ -19,6 +19,7 @@ fn startup_waiting_gate_is_only_for_fresh_or_exit_session_selection() {
+             crate::resume_picker::SessionTarget {
+                 path: Some(PathBuf::from("/tmp/restore")),
+                 thread_id: ThreadId::new(),
++                status: None,
+             }
+         )),
+         false
+@@ -28,6 +29,7 @@ fn startup_waiting_gate_is_only_for_fresh_or_exit_session_selection() {
+             crate::resume_picker::SessionTarget {
+                 path: Some(PathBuf::from("/tmp/fork")),
+                 thread_id: ThreadId::new(),
++                status: None,
+             }
+         )),
+         false
+@@ -39,10 +41,12 @@ fn startup_paused_goal_prompt_gate_is_only_for_quiet_resume() {
+     let resume = SessionSelection::Resume(crate::resume_picker::SessionTarget {
+         path: Some(PathBuf::from("/tmp/restore")),
+         thread_id: ThreadId::new(),
++        status: None,
+     });
+     let fork = SessionSelection::Fork(crate::resume_picker::SessionTarget {
+         path: Some(PathBuf::from("/tmp/fork")),
+         thread_id: ThreadId::new(),
++        status: None,
+     });
+     let no_images: Vec<PathBuf> = Vec::new();
+     let initial_images = vec![PathBuf::from("/tmp/image.png")];
+@@ -111,6 +115,7 @@ fn startup_waiting_gate_not_applied_for_resume_or_fork_session_selection() {
+         crate::resume_picker::SessionTarget {
+             path: Some(PathBuf::from("/tmp/restore")),
+             thread_id: ThreadId::new(),
++            status: None,
+         },
+     ));
+     assert_eq!(
+@@ -124,6 +129,7 @@ fn startup_waiting_gate_not_applied_for_resume_or_fork_session_selection() {
+         crate::resume_picker::SessionTarget {
+             path: Some(PathBuf::from("/tmp/fork")),
+             thread_id: ThreadId::new(),
++            status: None,
+         },
+     ));
+     assert_eq!(
+@@ -268,6 +274,7 @@ async fn ignore_same_thread_resume_reports_noop_for_current_thread() {
+     let ignored = app.ignore_same_thread_resume(&crate::resume_picker::SessionTarget {
+         path: Some(test_path_buf("/tmp/project")),
+         thread_id,
++        status: None,
+     });
  
-     let update_action = exit_info.update_action;
-@@ -3074,6 +3082,14 @@ mod tests {
-     }
+     assert!(ignored);
+@@ -292,6 +299,7 @@ async fn ignore_same_thread_resume_allows_reattaching_displayed_inactive_thread(
+     let ignored = app.ignore_same_thread_resume(&crate::resume_picker::SessionTarget {
+         path: Some(test_path_buf("/tmp/project")),
+         thread_id,
++        status: None,
+     });
  
-     fn sample_exit_info(conversation_id: Option<&str>, thread_name: Option<&str>) -> AppExitInfo {
-+        sample_exit_info_with_reason(conversation_id, thread_name, ExitReason::UserRequested)
-+    }
-+
-+    fn sample_exit_info_with_reason(
-+        conversation_id: Option<&str>,
-+        thread_name: Option<&str>,
-+        exit_reason: ExitReason,
-+    ) -> AppExitInfo {
-         let token_usage = TokenUsage {
-             output_tokens: 2,
-             total_tokens: 2,
-@@ -3087,7 +3103,7 @@ mod tests {
+     assert!(!ignored);
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index 57f6bf0f07..15bb014af0 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -38,6 +38,7 @@ use codex_app_server_protocol::ThreadListCwdFilter;
+ use codex_app_server_protocol::ThreadListParams;
+ use codex_app_server_protocol::ThreadSortKey as AppServerThreadSortKey;
+ use codex_app_server_protocol::ThreadSourceKind;
++use codex_app_server_protocol::ThreadStatus;
+ use codex_cloud_config::cloud_config_bundle_loader_for_storage;
+ use codex_config::CloudConfigBundleLoader;
+ use codex_config::ConfigLoadError;
+@@ -577,6 +578,7 @@ fn session_target_from_app_server_thread(
+         Ok(thread_id) => Some(resume_picker::SessionTarget {
+             path: thread.path,
              thread_id,
-             resume_hint: codex_utils_cli::resume_hint(thread_name, thread_id),
-             update_action: None,
--            exit_reason: ExitReason::UserRequested,
-+            exit_reason,
-         }
++            status: Some(thread.status),
+         }),
+         Err(err) => {
+             warn!(
+@@ -784,6 +786,40 @@ fn latest_session_cwd_filter<'a>(
      }
+ }
  
-@@ -3182,6 +3198,24 @@ mod tests {
-         );
++fn is_active_app_server_resume(
++    app_server_target: &AppServerTarget,
++    session_selection: &resume_picker::SessionSelection,
++) -> bool {
++    is_persistent_app_server_resume(app_server_target, session_selection)
++        && matches!(
++            session_selection,
++            resume_picker::SessionSelection::Resume(resume_picker::SessionTarget {
++                status: Some(ThreadStatus::Active { .. }),
++                ..
++            })
++        )
++}
++
++fn is_persistent_app_server_resume(
++    app_server_target: &AppServerTarget,
++    session_selection: &resume_picker::SessionSelection,
++) -> bool {
++    !matches!(app_server_target, AppServerTarget::Embedded)
++        && matches!(
++            session_selection,
++            resume_picker::SessionSelection::Resume(_)
++        )
++}
++
++fn persistent_app_server_resume_fallback_cwd(
++    app_server_target: &AppServerTarget,
++    session_selection: &resume_picker::SessionSelection,
++    current_cwd: &Path,
++) -> Option<PathBuf> {
++    is_active_app_server_resume(app_server_target, session_selection)
++        .then(|| current_cwd.to_path_buf())
++}
++
+ fn app_server_target_for_launch(
+     explicit_remote_endpoint: Option<RemoteAppServerEndpoint>,
+     explicit_remote_endpoint_is_default_local_daemon: bool,
+@@ -1616,9 +1652,17 @@ async fn run_ratatui_app(
+         }
+         _ => None,
+     };
++    let is_persistent_resume =
++        is_persistent_app_server_resume(&app_server_target, &session_selection);
+     let fallback_cwd = match action_and_target_session_if_resume_or_fork {
+         Some((action, target_session)) => {
+-            if uses_remote_workspace {
++            if let Some(cwd) = persistent_app_server_resume_fallback_cwd(
++                &app_server_target,
++                &session_selection,
++                current_cwd.as_path(),
++            ) {
++                Some(cwd)
++            } else if uses_remote_workspace {
+                 Some(current_cwd.to_path_buf())
+             } else {
+                 match resolve_cwd_for_resume_or_fork(
+@@ -1752,11 +1796,6 @@ async fn run_ratatui_app(
+ 
+     // Persistent app-server resumes may attach to an already-running thread,
+     // where resume config overrides are ignored.
+-    let is_persistent_resume = !matches!(&app_server_target, AppServerTarget::Embedded)
+-        && matches!(
+-            &session_selection,
+-            resume_picker::SessionSelection::Resume(_)
+-        );
+     let bypass_hook_trust_for_startup_review = config.bypass_hook_trust && !is_persistent_resume;
+     let hooks_request_handle = app_server.request_handle();
+     let hooks_cwd = config.cwd.to_path_buf();
+@@ -2172,6 +2211,7 @@ mod tests {
+         let target = crate::resume_picker::SessionTarget {
+             path: None,
+             thread_id,
++            status: None,
+         };
+ 
+         assert_eq!(target.display_label(), format!("thread {thread_id}"));
+@@ -2459,6 +2499,56 @@ mod tests {
+         Ok(())
      }
  
 +    #[test]
-+    fn format_exit_messages_reports_detached_session() {
-+        let exit_info = sample_exit_info_with_reason(
-+            Some("123e4567-e89b-12d3-a456-426614174000"),
-+            /*thread_name*/ None,
-+            ExitReason::Detached,
-+        );
-+        let lines = format_exit_messages(exit_info, /*color_enabled*/ false);
++    fn active_app_server_resume_skips_cwd_prompt() -> color_eyre::Result<()> {
++        let active_session = resume_picker::SessionTarget {
++            path: Some(PathBuf::from(
++                "/tmp/codex/sessions/2026/06/05/rollout.jsonl",
++            )),
++            thread_id: ThreadId::new(),
++            status: Some(ThreadStatus::Active {
++                active_flags: Vec::new(),
++            }),
++        };
++        let idle_session = resume_picker::SessionTarget {
++            path: None,
++            thread_id: ThreadId::new(),
++            status: Some(ThreadStatus::Idle),
++        };
++        let current_cwd = PathBuf::from("/workspace/project");
++        let local_daemon = AppServerTarget::LocalDaemon {
++            endpoint: RemoteAppServerEndpoint::UnixSocket {
++                socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
++            },
++        };
++
++        assert!(is_active_app_server_resume(
++            &local_daemon,
++            &resume_picker::SessionSelection::Resume(active_session.clone())
++        ));
 +        assert_eq!(
-+            lines,
-+            vec![
-+                "Token usage: total=2 input=0 output=2".to_string(),
-+                "Detached session: 123e4567-e89b-12d3-a456-426614174000".to_string(),
-+                "Reattach with: codex resume 123e4567-e89b-12d3-a456-426614174000".to_string(),
-+            ]
++            persistent_app_server_resume_fallback_cwd(
++                &local_daemon,
++                &resume_picker::SessionSelection::Resume(active_session.clone()),
++                current_cwd.as_path()
++            ),
++            Some(current_cwd.clone())
 +        );
++        assert!(!is_active_app_server_resume(
++            &local_daemon,
++            &resume_picker::SessionSelection::Resume(idle_session)
++        ));
++        assert!(!is_active_app_server_resume(
++            &AppServerTarget::Embedded,
++            &resume_picker::SessionSelection::Resume(active_session.clone())
++        ));
++        assert!(!is_active_app_server_resume(
++            &local_daemon,
++            &resume_picker::SessionSelection::Fork(active_session)
++        ));
++        Ok(())
 +    }
 +
-     #[test]
-     fn resume_model_flag_applies_when_no_root_flags() {
-         let interactive =
-diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
-index 2f598c00af..eabf277274 100644
---- a/codex-rs/tui/src/app.rs
-+++ b/codex-rs/tui/src/app.rs
-@@ -428,6 +428,7 @@ pub(crate) enum AppRunControl {
- #[derive(Debug, Clone)]
- pub enum ExitReason {
-     UserRequested,
-+    Detached,
-     Fatal(String),
+     #[tokio::test]
+     async fn latest_session_lookup_params_omit_local_filters_for_remote_sessions()
+     -> std::io::Result<()> {
+diff --git a/codex-rs/tui/src/resume_picker.rs b/codex-rs/tui/src/resume_picker.rs
+index b21b8a08cb..fcc9190aeb 100644
+--- a/codex-rs/tui/src/resume_picker.rs
++++ b/codex-rs/tui/src/resume_picker.rs
+@@ -38,6 +38,7 @@ use codex_app_server_protocol::ThreadItem;
+ use codex_app_server_protocol::ThreadListCwdFilter;
+ use codex_app_server_protocol::ThreadListParams;
+ use codex_app_server_protocol::ThreadSortKey;
++use codex_app_server_protocol::ThreadStatus;
+ use codex_config::types::SessionPickerViewMode;
+ use codex_protocol::ThreadId;
+ use codex_utils_path as path_utils;
+@@ -82,6 +83,7 @@ const PICKER_LIST_HORIZONTAL_INSET: u16 = 4;
+ pub struct SessionTarget {
+     pub path: Option<PathBuf>,
+     pub thread_id: ThreadId,
++    pub status: Option<ThreadStatus>,
  }
  
-diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
-index 55f976e3b8..78bb483391 100644
---- a/codex-rs/tui/src/app/event_dispatch.rs
-+++ b/codex-rs/tui/src/app/event_dispatch.rs
-@@ -320,7 +320,9 @@ impl App {
-                 }
-             }
-             AppEvent::Exit(mode) => {
--                if mode == ExitMode::ShutdownFirst {
-+                if mode == ExitMode::ShutdownFirst
-+                    || (mode == ExitMode::Detach && !self.app_server_target.supports_detach())
-+                {
-                     self.show_shutdown_feedback(tui)?;
-                 }
-                 return Ok(self.handle_exit_mode(app_server, mode).await);
-@@ -2290,6 +2292,14 @@ impl App {
-                 self.pending_shutdown_exit_thread_id = None;
-                 AppRunControl::Exit(ExitReason::UserRequested)
-             }
-+            ExitMode::Detach => {
-+                if self.app_server_target.supports_detach() {
-+                    self.pending_shutdown_exit_thread_id = None;
-+                    AppRunControl::Exit(ExitReason::Detached)
-+                } else {
-+                    Box::pin(self.handle_exit_mode(app_server, ExitMode::ShutdownFirst)).await
-+                }
-+            }
-             ExitMode::Immediate => {
-                 self.pending_shutdown_exit_thread_id = None;
-                 AppRunControl::Exit(ExitReason::UserRequested)
-diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
-index 082dcd1f1c..afb97b7d81 100644
---- a/codex-rs/tui/src/app/tests.rs
-+++ b/codex-rs/tui/src/app/tests.rs
-@@ -6175,6 +6175,56 @@ async fn shutdown_first_exit_uses_app_server_shutdown_without_submitting_op() {
-     );
- }
- 
-+#[tokio::test]
-+async fn detach_exit_falls_back_to_shutdown_first_for_embedded_app_server() {
-+    let (mut app, _app_event_rx, mut op_rx) = Box::pin(make_test_app_with_channels()).await;
-+    let thread_id = ThreadId::new();
-+    app.active_thread_id = Some(thread_id);
-+
-+    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
-+        app.chat_widget.config_ref(),
-+    ))
-+    .await
-+    .expect("embedded app server");
-+    let control = Box::pin(app.handle_exit_mode(&mut app_server, ExitMode::Detach)).await;
-+
-+    assert_eq!(app.pending_shutdown_exit_thread_id, None);
-+    assert!(matches!(
-+        control,
-+        AppRunControl::Exit(ExitReason::UserRequested)
-+    ));
-+    assert!(
-+        op_rx.try_recv().is_err(),
-+        "embedded detach fallback should use app-server shutdown, not Op::Shutdown"
-+    );
-+}
-+
-+#[tokio::test]
-+async fn detach_exit_leaves_local_daemon_thread_running() {
-+    let (mut app, _app_event_rx, mut op_rx) = Box::pin(make_test_app_with_channels()).await;
-+    let thread_id = ThreadId::new();
-+    app.active_thread_id = Some(thread_id);
-+    app.app_server_target = crate::AppServerTarget::LocalDaemon {
-+        endpoint: crate::RemoteAppServerEndpoint::UnixSocket {
-+            socket_path: test_absolute_path("/tmp/codex-test.sock"),
-+        },
-+    };
-+
-+    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
-+        app.chat_widget.config_ref(),
-+    ))
-+    .await
-+    .expect("embedded app server");
-+    let control = Box::pin(app.handle_exit_mode(&mut app_server, ExitMode::Detach)).await;
-+
-+    assert_eq!(app.pending_shutdown_exit_thread_id, None);
-+    assert!(matches!(control, AppRunControl::Exit(ExitReason::Detached)));
-+    assert!(
-+        op_rx.try_recv().is_err(),
-+        "detaching from a separate app-server should not submit shutdown"
-+    );
-+}
-+
- #[tokio::test]
- async fn interrupt_without_active_turn_is_treated_as_handled() {
-     Box::pin(async {
-diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
-index 6f80bac27b..47f463629d 100644
---- a/codex-rs/tui/src/app_event.rs
-+++ b/codex-rs/tui/src/app_event.rs
-@@ -1072,6 +1072,11 @@ pub(crate) struct PermissionProfileSelection {
- pub(crate) enum ExitMode {
-     /// Shutdown core and exit after completion.
-     ShutdownFirst,
-+    /// Detach from a thread owned by a separate app-server process.
-+    ///
-+    /// Embedded sessions fall back to `ShutdownFirst` because there is no
-+    /// independent process to keep the thread alive after the TUI exits.
-+    Detach,
-     /// Exit the UI loop immediately without waiting for shutdown.
-     ///
-     /// This skips `Op::Shutdown`, so any in-flight work may be dropped and
-diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
-index 3226d6ca3c..6c1fc25709 100644
---- a/codex-rs/tui/src/chatwidget.rs
-+++ b/codex-rs/tui/src/chatwidget.rs
-@@ -1429,12 +1429,20 @@ impl ChatWidget {
-     /// Request a shutdown-first quit.
-     ///
-     /// This is used for explicit quit commands (`/quit`, `/exit`, `/logout`) and for
--    /// the double-press Ctrl+C/Ctrl+D quit shortcut.
-+    /// the double-press Ctrl+C quit shortcut.
-     fn request_quit_without_confirmation(&self) {
-         self.app_event_tx
-             .send(AppEvent::Exit(ExitMode::ShutdownFirst));
-     }
- 
-+    /// Request a detach-or-quit exit.
-+    ///
-+    /// The app layer decides whether the active app-server target can keep the
-+    /// thread alive outside this TUI process.
-+    fn request_detach_without_confirmation(&self) {
-+        self.app_event_tx.send(AppEvent::Exit(ExitMode::Detach));
-+    }
-+
-     pub(crate) fn show_shutdown_in_progress(&mut self) {
-         self.bottom_pane.show_shutdown_in_progress();
-     }
-diff --git a/codex-rs/tui/src/chatwidget/interaction.rs b/codex-rs/tui/src/chatwidget/interaction.rs
-index 4ee2703170..0eebfb1ea3 100644
---- a/codex-rs/tui/src/chatwidget/interaction.rs
-+++ b/codex-rs/tui/src/chatwidget/interaction.rs
-@@ -462,8 +462,9 @@ impl ChatWidget {
- 
-     /// Handles a Ctrl+D press at the chat-widget layer.
-     ///
--    /// Ctrl-D only participates in quit when the composer is empty and no modal/popup is active.
--    /// Otherwise it should be routed to the active view and not attempt to quit.
-+    /// Ctrl-D only participates in detach/quit when the composer is empty and no
-+    /// modal/popup is active. Otherwise it should be routed to the active view
-+    /// and not attempt to exit.
-     fn on_ctrl_d(&mut self) -> bool {
-         let key = key_hint::ctrl(KeyCode::Char('d'));
-         if !DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED {
-@@ -472,14 +473,14 @@ impl ChatWidget {
-                 return false;
-             }
- 
--            self.request_quit_without_confirmation();
-+            self.request_detach_without_confirmation();
-             return true;
-         }
- 
-         if self.quit_shortcut_active_for(key) {
-             self.quit_shortcut_expires_at = None;
-             self.quit_shortcut_key = None;
--            self.request_quit_without_confirmation();
-+            self.request_detach_without_confirmation();
-             return true;
-         }
- 
-diff --git a/codex-rs/tui/src/chatwidget/slash_dispatch.rs b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
-index e0f6714278..96b9541931 100644
---- a/codex-rs/tui/src/chatwidget/slash_dispatch.rs
-+++ b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
-@@ -236,6 +236,12 @@ impl ChatWidget {
-             SlashCommand::Resume => {
-                 self.app_event_tx.send(AppEvent::OpenResumePicker);
-             }
-+            SlashCommand::Detach => {
-+                self.add_error_message(
-+                    "'/detach' is not exposed by this build; use Ctrl+D to detach when supported."
-+                        .to_string(),
-+                );
-+            }
-             SlashCommand::Fork => {
-                 self.app_event_tx.send(AppEvent::ForkCurrentSession);
-             }
-@@ -1065,6 +1071,7 @@ impl ChatWidget {
-             | SlashCommand::Delete
-             | SlashCommand::Clear
-             | SlashCommand::Resume
-+            | SlashCommand::Detach
-             | SlashCommand::Fork
-             | SlashCommand::Init
-             | SlashCommand::Compact
-diff --git a/codex-rs/tui/src/chatwidget/tests/slash_commands.rs b/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
-index e3475bc270..077e86d343 100644
---- a/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
-+++ b/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
-@@ -606,11 +606,11 @@ async fn queued_unknown_slash_reports_error_when_dequeued() {
- }
- 
- #[tokio::test]
--async fn ctrl_d_quits_without_prompt() {
-+async fn ctrl_d_requests_detach_without_prompt() {
-     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
- 
-     chat.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
--    assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::ShutdownFirst)));
-+    assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::Detach)));
- }
- 
- #[tokio::test]
-@@ -1693,6 +1693,24 @@ async fn slash_quit_requests_exit() {
-     assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::ShutdownFirst)));
- }
- 
-+#[tokio::test]
-+async fn slash_detach_is_hidden_shortcut_anchor_only() {
-+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-+
-+    chat.dispatch_command(SlashCommand::Detach);
-+
-+    let cells = drain_insert_history(&mut rx);
-+    let rendered = cells
-+        .iter()
-+        .map(|lines| lines_to_single_string(lines))
-+        .collect::<Vec<_>>()
-+        .join("\n");
-+    assert!(
-+        rendered.contains("use Ctrl+D to detach"),
-+        "expected hidden /detach guidance, got {rendered:?}"
-+    );
-+}
-+
- #[tokio::test]
- async fn slash_logout_requests_app_server_logout() {
-     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
-index 6bfe8b6e35..57f6bf0f07 100644
---- a/codex-rs/tui/src/lib.rs
-+++ b/codex-rs/tui/src/lib.rs
-@@ -271,6 +271,10 @@ impl AppServerTarget {
-         matches!(self, Self::Remote { .. })
-     }
- 
-+    pub(crate) fn supports_detach(&self) -> bool {
-+        !matches!(self, Self::Embedded)
-+    }
-+
-     fn thread_params_mode(&self) -> ThreadParamsMode {
-         if self.uses_remote_workspace() {
-             ThreadParamsMode::Remote
-diff --git a/codex-rs/tui/src/main.rs b/codex-rs/tui/src/main.rs
-index 814683e331..d20139b42a 100644
---- a/codex-rs/tui/src/main.rs
-+++ b/codex-rs/tui/src/main.rs
-@@ -16,6 +16,7 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
-         token_usage,
-         thread_id,
-         resume_hint,
-+        exit_reason,
-         ..
-     } = exit_info;
- 
-@@ -30,7 +31,14 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
-         } else {
-             resume_cmd
-         };
--        lines.push(format!("To continue this session, run {command}"));
-+        if matches!(exit_reason, ExitReason::Detached) {
-+            if let Some(thread_id) = thread_id {
-+                lines.push(format!("Detached session: {thread_id}"));
-+            }
-+            lines.push(format!("Reattach with: {command}"));
-+        } else {
-+            lines.push(format!("To continue this session, run {command}"));
-+        }
-     } else if is_fatal && let Some(thread_id) = thread_id {
-         lines.push(format!("Session ID: {thread_id}"));
-     }
-@@ -68,7 +76,7 @@ fn main() -> anyhow::Result<()> {
-                 eprintln!("ERROR: {message}");
-                 true
-             }
--            ExitReason::UserRequested => false,
-+            ExitReason::UserRequested | ExitReason::Detached => false,
-         };
- 
-         let color_enabled = supports_color::on(Stream::Stdout).is_some();
-diff --git a/codex-rs/tui/src/slash_command.rs b/codex-rs/tui/src/slash_command.rs
-index 5e3e906bae..b68ffe416f 100644
---- a/codex-rs/tui/src/slash_command.rs
-+++ b/codex-rs/tui/src/slash_command.rs
-@@ -34,6 +34,7 @@ pub enum SlashCommand {
-     Archive,
-     Delete,
-     Resume,
-+    Detach,
-     Fork,
-     App,
-     Init,
-@@ -91,6 +92,7 @@ impl SlashCommand {
-             SlashCommand::Resume => "resume a saved chat",
-             SlashCommand::Archive => "archive this session and exit",
-             SlashCommand::Delete => "permanently delete this session and exit",
-+            SlashCommand::Detach => "detach from the current chat",
-             SlashCommand::Clear => "clear the terminal and start a new chat",
-             SlashCommand::Fork => "fork the current chat",
-             SlashCommand::App => "continue this session in Codex Desktop",
-@@ -190,9 +192,14 @@ impl SlashCommand {
-             SlashCommand::New
-             | SlashCommand::Archive
-             | SlashCommand::Delete
-+            | SlashCommand::Resume
-+            | SlashCommand::Detach
-             | SlashCommand::Fork
-             | SlashCommand::Init
-             | SlashCommand::Compact
-+            | SlashCommand::Model
-+            | SlashCommand::Personality
-+            | SlashCommand::Permissions
-             | SlashCommand::Keymap
-             | SlashCommand::Vim
-             | SlashCommand::ElevateSandbox
-@@ -207,10 +214,6 @@ impl SlashCommand {
-             | SlashCommand::MemoryDrop
-             | SlashCommand::MemoryUpdate => false,
-             SlashCommand::Diff
--            | SlashCommand::Resume
--            | SlashCommand::Model
--            | SlashCommand::Personality
--            | SlashCommand::Permissions
-             | SlashCommand::Copy
-             | SlashCommand::Raw
-             | SlashCommand::Rename
-@@ -249,6 +252,7 @@ impl SlashCommand {
-             SlashCommand::Copy => !cfg!(target_os = "android"),
-             SlashCommand::App => cfg!(any(target_os = "macos", target_os = "windows")),
-             SlashCommand::Rollout | SlashCommand::TestApproval => cfg!(debug_assertions),
-+            SlashCommand::Detach => false,
-             _ => true,
+ impl SessionTarget {
+@@ -128,8 +130,17 @@ impl SessionPickerAction {
          }
      }
+ 
+-    fn selection(self, path: Option<PathBuf>, thread_id: ThreadId) -> SessionSelection {
+-        let target_session = SessionTarget { path, thread_id };
++    fn selection(
++        self,
++        path: Option<PathBuf>,
++        thread_id: ThreadId,
++        status: Option<ThreadStatus>,
++    ) -> SessionSelection {
++        let target_session = SessionTarget {
++            path,
++            thread_id,
++            status,
++        };
+         match self {
+             SessionPickerAction::Resume => SessionSelection::Resume(target_session),
+             SessionPickerAction::Fork => SessionSelection::Fork(target_session),
+@@ -832,6 +843,7 @@ struct Row {
+     path: Option<PathBuf>,
+     preview: String,
+     thread_id: Option<ThreadId>,
++    status: Option<ThreadStatus>,
+     thread_name: Option<String>,
+     created_at: Option<DateTime<Utc>>,
+     updated_at: Option<DateTime<Utc>>,
+@@ -1118,7 +1130,11 @@ impl PickerState {
+                         },
+                     };
+                     if let Some(thread_id) = thread_id {
+-                        return Ok(Some(self.action.selection(path, thread_id)));
++                        return Ok(Some(self.action.selection(
++                            path,
++                            thread_id,
++                            row.status.clone(),
++                        )));
+                     }
+                     self.inline_error = Some(match path {
+                         Some(path) => {
+@@ -1793,6 +1809,7 @@ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
+             preview.to_string()
+         },
+         thread_id: Some(thread_id),
++        status: Some(thread.status),
+         thread_name: thread.name,
+         created_at: chrono::DateTime::from_timestamp(thread.created_at, 0)
+             .map(|dt| dt.with_timezone(&Utc)),
+@@ -3242,6 +3259,7 @@ mod tests {
+             path: Some(PathBuf::from(path)),
+             preview: preview.to_string(),
+             thread_id: None,
++            status: None,
+             thread_name: None,
+             created_at: Some(timestamp),
+             updated_at: Some(timestamp),
+@@ -3288,6 +3306,7 @@ mod tests {
+             path: Some(PathBuf::from("/tmp/a.jsonl")),
+             preview: String::from("first message"),
+             thread_id: None,
++            status: None,
+             thread_name: Some(String::from("My session")),
+             created_at: None,
+             updated_at: None,
+@@ -3328,6 +3347,7 @@ mod tests {
+             path: Some(PathBuf::from("/tmp/a.jsonl")),
+             preview: String::from("first message"),
+             thread_id: Some(thread_id),
++            status: None,
+             thread_name: Some(String::from("My session")),
+             created_at: None,
+             updated_at: None,
+@@ -3388,6 +3408,7 @@ mod tests {
+             path: Some(PathBuf::from("/tmp/a.jsonl")),
+             preview: String::from("first message"),
+             thread_id: Some(thread_id),
++            status: None,
+             thread_name: Some(String::from("feat(tui): add raw scrollback mode")),
+             created_at: parse_timestamp_str("2026-05-02T14:31:08Z"),
+             updated_at: parse_timestamp_str("2026-05-02T14:48:19Z"),
+@@ -3598,6 +3619,7 @@ mod tests {
+             path: None,
+             preview: String::from("remote session"),
+             thread_id: Some(ThreadId::new()),
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -3623,6 +3645,7 @@ mod tests {
+             path: None,
+             preview: String::from("remote session"),
+             thread_id: Some(ThreadId::new()),
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -3654,6 +3677,7 @@ mod tests {
+                 path: Some(PathBuf::from("/tmp/a.jsonl")),
+                 preview: String::from("Fix resume picker timestamps"),
+                 thread_id: None,
++                status: None,
+                 thread_name: None,
+                 created_at: Some(now - Duration::minutes(16)),
+                 updated_at: Some(now - Duration::seconds(42)),
+@@ -3664,6 +3688,7 @@ mod tests {
+                 path: Some(PathBuf::from("/tmp/b.jsonl")),
+                 preview: String::from("Investigate lazy pagination cap"),
+                 thread_id: None,
++                status: None,
+                 thread_name: None,
+                 created_at: Some(now - Duration::hours(1)),
+                 updated_at: Some(now - Duration::minutes(35)),
+@@ -3674,6 +3699,7 @@ mod tests {
+                 path: Some(PathBuf::from("/tmp/c.jsonl")),
+                 preview: String::from("Explain the codebase"),
+                 thread_id: None,
++                status: None,
+                 thread_name: None,
+                 created_at: Some(now - Duration::hours(2)),
+                 updated_at: Some(now - Duration::hours(2)),
+@@ -4102,6 +4128,7 @@ mod tests {
+             path: None,
+             preview: String::from("preview"),
+             thread_id: Some(thread_id),
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -4140,6 +4167,7 @@ mod tests {
+                 path: None,
+                 preview: String::from("one"),
+                 thread_id: Some(ThreadId::new()),
++                status: None,
+                 thread_name: None,
+                 created_at: None,
+                 updated_at: None,
+@@ -4150,6 +4178,7 @@ mod tests {
+                 path: None,
+                 preview: String::from("two"),
+                 thread_id: Some(ThreadId::new()),
++                status: None,
+                 thread_name: None,
+                 created_at: None,
+                 updated_at: None,
+@@ -4219,6 +4248,7 @@ mod tests {
+                 path: None,
+                 preview: String::from("Find pending threads and emails"),
+                 thread_id: Some(thread_id),
++                status: None,
+                 thread_name: None,
+                 created_at: None,
+                 updated_at: None,
+@@ -4229,6 +4259,7 @@ mod tests {
+                 path: None,
+                 preview: String::from("Plan raw scrollback mode"),
+                 thread_id: Some(ThreadId::new()),
++                status: None,
+                 thread_name: None,
+                 created_at: None,
+                 updated_at: None,
+@@ -4284,6 +4315,7 @@ mod tests {
+             path: None,
+             preview: String::from("preview"),
+             thread_id: Some(thread_id),
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -4314,6 +4346,7 @@ mod tests {
+             path: Some(PathBuf::from("/tmp/a.jsonl")),
+             preview: String::from("preview"),
+             thread_id: None,
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -4390,6 +4423,7 @@ mod tests {
+             path: None,
+             preview: String::from("preview"),
+             thread_id: Some(thread_id),
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -4554,6 +4588,7 @@ session_picker_view = "dense"
+             path: None,
+             preview: String::from("preview"),
+             thread_id: Some(thread_id),
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -4593,6 +4628,7 @@ session_picker_view = "dense"
+             path: None,
+             preview: String::from("preview"),
+             thread_id: Some(thread_id),
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -4669,6 +4705,7 @@ session_picker_view = "dense"
+             thread_id: Some(
+                 ThreadId::from_string("019dabc1-0ef5-7431-b81c-03037f51f62c").expect("thread id"),
+             ),
++            status: None,
+             thread_name: None,
+             created_at: parse_timestamp_str("2026-04-28T16:30:00Z"),
+             updated_at: parse_timestamp_str("2026-04-28T17:45:00Z"),
+@@ -4923,6 +4960,7 @@ session_picker_view = "dense"
+             path: Some(PathBuf::from("/tmp/a.jsonl")),
+             preview: String::from("Investigate picker expansion"),
+             thread_id: Some(thread_id),
++            status: None,
+             thread_name: None,
+             created_at: parse_timestamp_str("2026-04-28T16:30:00Z"),
+             updated_at: parse_timestamp_str("2026-04-28T17:45:00Z"),
+@@ -4992,6 +5030,7 @@ session_picker_view = "dense"
+             thread_id: Some(
+                 ThreadId::from_string("019dabc1-0ef5-7431-b81c-03037f51f62c").expect("thread id"),
+             ),
++            status: None,
+             thread_name: None,
+             created_at: parse_timestamp_str("2026-04-28T16:30:00Z"),
+             updated_at: parse_timestamp_str("2026-04-28T17:45:00Z"),
+@@ -5050,6 +5089,7 @@ session_picker_view = "dense"
+                 path: Some(PathBuf::from(format!("/tmp/{idx}.jsonl"))),
+                 preview: format!("item-{idx}"),
+                 thread_id: None,
++                status: None,
+                 thread_name: None,
+                 created_at: Some(now - Duration::hours(idx)),
+                 updated_at: Some(now - Duration::minutes(idx * 5)),
+@@ -5102,6 +5142,7 @@ session_picker_view = "dense"
+                 path: Some(PathBuf::from(format!("/tmp/{idx}.jsonl"))),
+                 preview: format!("item-{idx}"),
+                 thread_id: None,
++                status: None,
+                 thread_name: None,
+                 created_at: Some(now - Duration::hours(idx)),
+                 updated_at: Some(now - Duration::minutes(idx * 5)),
+@@ -5653,6 +5694,7 @@ session_picker_view = "dense"
+             path: Some(PathBuf::from("/tmp/missing.jsonl")),
+             preview: String::from("missing metadata"),
+             thread_id: None,
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -5692,6 +5734,7 @@ session_picker_view = "dense"
+             path: None,
+             preview: String::from("pathless thread"),
+             thread_id: Some(thread_id),
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -5710,6 +5753,7 @@ session_picker_view = "dense"
+             Some(SessionSelection::Resume(SessionTarget {
+                 path: None,
+                 thread_id: selected_thread_id,
++                status: None,
+             })) => assert_eq!(selected_thread_id, thread_id),
+             other => panic!("unexpected selection: {other:?}"),
+         }

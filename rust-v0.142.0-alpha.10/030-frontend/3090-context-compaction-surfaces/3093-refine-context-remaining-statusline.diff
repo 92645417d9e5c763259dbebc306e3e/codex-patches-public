@@ -1,258 +1,279 @@
-diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
-index ef0de336c3..43dbcad984 100644
---- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
-+++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
-@@ -154,6 +154,12 @@ where
-             spans.extend(limit_spans);
-             continue;
-         }
-+        if item == StatusLineItem::ContextRemaining
-+            && let Some(context_spans) = context_remaining_line_spans(&line, style)
-+        {
-+            spans.extend(context_spans);
-+            continue;
-+        }
-         let text: String = line
-             .spans
-             .iter()
-@@ -292,6 +298,59 @@ fn limit_pace_style(pace: i64) -> Style {
-     Style::default().fg(color).add_modifier(Modifier::BOLD)
+diff --git a/codex-rs/tui/src/history_cell/messages.rs b/codex-rs/tui/src/history_cell/messages.rs
+index 2ca7414833..e3691d836d 100644
+--- a/codex-rs/tui/src/history_cell/messages.rs
++++ b/codex-rs/tui/src/history_cell/messages.rs
+@@ -91,16 +91,60 @@ fn trim_trailing_blank_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>
+     lines
  }
  
-+fn context_remaining_line_spans(
-+    line: &Line<'static>,
-+    base_style: Style,
-+) -> Option<Vec<Span<'static>>> {
-+    let mut output = Vec::new();
-+    let mut parsed_percent = false;
-+
-+    for span in &line.spans {
-+        if span.style == Style::default()
-+            && let Some(mut spans) = context_remaining_text_spans(span.content.as_ref(), base_style)
-+        {
-+            parsed_percent = true;
-+            output.append(&mut spans);
-+        } else {
-+            output.push(span.clone());
-+        }
-+    }
-+
-+    parsed_percent.then_some(output)
++fn line_visible_width(line: &Line<'_>) -> usize {
++    line.spans
++        .iter()
++        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
++        .sum()
 +}
 +
-+fn context_remaining_text_spans(text: &str, base_style: Style) -> Option<Vec<Span<'static>>> {
-+    let mut spans = Vec::new();
-+    let mut saw_percent = false;
-+
-+    for part in text.split_whitespace() {
-+        if !spans.is_empty() {
-+            spans.push(" ".into());
-+        }
-+        if let Some(percent) = parse_unsigned_percent(part) {
-+            saw_percent = true;
-+            spans.push(Span::styled(
-+                format!("{percent}%"),
-+                context_remaining_percent_style(percent),
-+            ));
-+        } else {
-+            spans.push(Span::styled(part.to_string(), base_style));
-+        }
-+    }
-+
-+    saw_percent.then_some(spans)
++fn border_line(
++    left: &'static str,
++    fill: &'static str,
++    right: &'static str,
++    width: u16,
++) -> Line<'static> {
++    let border_style = user_message_border_style();
++    let inner_width = usize::from(width.saturating_sub(2));
++    Line::from(vec![
++        Span::styled(left, border_style),
++        Span::styled(fill.repeat(inner_width), border_style),
++        Span::styled(right, border_style),
++    ])
 +}
 +
-+fn context_remaining_percent_style(percent: i64) -> Style {
-+    let color = match percent {
-+        75..=100 => Color::Green,
-+        50..=74 => Color::Yellow,
-+        25..=49 => Color::Rgb(255, 128, 0),
-+        _ => Color::Red,
-+    };
-+    Style::default().fg(color).add_modifier(Modifier::BOLD)
++fn framed_user_message_lines(
++    lines: Vec<Line<'static>>,
++    width: u16,
++    style: Style,
++) -> Vec<Line<'static>> {
++    let border_style = user_message_border_style();
++    let box_width = width.max(2);
++    let content_width = usize::from(box_width.saturating_sub(4)).max(1);
++    let mut out = vec![border_line("┌", "─", "┐", box_width)];
++
++    for mut line in lines {
++        line.style = style;
++        let padding = content_width.saturating_sub(line_visible_width(&line));
++        let mut spans = vec![Span::styled("│", border_style), Span::styled(" ", style)];
++        spans.extend(line.spans);
++        if padding > 0 {
++            spans.push(Span::styled(" ".repeat(padding), style));
++        }
++        spans.extend([Span::styled(" ", style), Span::styled("│", border_style)]);
++        out.push(Line::from(spans).style(style));
++    }
++
++    out.push(border_line("└", "─", "┘", box_width));
++    out
 +}
 +
- #[cfg(test)]
- mod tests {
-     use super::*;
-@@ -369,6 +428,36 @@ mod tests {
-         assert!(line.spans[6].style.add_modifier.contains(Modifier::DIM));
-     }
- 
-+    #[test]
-+    fn context_remaining_percent_uses_threshold_colors() {
-+        let cases = [
-+            ("100% of 258K left", Color::Green),
-+            ("75% of 258K left", Color::Green),
-+            ("74% of 258K left", Color::Yellow),
-+            ("50% of 258K left", Color::Yellow),
-+            ("49% of 258K left", Color::Rgb(255, 128, 0)),
-+            ("25% of 258K left", Color::Rgb(255, 128, 0)),
-+            ("24% of 258K left", Color::Red),
-+            ("0% of 258K left", Color::Red),
-+        ];
-+
-+        for (label, expected_color) in cases {
-+            let line = status_line_from_segments_with_resolver(
-+                [(StatusLineItem::ContextRemaining, label.to_string())],
-+                /*use_theme_colors*/ true,
-+                |_| Some(Style::default().cyan()),
-+            )
-+            .expect("status line");
-+
-+            assert_eq!(line_text(&line), label);
-+            assert_eq!(line.spans[0].style.fg, Some(expected_color));
-+            assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
-+            assert_eq!(line.spans[2].style.fg, Some(Color::Cyan));
-+            assert_eq!(line.spans[4].style.fg, Some(Color::Cyan));
-+            assert_eq!(line.spans[6].style.fg, Some(Color::Cyan));
-+        }
-+    }
-+
-     #[test]
-     fn status_line_segments_preserve_order_and_plain_text() {
-         let line = status_line_from_segments_with_resolver(
-diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
-index a186361efb..0754b0c143 100644
---- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
-+++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
-@@ -53,7 +53,7 @@ impl StatusSurfacePreviewItem {
-             StatusSurfacePreviewItem::Permissions => "Workspace",
-             StatusSurfacePreviewItem::ApprovalMode => "on-request",
-             StatusSurfacePreviewItem::ResponsesStreamConnection => "42ms",
--            StatusSurfacePreviewItem::ContextRemaining => "Context 0% left",
-+            StatusSurfacePreviewItem::ContextRemaining => "0% of 0 left",
-             StatusSurfacePreviewItem::ContextUsed => "Context 0% used",
-             StatusSurfacePreviewItem::FiveHourLimit => "primary 0%",
-             StatusSurfacePreviewItem::WeeklyLimit => "secondary 0%",
-diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_context_remaining_footer.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_context_remaining_footer.snap
-index 858f63b5e7..37981fdb30 100644
---- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_context_remaining_footer.snap
-+++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_context_remaining_footer.snap
-@@ -6,4 +6,4 @@ expression: normalized_backend_snapshot(terminal.backend())
- "┌──────────────────────────────────────────────────────────────────────────────┐"
- "› Ask Codex to do anything                                                     │"
- "└──────────────────────────────────────────────────────────────────────────────┘"
--"  gpt-5.4 xhigh fast · Context 100% left · /tmp/project                         "
-+"  gpt-5.4 xhigh fast · 100% of 258K left · /tmp/project                         "
-diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
-index 9135eedf0c..1ded5af5d4 100644
---- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
-+++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
-@@ -613,9 +613,7 @@ impl ChatWidget {
-                     Some(format!("{} used", format_tokens_compact(total)))
-                 }
-             }
--            StatusLineItem::ContextRemaining => self
--                .status_line_context_remaining_percent()
--                .map(|remaining| format!("Context {remaining}% left")),
-+            StatusLineItem::ContextRemaining => self.status_line_context_remaining_display(),
-             StatusLineItem::ContextUsed => self
-                 .status_line_context_used_percent()
-                 .map(|used| format!("Context {used}% used")),
-@@ -911,6 +909,18 @@ impl ChatWidget {
-         format!("{model} {label}{service_tier_label}")
-     }
- 
-+    fn status_line_context_remaining_display(&self) -> Option<String> {
-+        let remaining = self.status_line_context_remaining_percent()?;
-+        if let Some(window) = self.status_line_context_window_size() {
-+            Some(format!(
-+                "{remaining}% of {} left",
-+                format_tokens_compact(window)
-+            ))
-+        } else {
-+            Some(format!("{remaining}% left"))
-+        }
-+    }
-+
-     fn model_display_line(&self) -> Line<'static> {
-         let model = self
-             .active_turn_model_context
-@@ -945,7 +955,12 @@ impl ChatWidget {
-             " ".into(),
-         ]);
-         line.extend(Self::status_line_reasoning_effort_line(label, effort).spans);
--        line.spans.push(Span::from(service_tier_label));
-+        if service_tier_label == " fast" {
-+            line.spans.push(" ".into());
-+            line.spans.push("fast".red());
-+        } else {
-+            line.spans.push(Span::from(service_tier_label));
-+        }
-         line
-     }
- 
-@@ -987,9 +1002,9 @@ impl ChatWidget {
- 
-     fn fast_mode_display_line(&self) -> Line<'static> {
-         if self.current_service_tier() == Some(ServiceTier::Fast.request_value()) {
--            Line::from(vec!["Fast ".into(), "on".red()])
-+            Line::from(vec![Span::from("Fast").dim(), Span::from(" on").dim()])
-         } else {
--            Line::from("Fast off")
-+            Line::from(Span::from("Fast off").dim())
-         }
-     }
- 
-@@ -1480,14 +1495,24 @@ mod tests {
-     }
- 
-     #[test]
--    fn fast_mode_on_status_line_is_red_without_dim_override() {
--        let line = Line::from(vec!["Fast ".into(), "on".red()]);
--        let on = &line.spans[1];
+ impl HistoryCell for UserHistoryCell {
+     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+-        let wrap_width = width
+-            .saturating_sub(
+-                LIVE_PREFIX_COLS + 1, /* keep a one-column right margin for wrapping */
+-            )
+-            .max(1);
 -
--        assert_eq!(on.content.as_ref(), "on");
--        assert_eq!(on.style.fg, Some(Color::Red));
--        assert_eq!(on.style.add_modifier.contains(Modifier::DIM), false);
--        assert_eq!(on.style.sub_modifier.contains(Modifier::DIM), false);
-+    fn model_with_reasoning_fast_status_line_is_red_without_dim_override() {
-+        let line = status_line_from_segments(
-+            [(
-+                StatusLineItem::ModelWithReasoning,
-+                Line::from(vec!["gpt-5.4 xhigh ".into(), "fast".red()]),
-+            )],
-+            /*use_theme_colors*/ true,
-+        )
-+        .expect("status line");
-+        let fast = line
-+            .spans
-+            .iter()
-+            .find(|span| span.content.as_ref() == "fast")
-+            .expect("fast span");
-+
-+        assert_eq!(fast.style.fg, Some(Color::Red));
-+        assert_eq!(fast.style.add_modifier.contains(Modifier::DIM), false);
-+        assert_eq!(fast.style.sub_modifier.contains(Modifier::DIM), false);
+         let style = user_input_style();
+         let element_style = style.fg(Color::Cyan);
++        let content_width = width.saturating_sub(4).max(1);
++        let message_wrap_width = content_width.saturating_sub(LIVE_PREFIX_COLS).max(1);
+ 
+         let wrapped_remote_images = if self.remote_image_urls.is_empty() {
+             None
+@@ -112,7 +156,7 @@ impl HistoryCell for UserHistoryCell {
+                     .map(|(idx, _url)| {
+                         remote_image_display_line(element_style, idx.saturating_add(1))
+                     }),
+-                RtOptions::new(usize::from(wrap_width))
++                RtOptions::new(usize::from(content_width))
+                     .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
+             ))
+         };
+@@ -126,7 +170,7 @@ impl HistoryCell for UserHistoryCell {
+                     .split('\n')
+                     .map(|line| Line::from(line).style(style)),
+                 // Wrap algorithm matches textarea.rs.
+-                RtOptions::new(usize::from(wrap_width))
++                RtOptions::new(usize::from(message_wrap_width))
+                     .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
+             );
+             let wrapped = trim_trailing_blank_lines(wrapped);
+@@ -140,7 +184,7 @@ impl HistoryCell for UserHistoryCell {
+             );
+             let wrapped = adaptive_wrap_lines(
+                 raw_lines,
+-                RtOptions::new(usize::from(wrap_width))
++                RtOptions::new(usize::from(message_wrap_width))
+                     .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
+             );
+             let wrapped = trim_trailing_blank_lines(wrapped);
+@@ -151,29 +195,20 @@ impl HistoryCell for UserHistoryCell {
+             return Vec::new();
+         }
+ 
+-        let mut lines: Vec<Line<'static>> = vec![Line::from("").style(style)];
++        let mut lines: Vec<Line<'static>> = Vec::new();
+ 
+         if let Some(wrapped_remote_images) = wrapped_remote_images {
+-            lines.extend(prefix_lines(
+-                wrapped_remote_images,
+-                "  ".into(),
+-                "  ".into(),
+-            ));
++            lines.extend(wrapped_remote_images);
+             if wrapped_message.is_some() {
+                 lines.push(Line::from("").style(style));
+             }
+         }
+ 
+         if let Some(wrapped_message) = wrapped_message {
+-            lines.extend(prefix_lines(
+-                wrapped_message,
+-                "› ".bold().dim(),
+-                "  ".into(),
+-            ));
++            lines.extend(prefix_lines(wrapped_message, Span::from(""), "".into()));
+         }
+ 
+-        lines.push(Line::from("").style(style));
+-        lines
++        framed_user_message_lines(lines, width, style)
      }
  
-     #[test]
-diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
-index 5b9d76f4e1..5b504d9cff 100644
---- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
-+++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
-@@ -2405,13 +2405,14 @@ async fn status_line_context_used_renders_labeled_percent() {
- async fn status_line_context_remaining_renders_labeled_percent() {
-     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-     chat.thread_id = Some(ThreadId::new());
-+    chat.config.model_context_window = Some(258_000);
-     chat.config.tui_status_line = Some(vec!["context-remaining".to_string()]);
+     fn raw_lines(&self) -> Vec<Line<'static>> {
+diff --git a/codex-rs/tui/src/history_cell/mod.rs b/codex-rs/tui/src/history_cell/mod.rs
+index 43390c5271..ad5204e86c 100644
+--- a/codex-rs/tui/src/history_cell/mod.rs
++++ b/codex-rs/tui/src/history_cell/mod.rs
+@@ -32,6 +32,7 @@ use crate::render::renderable::Renderable;
+ use crate::session_state::ThreadSessionState;
+ use crate::style::proposed_plan_style;
+ use crate::style::user_input_style;
++use crate::style::user_message_border_style;
+ use crate::terminal_hyperlinks::HyperlinkLine;
+ use crate::terminal_hyperlinks::mark_buffer_hyperlinks;
+ use crate::terminal_hyperlinks::plain_hyperlink_lines;
+diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__raw_mode_toggle_transcript.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__raw_mode_toggle_transcript.snap
+index 993ae36ae5..1ce9944fbb 100644
+--- a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__raw_mode_toggle_transcript.snap
++++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__raw_mode_toggle_transcript.snap
+@@ -3,10 +3,10 @@ source: tui/src/history_cell/tests.rs
+ expression: rendered
+ ---
+ rich before:
+-
+-› Please format this
+-  for copying
+-
++┌──────────────────────────────────────┐
++│ Please format this                   │
++│ for copying                          │
++└──────────────────────────────────────┘
+ ■ - first item
+   - second item
+   
+@@ -39,10 +39,10 @@ structured output
+ second line
  
-     chat.refresh_status_line();
+ rich after:
+-
+-› Please format this
+-  for copying
+-
++┌──────────────────────────────────────┐
++│ Please format this                   │
++│ for copying                          │
++└──────────────────────────────────────┘
+ ■ - first item
+   - second item
+   
+diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_numbers_multiple_remote_images.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_numbers_multiple_remote_images.snap
+index 076df8fffb..f15bd7257b 100644
+--- a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_numbers_multiple_remote_images.snap
++++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_numbers_multiple_remote_images.snap
+@@ -1,9 +1,10 @@
+ ---
+-source: tui/src/history_cell.rs
++source: tui/src/history_cell/tests.rs
+ expression: rendered
+ ---
+-
+-  [Image #1]
+-  [Image #2]
+-
+-› describe both
++┌──────────────────────────────────────────────────────────────────────────────┐
++│ [Image #1]                                                                   │
++│ [Image #2]                                                                   │
++│                                                                              │
++│ describe both                                                                │
++└──────────────────────────────────────────────────────────────────────────────┘
+diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_renders_remote_image_urls.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_renders_remote_image_urls.snap
+index 923ee953ab..aa21865f4b 100644
+--- a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_renders_remote_image_urls.snap
++++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_renders_remote_image_urls.snap
+@@ -1,8 +1,9 @@
+ ---
+-source: tui/src/history_cell.rs
++source: tui/src/history_cell/tests.rs
+ expression: rendered
+ ---
+-
+-  [Image #1]
+-
+-› describe these
++┌──────────────────────────────────────────────────────────────────────────────┐
++│ [Image #1]                                                                   │
++│                                                                              │
++│ describe these                                                               │
++└──────────────────────────────────────────────────────────────────────────────┘
+diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_wraps_and_prefixes_each_line_snapshot.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_wraps_and_prefixes_each_line_snapshot.snap
+index 51ce9e312f..bb6757eefc 100644
+--- a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_wraps_and_prefixes_each_line_snapshot.snap
++++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__user_history_cell_wraps_and_prefixes_each_line_snapshot.snap
+@@ -1,9 +1,13 @@
+ ---
+-source: tui/src/history_cell.rs
++source: tui/src/history_cell/tests.rs
+ expression: rendered
+ ---
+-
+-› one two
+-  three
+-  four five
+-  six seven
++┌──────────┐
++│ one      │
++│ two      │
++│ three    │
++│ four     │
++│ five     │
++│ six      │
++│ seven    │
++└──────────┘
+diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
+index d277201ba9..337c2884ab 100644
+--- a/codex-rs/tui/src/history_cell/tests.rs
++++ b/codex-rs/tui/src/history_cell/tests.rs
+@@ -2085,7 +2085,7 @@ fn user_history_cell_trims_trailing_blank_message_lines() {
+         .rev()
+         .take_while(|line| line.trim().is_empty())
+         .count();
+-    assert_eq!(trailing_blank_count, 1);
++    assert_eq!(trailing_blank_count, 0);
+     assert!(rendered.iter().any(|line| line.contains("line one")));
+ }
  
-     assert_eq!(
-         status_line_text(&chat),
--        Some("Context 100% left".to_string())
-+        Some("100% of 258K left".to_string())
-     );
-     assert!(
-         drain_insert_history(&mut rx).is_empty(),
-@@ -2848,6 +2849,7 @@ async fn status_line_model_with_reasoning_context_remaining_footer_snapshot() {
-     assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
-     chat.show_welcome_banner = false;
-     chat.config.cwd = test_project_path().abs();
-+    chat.config.model_context_window = Some(258_000);
-     chat.config.tui_status_line = Some(vec![
-         "model-with-reasoning".to_string(),
-         "context-remaining".to_string(),
+@@ -2108,7 +2108,7 @@ fn user_history_cell_trims_trailing_blank_message_lines_with_text_elements() {
+         .rev()
+         .take_while(|line| line.trim().is_empty())
+         .count();
+-    assert_eq!(trailing_blank_count, 1);
++    assert_eq!(trailing_blank_count, 0);
+     assert!(rendered.iter().any(|line| line.contains("tokenized")));
+ }
+ 
+diff --git a/codex-rs/tui/src/style.rs b/codex-rs/tui/src/style.rs
+index 1ddf0fcf51..c15278ecd7 100644
+--- a/codex-rs/tui/src/style.rs
++++ b/codex-rs/tui/src/style.rs
+@@ -43,6 +43,10 @@ pub(crate) fn stable_dim_style() -> Style {
+     Style::default().fg(STABLE_DIM_FG)
+ }
+ 
++pub(crate) fn user_message_border_style() -> Style {
++    user_input_style().fg(Color::Yellow)
++}
++
+ /// Returns the style for a user-authored message using the provided terminal background.
+ pub fn user_message_style_for(terminal_bg: Option<(u8, u8, u8)>) -> Style {
+     terminal_bg
