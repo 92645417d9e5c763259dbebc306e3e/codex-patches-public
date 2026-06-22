@@ -1,1126 +1,157 @@
-diff --git a/codex-rs/app-server-daemon/src/client.rs b/codex-rs/app-server-daemon/src/client.rs
-index b926780f8d..ddc398e9e4 100644
---- a/codex-rs/app-server-daemon/src/client.rs
-+++ b/codex-rs/app-server-daemon/src/client.rs
-@@ -31,8 +31,8 @@ const INTERNAL_DAEMON_STATUS_METHOD: &str = "internal/daemon/status";
- #[derive(Debug, Clone, PartialEq, Eq)]
- pub(crate) struct ProbeInfo {
-     pub(crate) app_server_version: String,
--    pub(crate) active_client_count: usize,
--    pub(crate) running_assistant_turn_count: usize,
-+    pub(crate) active_client_count: Option<usize>,
-+    pub(crate) running_assistant_turn_count: Option<usize>,
- }
- 
- pub(crate) async fn probe(socket_path: &Path) -> Result<ProbeInfo> {
-@@ -57,18 +57,13 @@ async fn probe_inner(socket_path: &Path) -> Result<ProbeInfo> {
-     send_message(&mut websocket, &initialized)
-         .await
-         .context("failed to send initialized notification")?;
--    let status = daemon_status(&mut websocket)
--        .await
--        .unwrap_or(DaemonStatusResponse {
--            active_client_count: 0,
--            running_assistant_turn_count: 0,
--        });
-+    let status = daemon_status(&mut websocket).await.ok();
-     websocket.close(None).await.ok();
- 
-     Ok(ProbeInfo {
-         app_server_version: parse_version_from_user_agent(&initialize_response.user_agent)?,
--        active_client_count: status.active_client_count,
--        running_assistant_turn_count: status.running_assistant_turn_count,
-+        active_client_count: status.as_ref().map(|status| status.active_client_count),
-+        running_assistant_turn_count: status.map(|status| status.running_assistant_turn_count),
-     })
- }
- 
-diff --git a/codex-rs/app-server-daemon/src/lib.rs b/codex-rs/app-server-daemon/src/lib.rs
-index 862b46919f..3742bca65e 100644
---- a/codex-rs/app-server-daemon/src/lib.rs
-+++ b/codex-rs/app-server-daemon/src/lib.rs
-@@ -316,8 +316,8 @@ impl Daemon {
-                             Some(BackendKind::Pid),
-                             pid,
-                             Some(info.app_server_version),
--                            Some(info.active_client_count),
--                            Some(info.running_assistant_turn_count),
-+                            info.active_client_count,
-+                            info.running_assistant_turn_count,
-                         )
-                         .await);
-                 }
-@@ -334,8 +334,8 @@ impl Daemon {
-                             Some(BackendKind::Pid),
-                             pid,
-                             Some(info.app_server_version),
--                            Some(info.active_client_count),
--                            Some(info.running_assistant_turn_count),
-+                            info.active_client_count,
-+                            info.running_assistant_turn_count,
-                         )
-                         .await);
-                 }
-@@ -347,8 +347,8 @@ impl Daemon {
-                     self.running_backend(&settings).await?,
-                     /*pid*/ None,
-                     Some(info.app_server_version),
--                    Some(info.active_client_count),
--                    Some(info.running_assistant_turn_count),
-+                    info.active_client_count,
-+                    info.running_assistant_turn_count,
-                 )
-                 .await);
-         }
-@@ -361,8 +361,8 @@ impl Daemon {
-                     Some(BackendKind::Pid),
-                     /*pid*/ None,
-                     Some(info.app_server_version),
--                    Some(info.active_client_count),
--                    Some(info.running_assistant_turn_count),
-+                    info.active_client_count,
-+                    info.running_assistant_turn_count,
-                 )
-                 .await);
-         }
-@@ -376,8 +376,8 @@ impl Daemon {
-                 Some(BackendKind::Pid),
-                 pid,
-                 Some(info.app_server_version),
--                Some(info.active_client_count),
--                Some(info.running_assistant_turn_count),
-+                info.active_client_count,
-+                info.running_assistant_turn_count,
-             )
-             .await)
-     }
-@@ -405,8 +405,8 @@ impl Daemon {
-                 Some(BackendKind::Pid),
-                 pid,
-                 Some(info.app_server_version),
--                Some(info.active_client_count),
--                Some(info.running_assistant_turn_count),
-+                info.active_client_count,
-+                info.running_assistant_turn_count,
-             )
-             .await)
-     }
-@@ -501,8 +501,8 @@ impl Daemon {
-                 self.running_backend(&settings).await?,
-                 /*pid*/ None,
-                 Some(info.app_server_version),
--                Some(info.active_client_count),
--                Some(info.running_assistant_turn_count),
-+                info.active_client_count,
-+                info.running_assistant_turn_count,
-             )
-             .await)
-     }
-@@ -893,7 +893,8 @@ fn should_reexec_updater(
- 
- #[cfg(unix)]
- fn should_restart_running_backend_for_start(info: &client::ProbeInfo) -> bool {
--    info.active_client_count == 0 && info.running_assistant_turn_count == 0
-+    info.active_client_count.unwrap_or(0) == 0
-+        && info.running_assistant_turn_count.unwrap_or(0) == 0
- }
- 
- fn ensure_running_version_is_current_for_attach(
-@@ -1108,8 +1109,8 @@ mod tests {
-     fn restart_decision_preserves_forced_refreshes() {
-         let current_info = ProbeInfo {
-             app_server_version: "0.1.0".to_string(),
--            active_client_count: 1,
--            running_assistant_turn_count: 0,
-+            active_client_count: Some(1),
-+            running_assistant_turn_count: Some(0),
-         };
- 
-         assert_eq!(
-@@ -1144,18 +1145,18 @@ mod tests {
-     fn start_restarts_running_backend_only_when_idle_without_active_clients() {
-         let idle_no_active_clients = ProbeInfo {
-             app_server_version: "0.1.0".to_string(),
--            active_client_count: 0,
--            running_assistant_turn_count: 0,
-+            active_client_count: Some(0),
-+            running_assistant_turn_count: Some(0),
-         };
-         let detached_running_turn = ProbeInfo {
-             app_server_version: "0.1.0".to_string(),
--            active_client_count: 0,
--            running_assistant_turn_count: 1,
-+            active_client_count: Some(0),
-+            running_assistant_turn_count: Some(1),
-         };
-         let active_clients = ProbeInfo {
-             app_server_version: "0.1.0".to_string(),
--            active_client_count: 1,
--            running_assistant_turn_count: 0,
-+            active_client_count: Some(1),
-+            running_assistant_turn_count: Some(0),
-         };
- 
-         assert_eq!(
-@@ -1172,8 +1173,8 @@ mod tests {
-     fn start_restarts_idle_backend_before_stale_attach_check() {
-         let idle_stale = ProbeInfo {
-             app_server_version: "0.1.0".to_string(),
--            active_client_count: 0,
--            running_assistant_turn_count: 0,
-+            active_client_count: Some(0),
-+            running_assistant_turn_count: Some(0),
-         };
- 
-         assert!(
-@@ -1182,6 +1183,20 @@ mod tests {
-         );
-     }
- 
-+    #[test]
-+    fn start_restarts_backend_when_client_counts_are_unknown() {
-+        let unknown_counts = ProbeInfo {
-+            app_server_version: "0.1.0".to_string(),
-+            active_client_count: None,
-+            running_assistant_turn_count: None,
-+        };
-+
-+        assert!(
-+            should_restart_running_backend_for_start(&unknown_counts),
-+            "older daemons without client-count status should be replaced"
-+        );
-+    }
-+
-     #[cfg(target_os = "linux")]
-     #[test]
-     fn linux_unix_socket_inode_parser_matches_exact_path() {
-@@ -1201,8 +1216,8 @@ mod tests {
-     fn start_refuses_active_stale_backend() {
-         let active_stale = ProbeInfo {
-             app_server_version: "0.1.0".to_string(),
--            active_client_count: 1,
--            running_assistant_turn_count: 0,
-+            active_client_count: Some(1),
-+            running_assistant_turn_count: Some(0),
-         };
- 
-         let err = ensure_running_version_is_current_for_attach(&active_stale, Some("0.2.0"))
-@@ -1214,8 +1229,8 @@ mod tests {
-     fn start_refuses_stale_backend_with_running_turn() {
-         let running_turn_stale = ProbeInfo {
-             app_server_version: "0.1.0".to_string(),
--            active_client_count: 0,
--            running_assistant_turn_count: 1,
-+            active_client_count: Some(0),
-+            running_assistant_turn_count: Some(1),
-         };
- 
-         let err = ensure_running_version_is_current_for_attach(&running_turn_stale, Some("0.2.0"))
-diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
-index 1d3b7bad0e..67472e85bf 100644
---- a/codex-rs/tui/src/app.rs
-+++ b/codex-rs/tui/src/app.rs
-@@ -831,10 +831,15 @@ impl App {
-         let bootstrap_ms = bootstrap.duration.as_millis();
-         let mut model = bootstrap.default_model;
-         let available_models = bootstrap.available_models;
--        let remote_connection = crate::status::remote_connection::remote_connection_status_value(
--            &app_server_target,
--            app_server.server_version(),
--        );
-+        let remote_connection = app_server
-+            .server_version()
-+            .filter(|version| *version == CODEX_CLI_VERSION)
-+            .and_then(|version| {
-+                crate::status::remote_connection::remote_connection_status_value(
-+                    &app_server_target,
-+                    Some(version),
-+                )
-+            });
-         let exit_info = handle_model_migration_prompt_if_needed(
-             tui,
-             &mut config,
-diff --git a/codex-rs/tui/src/app/config_persistence.rs b/codex-rs/tui/src/app/config_persistence.rs
-index 784fc6b348..4b2c970259 100644
---- a/codex-rs/tui/src/app/config_persistence.rs
-+++ b/codex-rs/tui/src/app/config_persistence.rs
-@@ -25,7 +25,67 @@ async fn build_config_on_runtime_worker(
-     }
- }
- 
-+pub(super) fn permission_profile_selection_config_edits(
-+    selection: &PermissionProfileSelection,
-+) -> Vec<codex_app_server_protocol::ConfigEdit> {
-+    let mut edits = vec![crate::config_update::replace_config_value(
-+        "default_permissions",
-+        serde_json::json!(selection.profile_id),
-+    )];
-+    if let Some(policy) = selection.approval_policy {
-+        edits.push(crate::config_update::replace_config_value(
-+            "approval_policy",
-+            serde_json::to_value(policy)
-+                .unwrap_or_else(|err| panic!("approval policy should serialize: {err}")),
-+        ));
-+    }
-+    if let Some(reviewer) = selection.approvals_reviewer {
-+        edits.push(crate::config_update::replace_config_value(
-+            "approvals_reviewer",
-+            serde_json::json!(reviewer.to_string()),
-+        ));
-+    }
-+    edits
-+}
-+
- impl App {
-+    pub(super) async fn persist_permission_profile_selection(
-+        &mut self,
-+        app_server: &mut AppServerSession,
-+        selection: &PermissionProfileSelection,
-+    ) -> bool {
-+        let edits = permission_profile_selection_config_edits(selection);
-+
-+        let write_response = match crate::config_update::write_config_batch(
-+            app_server.request_handle(),
-+            edits,
-+        )
-+        .await
-+        {
-+            Ok(response) => response,
-+            Err(err) => {
-+                let error = crate::config_update::format_config_error(&err);
-+                tracing::error!(error = %error, "failed to persist permission profile selection");
-+                self.chat_widget
-+                    .add_error_message(format!("Failed to save permission profile: {error}"));
-+                return false;
-+            }
-+        };
-+        if write_response.status == WriteStatus::OkOverridden {
-+            let message = overridden_write_message(&write_response);
-+            tracing::warn!(
-+                message,
-+                "permission profile config write was overridden by effective config"
-+            );
-+            self.chat_widget.add_error_message(format!(
-+                "Permission profile was saved but not applied: {message}"
-+            ));
-+            return false;
-+        }
-+
-+        true
-+    }
-+
-     pub(super) async fn rebuild_config_for_cwd(&self, cwd: PathBuf) -> Result<Config> {
-         let mut overrides = self.harness_overrides.clone();
-         overrides.cwd = Some(cwd.clone());
-diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
-index 8047491b4e..1abece1b4d 100644
---- a/codex-rs/tui/src/app/event_dispatch.rs
-+++ b/codex-rs/tui/src/app/event_dispatch.rs
-@@ -1651,7 +1651,13 @@ impl App {
-                 }
-             }
-             AppEvent::SelectPermissionProfile(selection) => {
--                if self.apply_permission_profile_selection(selection).await {
-+                if self
-+                    .apply_permission_profile_selection(selection.clone())
-+                    .await
-+                {
-+                    let _ = self
-+                        .persist_permission_profile_selection(app_server, &selection)
-+                        .await;
-                     self.chat_widget.submit_initial_user_message_if_pending();
-                 }
-             }
-diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
-index 6cea81a634..bdcb42ba84 100644
---- a/codex-rs/tui/src/app/tests.rs
-+++ b/codex-rs/tui/src/app/tests.rs
-@@ -5,6 +5,7 @@ mod session_summary;
- mod startup;
- 
- use super::*;
-+use crate::app::config_persistence::permission_profile_selection_config_edits;
- use crate::app_backtrack::BacktrackSelection;
- use crate::app_backtrack::BacktrackState;
- use crate::app_backtrack::user_count;
-@@ -1946,6 +1947,41 @@ default_permissions = "locked-down"
-     Ok(())
- }
- 
-+#[test]
-+fn permission_profile_selection_config_edits_include_reviewer_and_policy() {
-+    let selection = PermissionProfileSelection {
-+        profile_id: codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS
-+            .to_string(),
-+        approval_policy: Some(AskForApproval::OnRequest),
-+        approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
-+        display_label: "Full Access + Agent Review".to_string(),
-+    };
-+
-+    let edits = permission_profile_selection_config_edits(&selection);
-+
-+    assert_eq!(
-+        edits
-+            .iter()
-+            .find(|edit| edit.key_path == "default_permissions")
-+            .map(|edit| &edit.value),
-+        Some(&serde_json::json!(":danger-full-access"))
-+    );
-+    assert_eq!(
-+        edits
-+            .iter()
-+            .find(|edit| edit.key_path == "approval_policy")
-+            .map(|edit| &edit.value),
-+        Some(&serde_json::json!("on-request"))
-+    );
-+    assert_eq!(
-+        edits
-+            .iter()
-+            .find(|edit| edit.key_path == "approvals_reviewer")
-+            .map(|edit| &edit.value),
-+        Some(&serde_json::json!("auto_review"))
-+    );
-+}
-+
- #[tokio::test]
- async fn update_feature_flags_enabling_guardian_selects_auto_review() -> Result<()> {
-     let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
 diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
-index 9f949c4fb9..66fc2df1f4 100644
+index 371b4b9b8e..683ea76ee0 100644
 --- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
 +++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
-@@ -103,10 +103,6 @@ pub(crate) enum StatusLineItem {
+@@ -103,6 +103,10 @@ pub(crate) enum StatusLineItem {
      #[strum(to_string = "approval-mode", serialize = "approval")]
      ApprovalMode,
  
--    /// Reviewer that handles command approvals.
--    #[strum(to_string = "approval-reviewer", serialize = "reviewer")]
--    ApprovalReviewer,
--
++    /// Reviewer that handles command approvals.
++    #[strum(to_string = "approval-reviewer", serialize = "reviewer")]
++    ApprovalReviewer,
++
      /// Percentage of context window remaining.
      ContextRemaining,
  
-@@ -180,9 +176,10 @@ impl StatusLineItem {
-             StatusLineItem::ResponsesStreamConnection => {
-                 "Current Responses stream connection latency or disconnect state (omitted when unavailable)"
+@@ -178,6 +182,7 @@ impl StatusLineItem {
              }
--            StatusLineItem::Permissions => "Active permission profile or sandbox mode",
-+            StatusLineItem::Permissions => {
-+                "Active permission profile (omitted when not one of the built-in profiles)"
-+            }
+             StatusLineItem::Permissions => "Active permission profile or sandbox mode",
              StatusLineItem::ApprovalMode => "Active command approval mode",
--            StatusLineItem::ApprovalReviewer => "Reviewer for command approvals",
++            StatusLineItem::ApprovalReviewer => "Reviewer for command approvals",
              StatusLineItem::ContextRemaining => {
                  "Percentage of context window remaining (omitted when unknown)"
              }
-@@ -238,7 +235,6 @@ impl StatusLineItem {
+@@ -231,6 +236,7 @@ impl StatusLineItem {
              }
              StatusLineItem::Permissions => StatusSurfacePreviewItem::Permissions,
              StatusLineItem::ApprovalMode => StatusSurfacePreviewItem::ApprovalMode,
--            StatusLineItem::ApprovalReviewer => StatusSurfacePreviewItem::ApprovalReviewer,
++            StatusLineItem::ApprovalReviewer => StatusSurfacePreviewItem::ApprovalReviewer,
              StatusLineItem::ContextRemaining => StatusSurfacePreviewItem::ContextRemaining,
              StatusLineItem::ContextUsed => StatusSurfacePreviewItem::ContextUsed,
              StatusLineItem::FiveHourLimit => StatusSurfacePreviewItem::FiveHourLimit,
-@@ -535,22 +531,6 @@ mod tests {
+@@ -527,6 +533,22 @@ mod tests {
          assert_eq!(StatusLineItem::CacheHitRate.to_string(), "cache-hit-rate");
      }
  
--    #[test]
--    fn approval_reviewer_is_selectable_id() {
--        assert_eq!(
--            "approval-reviewer".parse::<StatusLineItem>(),
--            Ok(StatusLineItem::ApprovalReviewer)
--        );
--        assert_eq!(
--            "reviewer".parse::<StatusLineItem>(),
--            Ok(StatusLineItem::ApprovalReviewer)
--        );
--        assert_eq!(
--            StatusLineItem::ApprovalReviewer.to_string(),
--            "approval-reviewer"
--        );
--    }
--
++    #[test]
++    fn approval_reviewer_is_selectable_id() {
++        assert_eq!(
++            "approval-reviewer".parse::<StatusLineItem>(),
++            Ok(StatusLineItem::ApprovalReviewer)
++        );
++        assert_eq!(
++            "reviewer".parse::<StatusLineItem>(),
++            Ok(StatusLineItem::ApprovalReviewer)
++        );
++        assert_eq!(
++            StatusLineItem::ApprovalReviewer.to_string(),
++            "approval-reviewer"
++        );
++    }
++
      #[test]
      fn reasoning_tokens_is_selectable_id() {
          assert_eq!(
 diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
-index 3977fbb9ed..808a059f11 100644
+index 808a059f11..3977fbb9ed 100644
 --- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
 +++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
-@@ -51,7 +51,6 @@ impl StatusLineAccent {
+@@ -51,6 +51,7 @@ impl StatusLineAccent {
              StatusLineItem::FastMode | StatusLineItem::RawOutput => Self::Mode,
              StatusLineItem::Permissions => Self::Mode,
              StatusLineItem::ApprovalMode => Self::Mode,
--            StatusLineItem::ApprovalReviewer => Self::Mode,
++            StatusLineItem::ApprovalReviewer => Self::Mode,
              StatusLineItem::ThreadTitle => Self::Thread,
              StatusLineItem::TaskProgress => Self::Progress,
          }
 diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
-index 721931a5d2..5c4ff57cbd 100644
+index a1cab118ca..6ecfc4bfb2 100644
 --- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
 +++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
-@@ -18,7 +18,6 @@ pub(crate) enum StatusSurfacePreviewItem {
+@@ -18,6 +18,7 @@ pub(crate) enum StatusSurfacePreviewItem {
      BranchChanges,
      Permissions,
      ApprovalMode,
--    ApprovalReviewer,
++    ApprovalReviewer,
      ResponsesStreamConnection,
      ContextRemaining,
      ContextUsed,
-@@ -52,9 +51,8 @@ impl StatusSurfacePreviewItem {
-             StatusSurfacePreviewItem::GitBranch => "feat/awesome-feature",
-             StatusSurfacePreviewItem::PullRequestNumber => "PR #123",
+@@ -53,6 +54,7 @@ impl StatusSurfacePreviewItem {
              StatusSurfacePreviewItem::BranchChanges => "+12 -3",
--            StatusSurfacePreviewItem::Permissions => "Workspace",
-+            StatusSurfacePreviewItem::Permissions => "Ask For Approval",
+             StatusSurfacePreviewItem::Permissions => "Workspace",
              StatusSurfacePreviewItem::ApprovalMode => "on-request",
--            StatusSurfacePreviewItem::ApprovalReviewer => "user",
++            StatusSurfacePreviewItem::ApprovalReviewer => "user",
              StatusSurfacePreviewItem::ResponsesStreamConnection => "42ms",
              StatusSurfacePreviewItem::ContextRemaining => "0% of 0 left",
              StatusSurfacePreviewItem::ContextUsed => "Context 0% used",
-@@ -90,7 +88,6 @@ impl StatusSurfacePreviewItem {
+@@ -88,6 +90,7 @@ impl StatusSurfacePreviewItem {
              Self::BranchChanges,
              Self::Permissions,
              Self::ApprovalMode,
--            Self::ApprovalReviewer,
++            Self::ApprovalReviewer,
              Self::ResponsesStreamConnection,
              Self::ContextRemaining,
              Self::ContextUsed,
-diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
-index 5a3a20bd6c..09671e975a 100644
---- a/codex-rs/tui/src/chatwidget.rs
-+++ b/codex-rs/tui/src/chatwidget.rs
-@@ -477,6 +477,7 @@ use chrono::Local;
- use codex_app_server_protocol::AskForApproval;
- use codex_file_search::FileMatch;
- use codex_protocol::models::ActivePermissionProfile;
-+use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
- use codex_protocol::models::PermissionProfile;
- use codex_protocol::openai_models::InputModality;
- use codex_protocol::openai_models::ModelPreset;
-@@ -492,7 +493,7 @@ const USER_SHELL_COMMAND_HELP_TITLE: &str = "Prefix a command with ! to run it l
- const USER_SHELL_COMMAND_HELP_HINT: &str = "Example: !ls";
- const ASK_FOR_APPROVAL_LABEL: &str = "Ask For Approval";
- const APPROVE_FOR_ME_LABEL: &str = "Approve For Me";
--const FULL_ACCESS_APPROVE_FOR_ME_LABEL: &str = "Full Access + Approved By Agent";
-+const FULL_ACCESS_AGENT_REVIEW_LABEL: &str = "Full Access + Agent Review";
- const YOLO_LABEL: &str = "YOLO";
- const WORKSPACE_USER_DESCRIPTION: &str =
-     "Workspace write sandbox. Ask the user before internet access or edits outside the workspace.";
-diff --git a/codex-rs/tui/src/chatwidget/permission_popups.rs b/codex-rs/tui/src/chatwidget/permission_popups.rs
-index cc15f28f08..b3504c347b 100644
---- a/codex-rs/tui/src/chatwidget/permission_popups.rs
-+++ b/codex-rs/tui/src/chatwidget/permission_popups.rs
-@@ -144,20 +144,20 @@ impl ChatWidget {
-                 if guardian_approval_enabled {
-                     let approval = AskForApproval::OnRequest;
-                     let selection = PermissionProfileSelection {
--                        profile_id: ":danger-no-sandbox".to_string(),
-+                        profile_id: BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS.to_string(),
-                         approval_policy: Some(approval),
-                         approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
--                        display_label: FULL_ACCESS_APPROVE_FOR_ME_LABEL.to_string(),
-+                        display_label: FULL_ACCESS_AGENT_REVIEW_LABEL.to_string(),
-                     };
-                     items.push(SelectionItem {
--                        name: FULL_ACCESS_APPROVE_FOR_ME_LABEL.to_string(),
-+                        name: FULL_ACCESS_AGENT_REVIEW_LABEL.to_string(),
-                         description: Some(FULL_ACCESS_AUTO_REVIEW_DESCRIPTION.to_string()),
-                         is_current: current_review_policy == ApprovalsReviewer::AutoReview
-                             && current_approval == approval
-                             && matches!(current_permission_profile, PermissionProfile::Disabled),
-                         actions: self.permission_mode_actions(
-                             &preset,
--                            FULL_ACCESS_APPROVE_FOR_ME_LABEL.to_string(),
-+                            FULL_ACCESS_AGENT_REVIEW_LABEL.to_string(),
-                             ApprovalsReviewer::AutoReview,
-                             Some(selection),
-                             /*return_to_permissions*/ !include_read_only,
-@@ -177,12 +177,19 @@ impl ChatWidget {
-                 items.push(SelectionItem {
-                     name: YOLO_LABEL.to_string(),
-                     description: Some(YOLO_DESCRIPTION.to_string()),
--                    is_current: false,
-+                    is_current: current_review_policy == ApprovalsReviewer::AutoReview
-+                        && current_approval == AskForApproval::Never
-+                        && matches!(current_permission_profile, PermissionProfile::Disabled),
-                     actions: self.permission_mode_actions(
-                         &preset,
-                         YOLO_LABEL.to_string(),
--                        ApprovalsReviewer::User,
--                        /*profile_selection*/ None,
-+                        ApprovalsReviewer::AutoReview,
-+                        Some(PermissionProfileSelection {
-+                            profile_id: BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS.to_string(),
-+                            approval_policy: Some(AskForApproval::Never),
-+                            approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
-+                            display_label: YOLO_LABEL.to_string(),
-+                        }),
-                         /*return_to_permissions*/ !include_read_only,
-                     ),
-                     dismiss_on_select: true,
-diff --git a/codex-rs/tui/src/chatwidget/permissions_menu.rs b/codex-rs/tui/src/chatwidget/permissions_menu.rs
-index 167d505a15..88c8b41264 100644
---- a/codex-rs/tui/src/chatwidget/permissions_menu.rs
-+++ b/codex-rs/tui/src/chatwidget/permissions_menu.rs
-@@ -44,7 +44,7 @@ impl ChatWidget {
-         }
-         items.push(self.builtin_permission_mode_selection_item(
-             full_access,
--            ":danger-no-sandbox",
-+            BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
-             full_access.description.to_string(),
-             AskForApproval::from(full_access.approval),
-             ApprovalsReviewer::User,
-@@ -52,7 +52,7 @@ impl ChatWidget {
-         if self.config.features.enabled(Feature::GuardianApproval) {
-             items.push(self.builtin_permission_mode_selection_item(
-                 full_access,
--                ":danger-no-sandbox",
-+                BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
-                 FULL_ACCESS_AUTO_REVIEW_DESCRIPTION.to_string(),
-                 AskForApproval::OnRequest,
-                 ApprovalsReviewer::AutoReview,
-@@ -60,11 +60,11 @@ impl ChatWidget {
-         }
-         items.push(self.builtin_permission_mode_selection_item_with_label(
-             full_access,
--            ":danger-no-sandbox",
-+            BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
-             YOLO_LABEL,
-             YOLO_DESCRIPTION.to_string(),
-             AskForApproval::Never,
--            ApprovalsReviewer::User,
-+            ApprovalsReviewer::AutoReview,
-             /*is_current_alias*/ false,
-         ));
-         items.push(self.builtin_permission_mode_selection_item(
-@@ -111,7 +111,7 @@ impl ChatWidget {
-         let label = match (preset.id, approvals_reviewer) {
-             ("auto", ApprovalsReviewer::AutoReview) => APPROVE_FOR_ME_LABEL,
-             ("auto", ApprovalsReviewer::User) => ASK_FOR_APPROVAL_LABEL,
--            ("full-access", ApprovalsReviewer::AutoReview) => FULL_ACCESS_APPROVE_FOR_ME_LABEL,
-+            ("full-access", ApprovalsReviewer::AutoReview) => FULL_ACCESS_AGENT_REVIEW_LABEL,
-             _ => preset.label,
-         };
-         self.builtin_permission_mode_selection_item_with_label(
-diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup.snap
-index 192c19b538..458b31f6e3 100644
---- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup.snap
-+++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup.snap
-@@ -5,23 +5,21 @@ expression: "render_bottom_popup(&chat, 80)"
- ---
-   Update Model Permissions
- 
--› 1. Ask For Approval (current)       Workspace write sandbox. Ask the user
--                                      before internet access or edits outside
--                                      the workspace.
--  2. Approve For Me                   Workspace write sandbox. Ask the auto-
--                                      review agent before internet access or
--                                      edits outside the workspace.
--  3. Full Access                      Codex can edit files outside this
--                                      workspace and access the internet
--                                      without asking for approval. Exercise
--                                      caution when using.
--  4. Full Access + Approved By Agent  Full filesystem and network access. Ask
--                                      the auto-review agent before privileged
--                                      actions.
--  5. YOLO                             Full filesystem and network access
--                                      without approval. Dangerous.
--  6. Read Only                        Codex can read files in the current
--                                      workspace. Approval is required to edit
--                                      files or access the internet.
-+› 1. Ask For Approval (current)  Workspace write sandbox. Ask the user before
-+                                 internet access or edits outside the
-+                                 workspace.
-+  2. Approve For Me              Workspace write sandbox. Ask the auto-review
-+                                 agent before internet access or edits outside
-+                                 the workspace.
-+  3. Full Access                 Codex can edit files outside this workspace
-+                                 and access the internet without asking for
-+                                 approval. Exercise caution when using.
-+  4. Full Access + Agent Review  Full filesystem and network access. Ask the
-+                                 auto-review agent before privileged actions.
-+  5. YOLO                        Full filesystem and network access without
-+                                 approval. Dangerous.
-+  6. Read Only                   Codex can read files in the current
-+                                 workspace. Approval is required to edit files
-+                                 or access the internet.
- 
-   Press enter to confirm or esc to go back
-diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup_with_custom_profiles.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup_with_custom_profiles.snap
-index 5f5bfc4d44..e8fd24e974 100644
---- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup_with_custom_profiles.snap
-+++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup_with_custom_profiles.snap
-@@ -5,26 +5,24 @@ expression: "render_bottom_popup(&chat, 80)"
- ---
-   Update Model Permissions
- 
--  1. Ask For Approval                 Workspace write sandbox. Ask the user
--                                      before internet access or edits outside
--                                      the workspace.
--  2. Approve For Me                   Workspace write sandbox. Ask the auto-
--                                      review agent before internet access or
--                                      edits outside the workspace.
--  3. Full Access                      Codex can edit files outside this
--                                      workspace and access the internet
--                                      without asking for approval. Exercise
--                                      caution when using.
--  4. Full Access + Approved By Agent  Full filesystem and network access. Ask
--                                      the auto-review agent before privileged
--                                      actions.
--  5. YOLO                             Full filesystem and network access
--                                      without approval. Dangerous.
--  6. Read Only                        Codex can read files in the current
--                                      workspace. Approval is required to edit
--                                      files or access the internet.
--› 7. locked-down (current)            Inspect and patch only approved
--                                      workspace files.
--  8. web-enabled                      Workspace profile with network access.
-+  1. Ask For Approval            Workspace write sandbox. Ask the user before
-+                                 internet access or edits outside the
-+                                 workspace.
-+  2. Approve For Me              Workspace write sandbox. Ask the auto-review
-+                                 agent before internet access or edits outside
-+                                 the workspace.
-+  3. Full Access                 Codex can edit files outside this workspace
-+                                 and access the internet without asking for
-+                                 approval. Exercise caution when using.
-+  4. Full Access + Agent Review  Full filesystem and network access. Ask the
-+                                 auto-review agent before privileged actions.
-+  5. YOLO                        Full filesystem and network access without
-+                                 approval. Dangerous.
-+  6. Read Only                   Codex can read files in the current
-+                                 workspace. Approval is required to edit files
-+                                 or access the internet.
-+› 7. locked-down (current)       Inspect and patch only approved workspace
-+                                 files.
-+  8. web-enabled                 Workspace profile with network access.
- 
-   Press enter to confirm or esc to go back
 diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
-index c2af000b94..40a2d6fe91 100644
+index 5505d1f77f..6fd92d3710 100644
 --- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
 +++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
-@@ -16,6 +16,8 @@ use crate::style::stable_dim_style;
- use codex_app_server_protocol::AskForApproval;
- use codex_protocol::config_types::ApprovalsReviewer;
- use codex_protocol::config_types::ServiceTier;
-+use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
-+use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
- use codex_protocol::models::PermissionProfile;
- use codex_utils_sandbox_summary::summarize_permission_profile;
- use ratatui::prelude::Stylize;
-@@ -603,9 +605,8 @@ impl ChatWidget {
-             StatusLineItem::ResponsesStreamConnection => {
-                 self.status_line_responses_stream_connection_display()
+@@ -605,6 +605,7 @@ impl ChatWidget {
              }
--            StatusLineItem::Permissions => Some(permissions_display(&self.config)),
-+            StatusLineItem::Permissions => permissions_display(&self.config),
+             StatusLineItem::Permissions => Some(permissions_display(&self.config)),
              StatusLineItem::ApprovalMode => Some(approval_mode_display(&self.config)),
--            StatusLineItem::ApprovalReviewer => Some(approval_reviewer_display(&self.config)),
++            StatusLineItem::ApprovalReviewer => Some(approval_reviewer_display(&self.config)),
              StatusLineItem::UsedTokens => {
                  let usage = self.status_line_total_usage();
                  let total = usage.blended_total();
-@@ -872,7 +873,6 @@ impl ChatWidget {
+@@ -853,6 +854,7 @@ impl ChatWidget {
              StatusSurfacePreviewItem::BranchChanges => StatusLineItem::BranchChanges,
              StatusSurfacePreviewItem::Permissions => StatusLineItem::Permissions,
              StatusSurfacePreviewItem::ApprovalMode => StatusLineItem::ApprovalMode,
--            StatusSurfacePreviewItem::ApprovalReviewer => StatusLineItem::ApprovalReviewer,
++            StatusSurfacePreviewItem::ApprovalReviewer => StatusLineItem::ApprovalReviewer,
              StatusSurfacePreviewItem::ResponsesStreamConnection => {
                  StatusLineItem::ResponsesStreamConnection
              }
-@@ -1359,33 +1359,69 @@ fn context_remaining_percent_style(percent: i64) -> Style {
-     Style::default().fg(color).add_modifier(Modifier::BOLD)
- }
- 
--fn permissions_display(config: &Config) -> String {
-+fn permissions_display(config: &Config) -> Option<String> {
-     let active_permission_profile = config.permissions.active_permission_profile();
--    if let Some(active_permission_profile) = active_permission_profile.as_ref()
--        && !active_permission_profile.id.starts_with(':')
--    {
--        return active_permission_profile.id.clone();
-+    let approval_policy = AskForApproval::from(config.permissions.approval_policy.value());
-+    let approvals_reviewer = config.approvals_reviewer;
-+    if let Some(active_permission_profile) = active_permission_profile.as_ref() {
-+        return match active_permission_profile.id.as_str() {
-+            BUILT_IN_PERMISSION_PROFILE_WORKSPACE => match (approval_policy, approvals_reviewer) {
-+                (AskForApproval::OnRequest, ApprovalsReviewer::User) => {
-+                    Some(ASK_FOR_APPROVAL_LABEL.to_string())
-+                }
-+                (AskForApproval::OnRequest, ApprovalsReviewer::AutoReview) => {
-+                    Some(APPROVE_FOR_ME_LABEL.to_string())
-+                }
-+                _ => None,
-+            },
-+            BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS => {
-+                match (approval_policy, approvals_reviewer) {
-+                    (AskForApproval::Never, ApprovalsReviewer::User) => {
-+                        Some("Full Access".to_string())
-+                    }
-+                    (AskForApproval::OnRequest, ApprovalsReviewer::AutoReview) => {
-+                        Some(FULL_ACCESS_AGENT_REVIEW_LABEL.to_string())
-+                    }
-+                    (AskForApproval::Never, ApprovalsReviewer::AutoReview) => {
-+                        Some(YOLO_LABEL.to_string())
-+                    }
-+                    _ => None,
-+                }
-+            }
-+            _ => None,
-+        };
-     }
- 
-     let permission_profile = config.permissions.effective_permission_profile();
-+    if permission_profile == PermissionProfile::Disabled {
-+        return match (approval_policy, approvals_reviewer) {
-+            (AskForApproval::Never, ApprovalsReviewer::User) => Some("Full Access".to_string()),
-+            (AskForApproval::OnRequest, ApprovalsReviewer::AutoReview) => {
-+                Some(FULL_ACCESS_AGENT_REVIEW_LABEL.to_string())
-+            }
-+            (AskForApproval::Never, ApprovalsReviewer::AutoReview) => Some(YOLO_LABEL.to_string()),
-+            _ => None,
-+        };
-+    }
-+
-     let workspace_roots = config.effective_workspace_roots();
-     let summary =
-         summarize_permission_profile(&permission_profile, &config.cwd, workspace_roots.as_slice());
--    if let Some(details) = summary.strip_prefix("read-only")
--        && !details.contains("(network access enabled)")
--    {
--        return "Read Only".to_string();
--    }
-     if let Some(details) = summary.strip_prefix("workspace-write")
-         && !details.contains("(network access enabled)")
-     {
--        return "Workspace".to_string();
--    }
--    if permission_profile == PermissionProfile::Disabled {
--        return "Full Access".to_string();
-+        return match (approval_policy, approvals_reviewer) {
-+            (AskForApproval::OnRequest, ApprovalsReviewer::User) => {
-+                Some(ASK_FOR_APPROVAL_LABEL.to_string())
-+            }
-+            (AskForApproval::OnRequest, ApprovalsReviewer::AutoReview) => {
-+                Some(APPROVE_FOR_ME_LABEL.to_string())
-+            }
-+            _ => None,
-+        };
-     }
- 
--    "Custom permissions".to_string()
-+    None
- }
- 
- fn approval_mode_display(config: &Config) -> String {
-@@ -1400,103 +1436,17 @@ fn approval_mode_display(config: &Config) -> String {
+@@ -1380,6 +1382,14 @@ fn approval_mode_display(config: &Config) -> String {
      config.permissions.approval_policy.value().to_string()
  }
  
--fn approval_reviewer_display(config: &Config) -> String {
--    match config.approvals_reviewer {
--        ApprovalsReviewer::AutoReview => "agent",
--        ApprovalsReviewer::User => "user",
--    }
--    .to_string()
--}
--
++fn approval_reviewer_display(config: &Config) -> String {
++    match config.approvals_reviewer {
++        ApprovalsReviewer::AutoReview => "agent",
++        ApprovalsReviewer::User => "user",
++    }
++    .to_string()
++}
++
  fn status_line_version_display_line(
      cli_version: &str,
      remote_app_server_version: Option<Option<&str>>,
- ) -> Line<'static> {
--    let Some(app_server_version) = remote_app_server_version else {
--        return Line::from(cli_version.to_string().red());
--    };
--    let Some(app_server_version) = app_server_version else {
--        return Line::from(vec![
--            cli_version.to_string().white(),
--            " ".into(),
--            "unknown".red(),
--        ]);
--    };
--    if app_server_version == "unknown" {
--        return Line::from(vec![
--            cli_version.to_string().white(),
--            " ".into(),
--            "unknown".red(),
--        ]);
--    }
--
--    let app_server_display_version = app_server_version.trim_start_matches('v');
--    if app_server_display_version == cli_version {
--        return Line::from(cli_version.to_string().green());
--    }
--    Line::from(vec![
--        cli_version.to_string().white(),
--        " ".into(),
--        app_server_display_version
--            .to_string()
--            .fg(app_server_version_color(
--                cli_version,
--                app_server_display_version,
--            )),
--    ])
--}
--
--fn app_server_version_color(cli_version: &str, app_server_version: &str) -> Color {
--    if app_server_version == cli_version {
--        return Color::Green;
--    }
--    match (
--        ParsedCodexVersion::parse(cli_version),
--        ParsedCodexVersion::parse(app_server_version),
--    ) {
--        (Some(cli), Some(app_server)) if cli.is_within_one_version_of(app_server) => Color::Yellow,
--        _ => Color::Red,
--    }
--}
--
--#[derive(Clone, Copy, Debug, Eq, PartialEq)]
--struct ParsedCodexVersion {
--    major: u64,
--    minor: u64,
--    patch: u64,
--}
--
--impl ParsedCodexVersion {
--    fn parse(value: &str) -> Option<Self> {
--        let value = value.trim();
--        let value = value
--            .strip_prefix("rust-v")
--            .or_else(|| value.strip_prefix('v'))
--            .unwrap_or(value);
--        let numeric = value.split_once('-').map_or(value, |(numeric, _)| numeric);
--        let mut parts = numeric.split('.');
--        let major = parts.next()?.parse().ok()?;
--        let minor = parts.next()?.parse().ok()?;
--        let patch = parts.next()?.parse().ok()?;
--        if parts.next().is_some() {
--            return None;
--        }
--        Some(Self {
--            major,
--            minor,
--            patch,
--        })
--    }
--
--    fn is_within_one_version_of(self, other: Self) -> bool {
--        if self.major != other.major {
--            return false;
--        }
--        if self.minor == other.minor {
--            return self.patch.abs_diff(other.patch) <= 1;
-+    if let Some(Some(app_server_version)) = remote_app_server_version {
-+        let app_server_display_version = app_server_version.trim_start_matches('v');
-+        if app_server_display_version == cli_version {
-+            return Line::from(cli_version.to_string().green());
-         }
--        self.minor.abs_diff(other.minor) <= 1
-     }
-+    Line::from(cli_version.to_string().red())
- }
- 
- fn parse_items_with_invalids<T>(ids: impl IntoIterator<Item = String>) -> (Vec<T>, Vec<String>)
-@@ -1543,19 +1493,16 @@ mod tests {
-         assert_eq!(matching.spans[0].style.fg, Some(Color::Green));
- 
-         let nearby = status_line_version_display_line("0.137.0-alpha.4", Some(Some("0.136.0")));
--        assert_eq!(line_text(nearby.clone()), "0.137.0-alpha.4 0.136.0");
--        assert_eq!(nearby.spans[0].style.fg, Some(Color::White));
--        assert_eq!(nearby.spans[2].style.fg, Some(Color::Yellow));
-+        assert_eq!(line_text(nearby.clone()), "0.137.0-alpha.4");
-+        assert_eq!(nearby.spans[0].style.fg, Some(Color::Red));
- 
-         let distant = status_line_version_display_line("0.137.0-alpha.4", Some(Some("0.120.0")));
--        assert_eq!(line_text(distant.clone()), "0.137.0-alpha.4 0.120.0");
--        assert_eq!(distant.spans[0].style.fg, Some(Color::White));
--        assert_eq!(distant.spans[2].style.fg, Some(Color::Red));
-+        assert_eq!(line_text(distant.clone()), "0.137.0-alpha.4");
-+        assert_eq!(distant.spans[0].style.fg, Some(Color::Red));
- 
-         let unknown = status_line_version_display_line("0.137.0-alpha.4", Some(None));
--        assert_eq!(line_text(unknown.clone()), "0.137.0-alpha.4 unknown");
--        assert_eq!(unknown.spans[0].style.fg, Some(Color::White));
--        assert_eq!(unknown.spans[2].style.fg, Some(Color::Red));
-+        assert_eq!(line_text(unknown.clone()), "0.137.0-alpha.4");
-+        assert_eq!(unknown.spans[0].style.fg, Some(Color::Red));
-     }
- 
-     #[allow(clippy::disallowed_methods)]
-diff --git a/codex-rs/tui/src/chatwidget/tests/permissions.rs b/codex-rs/tui/src/chatwidget/tests/permissions.rs
-index 31c62d0008..60ff760a02 100644
---- a/codex-rs/tui/src/chatwidget/tests/permissions.rs
-+++ b/codex-rs/tui/src/chatwidget/tests/permissions.rs
-@@ -256,7 +256,7 @@ async fn profile_permissions_full_access_opens_confirmation() {
-                 display_label,
-             }),
-         } if preset.id == "full-access"
--            && profile_id == ":danger-no-sandbox"
-+            && profile_id == ":danger-full-access"
-             && display_label == "Full Access"
-     ));
- }
-@@ -824,6 +824,7 @@ async fn permissions_selection_emits_history_cell_when_current_is_selected() {
-         .approval_policy
-         .set(AskForApproval::OnRequest.to_core())
-         .expect("set approval policy");
-+    chat.config.approvals_reviewer = ApprovalsReviewer::AutoReview;
-     chat.config
-         .permissions
-         .set_permission_profile(PermissionProfile::workspace_write())
-@@ -883,7 +884,7 @@ async fn permissions_selection_shows_full_access_reviewer_profiles() {
-         "Ask For Approval",
-         "Approve For Me",
-         "Full Access",
--        "Full Access + Approved By Agent",
-+        "Full Access + Agent Review",
-         "YOLO",
-     ] {
-         assert!(popup.contains(label), "expected {label} in popup: {popup}");
-@@ -1038,7 +1039,6 @@ async fn permissions_selection_can_disable_auto_review() {
-         .expect("set permission profile");
- 
-     chat.open_permissions_popup();
--    chat.handle_key_event(KeyEvent::from(KeyCode::Up));
-     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
- 
-     let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
 diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
-index e0192c3bb8..ed0ccfaf63 100644
+index 25d815baa4..e0192c3bb8 100644
 --- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
 +++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
-@@ -3,7 +3,12 @@ use crate::bottom_pane::goal_status_indicator_line;
- use crate::chatwidget::rate_limits::NUDGE_MODEL_SLUG;
- use crate::chatwidget::rate_limits::get_limits_duration;
- use crate::status::remote_connection::RemoteConnectionStatus;
-+use crate::version::CODEX_CLI_VERSION;
-+use codex_app_server_protocol::AskForApproval;
- use codex_app_server_protocol::SpendControlLimitSnapshot;
-+use codex_protocol::models::ActivePermissionProfile;
-+use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
-+use codex_protocol::models::PermissionProfile;
- use pretty_assertions::assert_eq;
- use ratatui::backend::TestBackend;
- use serial_test::serial;
-@@ -605,29 +610,41 @@ async fn status_line_codex_version_uses_remote_connection_version() {
-     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-     chat.remote_connection = Some(RemoteConnectionStatus {
-         address: "unix:///tmp/codex.sock".to_string(),
--        version: Some("0.135.0".to_string()),
-+        version: Some(CODEX_CLI_VERSION.to_string()),
-     });
- 
-     assert_eq!(
-         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::CodexVersion),
--        Some(format!("{CODEX_CLI_VERSION} 0.135.0"))
-+        Some(CODEX_CLI_VERSION.to_string())
+@@ -614,6 +614,23 @@ async fn status_line_codex_version_uses_remote_connection_version() {
      );
  }
  
++#[tokio::test]
++async fn status_line_approval_reviewer_shows_user_or_agent() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++
++    chat.config.approvals_reviewer = ApprovalsReviewer::User;
++    assert_eq!(
++        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::ApprovalReviewer),
++        Some("user".to_string())
++    );
++
++    chat.config.approvals_reviewer = ApprovalsReviewer::AutoReview;
++    assert_eq!(
++        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::ApprovalReviewer),
++        Some("agent".to_string())
++    );
++}
++
  #[tokio::test]
--async fn status_line_approval_reviewer_shows_user_or_agent() {
-+async fn status_line_permissions_shows_known_profile_combinations() {
+ async fn status_line_legacy_limit_items_prefer_matching_windows() {
      let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-+    chat.config
-+        .permissions
-+        .approval_policy
-+        .set(AskForApproval::OnRequest.to_core())
-+        .expect("set approval policy");
-+    chat.config
-+        .permissions
-+        .set_permission_profile_from_session_snapshot(PermissionProfileSnapshot::active(
-+            PermissionProfile::workspace_write(),
-+            ActivePermissionProfile::new(BUILT_IN_PERMISSION_PROFILE_WORKSPACE),
-+        ))
-+        .expect("set permission profile");
- 
-     chat.config.approvals_reviewer = ApprovalsReviewer::User;
-     assert_eq!(
--        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::ApprovalReviewer),
--        Some("user".to_string())
-+        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::Permissions),
-+        Some("Ask For Approval".to_string())
-     );
- 
-     chat.config.approvals_reviewer = ApprovalsReviewer::AutoReview;
-     assert_eq!(
--        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::ApprovalReviewer),
--        Some("agent".to_string())
-+        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::Permissions),
-+        Some("Approve For Me".to_string())
-     );
- }
- 
-diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
-index 4ea81c532a..7978ed4f66 100644
---- a/codex-rs/tui/src/lib.rs
-+++ b/codex-rs/tui/src/lib.rs
-@@ -16,6 +16,7 @@ use crate::legacy_core::format_exec_policy_error_with_source;
- use crate::session_resume::ResolveCwdOutcome;
- use crate::session_resume::resolve_cwd_for_resume_or_fork;
- pub use crate::startup_error::LocalStateDbStartupError;
-+use crate::version::CODEX_CLI_VERSION;
- use additional_dirs::add_dir_warning_message;
- use app::App;
- pub use app::AppExitInfo;
-@@ -401,7 +402,7 @@ pub fn remote_addr_supports_auth_token(endpoint: &RemoteAppServerEndpoint) -> bo
- 
- async fn connect_remote_app_server(
-     endpoint: RemoteAppServerEndpoint,
--) -> color_eyre::Result<AppServerClient> {
-+) -> color_eyre::Result<RemoteAppServerClient> {
-     let app_server = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-         endpoint,
-         client_name: "codex-tui".to_string(),
-@@ -413,7 +414,7 @@ async fn connect_remote_app_server(
-     })
-     .await
-     .wrap_err("failed to connect to remote app server")?;
--    Ok(AppServerClient::Remote(app_server))
-+    Ok(app_server)
- }
- 
- #[cfg(unix)]
-@@ -463,8 +464,36 @@ async fn start_app_server(
-         )
-         .await
-         .map(AppServerClient::InProcess),
--        AppServerTarget::LocalDaemon { endpoint } | AppServerTarget::Remote { endpoint } => {
--            connect_remote_app_server(endpoint.clone()).await
-+        AppServerTarget::LocalDaemon { endpoint } => {
-+            let app_server = connect_remote_app_server(endpoint.clone()).await?;
-+            if app_server.server_version() == Some(CODEX_CLI_VERSION) {
-+                return Ok(AppServerClient::Remote(app_server));
-+            }
-+            let _ = app_server.shutdown().await;
-+            start_embedded_app_server(
-+                arg0_paths,
-+                config,
-+                cli_kv_overrides,
-+                loader_overrides,
-+                strict_config,
-+                cloud_config_bundle,
-+                feedback,
-+                log_db,
-+                state_db,
-+                environment_manager,
-+            )
-+            .await
-+            .map(AppServerClient::InProcess)
-+        }
-+        AppServerTarget::Remote { endpoint } => {
-+            let app_server = connect_remote_app_server(endpoint.clone()).await?;
-+            if app_server.server_version() != Some(CODEX_CLI_VERSION) {
-+                color_eyre::eyre::bail!(
-+                    "remote app server version {:?} does not match Codex CLI version {CODEX_CLI_VERSION}",
-+                    app_server.server_version()
-+                );
-+            }
-+            Ok(AppServerClient::Remote(app_server))
-         }
-     }
- }

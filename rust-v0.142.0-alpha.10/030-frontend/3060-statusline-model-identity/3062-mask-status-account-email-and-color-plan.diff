@@ -1,1137 +1,379 @@
-diff --git a/codex-rs/core/src/state/session.rs b/codex-rs/core/src/state/session.rs
-index 80cfe17b02..b549aaa322 100644
---- a/codex-rs/core/src/state/session.rs
-+++ b/codex-rs/core/src/state/session.rs
-@@ -335,14 +335,21 @@ impl SessionState {
- }
- 
- // Sometimes new snapshots don't include credits or plan information.
--// Preserve those from the previous snapshot when missing. For `limit_id`, treat
--// missing values as the default `"codex"` bucket.
-+// Preserve those from the previous snapshot when missing. For `limit_id`, keep
-+// non-codex limit names distinct when the server omits the bucket id.
- fn merge_rate_limit_fields(
-     previous: Option<&RateLimitSnapshot>,
-     mut snapshot: RateLimitSnapshot,
- ) -> RateLimitSnapshot {
-     if snapshot.limit_id.is_none() {
--        snapshot.limit_id = Some("codex".to_string());
-+        snapshot.limit_id = Some(
-+            snapshot
-+                .limit_name
-+                .as_deref()
-+                .filter(|limit_name| !limit_name.eq_ignore_ascii_case("codex"))
-+                .unwrap_or("codex")
-+                .to_string(),
-+        );
-     }
-     if snapshot.credits.is_none() {
-         snapshot.credits = previous.and_then(|prior| prior.credits.clone());
-diff --git a/codex-rs/core/src/state/session_tests.rs b/codex-rs/core/src/state/session_tests.rs
-index 0fbb92b958..d11e3ed6df 100644
---- a/codex-rs/core/src/state/session_tests.rs
-+++ b/codex-rs/core/src/state/session_tests.rs
-@@ -64,6 +64,35 @@ async fn set_rate_limits_defaults_limit_id_to_codex_when_missing() {
-     );
- }
- 
-+#[tokio::test]
-+async fn set_rate_limits_uses_non_codex_limit_name_when_id_is_missing() {
-+    let session_configuration = make_session_configuration_for_tests().await;
-+    let mut state = SessionState::new(session_configuration);
-+
-+    state.set_rate_limits(RateLimitSnapshot {
-+        limit_id: None,
-+        limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
-+        primary: Some(RateLimitWindow {
-+            used_percent: 12.0,
-+            window_minutes: Some(60),
-+            resets_at: Some(100),
-+        }),
-+        secondary: None,
-+        credits: None,
-+        individual_limit: None,
-+        plan_type: None,
-+        rate_limit_reached_type: None,
-+    });
-+
-+    assert_eq!(
-+        state
-+            .latest_rate_limits
-+            .as_ref()
-+            .and_then(|v| v.limit_id.clone()),
-+        Some("GPT-5.3-Codex-Spark".to_string())
-+    );
-+}
-+
- #[tokio::test]
- async fn replace_history_clears_auto_compact_window_prefill() {
-     let session_configuration = make_session_configuration_for_tests().await;
-diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
-index 660c5f10fc..115bc64a3f 100644
---- a/codex-rs/tui/src/app.rs
-+++ b/codex-rs/tui/src/app.rs
-@@ -749,6 +749,7 @@ impl App {
-             feedback: self.feedback.clone(),
-             is_first_run: false,
-             status_account_display: self.chat_widget.status_account_display().cloned(),
-+            rate_limit_snapshots_by_limit_id: self.chat_widget.rate_limit_snapshots_by_limit_id(),
-             runtime_model_provider_base_url: self
-                 .chat_widget
-                 .runtime_model_provider_base_url()
-@@ -906,6 +907,7 @@ impl App {
-                     feedback: feedback.clone(),
-                     is_first_run,
-                     status_account_display: status_account_display.clone(),
-+                    rate_limit_snapshots_by_limit_id: BTreeMap::new(),
-                     runtime_model_provider_base_url: runtime_model_provider_base_url.clone(),
-                     initial_plan_type,
-                     model: Some(model.clone()),
-@@ -942,6 +944,7 @@ impl App {
-                     feedback: feedback.clone(),
-                     is_first_run,
-                     status_account_display: status_account_display.clone(),
-+                    rate_limit_snapshots_by_limit_id: BTreeMap::new(),
-                     runtime_model_provider_base_url: runtime_model_provider_base_url.clone(),
-                     initial_plan_type,
-                     model: config.model.clone(),
-@@ -981,6 +984,7 @@ impl App {
-                     feedback: feedback.clone(),
-                     is_first_run,
-                     status_account_display: status_account_display.clone(),
-+                    rate_limit_snapshots_by_limit_id: BTreeMap::new(),
-                     runtime_model_provider_base_url: runtime_model_provider_base_url.clone(),
-                     initial_plan_type,
-                     model: config.model.clone(),
-diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
-index 9b3db6ac2a..29a315c80c 100644
---- a/codex-rs/tui/src/app/tests.rs
-+++ b/codex-rs/tui/src/app/tests.rs
-@@ -26,6 +26,7 @@ use crate::history_cell::new_session_info;
- use crate::multi_agents::AgentPickerThreadEntry;
- use crate::multi_agents::SubAgentActivityDisplay;
- use assert_matches::assert_matches;
-+use std::collections::BTreeMap;
- 
- use crate::app_command::AppCommand as Op;
- use crate::diff_model::FileChange;
-@@ -56,6 +57,8 @@ use codex_app_server_protocol::NetworkPolicyRuleAction as AppServerNetworkPolicy
- use codex_app_server_protocol::NonSteerableTurnKind as AppServerNonSteerableTurnKind;
- use codex_app_server_protocol::PatchChangeKind;
- use codex_app_server_protocol::PermissionsRequestApprovalParams;
-+use codex_app_server_protocol::RateLimitSnapshot;
-+use codex_app_server_protocol::RateLimitWindow;
- use codex_app_server_protocol::RequestId as AppServerRequestId;
- use codex_app_server_protocol::ServerNotification;
- use codex_app_server_protocol::ServerRequest;
-@@ -334,6 +337,7 @@ async fn enqueue_primary_thread_session_replays_turns_before_initial_prompt_subm
-         feedback: codex_feedback::CodexFeedback::new(),
-         is_first_run: false,
-         status_account_display: None,
-+        rate_limit_snapshots_by_limit_id: BTreeMap::new(),
-         runtime_model_provider_base_url: None,
-         initial_plan_type: None,
-         model: Some(model),
-@@ -5804,6 +5808,7 @@ async fn replace_chat_widget_reseeds_collab_agent_metadata_for_replay() {
-         feedback: app.feedback.clone(),
-         is_first_run: false,
-         status_account_display: app.chat_widget.status_account_display().cloned(),
-+        rate_limit_snapshots_by_limit_id: app.chat_widget.rate_limit_snapshots_by_limit_id(),
-         runtime_model_provider_base_url: app
-             .chat_widget
-             .runtime_model_provider_base_url()
-@@ -5861,6 +5866,62 @@ async fn replace_chat_widget_reseeds_collab_agent_metadata_for_replay() {
-     );
- }
- 
-+#[tokio::test]
-+async fn replace_chat_widget_preserves_rate_limit_snapshots() {
-+    let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
-+    app.chat_widget
-+        .on_rate_limit_snapshot(Some(RateLimitSnapshot {
-+            limit_id: Some("codex".to_string()),
-+            limit_name: None,
-+            primary: Some(RateLimitWindow {
-+                used_percent: 25,
-+                window_duration_mins: Some(5 * 60),
-+                resets_at: None,
-+            }),
-+            secondary: None,
-+            credits: None,
-+            individual_limit: None,
-+            plan_type: None,
-+            rate_limit_reached_type: None,
-+        }));
-+
-+    let replacement = ChatWidget::new_with_app_event(ChatWidgetInit {
-+        config: app.config.clone(),
-+        frame_requester: crate::tui::FrameRequester::test_dummy(),
-+        app_event_tx: app.app_event_tx.clone(),
-+        workspace_command_runner: None,
-+        initial_user_message: None,
-+        enhanced_keys_supported: app.enhanced_keys_supported,
-+        has_chatgpt_account: app.chat_widget.has_chatgpt_account(),
-+        has_codex_backend_auth: app.chat_widget.has_codex_backend_auth(),
-+        model_catalog: app.model_catalog.clone(),
-+        feedback: app.feedback.clone(),
-+        is_first_run: false,
-+        status_account_display: app.chat_widget.status_account_display().cloned(),
-+        rate_limit_snapshots_by_limit_id: app.chat_widget.rate_limit_snapshots_by_limit_id(),
-+        runtime_model_provider_base_url: app
-+            .chat_widget
-+            .runtime_model_provider_base_url()
-+            .map(str::to_string),
-+        initial_plan_type: app.chat_widget.current_plan_type(),
-+        model: Some(app.chat_widget.current_model().to_string()),
-+        startup_tooltip_override: None,
-+        status_line_invalid_items_warned: app.status_line_invalid_items_warned.clone(),
-+        terminal_title_invalid_items_warned: app.terminal_title_invalid_items_warned.clone(),
-+        session_telemetry: app.session_telemetry.clone(),
-+    });
-+    app.replace_chat_widget(replacement);
-+
-+    assert_eq!(
-+        app.chat_widget
-+            .rate_limit_snapshots_by_limit_id()
-+            .get("codex")
-+            .and_then(|snapshot| snapshot.primary.as_ref())
-+            .map(|window| window.used_percent),
-+        Some(25.0)
-+    );
-+}
-+
- #[tokio::test]
- async fn refreshed_snapshot_session_persists_resumed_turns() {
-     let mut app = make_test_app().await;
-diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
-index 887db42831..71a6172374 100644
---- a/codex-rs/tui/src/app_server_session.rs
-+++ b/codex-rs/tui/src/app_server_session.rs
-@@ -1784,16 +1784,23 @@ pub(crate) fn app_server_rate_limit_snapshots(
-     let primary_limit_id = response.rate_limits.limit_id.clone();
-     let mut snapshots = vec![response.rate_limits];
-     if let Some(by_limit_id) = response.rate_limits_by_limit_id {
--        snapshots.extend(by_limit_id.into_iter().filter_map(|(limit_id, snapshot)| {
--            if primary_limit_id.as_deref().is_some_and(|primary_limit_id| {
--                primary_limit_id == limit_id
--                    || Some(primary_limit_id) == snapshot.limit_id.as_deref()
--            }) {
--                None
--            } else {
--                Some(snapshot)
--            }
--        }));
-+        snapshots.extend(
-+            by_limit_id
-+                .into_iter()
-+                .filter_map(|(limit_id, mut snapshot)| {
-+                    if primary_limit_id.as_deref().is_some_and(|primary_limit_id| {
-+                        primary_limit_id == limit_id
-+                            || Some(primary_limit_id) == snapshot.limit_id.as_deref()
-+                    }) {
-+                        None
-+                    } else {
-+                        if snapshot.limit_id.is_none() {
-+                            snapshot.limit_id = Some(limit_id);
-+                        }
-+                        Some(snapshot)
-+                    }
-+                }),
-+        );
-     }
-     snapshots
- }
-@@ -1852,6 +1859,23 @@ mod tests {
-         }
-     }
- 
-+    fn rate_limit_snapshot_without_id() -> RateLimitSnapshot {
-+        RateLimitSnapshot {
-+            limit_id: None,
-+            limit_name: None,
-+            primary: Some(codex_app_server_protocol::RateLimitWindow {
-+                used_percent: 0,
-+                window_duration_mins: Some(10_080),
-+                resets_at: None,
-+            }),
-+            secondary: None,
-+            credits: None,
-+            individual_limit: None,
-+            plan_type: None,
-+            rate_limit_reached_type: None,
-+        }
-+    }
-+
-     #[test]
-     fn app_server_rate_limit_snapshots_deduplicates_top_level_limit_from_map() {
-         let response = GetAccountRateLimitsResponse {
-@@ -1874,6 +1898,28 @@ mod tests {
-         );
-     }
- 
-+    #[test]
-+    fn app_server_rate_limit_snapshots_fills_missing_map_limit_id() {
-+        let response = GetAccountRateLimitsResponse {
-+            rate_limits: rate_limit_snapshot("codex"),
-+            rate_limits_by_limit_id: Some(HashMap::from([(
-+                "codex_spark".to_string(),
-+                rate_limit_snapshot_without_id(),
-+            )])),
-+            rate_limit_reset_credits: None,
-+        };
-+
-+        let snapshots = app_server_rate_limit_snapshots(response);
-+
-+        assert_eq!(
-+            snapshots
-+                .iter()
-+                .map(|snapshot| snapshot.limit_id.as_deref())
-+                .collect::<Vec<_>>(),
-+            vec![Some("codex"), Some("codex_spark")]
-+        );
-+    }
-+
-     #[test]
-     fn thread_settings_update_compat_detects_unsupported_errors() {
-         let cases = [
-diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
-index dc28ffe733..88a4133f37 100644
---- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
-+++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
-@@ -2,8 +2,10 @@
- 
- use ratatui::prelude::Stylize;
- use ratatui::style::Color;
-+use ratatui::style::Modifier;
- use ratatui::style::Style;
- use ratatui::text::Line;
-+use ratatui::text::Span;
- 
- use super::status_line_setup::StatusLineItem;
- use crate::render::highlight::foreground_style_for_scopes;
-@@ -140,6 +142,14 @@ where
-             &theme_style_for_accent,
-         );
-         let line: Line<'static> = segment.into();
-+        if matches!(
-+            item,
-+            StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit
-+        ) && let Some(limit_spans) = limit_metric_line_spans(&line, style)
-+        {
-+            spans.extend(limit_spans);
-+            continue;
-+        }
-         let text: String = line
-             .spans
-             .iter()
-@@ -213,6 +223,71 @@ fn soften_rgb_channel(channel: u8, luma: u16) -> u8 {
-     ((softened * STATUS_LINE_COLOR_BRIGHTNESS_PERCENT + 50) / 100) as u8
- }
- 
-+fn limit_metric_line_spans(line: &Line<'static>, base_style: Style) -> Option<Vec<Span<'static>>> {
-+    let mut output = Vec::new();
-+    let mut parsed_metric = false;
-+
-+    for span in &line.spans {
-+        if span.style == Style::default()
-+            && let Some(mut spans) = limit_metric_text_spans(span.content.as_ref(), base_style)
-+        {
-+            parsed_metric = true;
-+            output.append(&mut spans);
-+        } else {
-+            output.push(span.clone());
-+        }
-+    }
-+
-+    parsed_metric.then_some(output)
-+}
-+
-+fn limit_metric_text_spans(text: &str, base_style: Style) -> Option<Vec<Span<'static>>> {
-+    let mut spans = Vec::new();
-+    let mut saw_metric = false;
-+
-+    for part in text.split_whitespace() {
-+        if !spans.is_empty() {
-+            spans.push(" ".into());
-+        }
-+        if let Some(percent) = parse_unsigned_percent(part) {
-+            saw_metric = true;
-+            spans.push(Span::styled(format!("{percent}%"), Style::default()));
-+        } else if let Some(pace) = parse_pace_percent(part) {
-+            saw_metric = true;
-+            spans.push(Span::styled(format!("{pace:+}%"), limit_pace_style(pace)));
-+        } else {
-+            spans.push(Span::styled(part.to_string(), base_style));
-+        }
-+    }
-+
-+    saw_metric.then_some(spans)
-+}
-+
-+fn parse_unsigned_percent(text: &str) -> Option<i64> {
-+    if matches!(text.as_bytes().first(), Some(b'+' | b'-')) {
-+        return None;
-+    }
-+    let percent = text.strip_suffix('%')?.parse::<i64>().ok()?;
-+    Some(percent.clamp(0, 100))
-+}
-+
-+fn parse_pace_percent(text: &str) -> Option<i64> {
-+    if !matches!(text.as_bytes().first(), Some(b'+' | b'-')) {
-+        return None;
-+    }
-+    text.strip_suffix('%')?.parse::<i64>().ok()
-+}
-+
-+fn limit_pace_style(pace: i64) -> Style {
-+    let color = match pace {
-+        ..=-21 => Color::Red,
-+        -20..=-11 => Color::Rgb(255, 128, 0),
-+        -10..=-1 => Color::Yellow,
-+        _ => Color::Green,
-+    };
-+    Style::default().fg(color).add_modifier(Modifier::BOLD)
-+}
-+
- #[cfg(test)]
- mod tests {
-     use super::*;
-@@ -228,6 +303,68 @@ mod tests {
-             .collect::<String>()
-     }
- 
-+    #[test]
-+    fn rate_limit_segments_color_compact_pace_metric() {
-+        let line = status_line_from_segments_with_resolver(
-+            [(StatusLineItem::FiveHourLimit, "5h 80% +15%".to_string())],
-+            /*use_theme_colors*/ true,
-+            |_| Some(Style::default().red()),
-+        )
-+        .expect("status line");
-+
-+        assert_eq!(line_text(&line), "5h 80% +15%");
-+        assert_eq!(line.spans[0].style.fg, Some(Color::Red));
-+        assert_eq!(line.spans[2].style.fg, None);
-+        assert_eq!(line.spans[4].style.fg, Some(Color::Green));
-+        assert!(!line.spans[2].style.add_modifier.contains(Modifier::BOLD));
-+        assert!(line.spans[4].style.add_modifier.contains(Modifier::BOLD));
-+    }
-+
-+    #[test]
-+    fn rate_limit_pace_colors_show_surplus_and_deficit_thresholds() {
-+        let cases = [
-+            ("5h 60% +4%", Color::Green),
-+            ("5h 60% +0%", Color::Green),
-+            ("5h 60% -10%", Color::Yellow),
-+            ("5h 60% -11%", Color::Rgb(255, 128, 0)),
-+            ("5h 60% -20%", Color::Rgb(255, 128, 0)),
-+            ("5h 60% -21%", Color::Red),
-+            ("5h 60% -30%", Color::Red),
-+        ];
-+
-+        for (label, expected_color) in cases {
-+            let line = status_line_from_segments_with_resolver(
-+                [(StatusLineItem::FiveHourLimit, label.to_string())],
-+                /*use_theme_colors*/ true,
-+                |_| Some(Style::default().red()),
-+            )
-+            .expect("status line");
-+
-+            assert_eq!(line.spans[4].style.fg, Some(expected_color));
-+            assert!(line.spans[4].style.add_modifier.contains(Modifier::BOLD));
-+        }
-+    }
-+
-+    #[test]
-+    fn rate_limit_segments_preserve_explicit_secondary_dim() {
-+        let line = status_line_from_segments_with_resolver(
-+            [(
-+                StatusLineItem::FiveHourLimit,
-+                Line::from(vec!["5h 80% +15%".into(), " ".dim(), "60% +40%".dim()]),
-+            )],
-+            /*use_theme_colors*/ true,
-+            |_| Some(Style::default().red()),
-+        )
-+        .expect("status line");
-+
-+        assert_eq!(line_text(&line), "5h 80% +15% 60% +40%");
-+        assert_eq!(line.spans[0].style.fg, Some(Color::Red));
-+        assert_eq!(line.spans[2].style.fg, None);
-+        assert_eq!(line.spans[4].style.fg, Some(Color::Green));
-+        assert!(line.spans[5].style.add_modifier.contains(Modifier::DIM));
-+        assert!(line.spans[6].style.add_modifier.contains(Modifier::DIM));
-+    }
-+
-     #[test]
-     fn status_line_segments_preserve_order_and_plain_text() {
-         let line = status_line_from_segments_with_resolver(
-diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
-index 069ee6dd4a..6a8e8d2e07 100644
---- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
-+++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
-@@ -251,7 +251,7 @@ fn rate_limit_preview_copy(value: &str) -> Option<RateLimitPreviewCopy> {
-             name: "usage-limit",
-             description: "Remaining usage on the primary usage limit (omitted when unavailable)",
-         })
--    } else if value.starts_with("5h ") {
-+    } else if value.starts_with("5h ") || value.starts_with("5H ") {
-         Some(RateLimitPreviewCopy {
-             name: "five-hour-limit",
-             description: "Remaining usage on the 5-hour usage limit (omitted when unavailable)",
-@@ -261,12 +261,12 @@ fn rate_limit_preview_copy(value: &str) -> Option<RateLimitPreviewCopy> {
-             name: "daily-limit",
-             description: "Remaining usage on the daily usage limit (omitted when unavailable)",
-         })
--    } else if value.starts_with("weekly ") {
-+    } else if value.starts_with("weekly ") || value.starts_with("7D ") {
-         Some(RateLimitPreviewCopy {
-             name: "weekly-limit",
-             description: "Remaining usage on the weekly usage limit (omitted when unavailable)",
-         })
--    } else if value.starts_with("monthly ") {
-+    } else if value.starts_with("monthly ") || value.starts_with("30D ") {
-         Some(RateLimitPreviewCopy {
-             name: "monthly-limit",
-             description: "Remaining usage on the monthly usage limit (omitted when unavailable)",
 diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
-index feaad526fe..cfd3b5ced0 100644
+index 6c1fc25709..feaad526fe 100644
 --- a/codex-rs/tui/src/chatwidget.rs
 +++ b/codex-rs/tui/src/chatwidget.rs
-@@ -519,6 +519,7 @@ pub(crate) struct ChatWidgetInit {
-     pub(crate) feedback: codex_feedback::CodexFeedback,
-     pub(crate) is_first_run: bool,
-     pub(crate) status_account_display: Option<StatusAccountDisplay>,
-+    pub(crate) rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
-     pub(crate) runtime_model_provider_base_url: Option<String>,
-     pub(crate) initial_plan_type: Option<PlanType>,
-     pub(crate) model: Option<String>,
+@@ -565,6 +565,7 @@ pub(crate) struct ChatWidget {
+     current_collaboration_mode: CollaborationMode,
+     /// The currently active collaboration mask, if any.
+     active_collaboration_mask: Option<CollaborationModeMask>,
++    active_turn_model_context: Option<ActiveTurnModelContext>,
+     has_chatgpt_account: bool,
+     has_codex_backend_auth: bool,
+     model_catalog: Arc<ModelCatalog>,
+@@ -829,6 +830,12 @@ enum PlanModeNudgeScope {
+     Thread(ThreadId),
+ }
+ 
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub(crate) struct ActiveTurnModelContext {
++    pub(crate) model: String,
++    pub(crate) reasoning_effort: Option<ReasoningEffortConfig>,
++}
++
+ #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+ pub(crate) enum TurnAbortReason {
+     Interrupted,
 diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
-index fbe14ac628..9e7ab87705 100644
+index d6fe7b3241..fbe14ac628 100644
 --- a/codex-rs/tui/src/chatwidget/constructor.rs
 +++ b/codex-rs/tui/src/chatwidget/constructor.rs
-@@ -24,6 +24,7 @@ impl ChatWidget {
-             feedback,
-             is_first_run,
-             status_account_display,
-+            rate_limit_snapshots_by_limit_id,
-             runtime_model_provider_base_url,
-             initial_plan_type,
-             model,
-@@ -124,7 +125,7 @@ impl ChatWidget {
-             runtime_model_provider_base_url,
-             remote_connection: None,
-             token_info: None,
--            rate_limit_snapshots_by_limit_id: BTreeMap::new(),
-+            rate_limit_snapshots_by_limit_id,
-             responses_stream_connection_status: None,
-             refreshing_status_outputs: Vec::new(),
-             next_status_refresh_request_id: 0,
-diff --git a/codex-rs/tui/src/chatwidget/rate_limits.rs b/codex-rs/tui/src/chatwidget/rate_limits.rs
-index efb0b63628..8389860f42 100644
---- a/codex-rs/tui/src/chatwidget/rate_limits.rs
-+++ b/codex-rs/tui/src/chatwidget/rate_limits.rs
-@@ -172,10 +172,7 @@ impl ChatWidget {
-         source: RateLimitSnapshotSource,
-     ) {
-         if let Some(mut snapshot) = snapshot {
--            let limit_id = snapshot
--                .limit_id
--                .clone()
--                .unwrap_or_else(|| "codex".to_string());
-+            let limit_id = snapshot_limit_id(&snapshot);
-             let limit_label = snapshot
-                 .limit_name
-                 .clone()
-@@ -507,3 +504,14 @@ impl ChatWidget {
+@@ -113,6 +113,7 @@ impl ChatWidget {
+             skills_initial_state: None,
+             current_collaboration_mode,
+             active_collaboration_mask,
++            active_turn_model_context: None,
+             has_chatgpt_account,
+             has_codex_backend_auth,
+             model_catalog,
+diff --git a/codex-rs/tui/src/chatwidget/input_submission.rs b/codex-rs/tui/src/chatwidget/input_submission.rs
+index e00d8afc15..02c7df07ed 100644
+--- a/codex-rs/tui/src/chatwidget/input_submission.rs
++++ b/codex-rs/tui/src/chatwidget/input_submission.rs
+@@ -365,13 +365,15 @@ impl ChatWidget {
+             .filter(|_| self.current_model_supports_personality());
+         let service_tier = self.service_tier_update_for_core();
+         let active_permission_profile = self.config.permissions.active_permission_profile();
++        let submitted_model = effective_mode.model().to_string();
++        let submitted_effort = effective_mode.reasoning_effort();
+         let op = AppCommand::user_turn(
+             items,
+             self.config.cwd.to_path_buf(),
+             AskForApproval::from(self.config.permissions.approval_policy.value()),
+             active_permission_profile,
+-            effective_mode.model().to_string(),
+-            effective_mode.reasoning_effort(),
++            submitted_model.clone(),
++            submitted_effort.clone(),
+             /*summary*/ None,
+             service_tier,
+             /*final_output_json_schema*/ None,
+@@ -384,6 +386,11 @@ impl ChatWidget {
+             return (false, None);
          }
-     }
- }
-+
-+fn snapshot_limit_id(snapshot: &RateLimitSnapshot) -> String {
-+    snapshot.limit_id.clone().unwrap_or_else(|| {
-+        snapshot
-+            .limit_name
-+            .as_deref()
-+            .filter(|limit_name| !limit_name.eq_ignore_ascii_case("codex"))
-+            .unwrap_or("codex")
-+            .to_string()
-+    })
-+}
-diff --git a/codex-rs/tui/src/chatwidget/settings.rs b/codex-rs/tui/src/chatwidget/settings.rs
-index fa214fa81a..b41d0f4cf5 100644
---- a/codex-rs/tui/src/chatwidget/settings.rs
-+++ b/codex-rs/tui/src/chatwidget/settings.rs
-@@ -195,6 +195,12 @@ impl ChatWidget {
-         self.status_account_display.as_ref()
-     }
- 
-+    pub(crate) fn rate_limit_snapshots_by_limit_id(
-+        &self,
-+    ) -> BTreeMap<String, RateLimitSnapshotDisplay> {
-+        self.rate_limit_snapshots_by_limit_id.clone()
-+    }
-+
-     pub(crate) fn runtime_model_provider_base_url(&self) -> Option<&str> {
-         self.runtime_model_provider_base_url.as_deref()
-     }
-diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_setup_popup_rate_limits.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_setup_popup_rate_limits.snap
-index 7dca3c19d5..c3b0b206b9 100644
---- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_setup_popup_rate_limits.snap
-+++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_setup_popup_rate_limits.snap
-@@ -1,5 +1,6 @@
- ---
- source: tui/src/chatwidget/tests/status_surface_previews.rs
-+assertion_line: 316
- expression: status_line_popup_snapshot(&mut chat)
- ---
-   Configure Status Line
-@@ -16,5 +17,5 @@ expression: status_line_popup_snapshot(&mut chat)
-   [ ] reasoning             Current reasoning level
-   [ ] current-dir           Current working directory
- 
--  monthly 65% left · weekly 50% left
-+  30D 65% · 7D 50%
-   Press space to toggle; ←/→ to move; enter to confirm and close; esc to close
-diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_surface_previews_rate_limits.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_surface_previews_rate_limits.snap
-index 4ac0747486..64fc6ed233 100644
---- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_surface_previews_rate_limits.snap
-+++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_surface_previews_rate_limits.snap
-@@ -2,5 +2,5 @@
- source: tui/src/chatwidget/tests/status_surface_previews.rs
- expression: snapshot
- ---
--status line: monthly 65% left · weekly 50% left
--terminal title: monthly 65% left | weekly 50% left
-+status line: 30D 65% · 7D 50%
-+terminal title: 30D 65% | 7D 50%
-diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_rate_limits.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_rate_limits.snap
-index a5923c7e96..80d8c9fe81 100644
---- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_rate_limits.snap
-+++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__terminal_title_setup_popup_rate_limits.snap
-@@ -17,5 +17,5 @@ expression: terminal_title_popup_snapshot(&mut chat)
-   [ ] run-state      Compact session run-state text (Ready, Working, Thinking)
-   [ ] thread-title   Current thread title with thread identifier when named; identifier only when…
- 
--  monthly 65% left | weekly 50% left
-+  30D 65% | 7D 50%
-   Press space to toggle; ←/→ to move; enter to confirm and close; esc to close
-diff --git a/codex-rs/tui/src/chatwidget/status_controls.rs b/codex-rs/tui/src/chatwidget/status_controls.rs
-index d1ca5029b4..589378479c 100644
---- a/codex-rs/tui/src/chatwidget/status_controls.rs
-+++ b/codex-rs/tui/src/chatwidget/status_controls.rs
-@@ -387,8 +387,26 @@ impl ChatWidget {
-         label: &str,
-     ) -> Option<String> {
-         let window = window?;
-+        let metric = Self::status_line_limit_metric_display(window);
-+        Some(format!("{label} {metric}"))
-+    }
-+
-+    pub(super) fn status_line_limit_metric_display(window: &RateLimitWindowDisplay) -> String {
-         let remaining = (100.0f64 - window.used_percent).clamp(0.0f64, 100.0f64);
--        Some(format!("{label} {remaining:.0}% left"))
-+        if let Some(pace_percent) = window.pace_percent(chrono::Local::now()) {
-+            format!("{remaining:.0}% {pace_percent:+}%")
-+        } else {
-+            format!("{remaining:.0}%")
-+        }
-+    }
-+
-+    pub(super) fn spark_rate_limit_snapshot(&self) -> Option<&RateLimitSnapshotDisplay> {
-+        self.rate_limit_snapshots_by_limit_id
-+            .iter()
-+            .find_map(|(limit_id, snapshot)| {
-+                (limit_id != "codex" && snapshot_is_spark_limit(limit_id, snapshot))
-+                    .then_some(snapshot)
-+            })
-     }
- 
-     pub(super) fn status_line_reasoning_effort_label(
-@@ -400,3 +418,8 @@ impl ChatWidget {
+         if render_in_history {
++            self.active_turn_model_context = Some(ActiveTurnModelContext {
++                model: submitted_model,
++                reasoning_effort: submitted_effort,
++            });
++            self.refresh_model_dependent_surfaces();
+             self.input_queue.user_turn_pending_start = true;
          }
-     }
- }
-+
-+fn snapshot_is_spark_limit(limit_id: &str, snapshot: &RateLimitSnapshotDisplay) -> bool {
-+    limit_id.to_ascii_lowercase().contains("spark")
-+        || snapshot.limit_name.to_ascii_lowercase().contains("spark")
-+}
-diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
-index 28ae9ea468..1e9b0688aa 100644
---- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
-+++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
-@@ -17,6 +17,7 @@ use codex_protocol::config_types::ApprovalsReviewer;
- use codex_protocol::config_types::ServiceTier;
- use codex_protocol::models::PermissionProfile;
- use codex_utils_sandbox_summary::summarize_permission_profile;
-+use ratatui::prelude::Stylize;
- use ratatui::text::Span;
  
- use super::status_state::TerminalTitleStatusKind;
-@@ -623,7 +624,7 @@ impl ChatWidget {
-                     .rate_limit_snapshots_by_limit_id
-                     .get("codex")
-                     .and_then(five_hour_status_window)?;
--                let label = limit_label_for_window(window.window_minutes, is_secondary);
-+                let label = status_line_limit_label_for_window(window.window_minutes, is_secondary);
-                 self.status_line_limit_display(Some(window), &label)
+diff --git a/codex-rs/tui/src/chatwidget/session_flow.rs b/codex-rs/tui/src/chatwidget/session_flow.rs
+index 6966899ab0..087fd04f25 100644
+--- a/codex-rs/tui/src/chatwidget/session_flow.rs
++++ b/codex-rs/tui/src/chatwidget/session_flow.rs
+@@ -27,6 +27,7 @@ impl ChatWidget {
+         }
+         self.refresh_plan_mode_nudge();
+         self.turn_lifecycle.reset_thread();
++        self.active_turn_model_context = None;
+         self.thread_name = session.thread_name.clone();
+         self.current_goal_status_indicator = None;
+         self.current_goal_status = None;
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+index aaf72f779e..5b02d6481f 100644
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -53,6 +53,7 @@ impl ChatWidget {
+ 
+     pub(super) fn on_task_started_at(&mut self, started_at: Option<Instant>) {
+         self.input_queue.user_turn_pending_start = false;
++        self.active_turn_model_context = None;
+         let started_at = started_at.unwrap_or_else(Instant::now);
+         self.turn_lifecycle.start(started_at);
+         self.transcript.reset_turn_flags();
+@@ -168,6 +169,7 @@ impl ChatWidget {
+         // Mark task stopped and request redraw now that all content is in history.
+         self.status_state.pending_status_indicator_restore = false;
+         self.input_queue.user_turn_pending_start = false;
++        self.active_turn_model_context = None;
+         self.clear_active_hook_cell();
+         self.turn_lifecycle.finish();
+         self.update_task_running_state();
+@@ -327,6 +329,7 @@ impl ChatWidget {
+         self.clear_active_hook_cell();
+         // Reset running state and clear streaming buffers.
+         self.input_queue.user_turn_pending_start = false;
++        self.active_turn_model_context = None;
+         self.turn_lifecycle.finish();
+         self.update_task_running_state();
+         self.running_commands.clear();
+diff --git a/codex-rs/tui/src/history_cell/session.rs b/codex-rs/tui/src/history_cell/session.rs
+index d14c515c38..448c56e905 100644
+--- a/codex-rs/tui/src/history_cell/session.rs
++++ b/codex-rs/tui/src/history_cell/session.rs
+@@ -366,8 +366,8 @@ impl HistoryCell for SessionHeaderHistoryCell {
+                 spans.push(Span::from(reasoning.to_owned()));
              }
-             StatusLineItem::WeeklyLimit => {
-@@ -631,7 +632,7 @@ impl ChatWidget {
-                     .rate_limit_snapshots_by_limit_id
-                     .get("codex")
-                     .and_then(weekly_status_window)?;
--                let label = limit_label_for_window(window.window_minutes, is_secondary);
-+                let label = status_line_limit_label_for_window(window.window_minutes, is_secondary);
-                 self.status_line_limit_display(Some(window), &label)
+             if self.show_fast_status {
+-                spans.push("   ".into());
+-                spans.push(Span::styled("fast", self.model_style.magenta()));
++                spans.push(" ".into());
++                spans.push("fast".red());
              }
-             StatusLineItem::CodexVersion => Some(CODEX_CLI_VERSION.to_string()),
-@@ -683,6 +684,12 @@ impl ChatWidget {
-             StatusLineItem::ModelWithReasoning => Some(self.model_with_reasoning_display_line()),
-             StatusLineItem::FastMode => Some(self.fast_mode_display_line()),
-             StatusLineItem::ThreadTitle => self.status_line_thread_title_display_line(),
-+            StatusLineItem::FiveHourLimit => {
-+                self.status_line_limit_display_line(five_hour_status_window)
-+            }
-+            StatusLineItem::WeeklyLimit => {
-+                self.status_line_limit_display_line(weekly_status_window)
-+            }
-             _ => self.status_line_value_for_item(*item).map(Line::from),
-         }
-     }
-@@ -711,6 +718,30 @@ impl ChatWidget {
-         }
-     }
+             spans.push("   ".dim());
+             spans.push(CHANGE_MODEL_HINT_COMMAND.cyan());
+diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
+index d497280559..d277201ba9 100644
+--- a/codex-rs/tui/src/history_cell/tests.rs
++++ b/codex-rs/tui/src/history_cell/tests.rs
+@@ -20,6 +20,7 @@ use dirs::home_dir;
+ use pretty_assertions::assert_eq;
+ use ratatui::buffer::Buffer;
+ use ratatui::layout::Rect;
++use ratatui::style::Color;
+ use serde_json::json;
+ use std::collections::HashMap;
+ use std::path::PathBuf;
+@@ -1520,8 +1521,24 @@ fn session_header_includes_reasoning_level_when_present() {
+         .find(|line| line.contains("model:"))
+         .expect("model line");
  
-+    fn status_line_limit_display_line(
-+        &self,
-+        window_for_snapshot: fn(
-+            &RateLimitSnapshotDisplay,
-+        ) -> Option<(&RateLimitWindowDisplay, bool)>,
-+    ) -> Option<Line<'static>> {
-+        let (window, is_secondary) = self
-+            .rate_limit_snapshots_by_limit_id
-+            .get("codex")
-+            .and_then(window_for_snapshot)?;
-+        let label = status_line_limit_label_for_window(window.window_minutes, is_secondary);
-+        let mut spans = vec![Span::from(
-+            self.status_line_limit_display(Some(window), &label)?,
-+        )];
-+        if let Some((spark_window, _)) = self
-+            .spark_rate_limit_snapshot()
-+            .and_then(window_for_snapshot)
-+        {
-+            spans.push(" ".dim());
-+            spans.push(Self::status_line_limit_metric_display(spark_window).dim());
+-    assert!(model_line.contains("gpt-4o high   fast"));
++    assert!(model_line.contains("gpt-4o high fast"));
+     assert!(model_line.contains("/model to change"));
++
++    let display_lines = cell.display_lines(/*width*/ 80);
++    let model_line = display_lines
++        .iter()
++        .find(|line| {
++            line.spans
++                .iter()
++                .any(|span| span.content.contains("model:"))
++        })
++        .expect("styled model line");
++    let fast_span = model_line
++        .spans
++        .iter()
++        .find(|span| span.content.as_ref() == "fast")
++        .expect("fast span");
++    assert_eq!(fast_span.style.fg, Some(Color::Red));
+ }
+ 
+ #[test]
+diff --git a/codex-rs/tui/src/snapshots/codex_tui__app__tests__clear_ui_header_fast_status_fast_capable_models.snap b/codex-rs/tui/src/snapshots/codex_tui__app__tests__clear_ui_header_fast_status_fast_capable_models.snap
+index 841376c94f..8718e663ec 100644
+--- a/codex-rs/tui/src/snapshots/codex_tui__app__tests__clear_ui_header_fast_status_fast_capable_models.snap
++++ b/codex-rs/tui/src/snapshots/codex_tui__app__tests__clear_ui_header_fast_status_fast_capable_models.snap
+@@ -2,9 +2,9 @@
+ source: tui/src/app/tests.rs
+ expression: rendered
+ ---
+-┌────────────────────────────────────────────────────┐
+-│ >_ OpenAI Codex (v<VERSION>)                       │
+-│                                                    │
+-│ model:     gpt-5.4 xhigh   fast   /model to change │
+-│ directory: /tmp/project                            │
+-└────────────────────────────────────────────────────┘
++┌──────────────────────────────────────────────────┐
++│ >_ OpenAI Codex (v<VERSION>)                     │
++│                                                  │
++│ model:     gpt-5.4 xhigh fast   /model to change │
++│ directory: /tmp/project                          │
++└──────────────────────────────────────────────────┘
+diff --git a/codex-rs/tui/src/status/card.rs b/codex-rs/tui/src/status/card.rs
+index 61ffd3da7d..b6fc46827d 100644
+--- a/codex-rs/tui/src/status/card.rs
++++ b/codex-rs/tui/src/status/card.rs
+@@ -34,6 +34,7 @@ use super::format::FieldFormatter;
+ use super::format::line_display_width;
+ use super::format::push_label;
+ use super::format::truncate_line_to_width;
++use super::helpers::account_plan_style;
+ use super::helpers::compose_account_display;
+ use super::helpers::compose_model_display;
+ use super::helpers::format_directory_display;
+@@ -705,6 +706,53 @@ fn status_approval_label(
+     approval.to_string()
+ }
+ 
++fn account_display_spans(account: &StatusAccountDisplay) -> Vec<Span<'static>> {
++    match account {
++        StatusAccountDisplay::ChatGpt { email, plan } => match (email, plan) {
++            (Some(email), Some(plan)) => vec![
++                Span::from(mask_email(email)),
++                Span::from(" "),
++                Span::styled(plan.clone(), account_plan_style(plan)),
++            ],
++            (Some(email), None) => vec![Span::from(mask_email(email))],
++            (None, Some(plan)) => vec![Span::styled(plan.clone(), account_plan_style(plan))],
++            (None, None) => vec![Span::from("ChatGPT")],
++        },
++        StatusAccountDisplay::ApiKey => {
++            vec![Span::from(
++                "API key configured (run codex login to use ChatGPT)",
++            )]
 +        }
-+        Some(spans.into())
-+    }
-+
-     pub(super) fn status_surface_preview_value_for_item(
-         &mut self,
-         item: StatusSurfacePreviewItem,
-@@ -1165,6 +1196,15 @@ fn matches_window_label(window: &RateLimitWindowDisplay, label: &str) -> bool {
-         == Some(label)
- }
- 
-+fn status_line_limit_label_for_window(window_minutes: Option<i64>, is_secondary: bool) -> String {
-+    match limit_label_for_window(window_minutes, is_secondary).as_str() {
-+        "5h" => "5H".to_string(),
-+        "weekly" => "7D".to_string(),
-+        "monthly" => "30D".to_string(),
-+        label => label.to_string(),
 +    }
 +}
 +
- fn permissions_display(config: &Config) -> String {
-     let active_permission_profile = config.permissions.active_permission_profile();
-     if let Some(active_permission_profile) = active_permission_profile.as_ref()
-diff --git a/codex-rs/tui/src/chatwidget/tests/helpers.rs b/codex-rs/tui/src/chatwidget/tests/helpers.rs
-index 5a2630c625..5b09dc74d7 100644
---- a/codex-rs/tui/src/chatwidget/tests/helpers.rs
-+++ b/codex-rs/tui/src/chatwidget/tests/helpers.rs
-@@ -203,6 +203,7 @@ pub(super) async fn make_chatwidget_manual_with_auth(
-         feedback: codex_feedback::CodexFeedback::new(),
-         is_first_run: true,
-         status_account_display: None,
-+        rate_limit_snapshots_by_limit_id: BTreeMap::new(),
-         runtime_model_provider_base_url: None,
-         initial_plan_type: None,
-         model: Some(resolved_model.clone()),
-diff --git a/codex-rs/tui/src/chatwidget/tests/plan_mode.rs b/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
-index 547a891de4..b1c8c0b570 100644
---- a/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
-+++ b/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
-@@ -1533,6 +1533,7 @@ async fn make_startup_chat_with_cli_overrides(
-         feedback: codex_feedback::CodexFeedback::new(),
-         is_first_run: true,
-         status_account_display: None,
-+        rate_limit_snapshots_by_limit_id: BTreeMap::new(),
-         runtime_model_provider_base_url: None,
-         initial_plan_type: None,
-         model: Some(resolved_model),
-diff --git a/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs b/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
-index 1ffce73e2c..99b968762f 100644
---- a/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
-+++ b/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
-@@ -43,6 +43,7 @@ async fn experimental_mode_plan_is_ignored_on_startup() {
-         feedback: codex_feedback::CodexFeedback::new(),
-         is_first_run: true,
-         status_account_display: None,
-+        rate_limit_snapshots_by_limit_id: BTreeMap::new(),
-         runtime_model_provider_base_url: None,
-         initial_plan_type: None,
-         model: Some(resolved_model.clone()),
-diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
-index 696f0b716f..0baed75c5e 100644
---- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
-+++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
-@@ -456,6 +456,7 @@ async fn configured_pet_load_is_deferred_until_after_construction() {
-         feedback: codex_feedback::CodexFeedback::new(),
-         is_first_run: true,
-         status_account_display: None,
-+        rate_limit_snapshots_by_limit_id: BTreeMap::new(),
-         runtime_model_provider_base_url: None,
-         initial_plan_type: None,
-         model: Some(resolved_model),
-@@ -619,7 +620,7 @@ async fn status_line_uses_secondary_fallback_for_unsupported_window() {
- 
-     assert_eq!(
-         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::WeeklyLimit),
--        Some("secondary usage 50% left".to_string())
-+        Some("secondary usage 50%".to_string())
-     );
- }
- 
-@@ -648,11 +649,188 @@ async fn status_line_legacy_limit_items_prefer_matching_windows() {
- 
-     assert_eq!(
-         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::FiveHourLimit),
--        Some("5h 60% left".to_string())
-+        Some("5H 60%".to_string())
-     );
-     assert_eq!(
-         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::WeeklyLimit),
--        Some("weekly 6% left".to_string())
-+        Some("7D 6%".to_string())
-+    );
++fn mask_email(email: &str) -> String {
++    let Some((local, domain)) = email.split_once('@') else {
++        return email.to_string();
++    };
++    let Some((domain_name, suffix)) = domain.rsplit_once('.') else {
++        return email.to_string();
++    };
++    format!(
++        "{}@{}.{}",
++        mask_email_part(local),
++        mask_email_part(domain_name),
++        suffix
++    )
 +}
 +
-+#[tokio::test]
-+async fn status_line_limit_items_include_spark_bucket_when_available() {
-+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-+    chat.config.tui_status_line = Some(vec![
-+        "five-hour-limit".to_string(),
-+        "weekly-limit".to_string(),
-+    ]);
-+    chat.thread_id = Some(ThreadId::new());
-+
-+    chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
-+        limit_id: Some("codex".to_string()),
-+        limit_name: None,
-+        primary: Some(RateLimitWindow {
-+            used_percent: 20,
-+            window_duration_mins: Some(5 * 60),
-+            resets_at: None,
-+        }),
-+        secondary: Some(RateLimitWindow {
-+            used_percent: 30,
-+            window_duration_mins: Some(7 * 24 * 60),
-+            resets_at: None,
-+        }),
-+        credits: None,
-+        individual_limit: None,
-+        plan_type: None,
-+        rate_limit_reached_type: None,
-+    }));
-+    chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
-+        limit_id: Some("codex_spark".to_string()),
-+        limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
-+        primary: Some(RateLimitWindow {
-+            used_percent: 40,
-+            window_duration_mins: Some(5 * 60),
-+            resets_at: None,
-+        }),
-+        secondary: Some(RateLimitWindow {
-+            used_percent: 50,
-+            window_duration_mins: Some(7 * 24 * 60),
-+            resets_at: None,
-+        }),
-+        credits: None,
-+        individual_limit: None,
-+        plan_type: None,
-+        rate_limit_reached_type: None,
-+    }));
-+
-+    assert_eq!(
-+        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::FiveHourLimit),
-+        Some("5H 80%".to_string())
-+    );
-+    assert_eq!(
-+        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::WeeklyLimit),
-+        Some("7D 70%".to_string())
-+    );
-+    chat.refresh_status_line();
-+    assert_eq!(
-+        status_line_text(&chat),
-+        Some("5H 80% 60% · 7D 70% 50%".to_string())
-+    );
++fn mask_email_part(part: &str) -> String {
++    let mut chars = part.chars();
++    let Some(first) = chars.next() else {
++        return String::new();
++    };
++    let last = chars.next_back();
++    match last {
++        Some(last) => format!("{first}***{last}"),
++        None => format!("{first}***"),
++    }
 +}
 +
-+#[tokio::test]
-+async fn status_line_keeps_codex_and_spark_pace_separate() {
-+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-+    chat.config.tui_status_line = Some(vec!["weekly-limit".to_string()]);
-+    chat.thread_id = Some(ThreadId::new());
-+    let now = chrono::Local::now();
-+    let weekly_reset = Some((now + chrono::Duration::minutes(5_746)).timestamp());
-+
-+    chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
-+        limit_id: Some("codex".to_string()),
-+        limit_name: None,
-+        primary: Some(RateLimitWindow {
-+            used_percent: 64,
-+            window_duration_mins: Some(7 * 24 * 60),
-+            resets_at: weekly_reset,
-+        }),
-+        secondary: None,
-+        credits: None,
-+        individual_limit: None,
-+        plan_type: None,
-+        rate_limit_reached_type: None,
-+    }));
-+    chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
-+        limit_id: Some("codex_spark".to_string()),
-+        limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
-+        primary: Some(RateLimitWindow {
-+            used_percent: 85,
-+            window_duration_mins: Some(7 * 24 * 60),
-+            resets_at: weekly_reset,
-+        }),
-+        secondary: None,
-+        credits: None,
-+        individual_limit: None,
-+        plan_type: None,
-+        rate_limit_reached_type: None,
-+    }));
-+
-+    chat.refresh_status_line();
-+    assert_eq!(
-+        status_line_text(&chat),
-+        Some("7D 36% -21% 15% -42%".to_string())
-+    );
-+}
-+
-+#[tokio::test]
-+async fn spark_rate_limit_without_id_does_not_replace_codex_bucket() {
-+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-+
-+    chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
-+        limit_id: Some("codex".to_string()),
-+        limit_name: None,
-+        primary: Some(RateLimitWindow {
-+            used_percent: 64,
-+            window_duration_mins: Some(7 * 24 * 60),
-+            resets_at: None,
-+        }),
-+        secondary: None,
-+        credits: None,
-+        individual_limit: None,
-+        plan_type: None,
-+        rate_limit_reached_type: None,
-+    }));
-+    chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
-+        limit_id: None,
-+        limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
-+        primary: Some(RateLimitWindow {
-+            used_percent: 85,
-+            window_duration_mins: Some(7 * 24 * 60),
-+            resets_at: None,
-+        }),
-+        secondary: None,
-+        credits: None,
-+        individual_limit: None,
-+        plan_type: None,
-+        rate_limit_reached_type: None,
-+    }));
-+
-+    assert_eq!(
-+        chat.rate_limit_snapshots_by_limit_id
-+            .get("codex")
-+            .and_then(|snapshot| snapshot.primary.as_ref())
-+            .map(|window| window.used_percent),
-+        Some(64.0)
-+    );
-+    assert!(
-+        chat.rate_limit_snapshots_by_limit_id
-+            .values()
-+            .any(|snapshot| snapshot.limit_name.contains("Spark"))
-+    );
-+}
-+
-+#[tokio::test]
-+async fn status_line_limit_metric_keeps_zero_pace() {
-+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-+    let now = chrono::Local::now();
-+    chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
-+        limit_id: Some("codex".to_string()),
-+        limit_name: None,
-+        primary: Some(RateLimitWindow {
-+            used_percent: 50,
-+            window_duration_mins: Some(5 * 60),
-+            resets_at: Some((now + chrono::Duration::minutes(150)).timestamp()),
-+        }),
-+        secondary: None,
-+        credits: None,
-+        individual_limit: None,
-+        plan_type: None,
-+        rate_limit_reached_type: None,
-+    }));
-+
-+    assert_eq!(
-+        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::FiveHourLimit),
-+        Some("5H 50% +0%".to_string())
-     );
- }
- 
-@@ -681,11 +859,11 @@ async fn status_line_shows_secondary_non_weekly_when_primary_is_weekly() {
- 
-     assert_eq!(
-         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::FiveHourLimit),
--        Some("monthly 65% left".to_string())
-+        Some("30D 65%".to_string())
-     );
-     assert_eq!(
-         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::WeeklyLimit),
--        Some("weekly 6% left".to_string())
-+        Some("7D 6%".to_string())
-     );
- }
- 
-@@ -714,7 +892,7 @@ async fn status_line_five_hour_item_omits_weekly_only_limit() {
-     );
-     assert_eq!(
-         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::WeeklyLimit),
--        Some("weekly 91% left".to_string())
-+        Some("7D 91%".to_string())
-     );
- }
- 
-@@ -739,7 +917,7 @@ async fn status_line_single_monthly_primary_omits_weekly_limit_item() {
- 
-     assert_eq!(
-         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::FiveHourLimit),
--        Some("monthly 65% left".to_string())
-+        Some("30D 65%".to_string())
-     );
-     assert_eq!(
-         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::WeeklyLimit),
-@@ -772,7 +950,7 @@ async fn status_line_secondary_only_non_weekly_limit_omits_primary_limit_item()
-     );
-     assert_eq!(
-         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::WeeklyLimit),
--        Some("monthly 65% left".to_string())
-+        Some("30D 65%".to_string())
-     );
- }
- 
-diff --git a/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs b/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
-index f4aae6d7c5..ff1dbbef65 100644
---- a/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
-+++ b/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
-@@ -275,7 +275,7 @@ async fn status_surface_preview_omits_unavailable_rate_limit_items() {
-             &mut chat,
-             &[StatusLineItem::FiveHourLimit, StatusLineItem::WeeklyLimit]
-         ),
--        "weekly 91% left"
-+        "7D 91%"
-     );
-     assert_eq!(
-         title_preview_line(
-@@ -285,7 +285,7 @@ async fn status_surface_preview_omits_unavailable_rate_limit_items() {
-                 TerminalTitleItem::WeeklyLimit
-             ],
-         ),
--        "weekly 91% left"
-+        "7D 91%"
-     );
- }
- 
-diff --git a/codex-rs/tui/src/status/rate_limits.rs b/codex-rs/tui/src/status/rate_limits.rs
-index 2054f799d6..b39dd78c80 100644
---- a/codex-rs/tui/src/status/rate_limits.rs
-+++ b/codex-rs/tui/src/status/rate_limits.rs
-@@ -71,6 +71,8 @@ pub(crate) struct RateLimitWindowDisplay {
-     pub used_percent: f64,
-     /// Human-readable local reset time.
-     pub resets_at: Option<String>,
-+    /// Local reset timestamp used for pace calculations.
-+    pub resets_at_time: Option<DateTime<Local>>,
-     /// Window length in minutes when provided by the server.
-     pub window_minutes: Option<i64>,
- }
-@@ -86,9 +88,30 @@ impl RateLimitWindowDisplay {
-         Self {
-             used_percent: f64::from(window.used_percent),
-             resets_at,
-+            resets_at_time: resets_at_utc,
-             window_minutes: window.window_duration_mins,
+ impl HistoryCell for StatusHistoryCell {
+     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+         let mut lines: Vec<Line<'static>> = Vec::new();
+@@ -720,17 +768,7 @@ impl HistoryCell for StatusHistoryCell {
+             return Vec::new();
          }
+ 
+-        let account_value = self.account.as_ref().map(|account| match account {
+-            StatusAccountDisplay::ChatGpt { email, plan } => match (email, plan) {
+-                (Some(email), Some(plan)) => format!("{email} ({plan})"),
+-                (Some(email), None) => email.clone(),
+-                (None, Some(plan)) => plan.clone(),
+-                (None, None) => "ChatGPT".to_string(),
+-            },
+-            StatusAccountDisplay::ApiKey => {
+-                "API key configured (run codex login to use ChatGPT)".to_string()
+-            }
+-        });
++        let account_value = self.account.as_ref().map(account_display_spans);
+ 
+         let mut labels: Vec<String> = vec!["Model", "Directory", "Permissions", "Agents.md"]
+             .into_iter()
+@@ -833,7 +871,7 @@ impl HistoryCell for StatusHistoryCell {
+         lines.push(formatter.line("Agents.md", vec![Span::from(agents_summary)]));
+ 
+         if let Some(account_value) = account_value {
+-            lines.push(formatter.line("Account", vec![Span::from(account_value)]));
++            lines.push(formatter.line("Account", account_value));
+         }
+ 
+         if let Some(thread_name) = thread_name {
+diff --git a/codex-rs/tui/src/status/helpers.rs b/codex-rs/tui/src/status/helpers.rs
+index f03336a4b0..e8d51edd2e 100644
+--- a/codex-rs/tui/src/status/helpers.rs
++++ b/codex-rs/tui/src/status/helpers.rs
+@@ -7,6 +7,8 @@ use chrono::Local;
+ use codex_protocol::account::PlanType;
+ use codex_utils_path_uri::PathConvention;
+ use codex_utils_path_uri::PathUri;
++use ratatui::style::Color;
++use ratatui::style::Style;
+ use std::path::Path;
+ use unicode_width::UnicodeWidthStr;
+ 
+@@ -108,6 +110,22 @@ pub(crate) fn plan_type_display_name(plan_type: PlanType) -> String {
      }
-+
-+    pub(crate) fn pace_percent(&self, now: DateTime<Local>) -> Option<i64> {
-+        let resets_at = self.resets_at_time?;
-+        let window_minutes = self.window_minutes?;
-+        if window_minutes <= 0 {
-+            return None;
-+        }
-+
-+        let window = ChronoDuration::minutes(window_minutes);
-+        let total_seconds = window.num_seconds();
-+        if total_seconds <= 0 {
-+            return None;
-+        }
-+
-+        let starts_at = resets_at - window;
-+        let elapsed_seconds = now.signed_duration_since(starts_at).num_seconds();
-+        let elapsed_percent =
-+            (elapsed_seconds as f64 / total_seconds as f64 * 100.0).clamp(0.0, 100.0);
-+        Some((elapsed_percent - self.used_percent).round() as i64)
-+    }
  }
  
- #[derive(Debug, Clone)]
-@@ -423,6 +446,7 @@ mod tests {
-         RateLimitWindowDisplay {
-             used_percent,
-             resets_at: Some("soon".to_string()),
-+            resets_at_time: None,
-             window_minutes: Some(300),
-         }
-     }
-@@ -482,11 +506,13 @@ mod tests {
-             primary: Some(RateLimitWindowDisplay {
-                 used_percent: 20.0,
-                 resets_at: Some("soon".to_string()),
-+                resets_at_time: None,
-                 window_minutes: Some(60),
-             }),
-             secondary: Some(RateLimitWindowDisplay {
-                 used_percent: 40.0,
-                 resets_at: Some("later".to_string()),
-+                resets_at_time: None,
-                 window_minutes: Some(2 * 60),
-             }),
-             credits: None,
++#[allow(clippy::disallowed_methods)]
++pub(crate) fn account_plan_style(plan: &str) -> Style {
++    match plan
++        .to_ascii_lowercase()
++        .replace([' ', '-', '_'], "")
++        .as_str()
++    {
++        "free" => Style::default().fg(Color::DarkGray),
++        "plus" => Style::default().fg(Color::Green),
++        "business" | "team" | "enterprise" => Style::default().fg(Color::Cyan),
++        "prolite" => Style::default().fg(Color::Yellow),
++        "pro" => Style::default().fg(Color::Magenta),
++        _ => Style::default().fg(Color::Blue),
++    }
++}
++
+ pub(crate) fn format_tokens_compact(value: i64) -> String {
+     let value = value.max(0);
+     if value == 0 {
 diff --git a/codex-rs/tui/src/status/tests.rs b/codex-rs/tui/src/status/tests.rs
-index 0f595c0f11..6cedc6152f 100644
+index 3f2fc4640f..0f595c0f11 100644
 --- a/codex-rs/tui/src/status/tests.rs
 +++ b/codex-rs/tui/src/status/tests.rs
-@@ -60,6 +60,7 @@ fn stale_monthly_limit_marks_fresh_rolling_snapshot_stale() {
-         primary: Some(RateLimitWindowDisplay {
-             used_percent: 20.0,
-             resets_at: Some("soon".to_string()),
-+            resets_at_time: None,
-             window_minutes: Some(300),
-         }),
-         secondary: None,
+@@ -1836,6 +1836,60 @@ async fn status_snapshot_shows_stale_limits_message() {
+     assert_snapshot!(sanitized);
+ }
+ 
++#[tokio::test]
++async fn status_account_line_masks_email_and_colors_plan() {
++    let temp_home = TempDir::new().expect("temp home");
++    let mut config = test_config(&temp_home).await;
++    config.cwd = test_path_buf("/workspace/tests").abs();
++    let account_display = StatusAccountDisplay::ChatGpt {
++        email: Some("sydney@gmail.com".to_string()),
++        plan: Some("Pro Lite".to_string()),
++    };
++    let usage = TokenUsage::default();
++    let model_slug = get_model_offline_for_tests(config.model.as_deref());
++    let composite = new_status_output(
++        &config,
++        Some(&account_display),
++        /*token_info*/ None,
++        &usage,
++        &None,
++        /*thread_name*/ None,
++        /*forked_from*/ None,
++        /*rate_display*/ None,
++        None,
++        chrono::Local
++            .with_ymd_and_hms(2024, 1, 2, 3, 4, 5)
++            .single()
++            .expect("timestamp"),
++        &model_slug,
++        /*collaboration_mode*/ None,
++        /*reasoning_effort_override*/ None,
++    );
++    let lines = composite.display_lines(/*width*/ 80);
++    let rendered_lines = render_lines(&lines);
++    assert!(
++        rendered_lines
++            .iter()
++            .any(|line| line.contains("Account:") && line.contains("s***y@g***l.com Pro Lite")),
++        "missing formatted account line: {rendered_lines:?}"
++    );
++
++    let account_line = lines
++        .iter()
++        .find(|line| {
++            line.spans
++                .iter()
++                .any(|span| span.content.as_ref() == "Pro Lite")
++        })
++        .expect("account line");
++    let plan_span = account_line
++        .spans
++        .iter()
++        .find(|span| span.content.as_ref() == "Pro Lite")
++        .expect("plan span");
++    assert_eq!(plan_span.style.fg, Some(Color::Yellow));
++}
++
+ #[tokio::test]
+ async fn status_snapshot_cached_limits_hide_credits_without_flag() {
+     let temp_home = TempDir::new().expect("temp home");

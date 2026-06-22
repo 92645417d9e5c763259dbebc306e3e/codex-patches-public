@@ -1,561 +1,256 @@
-diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
-index ae3f4f9350..082dcd1f1c 100644
---- a/codex-rs/tui/src/app/tests.rs
-+++ b/codex-rs/tui/src/app/tests.rs
-@@ -94,6 +94,7 @@ use codex_protocol::models::FileSystemPermissions;
- use codex_protocol::models::NetworkPermissions;
- use codex_protocol::models::PermissionProfile;
- use codex_protocol::protocol::MAX_THREAD_GOAL_OBJECTIVE_CHARS;
-+use codex_protocol::protocol::SubAgentSource;
- use codex_protocol::request_permissions::RequestPermissionProfile;
- use codex_protocol::user_input::TextElement;
- use codex_utils_absolute_path::AbsolutePathBuf;
-@@ -1239,6 +1240,57 @@ async fn collab_receiver_notification_renders_metadata_without_app_server_read()
-     );
- }
- 
-+#[tokio::test]
-+async fn collab_receiver_notification_caches_thread_before_active_drain() -> Result<()> {
-+    let mut app = make_test_app().await;
-+    let primary_thread_id =
-+        ThreadId::from_string("00000000-0000-0000-0000-000000000125").expect("valid thread id");
-+    let receiver_thread_id =
-+        ThreadId::from_string("00000000-0000-0000-0000-000000000126").expect("valid thread id");
-+    app.primary_thread_id = Some(primary_thread_id);
-+
-+    app.enqueue_primary_thread_notification(ServerNotification::ItemCompleted(
-+        codex_app_server_protocol::ItemCompletedNotification {
-+            thread_id: primary_thread_id.to_string(),
-+            turn_id: "turn-1".to_string(),
-+            completed_at_ms: 0,
-+            item: ThreadItem::CollabAgentToolCall {
-+                id: "spawn-1".to_string(),
-+                tool: codex_app_server_protocol::CollabAgentTool::SpawnAgent,
-+                status: codex_app_server_protocol::CollabAgentToolCallStatus::Completed,
-+                sender_thread_id: primary_thread_id.to_string(),
-+                receiver_thread_ids: vec![receiver_thread_id.to_string()],
-+                prompt: Some("start scout".to_string()),
-+                model: None,
-+                reasoning_effort: None,
-+                agents_states: HashMap::from([(
-+                    receiver_thread_id.to_string(),
-+                    codex_app_server_protocol::CollabAgentState {
-+                        status: codex_app_server_protocol::CollabAgentStatus::Running,
-+                        message: None,
-+                        agent_nickname: Some("Scout".to_string()),
-+                        agent_role: Some("explorer".to_string()),
-+                    },
-+                )]),
-+            },
-+        },
-+    ))
-+    .await?;
-+
-+    assert_eq!(
-+        app.agent_navigation.get(&receiver_thread_id),
-+        Some(&AgentPickerThreadEntry {
-+            agent_nickname: Some("Scout".to_string()),
-+            agent_role: Some("explorer".to_string()),
-+            agent_path: None,
-+            is_running: false,
-+            is_closed: false,
-+        })
-+    );
-+
-+    Ok(())
-+}
-+
- #[tokio::test]
- async fn collab_receiver_notification_does_not_cache_not_found_thread() {
-     let mut app = make_test_app().await;
-@@ -2624,6 +2676,7 @@ async fn inactive_thread_exec_approval_splits_shell_wrapped_command() {
- async fn inactive_thread_file_change_approval_recovers_buffered_changes() {
-     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
-     let thread_id = ThreadId::new();
-+    app.ensure_thread_channel(thread_id);
-     app.enqueue_thread_notification(
-         thread_id,
-         ServerNotification::ItemStarted(ItemStartedNotification {
-@@ -2935,7 +2988,7 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
-         ServerNotification::ThreadStarted(ThreadStartedNotification {
-             thread: Thread {
-                 id: agent_thread_id.to_string(),
--                session_id: agent_thread_id.to_string(),
-+                session_id: main_thread_id.to_string(),
-                 forked_from_id: None,
-                 parent_thread_id: None,
-                 preview: "agent thread".to_string(),
-@@ -2995,6 +3048,310 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
-     Ok(())
- }
- 
-+#[tokio::test]
-+async fn foreign_thread_started_notification_does_not_create_agent_picker_entry() -> Result<()> {
-+    let mut app = make_test_app().await;
-+    let main_thread_id =
-+        ThreadId::from_string("00000000-0000-0000-0000-000000000401").expect("valid thread");
-+    let foreign_thread_id =
-+        ThreadId::from_string("00000000-0000-0000-0000-000000000402").expect("valid thread");
-+    let primary_cwd = test_path_buf("/tmp/main").abs();
-+    let primary_session = ThreadSessionState {
-+        approval_policy: AskForApproval::OnRequest,
-+        permission_profile: PermissionProfile::workspace_write(),
-+        runtime_workspace_roots: vec![primary_cwd.clone()],
-+        ..test_thread_session(main_thread_id, primary_cwd.to_path_buf())
-+    };
-+
-+    app.primary_thread_id = Some(main_thread_id);
-+    app.active_thread_id = Some(main_thread_id);
-+    app.primary_session_configured = Some(primary_session.clone());
-+    app.thread_event_channels.insert(
-+        main_thread_id,
-+        ThreadEventChannel::new_with_session(
-+            /*capacity*/ 4,
-+            primary_session.clone(),
-+            Vec::new(),
-+        ),
-+    );
-+
-+    app.enqueue_thread_notification(
-+        foreign_thread_id,
-+        ServerNotification::ThreadStarted(ThreadStartedNotification {
-+            thread: Thread {
-+                id: foreign_thread_id.to_string(),
-+                session_id: foreign_thread_id.to_string(),
-+                forked_from_id: None,
-+                parent_thread_id: None,
-+                preview: "foreign main thread".to_string(),
-+                ephemeral: false,
-+                model_provider: "agent-provider".to_string(),
-+                created_at: 1,
-+                updated_at: 2,
-+                recency_at: Some(2),
-+                status: codex_app_server_protocol::ThreadStatus::Idle,
-+                path: None,
-+                cwd: test_path_buf("/tmp/foreign").abs(),
-+                cli_version: "0.0.0".to_string(),
-+                source: SessionSource::Cli,
-+                thread_source: None,
-+                agent_nickname: None,
-+                agent_role: None,
-+                git_info: None,
-+                name: Some("foreign main thread".to_string()),
-+                turns: Vec::new(),
-+            },
-+        }),
-+    )
-+    .await?;
-+
-+    assert!(!app.thread_event_channels.contains_key(&foreign_thread_id));
-+    assert_eq!(app.agent_navigation.get(&foreign_thread_id), None);
-+
-+    Ok(())
-+}
-+
-+#[tokio::test]
-+async fn foreign_subagent_thread_started_notification_does_not_create_agent_picker_entry()
-+-> Result<()> {
-+    let mut app = make_test_app().await;
-+    let main_thread_id =
-+        ThreadId::from_string("00000000-0000-0000-0000-000000000501").expect("valid thread");
-+    let foreign_parent_thread_id =
-+        ThreadId::from_string("00000000-0000-0000-0000-000000000502").expect("valid thread");
-+    let foreign_agent_thread_id =
-+        ThreadId::from_string("00000000-0000-0000-0000-000000000503").expect("valid thread");
-+    let primary_cwd = test_path_buf("/tmp/main").abs();
-+    let primary_session = ThreadSessionState {
-+        approval_policy: AskForApproval::OnRequest,
-+        permission_profile: PermissionProfile::workspace_write(),
-+        runtime_workspace_roots: vec![primary_cwd.clone()],
-+        ..test_thread_session(main_thread_id, primary_cwd.to_path_buf())
-+    };
-+
-+    app.primary_thread_id = Some(main_thread_id);
-+    app.active_thread_id = Some(main_thread_id);
-+    app.primary_session_configured = Some(primary_session.clone());
-+    app.thread_event_channels.insert(
-+        main_thread_id,
-+        ThreadEventChannel::new_with_session(
-+            /*capacity*/ 4,
-+            primary_session.clone(),
-+            Vec::new(),
-+        ),
-+    );
-+
-+    app.enqueue_thread_notification(
-+        foreign_agent_thread_id,
-+        ServerNotification::ThreadStarted(ThreadStartedNotification {
-+            thread: Thread {
-+                id: foreign_agent_thread_id.to_string(),
-+                session_id: foreign_parent_thread_id.to_string(),
-+                forked_from_id: None,
-+                parent_thread_id: Some(foreign_parent_thread_id.to_string()),
-+                preview: "foreign sub-agent thread".to_string(),
-+                ephemeral: false,
-+                model_provider: "agent-provider".to_string(),
-+                created_at: 1,
-+                updated_at: 2,
-+                recency_at: Some(2),
-+                status: codex_app_server_protocol::ThreadStatus::Idle,
-+                path: None,
-+                cwd: test_path_buf("/tmp/foreign-agent").abs(),
-+                cli_version: "0.0.0".to_string(),
-+                source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-+                    parent_thread_id: foreign_parent_thread_id,
-+                    depth: 1,
-+                    agent_path: None,
-+                    agent_nickname: Some("Stray".to_string()),
-+                    agent_role: Some("worker".to_string()),
-+                }),
-+                thread_source: None,
-+                agent_nickname: Some("Stray".to_string()),
-+                agent_role: Some("worker".to_string()),
-+                git_info: None,
-+                name: Some("foreign sub-agent thread".to_string()),
-+                turns: Vec::new(),
-+            },
-+        }),
-+    )
-+    .await?;
-+
-+    assert!(
-+        !app.thread_event_channels
-+            .contains_key(&foreign_agent_thread_id)
-+    );
-+    assert_eq!(app.agent_navigation.get(&foreign_agent_thread_id), None);
-+
-+    Ok(())
-+}
-+
-+#[tokio::test]
-+async fn current_session_subagent_thread_started_notification_is_accepted_without_cached_parent()
-+-> Result<()> {
-+    let mut app = make_test_app().await;
-+    let main_thread_id =
-+        ThreadId::from_string("00000000-0000-0000-0000-000000000601").expect("valid thread");
-+    let agent_thread_id =
-+        ThreadId::from_string("00000000-0000-0000-0000-000000000602").expect("valid thread");
-+    let parent_thread_id =
-+        ThreadId::from_string("00000000-0000-0000-0000-000000000603").expect("valid thread");
-+    let primary_cwd = test_path_buf("/tmp/main").abs();
-+    let primary_session = ThreadSessionState {
-+        approval_policy: AskForApproval::OnRequest,
-+        permission_profile: PermissionProfile::workspace_write(),
-+        runtime_workspace_roots: vec![primary_cwd.clone()],
-+        ..test_thread_session(main_thread_id, primary_cwd.to_path_buf())
-+    };
-+
-+    app.primary_thread_id = Some(main_thread_id);
-+    app.active_thread_id = Some(main_thread_id);
-+    app.primary_session_configured = Some(primary_session.clone());
-+    app.thread_event_channels.insert(
-+        main_thread_id,
-+        ThreadEventChannel::new_with_session(
-+            /*capacity*/ 4,
-+            primary_session.clone(),
-+            Vec::new(),
-+        ),
-+    );
-+
-+    app.enqueue_thread_notification(
-+        agent_thread_id,
-+        ServerNotification::ThreadStarted(ThreadStartedNotification {
-+            thread: Thread {
-+                id: agent_thread_id.to_string(),
-+                session_id: main_thread_id.to_string(),
-+                forked_from_id: None,
-+                parent_thread_id: Some(parent_thread_id.to_string()),
-+                preview: "current sub-agent thread".to_string(),
-+                ephemeral: false,
-+                model_provider: "agent-provider".to_string(),
-+                created_at: 1,
-+                updated_at: 2,
-+                recency_at: Some(2),
-+                status: codex_app_server_protocol::ThreadStatus::Idle,
-+                path: None,
-+                cwd: test_path_buf("/tmp/agent").abs(),
-+                cli_version: "0.0.0".to_string(),
-+                source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-+                    parent_thread_id,
-+                    depth: 2,
-+                    agent_path: None,
-+                    agent_nickname: Some("Nested".to_string()),
-+                    agent_role: Some("worker".to_string()),
-+                }),
-+                thread_source: None,
-+                agent_nickname: Some("Nested".to_string()),
-+                agent_role: Some("worker".to_string()),
-+                git_info: None,
-+                name: Some("current sub-agent thread".to_string()),
-+                turns: Vec::new(),
-+            },
-+        }),
-+    )
-+    .await?;
-+
-+    assert_eq!(
-+        app.agent_navigation.get(&agent_thread_id),
-+        Some(&AgentPickerThreadEntry {
-+            agent_nickname: Some("Nested".to_string()),
-+            agent_role: Some("worker".to_string()),
-+            agent_path: None,
-+            is_running: false,
-+            is_closed: false,
-+        })
-+    );
-+
-+    Ok(())
-+}
-+
-+#[tokio::test]
-+async fn current_session_grandchild_thread_started_notification_is_accepted_by_known_parent()
-+-> Result<()> {
-+    let mut app = make_test_app().await;
-+    let main_thread_id =
-+        ThreadId::from_string("00000000-0000-0000-0000-000000000701").expect("valid thread");
-+    let parent_agent_thread_id =
-+        ThreadId::from_string("00000000-0000-0000-0000-000000000702").expect("valid thread");
-+    let grandchild_thread_id =
-+        ThreadId::from_string("00000000-0000-0000-0000-000000000703").expect("valid thread");
-+    let primary_cwd = test_path_buf("/tmp/main").abs();
-+    let primary_session = ThreadSessionState {
-+        approval_policy: AskForApproval::OnRequest,
-+        permission_profile: PermissionProfile::workspace_write(),
-+        runtime_workspace_roots: vec![primary_cwd.clone()],
-+        ..test_thread_session(main_thread_id, primary_cwd.to_path_buf())
-+    };
-+
-+    app.primary_thread_id = Some(main_thread_id);
-+    app.active_thread_id = Some(main_thread_id);
-+    app.primary_session_configured = Some(primary_session.clone());
-+    app.thread_event_channels.insert(
-+        main_thread_id,
-+        ThreadEventChannel::new_with_session(
-+            /*capacity*/ 4,
-+            primary_session.clone(),
-+            Vec::new(),
-+        ),
-+    );
-+    app.agent_navigation.upsert(
-+        parent_agent_thread_id,
-+        Some("Parent".to_string()),
-+        Some("worker".to_string()),
-+        /*is_closed*/ false,
-+    );
-+
-+    app.enqueue_thread_notification(
-+        grandchild_thread_id,
-+        ServerNotification::ThreadStarted(ThreadStartedNotification {
-+            thread: Thread {
-+                id: grandchild_thread_id.to_string(),
-+                session_id: parent_agent_thread_id.to_string(),
-+                forked_from_id: None,
-+                parent_thread_id: Some(parent_agent_thread_id.to_string()),
-+                preview: "grandchild sub-agent thread".to_string(),
-+                ephemeral: false,
-+                model_provider: "agent-provider".to_string(),
-+                created_at: 1,
-+                updated_at: 2,
-+                recency_at: Some(2),
-+                status: codex_app_server_protocol::ThreadStatus::Idle,
-+                path: None,
-+                cwd: test_path_buf("/tmp/grandchild").abs(),
-+                cli_version: "0.0.0".to_string(),
-+                source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-+                    parent_thread_id: parent_agent_thread_id,
-+                    depth: 2,
-+                    agent_path: None,
-+                    agent_nickname: Some("Grandchild".to_string()),
-+                    agent_role: Some("worker".to_string()),
-+                }),
-+                thread_source: None,
-+                agent_nickname: Some("Grandchild".to_string()),
-+                agent_role: Some("worker".to_string()),
-+                git_info: None,
-+                name: Some("grandchild sub-agent thread".to_string()),
-+                turns: Vec::new(),
-+            },
-+        }),
-+    )
-+    .await?;
-+
-+    assert_eq!(
-+        app.agent_navigation.get(&grandchild_thread_id),
-+        Some(&AgentPickerThreadEntry {
-+            agent_nickname: Some("Grandchild".to_string()),
-+            agent_role: Some("worker".to_string()),
-+            agent_path: None,
-+            is_running: false,
-+            is_closed: false,
-+        })
-+    );
-+
-+    Ok(())
-+}
-+
- #[tokio::test]
- async fn inactive_thread_started_notification_preserves_primary_model_when_path_missing()
- -> Result<()> {
-@@ -3028,7 +3385,7 @@ async fn inactive_thread_started_notification_preserves_primary_model_when_path_
-         ServerNotification::ThreadStarted(ThreadStartedNotification {
-             thread: Thread {
-                 id: agent_thread_id.to_string(),
--                session_id: agent_thread_id.to_string(),
-+                session_id: main_thread_id.to_string(),
-                 forked_from_id: None,
-                 parent_thread_id: None,
-                 preview: "agent thread".to_string(),
-@@ -3560,24 +3917,12 @@ async fn primary_thread_ignores_child_mcp_startup_notifications() {
-     .await;
- 
-     assert!(app_event_rx.try_recv().is_err());
--    let mut child_snapshot = app
--        .thread_event_channels
--        .get(&child_thread_id)
--        .expect("child thread channel should be created")
--        .store
--        .lock()
--        .await
--        .snapshot();
-     assert!(
--        matches!(
--            child_snapshot.events.as_slice(),
--            [ThreadBufferedEvent::Notification(
--                ServerNotification::McpServerStatusUpdated(_)
--            )]
--        ),
--        "child MCP startup notification should be buffered for the child thread"
-+        !app.thread_event_channels.contains_key(&child_thread_id),
-+        "child MCP startup notification should be ignored without creating local child state"
-     );
- 
-+    let mut child_snapshot = ThreadEventStore::new(/*capacity*/ 4).snapshot();
-     app.apply_refreshed_snapshot_thread(
-         child_thread_id,
-         AppServerStartedThread {
-@@ -3597,12 +3942,12 @@ async fn primary_thread_ignores_child_mcp_startup_notifications() {
-     }
-     let rendered = rendered_cells.join("\n");
-     assert_eq!(app.chat_widget.thread_id(), Some(child_thread_id));
--    assert_eq!(rendered.matches("sentry is not logged in").count(), 1);
-+    assert_eq!(rendered.matches("sentry is not logged in").count(), 0);
-     assert_eq!(
-         rendered
-             .matches("MCP startup incomplete (failed: sentry)")
-             .count(),
--        1
-+        0
-     );
- }
- 
-diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
-index 81517b19cb..a066ddb778 100644
---- a/codex-rs/tui/src/app/thread_routing.rs
-+++ b/codex-rs/tui/src/app/thread_routing.rs
-@@ -945,6 +945,10 @@ impl App {
-         thread_id: ThreadId,
-         notification: ServerNotification,
-     ) -> Result<()> {
-+        if !self.should_accept_thread_notification(thread_id, &notification) {
-+            return Ok(());
-+        }
-+        self.cache_collab_receiver_threads_for_notification(&notification);
-         if matches!(notification, ServerNotification::ThreadSettingsUpdated(_))
-             && self.primary_thread_id.is_some()
-             && self.primary_thread_id != Some(thread_id)
-@@ -1000,6 +1004,64 @@ impl App {
-         Ok(())
-     }
- 
-+    fn should_accept_thread_notification(
-+        &self,
-+        thread_id: ThreadId,
-+        notification: &ServerNotification,
-+    ) -> bool {
-+        if self.primary_thread_id == Some(thread_id)
-+            || self.thread_event_channels.contains_key(&thread_id)
-+            || self.agent_navigation.get(&thread_id).is_some()
-+        {
-+            return true;
-+        }
-+
-+        let ServerNotification::ThreadStarted(notification) = notification else {
-+            return false;
-+        };
-+
-+        self.thread_belongs_to_current_session_tree(&notification.thread)
-+    }
-+
-+    fn thread_belongs_to_current_session_tree(
-+        &self,
-+        thread: &codex_app_server_protocol::Thread,
-+    ) -> bool {
-+        let Some(primary_thread_id) = self.primary_thread_id else {
-+            return true;
-+        };
-+
-+        if thread.session_id == primary_thread_id.to_string() {
-+            return true;
-+        }
-+
-+        if let Some(parent_thread_id) = thread
-+            .forked_from_id
-+            .as_deref()
-+            .and_then(|thread_id| ThreadId::from_string(thread_id).ok())
-+            && self.is_current_session_thread(parent_thread_id)
-+        {
-+            return true;
-+        }
-+
-+        let codex_app_server_protocol::SessionSource::SubAgent(
-+            codex_protocol::protocol::SubAgentSource::ThreadSpawn {
-+                parent_thread_id, ..
-+            },
-+        ) = &thread.source
-+        else {
-+            return false;
-+        };
-+
-+        self.is_current_session_thread(*parent_thread_id)
-+    }
-+
-+    fn is_current_session_thread(&self, thread_id: ThreadId) -> bool {
-+        self.primary_thread_id == Some(thread_id)
-+            || self.thread_event_channels.contains_key(&thread_id)
-+            || self.agent_navigation.get(&thread_id).is_some()
-+    }
-+
-     /// Locally remembers receiver threads referenced by a collab notification.
-     ///
-     /// This intentionally avoids app-server reads on the active-thread rendering path. During large
-@@ -1035,15 +1097,23 @@ impl App {
-                 continue;
-             };
- 
--            let existing_entry = self.agent_navigation.get(&thread_id).cloned();
-             let (agent_nickname, agent_role) =
-                 collab_receiver_metadata(notification, receiver_thread_id);
--            let agent_nickname =
--                agent_nickname.or_else(|| existing_entry.as_ref()?.agent_nickname.clone());
--            let agent_role = agent_role.or_else(|| existing_entry.as_ref()?.agent_role.clone());
--            let is_closed = existing_entry.is_some_and(|entry| entry.is_closed);
--
--            self.upsert_agent_picker_thread(thread_id, agent_nickname, agent_role, is_closed);
-+            let existing_entry = self.agent_navigation.get(&thread_id).cloned();
-+            self.upsert_agent_picker_thread(
-+                thread_id,
-+                agent_nickname.or_else(|| {
-+                    existing_entry
-+                        .as_ref()
-+                        .and_then(|entry| entry.agent_nickname.clone())
-+                }),
-+                agent_role.or_else(|| {
-+                    existing_entry
-+                        .as_ref()
-+                        .and_then(|entry| entry.agent_role.clone())
-+                }),
-+                existing_entry.is_some_and(|entry| entry.is_closed),
-+            );
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+index 97e321cdde..5715ef72a6 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+@@ -206,7 +206,7 @@ use crate::render::Insets;
+ use crate::render::RectExt;
+ use crate::render::renderable::Renderable;
+ use crate::slash_command::SlashCommand;
+-use crate::style::user_message_style;
++use crate::style::user_input_style;
+ use codex_protocol::ThreadId;
+ use codex_protocol::user_input::ByteRange;
+ use codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS;
+@@ -4419,7 +4419,7 @@ impl ChatComposer {
+                 }
+             }
          }
+-        let style = user_message_style();
++        let style = user_input_style();
+         Block::default().style(style).render_ref(composer_rect, buf);
+         if !remote_images_rect.is_empty() {
+             Paragraph::new(self.attachments.remote_image_lines())
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__approval_overlay__tests__network_exec_prompt.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__approval_overlay__tests__network_exec_prompt.snap
+index aad5f89aa4..1f128e06d5 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__approval_overlay__tests__network_exec_prompt.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__approval_overlay__tests__network_exec_prompt.snap
+@@ -1,5 +1,6 @@
+ ---
+ source: tui/src/bottom_pane/approval_overlay.rs
++assertion_line: 2131
+ expression: "format!(\"{buf:?}\")"
+ ---
+ Buffer {
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approval_modal_exec.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approval_modal_exec.snap
+index f26da349a1..f288301660 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approval_modal_exec.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approval_modal_exec.snap
+@@ -1,5 +1,6 @@
+ ---
+ source: tui/src/chatwidget/tests/exec_flow.rs
++assertion_line: 1245
+ expression: terminal.backend().vt100().screen().contents()
+ ---
+ 
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approval_modal_exec_multiline_prefix_no_execpolicy.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approval_modal_exec_multiline_prefix_no_execpolicy.snap
+index 00cc144ebb..8001142f8e 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approval_modal_exec_multiline_prefix_no_execpolicy.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approval_modal_exec_multiline_prefix_no_execpolicy.snap
+@@ -1,5 +1,6 @@
+ ---
+ source: tui/src/chatwidget/tests/exec_flow.rs
++assertion_line: 1334
+ expression: contents
+ ---
+ 
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approval_modal_exec_no_reason.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approval_modal_exec_no_reason.snap
+index 7395f8d577..9c2463206e 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approval_modal_exec_no_reason.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approval_modal_exec_no_reason.snap
+@@ -1,5 +1,6 @@
+ ---
+ source: tui/src/chatwidget/tests/exec_flow.rs
++assertion_line: 1288
+ expression: terminal.backend().vt100().screen().contents()
+ ---
+ 
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approval_modal_patch.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approval_modal_patch.snap
+index 8635b66682..5234762162 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approval_modal_patch.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approval_modal_patch.snap
+@@ -1,7 +1,10 @@
+ ---
+ source: tui/src/chatwidget/tests/exec_flow.rs
++assertion_line: 1378
+ expression: contents
+ ---
++
++
+   Would you like to make the following edits?
+ 
+   Reason: The model wants to apply changes
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__exec_approval_modal_exec.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__exec_approval_modal_exec.snap
+index 3086586b11..1246559edf 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__exec_approval_modal_exec.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__exec_approval_modal_exec.snap
+@@ -1,6 +1,6 @@
+ ---
+ source: tui/src/chatwidget/tests/exec_flow.rs
+-assertion_line: 40
++assertion_line: 36
+ expression: "format!(\"{buf:?}\")"
+ ---
+ Buffer {
+diff --git a/codex-rs/tui/src/chatwidget/tests/helpers.rs b/codex-rs/tui/src/chatwidget/tests/helpers.rs
+index 2ea8a92330..99e4c10038 100644
+--- a/codex-rs/tui/src/chatwidget/tests/helpers.rs
++++ b/codex-rs/tui/src/chatwidget/tests/helpers.rs
+@@ -45,7 +45,7 @@ pub(super) fn normalize_snapshot_paths(text: impl Into<String>) -> String {
+ 
+     let platform_test_cwd = test_path_display("/tmp/project");
+     if platform_test_cwd == "/tmp/project" {
+-        text
++        normalize_space_only_lines(text)
+     } else {
+         for platform_prefix in truncated_path_variants(&platform_test_cwd)
+             .into_iter()
+@@ -58,10 +58,23 @@ pub(super) fn normalize_snapshot_paths(text: impl Into<String>) -> String {
+             text = text.replace(&format!("{platform_prefix}…"), &format!("{unix_prefix}…"));
+         }
+ 
+-        text
++        normalize_space_only_lines(text)
+     }
+ }
+ 
++fn normalize_space_only_lines(text: String) -> String {
++    text.lines()
++        .map(|line| {
++            if line.chars().all(|ch| ch == ' ') {
++                ""
++            } else {
++                line
++            }
++        })
++        .collect::<Vec<_>>()
++        .join("\n")
++}
++
+ pub(super) fn normalized_backend_snapshot<T: std::fmt::Display>(value: &T) -> String {
+     let platform_test_cwd = test_path_display("/tmp/project");
+     let rendered = format!("{value}");
+diff --git a/codex-rs/tui/src/chatwidget/tests/snapshots/codex_tui__chatwidget__tests__approval_requests__exec_approval_modal_exec.snap b/codex-rs/tui/src/chatwidget/tests/snapshots/codex_tui__chatwidget__tests__approval_requests__exec_approval_modal_exec.snap
+index fbb12551fd..d0af1680a7 100644
+--- a/codex-rs/tui/src/chatwidget/tests/snapshots/codex_tui__chatwidget__tests__approval_requests__exec_approval_modal_exec.snap
++++ b/codex-rs/tui/src/chatwidget/tests/snapshots/codex_tui__chatwidget__tests__approval_requests__exec_approval_modal_exec.snap
+@@ -1,5 +1,6 @@
+ ---
+ source: tui/src/chatwidget/tests/approval_requests.rs
++assertion_line: 38
+ expression: "format!(\"{buf:?}\")"
+ ---
+ Buffer {
+diff --git a/codex-rs/tui/src/history_cell/messages.rs b/codex-rs/tui/src/history_cell/messages.rs
+index 999064b652..2ca7414833 100644
+--- a/codex-rs/tui/src/history_cell/messages.rs
++++ b/codex-rs/tui/src/history_cell/messages.rs
+@@ -99,7 +99,7 @@ impl HistoryCell for UserHistoryCell {
+             )
+             .max(1);
+ 
+-        let style = user_message_style();
++        let style = user_input_style();
+         let element_style = style.fg(Color::Cyan);
+ 
+         let wrapped_remote_images = if self.remote_image_urls.is_empty() {
+diff --git a/codex-rs/tui/src/history_cell/mod.rs b/codex-rs/tui/src/history_cell/mod.rs
+index 9cef3e4fa5..b7dd0b9475 100644
+--- a/codex-rs/tui/src/history_cell/mod.rs
++++ b/codex-rs/tui/src/history_cell/mod.rs
+@@ -31,7 +31,7 @@ use crate::render::line_utils::push_owned_lines;
+ use crate::render::renderable::Renderable;
+ use crate::session_state::ThreadSessionState;
+ use crate::style::proposed_plan_style;
+-use crate::style::user_message_style;
++use crate::style::user_input_style;
+ use crate::terminal_hyperlinks::HyperlinkLine;
+ use crate::terminal_hyperlinks::mark_buffer_hyperlinks;
+ use crate::terminal_hyperlinks::plain_hyperlink_lines;
+diff --git a/codex-rs/tui/src/pager_overlay.rs b/codex-rs/tui/src/pager_overlay.rs
+index 9c5935fb4a..b1d55d374f 100644
+--- a/codex-rs/tui/src/pager_overlay.rs
++++ b/codex-rs/tui/src/pager_overlay.rs
+@@ -28,7 +28,7 @@ use crate::keymap::PagerKeymap;
+ use crate::render::Insets;
+ use crate::render::renderable::InsetRenderable;
+ use crate::render::renderable::Renderable;
+-use crate::style::user_message_style;
++use crate::style::user_input_style;
+ use crate::terminal_hyperlinks::HyperlinkLine;
+ use crate::terminal_hyperlinks::mark_buffer_hyperlinks;
+ use crate::terminal_hyperlinks::visible_lines;
+@@ -494,9 +494,9 @@ impl TranscriptOverlay {
+                     Box::new(CachedRenderable::new(CellRenderable {
+                         cell: c.clone(),
+                         style: if highlight_cell == Some(i) {
+-                            user_message_style().reversed()
++                            user_input_style().reversed()
+                         } else {
+-                            user_message_style()
++                            user_input_style()
+                         },
+                     })) as Box<dyn Renderable>
+                 } else {
+diff --git a/codex-rs/tui/src/style.rs b/codex-rs/tui/src/style.rs
+index 1900434186..1ddf0fcf51 100644
+--- a/codex-rs/tui/src/style.rs
++++ b/codex-rs/tui/src/style.rs
+@@ -11,6 +11,7 @@ use ratatui::style::Style;
+ use ratatui::style::Stylize;
+ 
+ const LIGHT_BG_ACCENT_RGB: (u8, u8, u8) = (0, 95, 135);
++const FALLBACK_USER_MESSAGE_BG: Color = Color::Indexed(236);
+ const STABLE_DIM_FG: Color = Color::Indexed(244);
+ // Decorative table rules should remain visible without competing with cell content.
+ const TABLE_SEPARATOR_FG_ALPHA: f32 = 0.20;
+@@ -19,6 +20,10 @@ pub fn user_message_style() -> Style {
+     user_message_style_for(default_bg())
+ }
+ 
++pub(crate) fn user_input_style() -> Style {
++    user_input_style_for(default_bg())
++}
++
+ pub fn proposed_plan_style() -> Style {
+     proposed_plan_style_for(default_bg())
+ }
+@@ -40,9 +45,15 @@ pub(crate) fn stable_dim_style() -> Style {
+ 
+ /// Returns the style for a user-authored message using the provided terminal background.
+ pub fn user_message_style_for(terminal_bg: Option<(u8, u8, u8)>) -> Style {
++    terminal_bg
++        .map(|bg| Style::default().bg(user_message_bg(bg)))
++        .unwrap_or_default()
++}
++
++pub(crate) fn user_input_style_for(terminal_bg: Option<(u8, u8, u8)>) -> Style {
+     match terminal_bg {
+         Some(bg) => Style::default().bg(user_message_bg(bg)),
+-        None => Style::default(),
++        None => Style::default().bg(FALLBACK_USER_MESSAGE_BG),
+     }
+ }
+ 
+@@ -115,6 +126,22 @@ mod tests {
+         assert_eq!(accent_style_for(/*terminal_bg*/ None), expected);
      }
  
++    #[test]
++    fn user_message_style_uses_no_background_when_background_is_unknown() {
++        assert_eq!(
++            user_message_style_for(/*terminal_bg*/ None),
++            Style::default()
++        );
++    }
++
++    #[test]
++    fn user_input_style_uses_gray_fallback_when_background_is_unknown() {
++        assert_eq!(
++            user_input_style_for(/*terminal_bg*/ None),
++            Style::default().bg(FALLBACK_USER_MESSAGE_BG)
++        );
++    }
++
+     #[test]
+     fn table_separator_blends_toward_dark_background() {
+         let style = table_separator_style_for(

@@ -1,91 +1,1098 @@
-diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
-index dd85b1826c..1279ab6a52 100644
---- a/codex-rs/tui/src/lib.rs
-+++ b/codex-rs/tui/src/lib.rs
-@@ -143,6 +143,7 @@ mod markdown_stream;
- mod markdown_text_merge;
- mod mention_codec;
- mod model_catalog;
-+mod model_color;
- mod model_migration;
- mod motion;
- mod multi_agents;
-diff --git a/codex-rs/tui/src/model_color.rs b/codex-rs/tui/src/model_color.rs
-new file mode 100644
-index 0000000000..b32205c9e0
---- /dev/null
-+++ b/codex-rs/tui/src/model_color.rs
-@@ -0,0 +1,73 @@
-+//! Local model-name colors for TUI personalization.
-+
-+#![allow(clippy::disallowed_methods)]
-+
-+use ratatui::style::Color;
-+use ratatui::style::Style;
-+
-+const MODEL_COLORS: [Color; 5] = [
-+    Color::Rgb(89, 169, 255),
-+    Color::Rgb(45, 212, 191),
-+    Color::Rgb(74, 222, 128),
-+    Color::Rgb(167, 139, 250),
-+    Color::Rgb(148, 163, 184),
-+];
-+const KNOWN_MODELS: [&str; 5] = [
-+    "gpt-5.4",
-+    "gpt-5.5",
-+    "gpt-5.4-mini",
-+    "gpt-5.3-codex",
-+    "gpt-5.2",
-+];
-+
-+pub(crate) fn model_style(model: &str) -> Style {
-+    Style::default().fg(model_color(model))
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+index b142a3ecf7..439f8c48d3 100644
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -1618,6 +1618,7 @@ server_notification_definitions! {
+     #[experimental("thread/settings/updated")]
+     ThreadSettingsUpdated => "thread/settings/updated" (v2::ThreadSettingsUpdatedNotification),
+     ThreadTokenUsageUpdated => "thread/tokenUsage/updated" (v2::ThreadTokenUsageUpdatedNotification),
++    ThreadResponseMetricsUpdated => "thread/responseMetrics/updated" (v2::ThreadResponseMetricsUpdatedNotification),
+     TurnStarted => "turn/started" (v2::TurnStartedNotification),
+     HookStarted => "hook/started" (v2::HookStartedNotification),
+     TurnCompleted => "turn/completed" (v2::TurnCompletedNotification),
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
+index c30bc0bddb..67adfbf789 100644
+--- a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
+@@ -1405,6 +1405,20 @@ pub struct ThreadTokenUsageUpdatedNotification {
+     pub token_usage: ThreadTokenUsage,
+ }
+ 
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ThreadResponseMetricsUpdatedNotification {
++    pub thread_id: String,
++    pub turn_id: String,
++    pub duration_ms: i64,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    #[ts(type = "number | null", optional)]
++    pub time_to_first_token_ms: Option<i64>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub token_usage: Option<TokenUsageBreakdown>,
 +}
 +
-+fn model_color(model: &str) -> Color {
-+    if let Some(idx) = KNOWN_MODELS
-+        .iter()
-+        .position(|known_model| *known_model == model)
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+ #[serde(rename_all = "camelCase")]
+ #[ts(export_to = "v2/")]
+diff --git a/codex-rs/app-server/src/bespoke_event_handling.rs b/codex-rs/app-server/src/bespoke_event_handling.rs
+index b7bc6c5bb1..0a54da36ad 100644
+--- a/codex-rs/app-server/src/bespoke_event_handling.rs
++++ b/codex-rs/app-server/src/bespoke_event_handling.rs
+@@ -61,6 +61,7 @@ use codex_app_server_protocol::ThreadRealtimeSdpNotification;
+ use codex_app_server_protocol::ThreadRealtimeStartedNotification;
+ use codex_app_server_protocol::ThreadRealtimeTranscriptDeltaNotification;
+ use codex_app_server_protocol::ThreadRealtimeTranscriptDoneNotification;
++use codex_app_server_protocol::ThreadResponseMetricsUpdatedNotification;
+ use codex_app_server_protocol::ThreadRollbackResponse;
+ use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
+ use codex_app_server_protocol::ThreadStatus;
+@@ -1632,7 +1633,24 @@ async fn handle_token_count_event(
+     token_count_event: TokenCountEvent,
+     outgoing: &ThreadScopedOutgoingMessageSender,
+ ) {
+-    let TokenCountEvent { info, rate_limits } = token_count_event;
++    let TokenCountEvent {
++        info,
++        rate_limits,
++        response_metrics,
++    } = token_count_event;
++    if let Some(response_metrics) = response_metrics {
++        outgoing
++            .send_server_notification(ServerNotification::ThreadResponseMetricsUpdated(
++                ThreadResponseMetricsUpdatedNotification {
++                    thread_id: conversation_id.to_string(),
++                    turn_id: turn_id.clone(),
++                    duration_ms: response_metrics.duration_ms,
++                    time_to_first_token_ms: response_metrics.time_to_first_token_ms,
++                    token_usage: response_metrics.token_usage.map(Into::into),
++                },
++            ))
++            .await;
++    }
+     if let Some(token_usage) = info.map(ThreadTokenUsage::from) {
+         let notification = ThreadTokenUsageUpdatedNotification {
+             thread_id: conversation_id.to_string(),
+@@ -2211,6 +2229,7 @@ mod tests {
+     use codex_protocol::protocol::GuardianAssessmentStatus;
+     use codex_protocol::protocol::RateLimitSnapshot;
+     use codex_protocol::protocol::RateLimitWindow;
++    use codex_protocol::protocol::ResponseMetricsEvent;
+     use codex_protocol::protocol::RolloutItem;
+     use codex_protocol::protocol::SessionSource;
+     use codex_protocol::protocol::SubAgentActivityEvent;
+@@ -3762,6 +3781,7 @@ mod tests {
+             TokenCountEvent {
+                 info: Some(info),
+                 rate_limits: Some(rate_limits),
++                response_metrics: None,
+             },
+             &outgoing,
+         )
+@@ -3819,6 +3839,7 @@ mod tests {
+             TokenCountEvent {
+                 info: None,
+                 rate_limits: None,
++                response_metrics: None,
+             },
+             &outgoing,
+         )
+@@ -3831,6 +3852,65 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[tokio::test]
++    async fn test_handle_token_count_event_emits_response_metrics_without_usage_info() -> Result<()>
 +    {
-+        return MODEL_COLORS[idx % MODEL_COLORS.len()];
++        let conversation_id = ThreadId::new();
++        let turn_id = "turn-metrics".to_string();
++        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
++        let outgoing = Arc::new(OutgoingMessageSender::new(
++            tx,
++            codex_analytics::AnalyticsEventsClient::disabled(),
++        ));
++        let outgoing = ThreadScopedOutgoingMessageSender::new(
++            outgoing,
++            vec![ConnectionId(1)],
++            ThreadId::new(),
++        );
++
++        handle_token_count_event(
++            conversation_id,
++            turn_id.clone(),
++            TokenCountEvent {
++                info: None,
++                rate_limits: None,
++                response_metrics: Some(ResponseMetricsEvent {
++                    duration_ms: 1_250,
++                    time_to_first_token_ms: Some(250),
++                    token_usage: Some(TokenUsage {
++                        input_tokens: 1_000,
++                        cached_input_tokens: 750,
++                        output_tokens: 100,
++                        reasoning_output_tokens: 25,
++                        total_tokens: 1_100,
++                    }),
++                }),
++            },
++            &outgoing,
++        )
++        .await;
++
++        let msg = recv_broadcast_message(&mut rx).await?;
++        match msg {
++            OutgoingMessage::AppServerNotification(
++                ServerNotification::ThreadResponseMetricsUpdated(payload),
++            ) => {
++                assert_eq!(payload.thread_id, conversation_id.to_string());
++                assert_eq!(payload.turn_id, turn_id);
++                assert_eq!(payload.duration_ms, 1_250);
++                assert_eq!(payload.time_to_first_token_ms, Some(250));
++                let usage = payload.token_usage.expect("metrics token usage");
++                assert_eq!(usage.input_tokens, 1_000);
++                assert_eq!(usage.cached_input_tokens, 750);
++                assert_eq!(usage.output_tokens, 100);
++                assert_eq!(usage.reasoning_output_tokens, 25);
++            }
++            other => bail!("unexpected notification: {other:?}"),
++        }
++        assert!(rx.try_recv().is_err(), "no extra messages expected");
++        Ok(())
 +    }
 +
-+    let idx = model
-+        .bytes()
-+        .fold(0usize, |acc, byte| acc.wrapping_add(byte as usize))
-+        % MODEL_COLORS.len();
-+    MODEL_COLORS[idx]
+     #[tokio::test]
+     async fn test_handle_turn_complete_emits_error_multiple_turns() -> Result<()> {
+         // Conversation A will have two turns; Conversation B will have one turn.
+diff --git a/codex-rs/app-server/src/request_processors/token_usage_replay.rs b/codex-rs/app-server/src/request_processors/token_usage_replay.rs
+index d4d2228d4b..f41e2db122 100644
+--- a/codex-rs/app-server/src/request_processors/token_usage_replay.rs
++++ b/codex-rs/app-server/src/request_processors/token_usage_replay.rs
+@@ -163,6 +163,7 @@ mod tests {
+             RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
+                 info: None,
+                 rate_limits: None,
++                response_metrics: None,
+             })),
+             RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                 client_id: None,
+diff --git a/codex-rs/app-server/tests/common/rollout.rs b/codex-rs/app-server/tests/common/rollout.rs
+index 6d446e1c42..84f1778f01 100644
+--- a/codex-rs/app-server/tests/common/rollout.rs
++++ b/codex-rs/app-server/tests/common/rollout.rs
+@@ -94,6 +94,7 @@ pub fn create_fake_rollout_with_token_usage(
+             model_context_window: Some(200_000),
+         }),
+         rate_limits: None,
++        response_metrics: None,
+     }))?;
+     let file_path = rollout_path(codex_home, filename_ts, &thread_id);
+     let line = json!({
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_resume.rs b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
+index 4be2fa3bca..805498dc61 100644
+--- a/codex-rs/app-server/tests/suite/v2/thread_resume.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
+@@ -1904,6 +1904,7 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
+                     model_context_window: Some(200_000),
+                 }),
+                 rate_limits: None,
++                response_metrics: None,
+             }))?,
+         })
+         .to_string(),
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 708cc0c4ec..73f55e3c2d 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -371,6 +371,7 @@ use codex_protocol::protocol::NonSteerableTurnKind;
+ use codex_protocol::protocol::Op;
+ use codex_protocol::protocol::RateLimitSnapshot;
+ use codex_protocol::protocol::RequestUserInputEvent;
++use codex_protocol::protocol::ResponseMetricsEvent;
+ use codex_protocol::protocol::ReviewDecision;
+ use codex_protocol::protocol::SandboxPolicy;
+ use codex_protocol::protocol::SessionConfiguredEvent;
+@@ -3619,11 +3620,37 @@ impl Session {
+     }
+ 
+     pub(crate) async fn send_token_count_event(&self, turn_context: &TurnContext) {
++        self.send_token_count_event_with_response_metrics(turn_context, None)
++            .await;
++    }
++
++    pub(crate) async fn send_token_count_event_with_response_metrics(
++        &self,
++        turn_context: &TurnContext,
++        response_metrics: Option<ResponseMetricsEvent>,
++    ) {
+         let (info, rate_limits) = {
+             let state = self.state.lock().await;
+             state.token_info_and_rate_limits()
+         };
+-        let event = EventMsg::TokenCount(TokenCountEvent { info, rate_limits });
++        let event = EventMsg::TokenCount(TokenCountEvent {
++            info,
++            rate_limits,
++            response_metrics,
++        });
++        self.send_event(turn_context, event).await;
++    }
++
++    pub(crate) async fn send_response_metrics_event(
++        &self,
++        turn_context: &TurnContext,
++        response_metrics: ResponseMetricsEvent,
++    ) {
++        let event = EventMsg::TokenCount(TokenCountEvent {
++            info: None,
++            rate_limits: None,
++            response_metrics: Some(response_metrics),
++        });
+         self.send_event(turn_context, event).await;
+     }
+ 
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index e22b5aa19f..c857cadce9 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -2004,24 +2004,28 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
+         TokenCountEvent {
+             info: Some(info1),
+             rate_limits: None,
++            response_metrics: None,
+         },
+     )));
+     rollout_items.push(RolloutItem::EventMsg(EventMsg::TokenCount(
+         TokenCountEvent {
+             info: None,
+             rate_limits: None,
++            response_metrics: None,
+         },
+     )));
+     rollout_items.push(RolloutItem::EventMsg(EventMsg::TokenCount(
+         TokenCountEvent {
+             info: Some(info2.clone()),
+             rate_limits: None,
++            response_metrics: None,
+         },
+     )));
+     rollout_items.push(RolloutItem::EventMsg(EventMsg::TokenCount(
+         TokenCountEvent {
+             info: None,
+             rate_limits: None,
++            response_metrics: None,
+         },
+     )));
+ 
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index 6df521eae6..f66760e154 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -3,6 +3,7 @@ use std::collections::HashSet;
+ use std::path::PathBuf;
+ use std::sync::Arc;
+ use std::sync::atomic::Ordering;
++use std::time::Instant;
+ 
+ use crate::SkillInjections;
+ use crate::build_skill_injections;
+@@ -67,6 +68,7 @@ use crate::tools::spec_plan::search_tool_enabled;
+ use crate::tools::spec_plan::tool_suggest_enabled;
+ use crate::turn_diff_tracker::TurnDiffTracker;
+ use crate::turn_timing::record_turn_ttft_metric;
++use crate::turn_timing::response_event_records_turn_ttft;
+ use crate::util::error_or_panic;
+ use codex_analytics::AppInvocation;
+ use codex_analytics::CompactionPhase;
+@@ -102,6 +104,7 @@ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::PlanDeltaEvent;
+ use codex_protocol::protocol::ReasoningContentDeltaEvent;
+ use codex_protocol::protocol::ReasoningRawContentDeltaEvent;
++use codex_protocol::protocol::ResponseMetricsEvent;
+ use codex_protocol::protocol::TurnDiffEvent;
+ use codex_protocol::protocol::WarningEvent;
+ use codex_protocol::user_input::UserInput;
+@@ -1976,6 +1979,7 @@ async fn try_run_sampling_request(
+         turn_context.provider.info().name.as_str(),
+     );
+     let sampling_timing_guard = turn_context.turn_timing_state.begin_sampling();
++    let response_started_at = Instant::now();
+     let mut stream = client_session
+         .stream(
+             prompt,
+@@ -2005,6 +2009,7 @@ async fn try_run_sampling_request(
+     let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
+     let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
+     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
++    let mut response_time_to_first_token_ms: Option<i64> = None;
+     let defer_streamed_turn_items_for_contributors =
+         !sess.services.extensions.turn_item_contributors().is_empty();
+     let mut active_item_is_streaming_to_client = false;
+@@ -2049,6 +2054,10 @@ async fn try_run_sampling_request(
+             .session_telemetry
+             .record_responses(&handle_responses, &event);
+         record_turn_ttft_metric(&turn_context, &event).await;
++        if response_time_to_first_token_ms.is_none() && response_event_records_turn_ttft(&event) {
++            response_time_to_first_token_ms =
++                Some(i64::try_from(response_started_at.elapsed().as_millis()).unwrap_or(i64::MAX));
++        }
+ 
+         match event {
+             ResponseEvent::Created => {}
+@@ -2261,6 +2270,12 @@ async fn try_run_sampling_request(
+                 end_turn,
+                 ..
+             } => {
++                let response_metrics = ResponseMetricsEvent {
++                    duration_ms: i64::try_from(response_started_at.elapsed().as_millis())
++                        .unwrap_or(i64::MAX),
++                    time_to_first_token_ms: response_time_to_first_token_ms,
++                    token_usage: token_usage.clone(),
++                };
+                 flush_assistant_text_segments_all(
+                     &sess,
+                     &turn_context,
+@@ -2276,6 +2291,8 @@ async fn try_run_sampling_request(
+                 if let Err(err) = budget_result {
+                     break Err(err);
+                 }
++                sess.send_response_metrics_event(&turn_context, response_metrics)
++                    .await;
+                 if let Some(false) = end_turn {
+                     needs_follow_up = true;
+                 }
+diff --git a/codex-rs/core/src/turn_timing.rs b/codex-rs/core/src/turn_timing.rs
+index 8a93a91833..f72a11ae95 100644
+--- a/codex-rs/core/src/turn_timing.rs
++++ b/codex-rs/core/src/turn_timing.rs
+@@ -327,7 +327,7 @@ impl TurnTimingStateInner {
+     }
+ }
+ 
+-fn response_event_records_turn_ttft(event: &ResponseEvent) -> bool {
++pub(crate) fn response_event_records_turn_ttft(event: &ResponseEvent) -> bool {
+     match event {
+         ResponseEvent::OutputItemDone(item) | ResponseEvent::OutputItemAdded(item) => {
+             response_item_records_turn_ttft(item)
+diff --git a/codex-rs/external-agent-sessions/src/export.rs b/codex-rs/external-agent-sessions/src/export.rs
+index 2990c0f5ea..7bb23f8584 100644
+--- a/codex-rs/external-agent-sessions/src/export.rs
++++ b/codex-rs/external-agent-sessions/src/export.rs
+@@ -161,6 +161,7 @@ fn token_count_item(last_model_visible_tokens: i64) -> RolloutItem {
+             model_context_window: None,
+         }),
+         rate_limits: None,
++        response_metrics: None,
+     }))
+ }
+ 
+diff --git a/codex-rs/protocol/src/protocol.rs b/codex-rs/protocol/src/protocol.rs
+index e34cacee81..cc6e2f737b 100644
+--- a/codex-rs/protocol/src/protocol.rs
++++ b/codex-rs/protocol/src/protocol.rs
+@@ -2099,6 +2099,15 @@ impl TokenUsageInfo {
+ pub struct TokenCountEvent {
+     pub info: Option<TokenUsageInfo>,
+     pub rate_limits: Option<RateLimitSnapshot>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub response_metrics: Option<ResponseMetricsEvent>,
 +}
 +
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+    use pretty_assertions::assert_eq;
-+
-+    #[test]
-+    fn known_models_have_stable_colors() {
-+        for (idx, model) in KNOWN_MODELS.iter().enumerate() {
-+            let color = MODEL_COLORS[idx % MODEL_COLORS.len()];
-+            assert_eq!(model_style(model).fg, Some(color));
++#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
++pub struct ResponseMetricsEvent {
++    pub duration_ms: i64,
++    pub time_to_first_token_ms: Option<i64>,
++    pub token_usage: Option<TokenUsage>,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, TS)]
+diff --git a/codex-rs/state/src/runtime/threads.rs b/codex-rs/state/src/runtime/threads.rs
+index 576f760264..33ad2a49ec 100644
+--- a/codex-rs/state/src/runtime/threads.rs
++++ b/codex-rs/state/src/runtime/threads.rs
+@@ -2685,6 +2685,7 @@ mod tests {
+                     model_context_window: None,
+                 }),
+                 rate_limits: None,
++                response_metrics: None,
+             },
+         ))];
+         let override_updated_at =
+diff --git a/codex-rs/thread-store/src/local/mod.rs b/codex-rs/thread-store/src/local/mod.rs
+index 0f10a2c828..9da7e9274c 100644
+--- a/codex-rs/thread-store/src/local/mod.rs
++++ b/codex-rs/thread-store/src/local/mod.rs
+@@ -521,6 +521,7 @@ mod tests {
+                     codex_protocol::protocol::TokenCountEvent {
+                         info: None,
+                         rate_limits: None,
++                        response_metrics: None,
+                     },
+                 )),
+                 RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+@@ -605,6 +606,7 @@ mod tests {
+                 codex_protocol::protocol::TokenCountEvent {
+                     info: None,
+                     rate_limits: None,
++                    response_metrics: None,
+                 },
+             ))])
+             .await
+diff --git a/codex-rs/tui/src/app/app_server_event_targets.rs b/codex-rs/tui/src/app/app_server_event_targets.rs
+index 602e881f2f..97e6154b5d 100644
+--- a/codex-rs/tui/src/app/app_server_event_targets.rs
++++ b/codex-rs/tui/src/app/app_server_event_targets.rs
+@@ -61,6 +61,9 @@ pub(super) fn server_notification_thread_target(
+         ServerNotification::ThreadTokenUsageUpdated(notification) => {
+             Some(notification.thread_id.as_str())
+         }
++        ServerNotification::ThreadResponseMetricsUpdated(notification) => {
++            Some(notification.thread_id.as_str())
 +        }
-+    }
+         ServerNotification::ThreadGoalUpdated(notification) => {
+             Some(notification.thread_id.as_str())
+         }
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+index 32b8e02f92..8ae5232c75 100644
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -1602,6 +1602,9 @@ impl App {
+             &event,
+             ThreadBufferedEvent::Notification(ServerNotification::TurnStarted(_))
+                 | ThreadBufferedEvent::Notification(ServerNotification::ThreadTokenUsageUpdated(_))
++                | ThreadBufferedEvent::Notification(
++                    ServerNotification::ThreadResponseMetricsUpdated(_)
++                )
+         );
+         match event {
+             ThreadBufferedEvent::Notification(notification) => {
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+index 95123e2616..e01ac1fc33 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -133,9 +133,18 @@ pub(crate) enum StatusLineItem {
+     /// Total output tokens generated.
+     TotalOutputTokens,
+ 
+-    /// Total reasoning output tokens generated.
++    /// Last response reasoning output tokens.
++    #[strum(to_string = "last-reasoning-tokens", serialize = "reasoning-tokens")]
+     ReasoningTokens,
+ 
++    /// Last response visible output tokens per second.
++    #[strum(to_string = "last-tps", serialize = "tps")]
++    TokensPerSecond,
 +
-+    #[test]
-+    fn known_model_colors_do_not_repeat_before_palette_wraps() {
-+        let colors: std::collections::HashSet<_> = KNOWN_MODELS
-+            .iter()
-+            .map(|model| model_style(model).fg)
-+            .collect();
++    /// Last response time to first token.
++    #[strum(to_string = "last-ttft", serialize = "ttft")]
++    TimeToFirstToken,
 +
+     /// Prompt cache hit rate for input tokens.
+     CacheHitRate,
+ 
+@@ -200,7 +209,13 @@ impl StatusLineItem {
+             StatusLineItem::TotalInputTokens => "Total input tokens used in session",
+             StatusLineItem::TotalOutputTokens => "Total output tokens used in session",
+             StatusLineItem::ReasoningTokens => {
+-                "Reasoning output tokens and percentage of output (omitted when zero)"
++                "Last response reasoning output tokens (omitted when zero)"
++            }
++            StatusLineItem::TokensPerSecond => {
++                "Last response visible output tokens per second (omitted until available)"
++            }
++            StatusLineItem::TimeToFirstToken => {
++                "Last response time to first token (omitted until available)"
+             }
+             StatusLineItem::CacheHitRate => {
+                 "Prompt cache hit rate for input tokens (omitted when unavailable)"
+@@ -243,6 +258,8 @@ impl StatusLineItem {
+             StatusLineItem::TotalInputTokens => StatusSurfacePreviewItem::TotalInputTokens,
+             StatusLineItem::TotalOutputTokens => StatusSurfacePreviewItem::TotalOutputTokens,
+             StatusLineItem::ReasoningTokens => StatusSurfacePreviewItem::ReasoningTokens,
++            StatusLineItem::TokensPerSecond => StatusSurfacePreviewItem::TokensPerSecond,
++            StatusLineItem::TimeToFirstToken => StatusSurfacePreviewItem::TimeToFirstToken,
+             StatusLineItem::CacheHitRate => StatusSurfacePreviewItem::CacheHitRate,
+             StatusLineItem::SessionId => StatusSurfacePreviewItem::SessionId,
+             StatusLineItem::FastMode => StatusSurfacePreviewItem::FastMode,
+@@ -531,10 +548,38 @@ mod tests {
+ 
+     #[test]
+     fn reasoning_tokens_is_selectable_id() {
 +        assert_eq!(
-+            colors.len(),
-+            KNOWN_MODELS.len().min(MODEL_COLORS.len()),
-+            "known model colors should not repeat before palette colors are exhausted"
++            "last-reasoning-tokens".parse::<StatusLineItem>(),
++            Ok(StatusLineItem::ReasoningTokens)
++        );
+         assert_eq!(
+             "reasoning-tokens".parse::<StatusLineItem>(),
+             Ok(StatusLineItem::ReasoningTokens)
+         );
++        assert_eq!(
++            StatusLineItem::ReasoningTokens.to_string(),
++            "last-reasoning-tokens"
 +        );
 +    }
 +
 +    #[test]
-+    fn unknown_model_color_is_deterministic() {
-+        assert_eq!(model_style("future-model"), model_style("future-model"));
++    fn response_metrics_are_selectable_ids() {
++        assert_eq!(
++            "last-tps".parse::<StatusLineItem>(),
++            Ok(StatusLineItem::TokensPerSecond)
++        );
++        assert_eq!(
++            "tps".parse::<StatusLineItem>(),
++            Ok(StatusLineItem::TokensPerSecond)
++        );
++        assert_eq!(
++            "last-ttft".parse::<StatusLineItem>(),
++            Ok(StatusLineItem::TimeToFirstToken)
++        );
++        assert_eq!(
++            "ttft".parse::<StatusLineItem>(),
++            Ok(StatusLineItem::TimeToFirstToken)
++        );
+     }
+ 
+     #[test]
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+index 808a059f11..470c2de1c8 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -45,6 +45,8 @@ impl StatusLineAccent {
+             | StatusLineItem::TotalInputTokens
+             | StatusLineItem::TotalOutputTokens
+             | StatusLineItem::ReasoningTokens
++            | StatusLineItem::TokensPerSecond
++            | StatusLineItem::TimeToFirstToken
+             | StatusLineItem::CacheHitRate => Self::Usage,
+             StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit => Self::Limit,
+             StatusLineItem::CodexVersion | StatusLineItem::SessionId => Self::Metadata,
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+index 6efac366bd..ba715d30e1 100644
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -29,6 +29,8 @@ pub(crate) enum StatusSurfacePreviewItem {
+     TotalInputTokens,
+     TotalOutputTokens,
+     ReasoningTokens,
++    TokensPerSecond,
++    TimeToFirstToken,
+     CacheHitRate,
+     SessionId,
+     FastMode,
+@@ -63,7 +65,9 @@ impl StatusSurfacePreviewItem {
+             StatusSurfacePreviewItem::UsedTokens => "0 used",
+             StatusSurfacePreviewItem::TotalInputTokens => "0 in",
+             StatusSurfacePreviewItem::TotalOutputTokens => "0 out",
+-            StatusSurfacePreviewItem::ReasoningTokens => "0 0.0% reasoning",
++            StatusSurfacePreviewItem::ReasoningTokens => "12 reasoning",
++            StatusSurfacePreviewItem::TokensPerSecond => "20.0 TPS",
++            StatusSurfacePreviewItem::TimeToFirstToken => "250ms TTFT",
+             StatusSurfacePreviewItem::CacheHitRate => "Cache 0.0% hit",
+             StatusSurfacePreviewItem::SessionId => "550e8400-e29b-41d4",
+             StatusSurfacePreviewItem::FastMode => "Fast on",
+@@ -99,6 +103,8 @@ impl StatusSurfacePreviewItem {
+             Self::TotalInputTokens,
+             Self::TotalOutputTokens,
+             Self::ReasoningTokens,
++            Self::TokensPerSecond,
++            Self::TimeToFirstToken,
+             Self::CacheHitRate,
+             Self::SessionId,
+             Self::FastMode,
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 09671e975a..30eaf0ed48 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -111,9 +111,11 @@ use codex_app_server_protocol::SkillsListResponse;
+ use codex_app_server_protocol::ThreadGoal as AppThreadGoal;
+ use codex_app_server_protocol::ThreadGoalStatus as AppThreadGoalStatus;
+ use codex_app_server_protocol::ThreadItem;
++use codex_app_server_protocol::ThreadResponseMetricsUpdatedNotification;
+ use codex_app_server_protocol::ThreadSettings;
+ use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
+ use codex_app_server_protocol::ThreadTokenUsage;
++use codex_app_server_protocol::TokenUsageBreakdown;
+ use codex_app_server_protocol::ToolRequestUserInputParams;
+ use codex_app_server_protocol::Turn;
+ use codex_app_server_protocol::TurnCompletedNotification;
+@@ -614,6 +616,9 @@ pub(crate) struct ChatWidget {
+     pending_rate_limit_reset_request_id: Option<u64>,
+     pending_rate_limit_reset_hint_request_id: Option<u64>,
+     pending_rate_limit_reset_hint: Option<PlainHistoryCell>,
++    last_response_tps: Option<f64>,
++    last_response_ttft_ms: Option<i64>,
++    last_response_reasoning_tokens: Option<i64>,
+     available_rate_limit_reset_credits: Option<i64>,
+     next_rate_limit_reset_request_id: u64,
+     plan_type: Option<PlanType>,
+@@ -975,6 +980,16 @@ fn token_usage_info_from_app_server(token_usage: ThreadTokenUsage) -> TokenUsage
+     }
+ }
+ 
++fn token_usage_from_app_server(token_usage: TokenUsageBreakdown) -> TokenUsage {
++    TokenUsage {
++        total_tokens: token_usage.total_tokens,
++        input_tokens: token_usage.input_tokens,
++        cached_input_tokens: token_usage.cached_input_tokens,
++        output_tokens: token_usage.output_tokens,
++        reasoning_output_tokens: token_usage.reasoning_output_tokens,
 +    }
 +}
++
+ impl ChatWidget {
+     /// Stores or overwrites the cached nickname and role for a collab agent thread.
+     ///
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 1fed162d15..8e6e7122c8 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -139,6 +139,9 @@ impl ChatWidget {
+             pending_rate_limit_reset_request_id: None,
+             pending_rate_limit_reset_hint_request_id: None,
+             pending_rate_limit_reset_hint: None,
++            last_response_tps: None,
++            last_response_ttft_ms: None,
++            last_response_reasoning_tokens: None,
+             available_rate_limit_reset_credits: None,
+             next_rate_limit_reset_request_id: 0,
+             plan_type: initial_plan_type,
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index ab4e79d175..4317938082 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -34,6 +34,9 @@ impl ChatWidget {
+                     notification.token_usage,
+                 )));
+             }
++            ServerNotification::ThreadResponseMetricsUpdated(notification) => {
++                self.on_response_metrics_updated(notification);
++            }
+             ServerNotification::ThreadNameUpdated(notification) => {
+                 match ThreadId::from_string(&notification.thread_id) {
+                     Ok(thread_id) => {
+@@ -265,6 +268,7 @@ impl ChatWidget {
+                 self.on_task_complete(
+                     /*last_agent_message*/ None,
+                     notification.turn.duration_ms,
++                    notification.time_to_first_token_ms,
+                     replay_kind.is_some(),
+                 )
+             }
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 921de77285..58db4f61bb 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -646,6 +646,8 @@ impl ChatWidget {
+                 format_tokens_compact(self.status_line_total_usage().output_tokens)
+             )),
+             StatusLineItem::ReasoningTokens => self.status_line_reasoning_tokens_text(),
++            StatusLineItem::TokensPerSecond => self.status_line_tps_text(),
++            StatusLineItem::TimeToFirstToken => self.status_line_ttft_text(),
+             StatusLineItem::CacheHitRate => self
+                 .status_line_total_usage()
+                 .cache_hit_rate_percent()
+@@ -691,33 +693,25 @@ impl ChatWidget {
+     }
+ 
+     fn status_line_reasoning_tokens_text(&self) -> Option<String> {
+-        let usage = self.status_line_total_usage();
+-        let reasoning_tokens = usage.reasoning_output_tokens;
+-        let rate = usage.reasoning_output_percent()?;
+-        (reasoning_tokens > 0).then(|| {
+-            format!(
+-                "{} {rate:.1}% reasoning",
+-                format_tokens_compact(reasoning_tokens)
+-            )
+-        })
++        self.last_response_reasoning_tokens
++            .filter(|tokens| *tokens > 0)
++            .map(|tokens| format!("{} reasoning", format_tokens_compact(tokens)))
+     }
+ 
+     fn status_line_reasoning_tokens_display_line(&self) -> Option<Line<'static>> {
+-        let usage = self.status_line_total_usage();
+-        let reasoning_tokens = usage.reasoning_output_tokens;
+-        let rate = usage.reasoning_output_percent()?;
+-        if reasoning_tokens <= 0 {
+-            return None;
+-        }
+-        let percent_style = status_line_style_for_item(
+-            StatusLineItem::FiveHourLimit,
+-            self.config.tui_status_line_use_colors,
+-        );
+-        Some(Line::from(vec![
+-            Span::from(format!("{} ", format_tokens_compact(reasoning_tokens))),
+-            Span::styled(format!("{rate:.1}%"), percent_style),
+-            Span::from(" reasoning"),
+-        ]))
++        self.status_line_reasoning_tokens_text().map(Line::from)
++    }
++
++    fn status_line_tps_text(&self) -> Option<String> {
++        self.last_response_tps
++            .filter(|tps| tps.is_finite() && *tps > 0.0)
++            .map(|tps| format!("{tps:.1} TPS"))
++    }
++
++    fn status_line_ttft_text(&self) -> Option<String> {
++        self.last_response_ttft_ms
++            .filter(|ms| *ms > 0)
++            .map(|ms| format!("{} TTFT", format_duration_ms(ms)))
+     }
+ 
+     fn status_line_line_for_item(&mut self, item: &StatusLineItem) -> Option<Line<'static>> {
+@@ -873,6 +867,8 @@ impl ChatWidget {
+             StatusSurfacePreviewItem::TotalInputTokens => StatusLineItem::TotalInputTokens,
+             StatusSurfacePreviewItem::TotalOutputTokens => StatusLineItem::TotalOutputTokens,
+             StatusSurfacePreviewItem::ReasoningTokens => StatusLineItem::ReasoningTokens,
++            StatusSurfacePreviewItem::TokensPerSecond => StatusLineItem::TokensPerSecond,
++            StatusSurfacePreviewItem::TimeToFirstToken => StatusLineItem::TimeToFirstToken,
+             StatusSurfacePreviewItem::CacheHitRate => StatusLineItem::CacheHitRate,
+             StatusSurfacePreviewItem::SessionId => StatusLineItem::SessionId,
+             StatusSurfacePreviewItem::FastMode => StatusLineItem::FastMode,
+@@ -1232,6 +1228,20 @@ fn weekly_status_window(
+         .or_else(|| snapshot.secondary.as_ref().map(|window| (window, true)))
+ }
+ 
++fn format_duration_ms(ms: i64) -> String {
++    if ms < 1_000 {
++        return format!("{ms}ms");
++    }
++    let seconds = ms as f64 / 1_000.0;
++    if seconds < 10.0 {
++        format!("{seconds:.2}s")
++    } else if seconds < 100.0 {
++        format!("{seconds:.1}s")
++    } else {
++        format!("{seconds:.0}s")
++    }
++}
++
+ fn find_codex_window<'a>(
+     snapshot: &'a RateLimitSnapshotDisplay,
+     label: &str,
+diff --git a/codex-rs/tui/src/chatwidget/tests/exec_flow.rs b/codex-rs/tui/src/chatwidget/tests/exec_flow.rs
+index b8b8312c50..a5a228d3d5 100644
+--- a/codex-rs/tui/src/chatwidget/tests/exec_flow.rs
++++ b/codex-rs/tui/src/chatwidget/tests/exec_flow.rs
+@@ -594,7 +594,8 @@ async fn unified_exec_end_after_task_complete_is_suppressed() {
+     drain_insert_history(&mut rx);
+ 
+     chat.on_task_complete(
+-        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
++        /*last_agent_message*/ None, /*duration_ms*/ None,
++        /*time_to_first_token_ms*/ None, /*from_replay*/ false,
+     );
+     end_exec(&mut chat, begin, "", "", /*exit_code*/ 0);
+ 
+@@ -610,7 +611,8 @@ async fn unified_exec_interaction_after_task_complete_is_suppressed() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+     chat.on_task_started();
+     chat.on_task_complete(
+-        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
++        /*last_agent_message*/ None, /*duration_ms*/ None,
++        /*time_to_first_token_ms*/ None, /*from_replay*/ false,
+     );
+ 
+     terminal_interaction(&mut chat, "call-1", "proc-1", "ls\n");
+diff --git a/codex-rs/tui/src/chatwidget/tests/plan_mode.rs b/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
+index 4a36132548..1c2da44864 100644
+--- a/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
++++ b/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
+@@ -46,7 +46,8 @@ async fn plan_mode_nudge_hides_while_task_or_modal_is_active() {
+     assert!(!chat.bottom_pane.plan_mode_nudge_visible());
+ 
+     chat.on_task_complete(
+-        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
++        /*last_agent_message*/ None, /*duration_ms*/ None,
++        /*time_to_first_token_ms*/ None, /*from_replay*/ false,
+     );
+     chat.show_selection_view(SelectionViewParams {
+         items: vec![SelectionItem {
+@@ -942,6 +943,7 @@ async fn plan_implementation_popup_skips_when_messages_queued() {
+     chat.on_task_complete(
+         Some("Plan details".to_string()),
+         /*duration_ms*/ None,
++        /*time_to_first_token_ms*/ None,
+         /*from_replay*/ false,
+     );
+ 
+@@ -969,7 +971,8 @@ async fn plan_implementation_popup_skips_without_proposed_plan() {
+         }],
+     });
+     chat.on_task_complete(
+-        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
++        /*last_agent_message*/ None, /*duration_ms*/ None,
++        /*time_to_first_token_ms*/ None, /*from_replay*/ false,
+     );
+ 
+     let popup = render_bottom_popup(&chat, /*width*/ 80);
+@@ -991,7 +994,8 @@ async fn plan_implementation_popup_shows_after_proposed_plan_output() {
+     chat.on_plan_delta("- Step 1\n- Step 2\n".to_string());
+     chat.on_plan_item_completed("- Step 1\n- Step 2\n".to_string());
+     chat.on_task_complete(
+-        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
++        /*last_agent_message*/ None, /*duration_ms*/ None,
++        /*time_to_first_token_ms*/ None, /*from_replay*/ false,
+     );
+ 
+     let popup = render_bottom_popup(&chat, /*width*/ 80);
+@@ -1034,7 +1038,8 @@ async fn plan_implementation_popup_skips_when_steer_follows_proposed_plan() {
+ 
+     complete_user_message(&mut chat, "user-1", "Please continue.");
+     chat.on_task_complete(
+-        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
++        /*last_agent_message*/ None, /*duration_ms*/ None,
++        /*time_to_first_token_ms*/ None, /*from_replay*/ false,
+     );
+ 
+     let popup = render_bottom_popup(&chat, /*width*/ 80);
+@@ -1081,7 +1086,8 @@ async fn plan_implementation_popup_shows_after_new_plan_follows_steer() {
+         .to_string(),
+     );
+     chat.on_task_complete(
+-        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
++        /*last_agent_message*/ None, /*duration_ms*/ None,
++        /*time_to_first_token_ms*/ None, /*from_replay*/ false,
+     );
+ 
+     let popup = render_bottom_popup(&chat, /*width*/ 80);
+@@ -1110,7 +1116,8 @@ async fn plan_implementation_popup_skips_when_rate_limit_prompt_pending() {
+     });
+     chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 92.0)));
+     chat.on_task_complete(
+-        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
++        /*last_agent_message*/ None, /*duration_ms*/ None,
++        /*time_to_first_token_ms*/ None, /*from_replay*/ false,
+     );
+ 
+     let popup = render_bottom_popup(&chat, /*width*/ 80);
+@@ -1211,6 +1218,7 @@ async fn submit_user_message_queues_while_compaction_turn_is_running() {
+                 completed_at: Some(0),
+                 duration_ms: None,
+             },
++            time_to_first_token_ms: None,
+         }),
+         /*replay_kind*/ None,
+     );
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index ed0ccfaf63..7b78a38644 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -3211,7 +3211,8 @@ async fn runtime_metrics_websocket_timing_logs_and_final_separator_sums_totals()
+     assert!(second_log.contains("TTFT: 80ms (iapi)"));
+ 
+     chat.on_task_complete(
+-        /*last_agent_message*/ None, /*duration_ms*/ None, /*from_replay*/ false,
++        /*last_agent_message*/ None, /*duration_ms*/ None,
++        /*time_to_first_token_ms*/ None, /*from_replay*/ false,
+     );
+     let mut final_separator = None;
+     while let Ok(event) = rx.try_recv() {
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+index 9b3ca6baa7..3543e85fbd 100644
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -63,6 +63,9 @@ impl ChatWidget {
+         }
+         self.turn_runtime_metrics = RuntimeMetricsSummary::default();
+         self.session_telemetry.reset_runtime_metrics();
++        self.last_response_tps = None;
++        self.last_response_ttft_ms = None;
++        self.last_response_reasoning_tokens = None;
+         self.bottom_pane.clear_quit_shortcut_hint();
+         self.quit_shortcut_expires_at = None;
+         self.quit_shortcut_key = None;
+@@ -90,6 +93,7 @@ impl ChatWidget {
+         &mut self,
+         last_agent_message: Option<String>,
+         duration_ms: Option<i64>,
++        _time_to_first_token_ms: Option<i64>,
+         from_replay: bool,
+     ) {
+         self.input_queue.submit_pending_steers_after_interrupt = false;
+@@ -456,6 +460,22 @@ impl ChatWidget {
+         }
+     }
+ 
++    pub(super) fn on_response_metrics_updated(
++        &mut self,
++        notification: ThreadResponseMetricsUpdatedNotification,
++    ) {
++        let usage = notification.token_usage.map(token_usage_from_app_server);
++        let duration_ms = positive_ms(Some(notification.duration_ms));
++        self.last_response_tps = response_tokens_per_second(usage.as_ref(), duration_ms);
++        self.last_response_ttft_ms = positive_ms(notification.time_to_first_token_ms);
++        self.last_response_reasoning_tokens = usage
++            .as_ref()
++            .map(|usage| usage.reasoning_output_tokens)
++            .filter(|tokens| *tokens > 0);
++        self.refresh_status_surfaces();
++        self.request_redraw();
++    }
++
+     pub(super) fn handle_non_retry_error(
+         &mut self,
+         message: String,
+@@ -532,3 +552,77 @@ impl ChatWidget {
+         "Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.".to_string()
+     }
+ }
++
++fn positive_ms(value: Option<i64>) -> Option<i64> {
++    value.filter(|value| *value > 0)
++}
++
++fn response_tokens_per_second(usage: Option<&TokenUsage>, duration_ms: Option<i64>) -> Option<f64> {
++    let usage = usage?;
++    let duration = positive_ms(duration_ms)?;
++    let output_tokens = visible_output_tokens(usage);
++    if output_tokens == 0 {
++        return None;
++    }
++    Some(output_tokens as f64 / (duration as f64 / 1_000.0))
++}
++
++fn visible_output_tokens(usage: &TokenUsage) -> i64 {
++    usage
++        .output_tokens
++        .saturating_sub(usage.reasoning_output_tokens)
++        .max(0)
++}
++
++#[cfg(test)]
++mod response_metrics_tests {
++    use super::*;
++
++    #[test]
++    fn tps_excludes_reasoning_output_tokens() {
++        let token_usage = TokenUsage {
++            input_tokens: 1_000,
++            cached_input_tokens: 0,
++            output_tokens: 500,
++            reasoning_output_tokens: 450,
++            total_tokens: 1_500,
++        };
++
++        assert_eq!(
++            response_tokens_per_second(Some(&token_usage), Some(10_000)),
++            Some(5.0)
++        );
++    }
++
++    #[test]
++    fn tps_is_hidden_when_visible_output_is_absent() {
++        let token_usage = TokenUsage {
++            input_tokens: 1_000,
++            cached_input_tokens: 0,
++            output_tokens: 200,
++            reasoning_output_tokens: 200,
++            total_tokens: 1_200,
++        };
++
++        assert_eq!(
++            response_tokens_per_second(Some(&token_usage), Some(10_000)),
++            None
++        );
++    }
++
++    #[test]
++    fn tps_is_hidden_without_positive_duration() {
++        let token_usage = TokenUsage {
++            input_tokens: 1_000,
++            cached_input_tokens: 0,
++            output_tokens: 200,
++            reasoning_output_tokens: 50,
++            total_tokens: 1_200,
++        };
++
++        assert_eq!(
++            response_tokens_per_second(Some(&token_usage), Some(0)),
++            None
++        );
++    }
++}
+diff --git a/codex-rs/tui/src/history_cell/separators.rs b/codex-rs/tui/src/history_cell/separators.rs
+index 9d21218290..41e081ecf9 100644
+--- a/codex-rs/tui/src/history_cell/separators.rs
++++ b/codex-rs/tui/src/history_cell/separators.rs
+@@ -14,6 +14,7 @@ pub struct FinalMessageSeparator {
+     runtime_metrics: Option<RuntimeMetricsSummary>,
+     timing_label: FinalMessageTimingLabel,
+ }
++
+ impl FinalMessageSeparator {
+     /// Creates a separator; completed turns should pass the UI's local active-turn elapsed time.
+     pub(crate) fn new(
+@@ -215,7 +216,6 @@ impl HistoryCell for FinalMessageSeparator {
+             label_spans.push(metrics_label.clone().dim());
+             label_text_parts.push(metrics_label);
+         }
+-
+         if label_text_parts.is_empty() {
+             return vec![Line::from_iter(["─".repeat(width as usize).dim()])];
+         }
+diff --git a/codex-rs/tui/src/status_indicator_widget.rs b/codex-rs/tui/src/status_indicator_widget.rs
+index f9221f6c6b..3978e8a6e2 100644
+--- a/codex-rs/tui/src/status_indicator_widget.rs
++++ b/codex-rs/tui/src/status_indicator_widget.rs
+@@ -311,7 +311,6 @@ impl Renderable for StatusIndicatorWidget {
+             spans.push(" · ".dim());
+             spans.push(message.clone().dim());
+         }
+-
+         let mut lines = Vec::new();
+         lines.push(truncate_line_with_ellipsis_if_overflow(
+             Line::from(spans),
+@@ -442,11 +441,11 @@ mod tests {
+         w.is_paused = true;
+         w.elapsed_running = Duration::ZERO;
+ 
+-        let mut terminal = Terminal::new(TestBackend::new(80, 1)).expect("terminal");
++        let mut terminal = Terminal::new(TestBackend::new(120, 1)).expect("terminal");
+         terminal
+             .draw(|f| w.render(f.area(), f.buffer_mut()))
+             .expect("draw");
+-        let line = terminal.backend().buffer().content()[..80]
++        let line = terminal.backend().buffer().content()[..120]
+             .iter()
+             .map(ratatui::buffer::Cell::symbol)
+             .collect::<String>();
+diff --git a/codex-rs/tui/src/token_usage.rs b/codex-rs/tui/src/token_usage.rs
+index f68c14f472..d84f75af9c 100644
+--- a/codex-rs/tui/src/token_usage.rs
++++ b/codex-rs/tui/src/token_usage.rs
+@@ -43,15 +43,6 @@ impl TokenUsage {
+         Some((cached as f64 / input as f64) * 100.0)
+     }
+ 
+-    pub(crate) fn reasoning_output_percent(&self) -> Option<f64> {
+-        let output = self.output_tokens.max(0);
+-        let reasoning = self.reasoning_output_tokens.max(0).min(output);
+-        if output == 0 || reasoning == 0 {
+-            return None;
+-        }
+-        Some((reasoning as f64 / output as f64) * 100.0)
+-    }
+-
+     /// Returns the raw `total_tokens` value. For `last_token_usage`, this is the latest active
+     /// context size; for `total_token_usage`, this is the accumulated session total.
+     pub(crate) fn tokens_in_context_window(&self) -> i64 {
+@@ -144,18 +135,4 @@ mod tests {
+             "Token usage: total=110 input=100 output=10"
+         );
+     }
+-
+-    #[test]
+-    fn reasoning_output_percent_uses_output_tokens() {
+-        let usage = TokenUsage {
+-            output_tokens: 382_248,
+-            reasoning_output_tokens: 56_728,
+-            ..TokenUsage::default()
+-        };
+-
+-        assert_eq!(
+-            format!("{:.1}", usage.reasoning_output_percent().unwrap()),
+-            "14.8"
+-        );
+-    }
+ }

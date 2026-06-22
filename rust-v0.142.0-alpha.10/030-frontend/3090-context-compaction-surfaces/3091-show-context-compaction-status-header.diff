@@ -1,258 +1,94 @@
-diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
-index ef0de336c3..43dbcad984 100644
---- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
-+++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
-@@ -154,6 +154,12 @@ where
-             spans.extend(limit_spans);
-             continue;
-         }
-+        if item == StatusLineItem::ContextRemaining
-+            && let Some(context_spans) = context_remaining_line_spans(&line, style)
-+        {
-+            spans.extend(context_spans);
-+            continue;
-+        }
-         let text: String = line
-             .spans
-             .iter()
-@@ -292,6 +298,59 @@ fn limit_pace_style(pace: i64) -> Style {
-     Style::default().fg(color).add_modifier(Modifier::BOLD)
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index 8f92966f81..b1b6b8cf99 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -317,6 +317,9 @@ impl ChatWidget {
+             ThreadItem::ImageGeneration { .. } => {
+                 self.on_image_generation_begin();
+             }
++            ThreadItem::ContextCompaction { .. } => {
++                self.start_context_compaction_status();
++            }
+             ThreadItem::CollabAgentToolCall {
+                 id,
+                 tool,
+diff --git a/codex-rs/tui/src/chatwidget/replay.rs b/codex-rs/tui/src/chatwidget/replay.rs
+index 27069693ea..34c8db0471 100644
+--- a/codex-rs/tui/src/chatwidget/replay.rs
++++ b/codex-rs/tui/src/chatwidget/replay.rs
+@@ -168,6 +168,9 @@ impl ChatWidget {
+             }
+             ThreadItem::ContextCompaction { .. } => {
+                 self.add_info_message("Context compacted".to_string(), /*hint*/ None);
++                if self.status_state.current_status.header == "Compacting" {
++                    self.set_status_header(String::from("Working"));
++                }
+             }
+             ThreadItem::HookPrompt { .. } => {}
+             ThreadItem::CollabAgentToolCall {
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index afb4cd9c2b..ee054f4901 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -190,6 +190,39 @@ async fn thread_settings_updated_preserves_default_settings_for_plan_mode() {
+     );
  }
  
-+fn context_remaining_line_spans(
-+    line: &Line<'static>,
-+    base_style: Style,
-+) -> Option<Vec<Span<'static>>> {
-+    let mut output = Vec::new();
-+    let mut parsed_percent = false;
++#[tokio::test]
++async fn context_compaction_item_started_updates_status_header() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
 +
-+    for span in &line.spans {
-+        if span.style == Style::default()
-+            && let Some(mut spans) = context_remaining_text_spans(span.content.as_ref(), base_style)
-+        {
-+            parsed_percent = true;
-+            output.append(&mut spans);
-+        } else {
-+            output.push(span.clone());
-+        }
-+    }
++    chat.handle_server_notification(
++        ServerNotification::ItemStarted(ItemStartedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            started_at_ms: 0,
++            item: AppServerThreadItem::ContextCompaction {
++                id: "compact-1".to_string(),
++            },
++        }),
++        /*replay_kind*/ None,
++    );
 +
-+    parsed_percent.then_some(output)
++    assert_eq!(chat.status_state.current_status.header, "Compacting");
++
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            completed_at_ms: 0,
++            item: AppServerThreadItem::ContextCompaction {
++                id: "compact-1".to_string(),
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++
++    assert_eq!(chat.status_state.current_status.header, "Working");
 +}
 +
-+fn context_remaining_text_spans(text: &str, base_style: Style) -> Option<Vec<Span<'static>>> {
-+    let mut spans = Vec::new();
-+    let mut saw_percent = false;
-+
-+    for part in text.split_whitespace() {
-+        if !spans.is_empty() {
-+            spans.push(" ".into());
-+        }
-+        if let Some(percent) = parse_unsigned_percent(part) {
-+            saw_percent = true;
-+            spans.push(Span::styled(
-+                format!("{percent}%"),
-+                context_remaining_percent_style(percent),
-+            ));
-+        } else {
-+            spans.push(Span::styled(part.to_string(), base_style));
-+        }
-+    }
-+
-+    saw_percent.then_some(spans)
-+}
-+
-+fn context_remaining_percent_style(percent: i64) -> Style {
-+    let color = match percent {
-+        75..=100 => Color::Green,
-+        50..=74 => Color::Yellow,
-+        25..=49 => Color::Rgb(255, 128, 0),
-+        _ => Color::Red,
-+    };
-+    Style::default().fg(color).add_modifier(Modifier::BOLD)
-+}
-+
- #[cfg(test)]
- mod tests {
-     use super::*;
-@@ -369,6 +428,36 @@ mod tests {
-         assert!(line.spans[6].style.add_modifier.contains(Modifier::DIM));
-     }
- 
-+    #[test]
-+    fn context_remaining_percent_uses_threshold_colors() {
-+        let cases = [
-+            ("100% of 258K left", Color::Green),
-+            ("75% of 258K left", Color::Green),
-+            ("74% of 258K left", Color::Yellow),
-+            ("50% of 258K left", Color::Yellow),
-+            ("49% of 258K left", Color::Rgb(255, 128, 0)),
-+            ("25% of 258K left", Color::Rgb(255, 128, 0)),
-+            ("24% of 258K left", Color::Red),
-+            ("0% of 258K left", Color::Red),
-+        ];
-+
-+        for (label, expected_color) in cases {
-+            let line = status_line_from_segments_with_resolver(
-+                [(StatusLineItem::ContextRemaining, label.to_string())],
-+                /*use_theme_colors*/ true,
-+                |_| Some(Style::default().cyan()),
-+            )
-+            .expect("status line");
-+
-+            assert_eq!(line_text(&line), label);
-+            assert_eq!(line.spans[0].style.fg, Some(expected_color));
-+            assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
-+            assert_eq!(line.spans[2].style.fg, Some(Color::Cyan));
-+            assert_eq!(line.spans[4].style.fg, Some(Color::Cyan));
-+            assert_eq!(line.spans[6].style.fg, Some(Color::Cyan));
-+        }
-+    }
-+
-     #[test]
-     fn status_line_segments_preserve_order_and_plain_text() {
-         let line = status_line_from_segments_with_resolver(
-diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
-index a186361efb..0754b0c143 100644
---- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
-+++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
-@@ -53,7 +53,7 @@ impl StatusSurfacePreviewItem {
-             StatusSurfacePreviewItem::Permissions => "Workspace",
-             StatusSurfacePreviewItem::ApprovalMode => "on-request",
-             StatusSurfacePreviewItem::ResponsesStreamConnection => "42ms",
--            StatusSurfacePreviewItem::ContextRemaining => "Context 0% left",
-+            StatusSurfacePreviewItem::ContextRemaining => "0% of 0 left",
-             StatusSurfacePreviewItem::ContextUsed => "Context 0% used",
-             StatusSurfacePreviewItem::FiveHourLimit => "primary 0%",
-             StatusSurfacePreviewItem::WeeklyLimit => "secondary 0%",
-diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_context_remaining_footer.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_context_remaining_footer.snap
-index 858f63b5e7..37981fdb30 100644
---- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_context_remaining_footer.snap
-+++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_context_remaining_footer.snap
-@@ -6,4 +6,4 @@ expression: normalized_backend_snapshot(terminal.backend())
- "┌──────────────────────────────────────────────────────────────────────────────┐"
- "› Ask Codex to do anything                                                     │"
- "└──────────────────────────────────────────────────────────────────────────────┘"
--"  gpt-5.4 xhigh fast · Context 100% left · /tmp/project                         "
-+"  gpt-5.4 xhigh fast · 100% of 258K left · /tmp/project                         "
-diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
-index 9135eedf0c..1ded5af5d4 100644
---- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
-+++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
-@@ -613,9 +613,7 @@ impl ChatWidget {
-                     Some(format!("{} used", format_tokens_compact(total)))
-                 }
+ #[tokio::test]
+ async fn collab_spawn_end_shows_requested_model_and_effort() {
+     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+index 9a9203af76..cb556fd747 100644
+--- a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
++++ b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+@@ -262,6 +262,9 @@ impl ChatWidget {
+             item @ ThreadItem::McpToolCall { .. } => {
+                 self.handle_mcp_tool_call_started_now(item);
              }
--            StatusLineItem::ContextRemaining => self
--                .status_line_context_remaining_percent()
--                .map(|remaining| format!("Context {remaining}% left")),
-+            StatusLineItem::ContextRemaining => self.status_line_context_remaining_display(),
-             StatusLineItem::ContextUsed => self
-                 .status_line_context_used_percent()
-                 .map(|used| format!("Context {used}% used")),
-@@ -911,6 +909,18 @@ impl ChatWidget {
-         format!("{model} {label}{service_tier_label}")
-     }
- 
-+    fn status_line_context_remaining_display(&self) -> Option<String> {
-+        let remaining = self.status_line_context_remaining_percent()?;
-+        if let Some(window) = self.status_line_context_window_size() {
-+            Some(format!(
-+                "{remaining}% of {} left",
-+                format_tokens_compact(window)
-+            ))
-+        } else {
-+            Some(format!("{remaining}% left"))
-+        }
-+    }
-+
-     fn model_display_line(&self) -> Line<'static> {
-         let model = self
-             .active_turn_model_context
-@@ -945,7 +955,12 @@ impl ChatWidget {
-             " ".into(),
-         ]);
-         line.extend(Self::status_line_reasoning_effort_line(label, effort).spans);
--        line.spans.push(Span::from(service_tier_label));
-+        if service_tier_label == " fast" {
-+            line.spans.push(" ".into());
-+            line.spans.push("fast".red());
-+        } else {
-+            line.spans.push(Span::from(service_tier_label));
-+        }
-         line
-     }
- 
-@@ -987,9 +1002,9 @@ impl ChatWidget {
- 
-     fn fast_mode_display_line(&self) -> Line<'static> {
-         if self.current_service_tier() == Some(ServiceTier::Fast.request_value()) {
--            Line::from(vec!["Fast ".into(), "on".red()])
-+            Line::from(vec![Span::from("Fast").dim(), Span::from(" on").dim()])
-         } else {
--            Line::from("Fast off")
-+            Line::from(Span::from("Fast off").dim())
++            ThreadItem::ContextCompaction { .. } => {
++                self.start_context_compaction_status();
++            }
+             _ => {}
          }
      }
- 
-@@ -1480,14 +1495,24 @@ mod tests {
+@@ -312,7 +315,6 @@ impl ChatWidget {
+             used_tokens,
+         }
      }
- 
-     #[test]
--    fn fast_mode_on_status_line_is_red_without_dim_override() {
--        let line = Line::from(vec!["Fast ".into(), "on".red()]);
--        let on = &line.spans[1];
 -
--        assert_eq!(on.content.as_ref(), "on");
--        assert_eq!(on.style.fg, Some(Color::Red));
--        assert_eq!(on.style.add_modifier.contains(Modifier::DIM), false);
--        assert_eq!(on.style.sub_modifier.contains(Modifier::DIM), false);
-+    fn model_with_reasoning_fast_status_line_is_red_without_dim_override() {
-+        let line = status_line_from_segments(
-+            [(
-+                StatusLineItem::ModelWithReasoning,
-+                Line::from(vec!["gpt-5.4 xhigh ".into(), "fast".red()]),
-+            )],
-+            /*use_theme_colors*/ true,
-+        )
-+        .expect("status line");
-+        let fast = line
-+            .spans
-+            .iter()
-+            .find(|span| span.content.as_ref() == "fast")
-+            .expect("fast span");
-+
-+        assert_eq!(fast.style.fg, Some(Color::Red));
-+        assert_eq!(fast.style.add_modifier.contains(Modifier::DIM), false);
-+        assert_eq!(fast.style.sub_modifier.contains(Modifier::DIM), false);
-     }
- 
-     #[test]
-diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
-index 5b9d76f4e1..5b504d9cff 100644
---- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
-+++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
-@@ -2405,13 +2405,14 @@ async fn status_line_context_used_renders_labeled_percent() {
- async fn status_line_context_remaining_renders_labeled_percent() {
-     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-     chat.thread_id = Some(ThreadId::new());
-+    chat.config.model_context_window = Some(258_000);
-     chat.config.tui_status_line = Some(vec!["context-remaining".to_string()]);
- 
-     chat.refresh_status_line();
- 
-     assert_eq!(
-         status_line_text(&chat),
--        Some("Context 100% left".to_string())
-+        Some("100% of 258K left".to_string())
-     );
-     assert!(
-         drain_insert_history(&mut rx).is_empty(),
-@@ -2848,6 +2849,7 @@ async fn status_line_model_with_reasoning_context_remaining_footer_snapshot() {
-     assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
-     chat.show_welcome_banner = false;
-     chat.config.cwd = test_project_path().abs();
-+    chat.config.model_context_window = Some(258_000);
-     chat.config.tui_status_line = Some(vec![
-         "model-with-reasoning".to_string(),
-         "context-remaining".to_string(),
+     pub(crate) fn handle_queued_item_completed_now(&mut self, item: ThreadItem) {
+         match item {
+             item @ ThreadItem::CommandExecution { .. } => {
