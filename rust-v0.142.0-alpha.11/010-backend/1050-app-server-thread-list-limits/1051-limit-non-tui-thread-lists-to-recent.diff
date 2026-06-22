@@ -1,0 +1,205 @@
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 33cf142fe8..3008dc2bf3 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -65,6 +65,9 @@ use codex_app_server_protocol::JSONRPCNotification;
+ use codex_app_server_protocol::JSONRPCRequest;
+ use codex_app_server_protocol::JSONRPCResponse;
+ use codex_app_server_protocol::ServerRequestPayload;
++use codex_app_server_protocol::SortDirection;
++use codex_app_server_protocol::ThreadListParams;
++use codex_app_server_protocol::ThreadSortKey;
+ use codex_app_server_protocol::experimental_required_message;
+ use codex_arg0::Arg0DispatchPaths;
+ use codex_chatgpt::workspace_settings;
+@@ -97,6 +100,8 @@ use crate::models_refresh_worker::ModelsRefreshWorker;
+ 
+ const EXTERNAL_AUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
+ const CONNECTION_RPC_DRAIN_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
++const NON_TUI_THREAD_LIST_LIMIT: u32 = 5;
++const TUI_CLIENT_NAME: &str = "codex-tui";
+ 
+ fn deserialize_client_request(
+     request: &JSONRPCRequest,
+@@ -949,6 +954,9 @@ impl MessageProcessor {
+             request_id: codex_request.id().clone(),
+         };
+ 
++        let limit_thread_list_for_client =
++            should_limit_thread_list_for_client(app_server_client_name.as_deref());
++        let mut limit_thread_list_response = false;
+         let result: Result<Option<ClientResponsePayload>, JSONRPCErrorError> = match codex_request {
+             ClientRequest::Initialize { .. } => {
+                 panic!("Initialize should be handled before initialized request dispatch");
+@@ -1208,7 +1216,11 @@ impl MessageProcessor {
+                     .thread_rollback(&request_id, params)
+                     .await
+             }
+-            ClientRequest::ThreadList { params, .. } => {
++            ClientRequest::ThreadList { mut params, .. } => {
++                if limit_thread_list_for_client {
++                    apply_non_tui_thread_list_limit(&mut params);
++                    limit_thread_list_response = true;
++                }
+                 self.thread_processor.thread_list(params).await
+             }
+             ClientRequest::ThreadSearch { params, .. } => {
+@@ -1505,6 +1517,11 @@ impl MessageProcessor {
+ 
+         match result {
+             Ok(Some(response)) => {
++                let response = if limit_thread_list_response {
++                    limit_non_tui_thread_list_response(response)
++                } else {
++                    response
++                };
+                 self.outgoing
+                     .send_response_as(request_id.clone(), response)
+                     .await;
+@@ -1518,6 +1535,32 @@ impl MessageProcessor {
+     }
+ }
+ 
++fn should_limit_thread_list_for_client(client_name: Option<&str>) -> bool {
++    client_name != Some(TUI_CLIENT_NAME)
++}
++
++fn apply_non_tui_thread_list_limit(params: &mut ThreadListParams) {
++    params.cursor = None;
++    params.limit = Some(NON_TUI_THREAD_LIST_LIMIT);
++    params.sort_key = Some(ThreadSortKey::UpdatedAt);
++    params.sort_direction = Some(SortDirection::Desc);
++}
++
++fn limit_non_tui_thread_list_response(response: ClientResponsePayload) -> ClientResponsePayload {
++    match response {
++        ClientResponsePayload::ThreadList(mut response) => {
++            response.next_cursor = None;
++            response.backwards_cursor = None;
++            ClientResponsePayload::ThreadList(response)
++        }
++        other => other,
++    }
++}
++
+ #[cfg(test)]
+ #[path = "message_processor_tracing_tests.rs"]
+ mod message_processor_tracing_tests;
++
++#[cfg(test)]
++#[path = "message_processor_thread_list_tests.rs"]
++mod message_processor_thread_list_tests;
+diff --git a/codex-rs/app-server/src/message_processor_thread_list_tests.rs b/codex-rs/app-server/src/message_processor_thread_list_tests.rs
+new file mode 100644
+index 0000000000..671631883a
+--- /dev/null
++++ b/codex-rs/app-server/src/message_processor_thread_list_tests.rs
+@@ -0,0 +1,79 @@
++use super::*;
++use codex_app_server_protocol::ThreadListResponse;
++use pretty_assertions::assert_eq;
++
++#[test]
++fn every_app_server_client_except_tui_thread_list_is_limited() {
++    assert_eq!(
++        should_limit_thread_list_for_client(Some("codex-tui")),
++        false
++    );
++    assert_eq!(
++        should_limit_thread_list_for_client(Some("codex-backend")),
++        true
++    );
++    assert_eq!(
++        should_limit_thread_list_for_client(Some("codex_app_server_daemon")),
++        true
++    );
++    assert_eq!(should_limit_thread_list_for_client(None), true);
++}
++
++#[test]
++fn non_tui_thread_list_request_is_forced_to_recent_five() {
++    let mut params = ThreadListParams {
++        cursor: Some("client-cursor".to_string()),
++        limit: Some(100),
++        sort_key: Some(ThreadSortKey::CreatedAt),
++        sort_direction: Some(SortDirection::Asc),
++        model_providers: None,
++        source_kinds: None,
++        archived: None,
++        cwd: None,
++        parent_thread_id: None,
++        use_state_db_only: false,
++        search_term: None,
++    };
++
++    apply_non_tui_thread_list_limit(&mut params);
++
++    assert_eq!(
++        params,
++        ThreadListParams {
++            cursor: None,
++            limit: Some(NON_TUI_THREAD_LIST_LIMIT),
++            sort_key: Some(ThreadSortKey::UpdatedAt),
++            sort_direction: Some(SortDirection::Desc),
++            model_providers: None,
++            source_kinds: None,
++            archived: None,
++            cwd: None,
++            parent_thread_id: None,
++            use_state_db_only: false,
++            search_term: None,
++        }
++    );
++}
++
++#[test]
++fn non_tui_thread_list_response_hides_pagination() {
++    let response = ClientResponsePayload::ThreadList(ThreadListResponse {
++        data: Vec::new(),
++        next_cursor: Some("next".to_string()),
++        backwards_cursor: Some("back".to_string()),
++    });
++
++    let ClientResponsePayload::ThreadList(response) = limit_non_tui_thread_list_response(response)
++    else {
++        panic!("expected thread list response");
++    };
++
++    assert_eq!(
++        response,
++        ThreadListResponse {
++            data: Vec::new(),
++            next_cursor: None,
++            backwards_cursor: None,
++        }
++    );
++}
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_list.rs b/codex-rs/app-server/tests/suite/v2/thread_list.rs
+index dfe250da75..a629654a05 100644
+--- a/codex-rs/app-server/tests/suite/v2/thread_list.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_list.rs
+@@ -10,6 +10,7 @@ use app_test_support::test_absolute_path;
+ use app_test_support::to_response;
+ use chrono::DateTime;
+ use chrono::Utc;
++use codex_app_server_protocol::ClientInfo;
+ use codex_app_server_protocol::GitInfo as ApiGitInfo;
+ use codex_app_server_protocol::JSONRPCError;
+ use codex_app_server_protocol::JSONRPCResponse;
+@@ -51,7 +52,15 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
+ 
+ async fn init_mcp(codex_home: &Path) -> Result<TestAppServer> {
+     let mut mcp = TestAppServer::new(codex_home).await?;
+-    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
++    timeout(
++        DEFAULT_READ_TIMEOUT,
++        mcp.initialize_with_client_info(ClientInfo {
++            name: "codex-tui".to_string(),
++            title: None,
++            version: "0.1.0".to_string(),
++        }),
++    )
++    .await??;
+     Ok(mcp)
+ }
+ 
