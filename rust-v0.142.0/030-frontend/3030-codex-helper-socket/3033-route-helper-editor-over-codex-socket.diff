@@ -45,10 +45,18 @@ index 5d891c128b..5d01d32610 100644
              .with_restored(tui::RestoreMode::KeepRaw, || async {
                  external_editor::run_editor(&seed, &editor_cmd).await
 diff --git a/codex-rs/tui/src/codex_socket.rs b/codex-rs/tui/src/codex_socket.rs
-index 7599dbaec7..65f043a972 100644
+index 785fd034a6..50c47c07f8 100644
 --- a/codex-rs/tui/src/codex_socket.rs
 +++ b/codex-rs/tui/src/codex_socket.rs
-@@ -41,6 +41,18 @@ struct CompletionPayload {
+@@ -19,6 +19,7 @@ const SOCKET_IO_TIMEOUT: Duration = Duration::from_millis(500);
+ const CXU_RUNTIME_EPHEMERAL_ROOT_ENV: &str = "RUNTIME_EPHEMERAL_ROOT";
+ const CXU_RUNTIME_ROOT_NAME: &str = "cxu";
+ const CODEX_SOCKET_NAME: &str = "codex.sock";
++const CXU_EDITOR_DISABLED_ERROR: &str = "helper editor disabled";
+ 
+ #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+ struct CompletionPayload {
+@@ -44,6 +45,18 @@ struct CompletionPayload {
      created_at: String,
  }
  
@@ -67,7 +75,7 @@ index 7599dbaec7..65f043a972 100644
  #[derive(Debug, Deserialize)]
  struct CodexSocketResponse {
      #[serde(rename = "OK")]
-@@ -62,6 +74,32 @@ pub(crate) fn notify_turn_completed(notification: &TurnCompletedNotification, wo
+@@ -65,6 +78,40 @@ pub(crate) fn notify_turn_completed(notification: &TurnCompletedNotification, wo
      });
  }
  
@@ -88,22 +96,38 @@ index 7599dbaec7..65f043a972 100644
 +    .map_err(|err| err.to_string())?;
 +
 +    match response {
-+        Ok(response) => response
-+            .content
-+            .map(Some)
-+            .ok_or_else(|| "codex helper editor response did not include Content".to_string()),
++        Ok(response) => editor_response_content(response),
 +        Err(err) if is_helper_unavailable(&err) => Ok(None),
 +        Err(err) => Err(err),
 +    }
 +}
 +
++fn editor_response_content(response: CodexSocketResponse) -> Result<Option<String>, String> {
++    let content = response
++        .content
++        .ok_or_else(|| "codex helper editor response did not include Content".to_string())?;
++    if content.is_empty() {
++        Ok(None)
++    } else {
++        Ok(Some(content))
++    }
++}
++
  fn codex_socket_path() -> PathBuf {
-     std::env::temp_dir().join("cxh").join("codex.sock")
+     std::env::var_os(CXU_RUNTIME_EPHEMERAL_ROOT_ENV)
+         .filter(|value| !value.is_empty())
+@@ -196,6 +243,7 @@ fn is_helper_unavailable(err: &str) -> bool {
+     err.contains("No such file or directory")
+         || err.contains("Connection refused")
+         || err.contains("codex helper socket is only supported on Unix")
++        || err.contains(CXU_EDITOR_DISABLED_ERROR)
  }
-@@ -196,6 +234,12 @@ mod tests {
-     use super::*;
+ 
+ #[cfg(test)]
+@@ -204,6 +252,12 @@ mod tests {
      use codex_app_server_protocol::Turn;
      use codex_app_server_protocol::TurnItemsView;
+     use serial_test::serial;
 +    #[cfg(unix)]
 +    use std::os::unix::net::UnixListener;
 +    #[cfg(unix)]
@@ -113,7 +137,7 @@ index 7599dbaec7..65f043a972 100644
  
      fn notification(
          status: TurnStatus,
-@@ -269,12 +313,60 @@ mod tests {
+@@ -277,6 +331,35 @@ mod tests {
          );
      }
  
@@ -135,10 +159,22 @@ index 7599dbaec7..65f043a972 100644
 +        assert!(json.get("Display").is_none());
 +    }
 +
++    #[test]
++    fn empty_helper_editor_content_falls_back_to_default_editor() {
++        let response = CodexSocketResponse {
++            ok: true,
++            error: None,
++            content: Some(String::new()),
++        };
++
++        assert_eq!(editor_response_content(response).expect("response"), None);
++    }
++
      #[test]
      fn socket_path_uses_system_temp_root() {
          let path = codex_socket_path();
-         assert!(path.ends_with(Path::new("cxh").join("codex.sock")));
+@@ -300,6 +383,36 @@ mod tests {
+         assert_eq!(path, Path::new("/tmp/custom-cxu").join("codex.sock"));
      }
  
 +    #[cfg(unix)]
