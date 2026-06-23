@@ -1,5 +1,5 @@
 diff --git a/codex-rs/tui/src/resume_picker.rs b/codex-rs/tui/src/resume_picker.rs
-index fcc9190aeb..ad279990c8 100644
+index fcc9190aeb..7e63828f3c 100644
 --- a/codex-rs/tui/src/resume_picker.rs
 +++ b/codex-rs/tui/src/resume_picker.rs
 @@ -33,11 +33,13 @@ use crate::wrapping::RtOptions;
@@ -57,7 +57,7 @@ index fcc9190aeb..ad279990c8 100644
      filter_mode: SessionFilterMode,
      filter_cwd: Option<PathBuf>,
      local_filter_cwd: Option<PathBuf>,
-@@ -748,31 +756,150 @@ async fn load_app_server_page(
+@@ -748,31 +756,152 @@ async fn load_app_server_page(
      provider_filter: ProviderFilter,
      sort_key: ThreadSortKey,
      include_non_interactive: bool,
@@ -138,6 +138,8 @@ index fcc9190aeb..ad279990c8 100644
 +            continue;
 +        }
 +        if let Some(row) = row_from_app_server_thread(thread) {
++            let mut row = row;
++            row.pinned = true;
 +            rows.push(row);
 +        }
 +    }
@@ -214,7 +216,15 @@ index fcc9190aeb..ad279990c8 100644
  async fn load_transcript_preview(
      app_server: &mut AppServerSession,
      thread_id: ThreadId,
-@@ -935,6 +1062,7 @@ impl PickerState {
+@@ -845,6 +974,7 @@ struct Row {
+     thread_id: Option<ThreadId>,
+     status: Option<ThreadStatus>,
+     thread_name: Option<String>,
++    pinned: bool,
+     created_at: Option<DateTime<Utc>>,
+     updated_at: Option<DateTime<Utc>>,
+     cwd: Option<PathBuf>,
+@@ -935,6 +1065,7 @@ impl PickerState {
              view_rows: None,
              view_width: None,
              provider_filter,
@@ -222,7 +232,7 @@ index fcc9190aeb..ad279990c8 100644
              filter_mode: SessionFilterMode::from_show_all(show_all, filter_cwd.as_deref()),
              local_filter_cwd: filter_cwd.clone(),
              filter_cwd,
-@@ -1292,9 +1420,20 @@ impl PickerState {
+@@ -1292,9 +1423,20 @@ impl PickerState {
              cwd_filter: self.active_cwd_filter(),
              provider_filter: self.provider_filter.clone(),
              sort_key: self.sort_key,
@@ -243,7 +253,7 @@ index fcc9190aeb..ad279990c8 100644
      async fn handle_background_event(&mut self, event: BackgroundEvent) -> Result<()> {
          match event {
              BackgroundEvent::Page {
-@@ -1602,6 +1741,7 @@ impl PickerState {
+@@ -1602,6 +1744,7 @@ impl PickerState {
              cwd_filter: self.active_cwd_filter(),
              provider_filter: self.provider_filter.clone(),
              sort_key: self.sort_key,
@@ -251,7 +261,191 @@ index fcc9190aeb..ad279990c8 100644
          }));
      }
  
-@@ -3253,6 +3393,15 @@ mod tests {
+@@ -1736,6 +1879,7 @@ impl PickerState {
+             })
+             .sum::<usize>()
+             + self.row_separator_height() * end_inclusive.saturating_sub(start)
++            + pinned_group_boundaries_between(&self.filtered_rows, start, end_inclusive)
+     }
+ 
+     fn has_more_above(&self) -> bool {
+@@ -1765,7 +1909,8 @@ impl PickerState {
+                 self.view_width.unwrap_or(u16::MAX),
+             )
+             .len();
+-            let separator_height = usize::from(offset > 0) * self.row_separator_height();
++            let separator_height = usize::from(offset > 0) * self.row_separator_height()
++                + usize::from(offset > 0 && is_pinned_group_boundary(&self.filtered_rows, row_idx));
+             if used + separator_height + row_height > capacity {
+                 return true;
+             }
+@@ -1811,6 +1956,7 @@ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
+         thread_id: Some(thread_id),
+         status: Some(thread.status),
+         thread_name: thread.name,
++        pinned: false,
+         created_at: chrono::DateTime::from_timestamp(thread.created_at, 0)
+             .map(|dt| dt.with_timezone(&Utc)),
+         updated_at: chrono::DateTime::from_timestamp(thread.updated_at, 0)
+@@ -2469,10 +2615,20 @@ fn render_list(frame: &mut crate::custom_terminal::Frame, area: Rect, state: &Pi
+             break;
+         }
+         let row_idx = start + idx;
++        let pinned_separator_before = idx > 0 && is_pinned_group_boundary(rows, row_idx);
++        if pinned_separator_before {
++            let separator_idx = visual_row_idx(rows, row_idx).saturating_sub(1);
++            let line = pinned_group_separator_line(separator_idx.is_multiple_of(2), area.width);
++            frame.render_widget_ref(line, Rect::new(area.x, y, area.width, 1));
++            y = y.saturating_add(1);
++            if y >= content_area.y.saturating_add(content_area.height) {
++                break;
++            }
++        }
+         let is_selected = row_idx == state.selected;
+         let is_expanded =
+             is_selected && row.thread_id.is_some() && state.expanded_thread_id == row.thread_id;
+-        let is_zebra = row_idx.is_multiple_of(2);
++        let is_zebra = visual_row_idx(rows, row_idx).is_multiple_of(2);
+         for line in render_session_lines(row, state, is_selected, is_expanded, is_zebra, area.width)
+         {
+             if y >= content_area.y.saturating_add(content_area.height) {
+@@ -2514,6 +2670,44 @@ fn render_list(frame: &mut crate::custom_terminal::Frame, area: Rect, state: &Pi
+     }
+ }
+ 
++fn visual_row_idx(rows: &[Row], row_idx: usize) -> usize {
++    row_idx + pinned_group_boundaries_before(rows, row_idx)
++}
++
++fn pinned_group_boundaries_before(rows: &[Row], row_idx: usize) -> usize {
++    if row_idx == 0 {
++        return 0;
++    }
++    (1..=row_idx)
++        .filter(|&idx| is_pinned_group_boundary(rows, idx))
++        .count()
++}
++
++fn pinned_group_boundaries_between(rows: &[Row], start: usize, end_inclusive: usize) -> usize {
++    if start >= end_inclusive {
++        return 0;
++    }
++    (start.saturating_add(1)..=end_inclusive)
++        .filter(|&idx| is_pinned_group_boundary(rows, idx))
++        .count()
++}
++
++fn is_pinned_group_boundary(rows: &[Row], row_idx: usize) -> bool {
++    row_idx > 0
++        && rows
++            .get(row_idx - 1)
++            .zip(rows.get(row_idx))
++            .is_some_and(|(previous, current)| previous.pinned && !current.pinned)
++}
++
++fn pinned_group_separator_line(is_zebra: bool, width: u16) -> Line<'static> {
++    if is_zebra {
++        apply_line_background(Line::default(), dense_zebra_style(), width)
++    } else {
++        Line::default()
++    }
++}
++
+ fn more_line(label: &'static str) -> Line<'static> {
+     vec![label.dim()].into()
+ }
+@@ -2545,13 +2739,23 @@ fn render_comfortable_session_lines(
+     width: u16,
+ ) -> Vec<Line<'static>> {
+     let marker = selection_marker(is_selected, is_expanded);
+-    let title = truncate_text(row.display_preview(), width.saturating_sub(2) as usize);
++    let pinned_label = row.pinned.then(pinned_session_label_span);
++    let label_width = pinned_label.as_ref().map_or(0, Span::width);
++    let title_width = (width as usize)
++        .saturating_sub(marker.width())
++        .saturating_sub(label_width);
++    let title = truncate_text(row.display_preview(), title_width);
+     let title = if is_selected {
+         selected_session_title_span(title)
+     } else {
+         title.into()
+     };
+-    let title_line = Line::from(vec![marker, title]);
++    let mut title_spans = vec![marker];
++    if let Some(label) = pinned_label {
++        title_spans.push(label);
++    }
++    title_spans.push(title);
++    let title_line = Line::from(title_spans);
+     let mut lines = vec![title_line];
+     let row_style = if is_selected {
+         Some(dense_selected_style())
+@@ -2636,6 +2840,7 @@ fn render_dense_session_lines(
+         marker,
+         date: &date,
+         title: row.display_preview(),
++        pinned: row.pinned,
+         is_selected,
+         is_zebra,
+         width,
+@@ -2650,6 +2855,7 @@ struct DenseSummaryInput<'a> {
+     marker: Span<'static>,
+     date: &'a str,
+     title: &'a str,
++    pinned: bool,
+     is_selected: bool,
+     is_zebra: bool,
+     width: u16,
+@@ -2659,17 +2865,25 @@ fn dense_summary_line(input: DenseSummaryInput<'_>) -> Line<'static> {
+     let marker_width = input.marker.width();
+     let available = (input.width as usize).saturating_sub(marker_width);
+     let columns = dense_columns(available);
++    let pinned_label = input.pinned.then(pinned_session_label_span);
++    let label_width = pinned_label.as_ref().map_or(0, Span::width);
+     let title = if input.is_selected {
+-        selected_session_title_span(dense_column_text(input.title, columns.title_width))
++        selected_session_title_span(dense_column_text(
++            input.title,
++            columns.title_width.saturating_sub(label_width),
++        ))
+     } else {
+-        dense_column_text(input.title, columns.title_width).into()
++        dense_column_text(input.title, columns.title_width.saturating_sub(label_width)).into()
+     };
+ 
+-    let spans = vec![
++    let mut spans = vec![
+         input.marker,
+         dense_column_text(input.date, columns.date_width).dim(),
+-        title,
+     ];
++    if let Some(label) = pinned_label {
++        spans.push(label);
++    }
++    spans.push(title);
+     let mut line = Line::from(spans);
+     if input.is_selected {
+         let padding = (input.width as usize).saturating_sub(line.width());
+@@ -2748,6 +2962,18 @@ fn selected_session_title_span(title: String) -> Span<'static> {
+     title.set_style(selected_session_style())
+ }
+ 
++fn pinned_session_label_span() -> Span<'static> {
++    "Pinned ".set_style(pinned_session_label_style().bold())
++}
++
++fn pinned_session_label_style() -> Style {
++    if default_bg().is_some_and(is_light) {
++        Style::default().fg(best_color((0, 100, 0)))
++    } else {
++        Style::default().fg(Color::Cyan)
++    }
++}
++
+ fn render_footer_lines(
+     sort_key: ThreadSortKey,
+     created: &str,
+@@ -3253,6 +3479,15 @@ mod tests {
          })
      }
  
@@ -267,7 +461,15 @@ index fcc9190aeb..ad279990c8 100644
      fn make_row(path: &str, ts: &str, preview: &str) -> Row {
          let timestamp = parse_timestamp_str(ts).expect("timestamp should parse");
          Row {
-@@ -3268,6 +3417,85 @@ mod tests {
+@@ -3261,6 +3496,7 @@ mod tests {
+             thread_id: None,
+             status: None,
+             thread_name: None,
++            pinned: false,
+             created_at: Some(timestamp),
+             updated_at: Some(timestamp),
+             cwd: None,
+@@ -3268,6 +3504,85 @@ mod tests {
          }
      }
  
@@ -353,3 +555,292 @@ index fcc9190aeb..ad279990c8 100644
      fn footer_lines_text(state: &PickerState, width: u16) -> String {
          footer_hint_lines(state, width)
              .into_iter()
+@@ -3308,6 +3623,7 @@ mod tests {
+             thread_id: None,
+             status: None,
+             thread_name: Some(String::from("My session")),
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: None,
+@@ -3349,6 +3665,7 @@ mod tests {
+             thread_id: Some(thread_id),
+             status: None,
+             thread_name: Some(String::from("My session")),
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: Some(PathBuf::from("/tmp/codex-session-picker")),
+@@ -3410,6 +3727,7 @@ mod tests {
+             thread_id: Some(thread_id),
+             status: None,
+             thread_name: Some(String::from("feat(tui): add raw scrollback mode")),
++            pinned: false,
+             created_at: parse_timestamp_str("2026-05-02T14:31:08Z"),
+             updated_at: parse_timestamp_str("2026-05-02T14:48:19Z"),
+             cwd: Some(PathBuf::from("/Users/felipe.coury/code/codex")),
+@@ -3621,6 +3939,7 @@ mod tests {
+             thread_id: Some(ThreadId::new()),
+             status: None,
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: Some(PathBuf::from("/srv/real-project")),
+@@ -3647,6 +3966,7 @@ mod tests {
+             thread_id: Some(ThreadId::new()),
+             status: None,
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: Some(PathBuf::from("/srv/remote-project")),
+@@ -3679,6 +3999,7 @@ mod tests {
+                 thread_id: None,
+                 status: None,
+                 thread_name: None,
++                pinned: false,
+                 created_at: Some(now - Duration::minutes(16)),
+                 updated_at: Some(now - Duration::seconds(42)),
+                 cwd: None,
+@@ -3690,6 +4011,7 @@ mod tests {
+                 thread_id: None,
+                 status: None,
+                 thread_name: None,
++                pinned: false,
+                 created_at: Some(now - Duration::hours(1)),
+                 updated_at: Some(now - Duration::minutes(35)),
+                 cwd: None,
+@@ -3701,6 +4023,7 @@ mod tests {
+                 thread_id: None,
+                 status: None,
+                 thread_name: None,
++                pinned: false,
+                 created_at: Some(now - Duration::hours(2)),
+                 updated_at: Some(now - Duration::hours(2)),
+                 cwd: None,
+@@ -4130,6 +4453,7 @@ mod tests {
+             thread_id: Some(thread_id),
+             status: None,
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: None,
+@@ -4169,6 +4493,7 @@ mod tests {
+                 thread_id: Some(ThreadId::new()),
+                 status: None,
+                 thread_name: None,
++                pinned: false,
+                 created_at: None,
+                 updated_at: None,
+                 cwd: None,
+@@ -4180,6 +4505,7 @@ mod tests {
+                 thread_id: Some(ThreadId::new()),
+                 status: None,
+                 thread_name: None,
++                pinned: false,
+                 created_at: None,
+                 updated_at: None,
+                 cwd: None,
+@@ -4250,6 +4576,7 @@ mod tests {
+                 thread_id: Some(thread_id),
+                 status: None,
+                 thread_name: None,
++                pinned: false,
+                 created_at: None,
+                 updated_at: None,
+                 cwd: None,
+@@ -4261,6 +4588,7 @@ mod tests {
+                 thread_id: Some(ThreadId::new()),
+                 status: None,
+                 thread_name: None,
++                pinned: false,
+                 created_at: None,
+                 updated_at: None,
+                 cwd: None,
+@@ -4317,6 +4645,7 @@ mod tests {
+             thread_id: Some(thread_id),
+             status: None,
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: None,
+@@ -4348,6 +4677,7 @@ mod tests {
+             thread_id: None,
+             status: None,
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: None,
+@@ -4425,6 +4755,7 @@ mod tests {
+             thread_id: Some(thread_id),
+             status: None,
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: None,
+@@ -4590,6 +4921,7 @@ session_picker_view = "dense"
+             thread_id: Some(thread_id),
+             status: None,
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: None,
+@@ -4630,6 +4962,7 @@ session_picker_view = "dense"
+             thread_id: Some(thread_id),
+             status: None,
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: None,
+@@ -4707,6 +5040,7 @@ session_picker_view = "dense"
+             ),
+             status: None,
+             thread_name: None,
++            pinned: false,
+             created_at: parse_timestamp_str("2026-04-28T16:30:00Z"),
+             updated_at: parse_timestamp_str("2026-04-28T17:45:00Z"),
+             cwd: Some(PathBuf::from(
+@@ -4839,12 +5173,80 @@ session_picker_view = "dense"
+         assert!(!rendered.contains("Raw conversation preview"));
+     }
+ 
++    #[test]
++    fn comfortable_pinned_session_line_marks_row() {
++        let loader = page_only_loader(|_| {});
++        let state = PickerState::new(
++            FrameRequester::test_dummy(),
++            loader,
++            ProviderFilter::MatchDefault(String::from("openai")),
++            /*show_all*/ true,
++            /*filter_cwd*/ None,
++            SessionPickerAction::Resume,
++        );
++        let mut row = make_row(
++            "/tmp/a.jsonl",
++            "2026-05-02T11:45:00Z",
++            "Pinned renamed session",
++        );
++        row.pinned = true;
++
++        let rendered = render_comfortable_session_lines(
++            &row, &state, /*is_selected*/ false, /*is_expanded*/ false,
++            /*is_zebra*/ false, /*width*/ 80,
++        )[0]
++        .to_string();
++
++        assert!(rendered.contains("Pinned"));
++        assert!(rendered.contains("Pinned renamed session"));
++    }
++
++    #[test]
++    fn dense_pinned_session_line_marks_row() {
++        let mut row = dense_snapshot_row();
++        row.preview = String::from("Pinned dense session");
++        row.pinned = true;
++
++        let loader = page_only_loader(|_| {});
++        let state = PickerState::new(
++            FrameRequester::test_dummy(),
++            loader,
++            ProviderFilter::MatchDefault(String::from("openai")),
++            /*show_all*/ true,
++            /*filter_cwd*/ None,
++            SessionPickerAction::Resume,
++        );
++
++        let rendered = render_dense_session_lines(
++            &row, &state, /*is_selected*/ false, /*is_expanded*/ false,
++            /*is_zebra*/ false, /*width*/ 100,
++        )[0]
++        .to_string();
++
++        assert!(rendered.contains("Pinned"));
++        assert!(rendered.contains("Pinned dense session"));
++    }
++
++    #[test]
++    fn pinned_group_separator_counts_as_visual_row() {
++        let mut pinned = make_row("/tmp/a.jsonl", "2026-05-02T11:45:00Z", "Pinned");
++        pinned.pinned = true;
++        let regular = make_row("/tmp/b.jsonl", "2026-05-02T11:44:00Z", "Regular");
++        let rows = vec![pinned, regular];
++
++        assert!(is_pinned_group_boundary(&rows, 1));
++        assert_eq!(pinned_group_boundaries_between(&rows, 0, 1), 1);
++        assert_eq!(visual_row_idx(&rows, 0), 0);
++        assert_eq!(visual_row_idx(&rows, 1), 2);
++    }
++
+     #[test]
+     fn dense_selected_summary_line_uses_full_width_selection_style() {
+         let line = dense_summary_line(DenseSummaryInput {
+             marker: selection_marker(/*is_selected*/ true, /*is_expanded*/ false),
+             date: "15m ago",
+             title: "Selected dense row",
++            pinned: false,
+             is_selected: true,
+             is_zebra: false,
+             width: 80,
+@@ -4861,6 +5263,7 @@ session_picker_view = "dense"
+             marker: selection_marker(/*is_selected*/ false, /*is_expanded*/ false),
+             date: "15m ago",
+             title: "Zebra dense row",
++            pinned: false,
+             is_selected: false,
+             is_zebra: true,
+             width: 80,
+@@ -4962,6 +5365,7 @@ session_picker_view = "dense"
+             thread_id: Some(thread_id),
+             status: None,
+             thread_name: None,
++            pinned: false,
+             created_at: parse_timestamp_str("2026-04-28T16:30:00Z"),
+             updated_at: parse_timestamp_str("2026-04-28T17:45:00Z"),
+             cwd: Some(PathBuf::from("/tmp/codex")),
+@@ -5032,6 +5436,7 @@ session_picker_view = "dense"
+             ),
+             status: None,
+             thread_name: None,
++            pinned: false,
+             created_at: parse_timestamp_str("2026-04-28T16:30:00Z"),
+             updated_at: parse_timestamp_str("2026-04-28T17:45:00Z"),
+             cwd: Some(PathBuf::from("/tmp/codex")),
+@@ -5091,6 +5496,7 @@ session_picker_view = "dense"
+                 thread_id: None,
+                 status: None,
+                 thread_name: None,
++                pinned: false,
+                 created_at: Some(now - Duration::hours(idx)),
+                 updated_at: Some(now - Duration::minutes(idx * 5)),
+                 cwd: None,
+@@ -5144,6 +5550,7 @@ session_picker_view = "dense"
+                 thread_id: None,
+                 status: None,
+                 thread_name: None,
++                pinned: false,
+                 created_at: Some(now - Duration::hours(idx)),
+                 updated_at: Some(now - Duration::minutes(idx * 5)),
+                 cwd: None,
+@@ -5696,6 +6103,7 @@ session_picker_view = "dense"
+             thread_id: None,
+             status: None,
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: None,
+@@ -5736,6 +6144,7 @@ session_picker_view = "dense"
+             thread_id: Some(thread_id),
+             status: None,
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: None,
