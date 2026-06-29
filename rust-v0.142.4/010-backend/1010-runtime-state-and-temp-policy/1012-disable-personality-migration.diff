@@ -1,0 +1,415 @@
+diff --git a/codex-rs/app-server/tests/suite/v2/turn_start.rs b/codex-rs/app-server/tests/suite/v2/turn_start.rs
+index 1f73a3c88c..62da64d9dd 100644
+--- a/codex-rs/app-server/tests/suite/v2/turn_start.rs
++++ b/codex-rs/app-server/tests/suite/v2/turn_start.rs
+@@ -99,7 +99,6 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
+ #[cfg(not(windows))]
+ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+ const TEST_ORIGINATOR: &str = "codex_vscode";
+-const LOCAL_PRAGMATIC_TEMPLATE: &str = "You are a deeply pragmatic, effective software engineer.";
+ const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
+ const TINY_PNG_BYTES: &[u8] = &[
+     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
+@@ -2023,7 +2022,7 @@ async fn turn_start_change_personality_mid_thread_v2() -> Result<()> {
+ }
+ 
+ #[tokio::test]
+-async fn turn_start_uses_migrated_pragmatic_personality_without_override_v2() -> Result<()> {
++async fn turn_start_does_not_run_startup_personality_migration_v2() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+     let server = responses::start_mock_server().await;
+@@ -2056,13 +2055,13 @@ async fn turn_start_uses_migrated_pragmatic_personality_without_override_v2() ->
+     let persisted_toml: ConfigToml = toml::from_str(&std::fs::read_to_string(
+         codex_home.path().join("config.toml"),
+     )?)?;
+-    assert_eq!(persisted_toml.personality, Some(Personality::Pragmatic));
++    assert_eq!(persisted_toml.personality, None);
+     assert!(
+-        codex_home
++        !codex_home
+             .path()
+             .join(PERSONALITY_MIGRATION_FILENAME)
+             .exists(),
+-        "expected personality migration marker to be written on startup"
++        "personality migration should stay disabled on startup"
+     );
+ 
+     let thread_req = mcp
+@@ -2103,12 +2102,7 @@ async fn turn_start_uses_migrated_pragmatic_personality_without_override_v2() ->
+     )
+     .await??;
+ 
+-    let request = response_mock.single_request();
+-    let instructions_text = request.instructions_text();
+-    assert!(
+-        instructions_text.contains(LOCAL_PRAGMATIC_TEMPLATE),
+-        "expected startup-migrated pragmatic personality in model instructions, got: {instructions_text:?}"
+-    );
++    let _request = response_mock.single_request();
+ 
+     Ok(())
+ }
+diff --git a/codex-rs/core/src/personality_migration.rs b/codex-rs/core/src/personality_migration.rs
+index 2b49e0680f..0c828aed2f 100644
+--- a/codex-rs/core/src/personality_migration.rs
++++ b/codex-rs/core/src/personality_migration.rs
+@@ -1,16 +1,7 @@
+-use crate::config::edit::ConfigEditsBuilder;
+ use codex_config::config_toml::ConfigToml;
+-use codex_protocol::config_types::Personality;
+ use codex_rollout::state_db::StateDbHandle;
+-use codex_thread_store::ListThreadsParams;
+-use codex_thread_store::LocalThreadStore;
+-use codex_thread_store::LocalThreadStoreConfig;
+-use codex_thread_store::ThreadSortKey;
+-use codex_thread_store::ThreadStore;
+ use std::io;
+ use std::path::Path;
+-use tokio::fs::OpenOptions;
+-use tokio::io::AsyncWriteExt;
+ 
+ pub const PERSONALITY_MIGRATION_FILENAME: &str = ".personality_migration";
+ 
+@@ -25,90 +16,17 @@ pub enum PersonalityMigrationStatus {
+ pub async fn maybe_migrate_personality(
+     codex_home: &Path,
+     config_toml: &ConfigToml,
+-    state_db: Option<StateDbHandle>,
++    _state_db: Option<StateDbHandle>,
+ ) -> io::Result<PersonalityMigrationStatus> {
+-    let marker_path = codex_home.join(PERSONALITY_MIGRATION_FILENAME);
+-    if tokio::fs::try_exists(&marker_path).await? {
++    if tokio::fs::try_exists(codex_home.join(PERSONALITY_MIGRATION_FILENAME)).await? {
+         return Ok(PersonalityMigrationStatus::SkippedMarker);
+     }
+ 
+     if config_toml.personality.is_some() {
+-        create_marker(&marker_path).await?;
+         return Ok(PersonalityMigrationStatus::SkippedExplicitPersonality);
+     }
+ 
+-    let model_provider_id = config_toml
+-        .model_provider
+-        .clone()
+-        .unwrap_or_else(|| "openai".to_string());
+-
+-    if !has_recorded_sessions(codex_home, model_provider_id.as_str(), state_db).await? {
+-        create_marker(&marker_path).await?;
+-        return Ok(PersonalityMigrationStatus::SkippedNoSessions);
+-    }
+-
+-    ConfigEditsBuilder::new(codex_home)
+-        .set_personality(Some(Personality::Pragmatic))
+-        .apply()
+-        .await
+-        .map_err(|err| {
+-            io::Error::other(format!("failed to persist personality migration: {err}"))
+-        })?;
+-
+-    create_marker(&marker_path).await?;
+-    Ok(PersonalityMigrationStatus::Applied)
+-}
+-
+-async fn has_recorded_sessions(
+-    codex_home: &Path,
+-    default_provider: &str,
+-    state_db: Option<StateDbHandle>,
+-) -> io::Result<bool> {
+-    let store = LocalThreadStore::new(
+-        LocalThreadStoreConfig {
+-            codex_home: codex_home.to_path_buf(),
+-            sqlite_home: codex_home.to_path_buf(),
+-            default_model_provider_id: default_provider.to_string(),
+-        },
+-        state_db,
+-    );
+-    if has_threads(&store, /*archived*/ false).await? {
+-        return Ok(true);
+-    }
+-    has_threads(&store, /*archived*/ true).await
+-}
+-
+-async fn has_threads(store: &LocalThreadStore, archived: bool) -> io::Result<bool> {
+-    store
+-        .list_threads(ListThreadsParams {
+-            page_size: 1,
+-            cursor: None,
+-            sort_key: ThreadSortKey::CreatedAt,
+-            sort_direction: codex_thread_store::SortDirection::Desc,
+-            allowed_sources: Vec::new(),
+-            model_providers: None,
+-            cwd_filters: None,
+-            parent_thread_id: None,
+-            archived,
+-            search_term: None,
+-            use_state_db_only: false,
+-        })
+-        .await
+-        .map(|page| !page.items.is_empty())
+-        .map_err(io::Error::other)
+-}
+-
+-async fn create_marker(marker_path: &Path) -> io::Result<()> {
+-    match OpenOptions::new()
+-        .create_new(true)
+-        .write(true)
+-        .open(marker_path)
+-        .await
+-    {
+-        Ok(mut file) => file.write_all(b"v1\n").await,
+-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+-        Err(err) => Err(err),
+-    }
++    Ok(PersonalityMigrationStatus::SkippedNoSessions)
+ }
+ 
+ #[cfg(test)]
+diff --git a/codex-rs/core/src/personality_migration_tests.rs b/codex-rs/core/src/personality_migration_tests.rs
+index 57f06317a1..0b72969d6f 100644
+--- a/codex-rs/core/src/personality_migration_tests.rs
++++ b/codex-rs/core/src/personality_migration_tests.rs
+@@ -1,5 +1,7 @@
+ use super::*;
++use crate::config::edit::ConfigEditsBuilder;
+ use codex_protocol::ThreadId;
++use codex_protocol::config_types::Personality;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::RolloutItem;
+ use codex_protocol::protocol::RolloutLine;
+@@ -88,41 +90,37 @@ async fn write_rollout_with_user_event(dir: &Path, thread_id: ThreadId) -> io::R
+ }
+ 
+ #[tokio::test]
+-async fn applies_when_sessions_exist_and_no_personality() -> io::Result<()> {
++async fn skips_when_sessions_exist_and_no_personality() -> io::Result<()> {
+     let temp = TempDir::new()?;
+     write_session_with_user_event(temp.path()).await?;
+ 
+     let config_toml = ConfigToml::default();
+     let status = maybe_migrate_personality(temp.path(), &config_toml, /*state_db*/ None).await?;
+ 
+-    assert_eq!(status, PersonalityMigrationStatus::Applied);
+-    assert!(temp.path().join(PERSONALITY_MIGRATION_FILENAME).exists());
+-
+-    let persisted = read_config_toml(temp.path()).await?;
+-    assert_eq!(persisted.personality, Some(Personality::Pragmatic));
++    assert_eq!(status, PersonalityMigrationStatus::SkippedNoSessions);
++    assert!(!temp.path().join(PERSONALITY_MIGRATION_FILENAME).exists());
++    assert!(!temp.path().join("config.toml").exists());
+     Ok(())
+ }
+ 
+ #[tokio::test]
+-async fn applies_when_only_archived_sessions_exist_and_no_personality() -> io::Result<()> {
++async fn skips_when_only_archived_sessions_exist_and_no_personality() -> io::Result<()> {
+     let temp = TempDir::new()?;
+     write_archived_session_with_user_event(temp.path()).await?;
+ 
+     let config_toml = ConfigToml::default();
+     let status = maybe_migrate_personality(temp.path(), &config_toml, /*state_db*/ None).await?;
+ 
+-    assert_eq!(status, PersonalityMigrationStatus::Applied);
+-    assert!(temp.path().join(PERSONALITY_MIGRATION_FILENAME).exists());
+-
+-    let persisted = read_config_toml(temp.path()).await?;
+-    assert_eq!(persisted.personality, Some(Personality::Pragmatic));
++    assert_eq!(status, PersonalityMigrationStatus::SkippedNoSessions);
++    assert!(!temp.path().join(PERSONALITY_MIGRATION_FILENAME).exists());
++    assert!(!temp.path().join("config.toml").exists());
+     Ok(())
+ }
+ 
+ #[tokio::test]
+ async fn skips_when_marker_exists() -> io::Result<()> {
+     let temp = TempDir::new()?;
+-    create_marker(&temp.path().join(PERSONALITY_MIGRATION_FILENAME)).await?;
++    tokio::fs::write(temp.path().join(PERSONALITY_MIGRATION_FILENAME), b"v1\n").await?;
+ 
+     let config_toml = ConfigToml::default();
+     let status = maybe_migrate_personality(temp.path(), &config_toml, /*state_db*/ None).await?;
+@@ -148,7 +146,7 @@ async fn skips_when_personality_explicit() -> io::Result<()> {
+         status,
+         PersonalityMigrationStatus::SkippedExplicitPersonality
+     );
+-    assert!(temp.path().join(PERSONALITY_MIGRATION_FILENAME).exists());
++    assert!(!temp.path().join(PERSONALITY_MIGRATION_FILENAME).exists());
+ 
+     let persisted = read_config_toml(temp.path()).await?;
+     assert_eq!(persisted.personality, Some(Personality::Friendly));
+@@ -162,7 +160,7 @@ async fn skips_when_no_sessions() -> io::Result<()> {
+     let status = maybe_migrate_personality(temp.path(), &config_toml, /*state_db*/ None).await?;
+ 
+     assert_eq!(status, PersonalityMigrationStatus::SkippedNoSessions);
+-    assert!(temp.path().join(PERSONALITY_MIGRATION_FILENAME).exists());
++    assert!(!temp.path().join(PERSONALITY_MIGRATION_FILENAME).exists());
+     assert!(!temp.path().join("config.toml").exists());
+     Ok(())
+ }
+diff --git a/codex-rs/core/tests/suite/personality_migration.rs b/codex-rs/core/tests/suite/personality_migration.rs
+index bbab961817..d87a4e47ed 100644
+--- a/codex-rs/core/tests/suite/personality_migration.rs
++++ b/codex-rs/core/tests/suite/personality_migration.rs
+@@ -5,7 +5,6 @@ use codex_core::personality_migration::PERSONALITY_MIGRATION_FILENAME;
+ use codex_core::personality_migration::PersonalityMigrationStatus;
+ use codex_core::personality_migration::maybe_migrate_personality;
+ use codex_protocol::ThreadId;
+-use codex_protocol::config_types::Personality;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::RolloutItem;
+ use codex_protocol::protocol::RolloutLine;
+@@ -170,10 +169,7 @@ async fn no_marker_no_sessions_no_change() -> io::Result<()> {
+         maybe_migrate_personality(temp.path(), &ConfigToml::default(), /*state_db*/ None).await?;
+ 
+     assert_eq!(status, PersonalityMigrationStatus::SkippedNoSessions);
+-    assert_eq!(
+-        tokio::fs::try_exists(temp.path().join(PERSONALITY_MIGRATION_FILENAME)).await?,
+-        true
+-    );
++    assert!(!tokio::fs::try_exists(temp.path().join(PERSONALITY_MIGRATION_FILENAME)).await?);
+     assert_eq!(
+         tokio::fs::try_exists(temp.path().join("config.toml")).await?,
+         false
+@@ -182,21 +178,15 @@ async fn no_marker_no_sessions_no_change() -> io::Result<()> {
+ }
+ 
+ #[tokio::test]
+-async fn no_marker_sessions_sets_personality() -> io::Result<()> {
++async fn no_marker_sessions_skip_without_writing_personality() -> io::Result<()> {
+     let temp = TempDir::new()?;
+     write_session_with_user_event(temp.path()).await?;
+ 
+     let status =
+         maybe_migrate_personality(temp.path(), &ConfigToml::default(), /*state_db*/ None).await?;
+ 
+-    assert_eq!(status, PersonalityMigrationStatus::Applied);
+-    assert_eq!(
+-        tokio::fs::try_exists(temp.path().join(PERSONALITY_MIGRATION_FILENAME)).await?,
+-        true
+-    );
+-
+-    let persisted = read_config_toml(temp.path()).await?;
+-    assert_eq!(persisted.personality, Some(Personality::Pragmatic));
++    assert_eq!(status, PersonalityMigrationStatus::SkippedNoSessions);
++    assert!(!tokio::fs::try_exists(temp.path().join(PERSONALITY_MIGRATION_FILENAME)).await?);
+     Ok(())
+ }
+ 
+@@ -209,10 +199,7 @@ async fn no_marker_sessions_preserves_existing_config_fields() -> io::Result<()>
+ 
+     let status = maybe_migrate_personality(temp.path(), &config_toml, /*state_db*/ None).await?;
+ 
+-    assert_eq!(status, PersonalityMigrationStatus::Applied);
+-    let persisted = read_config_toml(temp.path()).await?;
+-    assert_eq!(persisted.model, Some("gpt-5.4".to_string()));
+-    assert_eq!(persisted.personality, Some(Personality::Pragmatic));
++    assert_eq!(status, PersonalityMigrationStatus::SkippedNoSessions);
+     Ok(())
+ }
+ 
+@@ -225,10 +212,7 @@ async fn no_marker_meta_only_rollout_is_treated_as_no_sessions() -> io::Result<(
+         maybe_migrate_personality(temp.path(), &ConfigToml::default(), /*state_db*/ None).await?;
+ 
+     assert_eq!(status, PersonalityMigrationStatus::SkippedNoSessions);
+-    assert_eq!(
+-        tokio::fs::try_exists(temp.path().join(PERSONALITY_MIGRATION_FILENAME)).await?,
+-        true
+-    );
++    assert!(!tokio::fs::try_exists(temp.path().join(PERSONALITY_MIGRATION_FILENAME)).await?);
+     assert_eq!(
+         tokio::fs::try_exists(temp.path().join("config.toml")).await?,
+         false
+@@ -248,10 +232,7 @@ async fn no_marker_explicit_global_personality_skips_migration() -> io::Result<(
+         status,
+         PersonalityMigrationStatus::SkippedExplicitPersonality
+     );
+-    assert_eq!(
+-        tokio::fs::try_exists(temp.path().join(PERSONALITY_MIGRATION_FILENAME)).await?,
+-        true
+-    );
++    assert!(!tokio::fs::try_exists(temp.path().join(PERSONALITY_MIGRATION_FILENAME)).await?);
+     assert_eq!(
+         tokio::fs::try_exists(temp.path().join("config.toml")).await?,
+         false
+@@ -260,7 +241,7 @@ async fn no_marker_explicit_global_personality_skips_migration() -> io::Result<(
+ }
+ 
+ #[tokio::test]
+-async fn no_marker_profile_personality_does_not_skip_migration() -> io::Result<()> {
++async fn no_marker_profile_personality_skip_without_writing_personality() -> io::Result<()> {
+     let temp = TempDir::new()?;
+     write_session_with_user_event(temp.path()).await?;
+     let config_toml = parse_config_toml(
+@@ -274,17 +255,9 @@ personality = "friendly"
+ 
+     let status = maybe_migrate_personality(temp.path(), &config_toml, /*state_db*/ None).await?;
+ 
+-    assert_eq!(status, PersonalityMigrationStatus::Applied);
+-    assert_eq!(
+-        tokio::fs::try_exists(temp.path().join(PERSONALITY_MIGRATION_FILENAME)).await?,
+-        true
+-    );
+-    assert_eq!(
+-        tokio::fs::try_exists(temp.path().join("config.toml")).await?,
+-        true
+-    );
+-    let persisted = read_config_toml(temp.path()).await?;
+-    assert_eq!(persisted.personality, Some(Personality::Pragmatic));
++    assert_eq!(status, PersonalityMigrationStatus::SkippedNoSessions);
++    assert!(!tokio::fs::try_exists(temp.path().join(PERSONALITY_MIGRATION_FILENAME)).await?);
++    assert!(!tokio::fs::try_exists(temp.path().join("config.toml")).await?);
+     Ok(())
+ }
+ 
+@@ -308,15 +281,12 @@ async fn missing_legacy_profile_does_not_block_migration() -> io::Result<()> {
+     let status = maybe_migrate_personality(temp.path(), &config_toml, /*state_db*/ None).await?;
+ 
+     assert_eq!(status, PersonalityMigrationStatus::SkippedNoSessions);
+-    assert_eq!(
+-        tokio::fs::try_exists(temp.path().join(PERSONALITY_MIGRATION_FILENAME)).await?,
+-        true
+-    );
++    assert!(!tokio::fs::try_exists(temp.path().join(PERSONALITY_MIGRATION_FILENAME)).await?);
+     Ok(())
+ }
+ 
+ #[tokio::test]
+-async fn applied_migration_is_idempotent_on_second_run() -> io::Result<()> {
++async fn disabled_migration_is_idempotent_on_second_run() -> io::Result<()> {
+     let temp = TempDir::new()?;
+     write_session_with_user_event(temp.path()).await?;
+ 
+@@ -325,28 +295,20 @@ async fn applied_migration_is_idempotent_on_second_run() -> io::Result<()> {
+     let second_status =
+         maybe_migrate_personality(temp.path(), &ConfigToml::default(), /*state_db*/ None).await?;
+ 
+-    assert_eq!(first_status, PersonalityMigrationStatus::Applied);
+-    assert_eq!(second_status, PersonalityMigrationStatus::SkippedMarker);
+-    let persisted = read_config_toml(temp.path()).await?;
+-    assert_eq!(persisted.personality, Some(Personality::Pragmatic));
++    assert_eq!(first_status, PersonalityMigrationStatus::SkippedNoSessions);
++    assert_eq!(second_status, PersonalityMigrationStatus::SkippedNoSessions);
+     Ok(())
+ }
+ 
+ #[tokio::test]
+-async fn no_marker_archived_sessions_sets_personality() -> io::Result<()> {
++async fn no_marker_archived_sessions_skip_without_writing_personality() -> io::Result<()> {
+     let temp = TempDir::new()?;
+     write_archived_session_with_user_event(temp.path()).await?;
+ 
+     let status =
+         maybe_migrate_personality(temp.path(), &ConfigToml::default(), /*state_db*/ None).await?;
+ 
+-    assert_eq!(status, PersonalityMigrationStatus::Applied);
+-    assert_eq!(
+-        tokio::fs::try_exists(temp.path().join(PERSONALITY_MIGRATION_FILENAME)).await?,
+-        true
+-    );
+-
+-    let persisted = read_config_toml(temp.path()).await?;
+-    assert_eq!(persisted.personality, Some(Personality::Pragmatic));
++    assert_eq!(status, PersonalityMigrationStatus::SkippedNoSessions);
++    assert!(!tokio::fs::try_exists(temp.path().join(PERSONALITY_MIGRATION_FILENAME)).await?);
+     Ok(())
+ }

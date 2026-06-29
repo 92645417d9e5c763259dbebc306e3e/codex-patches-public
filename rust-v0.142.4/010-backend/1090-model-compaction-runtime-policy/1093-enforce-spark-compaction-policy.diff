@@ -1,0 +1,222 @@
+diff --git a/codex-rs/core/src/agent/control_tests.rs b/codex-rs/core/src/agent/control_tests.rs
+index 9231cb7b37..5f738347cf 100644
+--- a/codex-rs/core/src/agent/control_tests.rs
++++ b/codex-rs/core/src/agent/control_tests.rs
+@@ -2,7 +2,8 @@ use super::*;
+ use crate::CodexThread;
+ use crate::StateDbHandle;
+ use crate::ThreadManager;
+-use crate::agent::agent_status_from_event;
++use crate::agent::status::agent_status_from_event;
++use crate::agent::status::agent_status_update;
+ use crate::config::AgentRoleConfig;
+ use crate::config::Config;
+ use crate::config::ConfigBuilder;
+@@ -326,6 +327,23 @@ async fn on_event_updates_status_from_error() {
+     assert_eq!(status, Some(expected));
+ }
+ 
++#[tokio::test]
++async fn empty_task_complete_does_not_overwrite_error_status() {
++    let current = AgentStatus::Errored("boom".to_string());
++    let status = agent_status_update(
++        &current,
++        &EventMsg::TurnComplete(TurnCompleteEvent {
++            turn_id: "turn-1".to_string(),
++            last_agent_message: None,
++            completed_at: None,
++            duration_ms: None,
++            time_to_first_token_ms: None,
++        }),
++    );
++
++    assert_eq!(status, None);
++}
++
+ #[tokio::test]
+ async fn on_event_updates_status_from_turn_aborted() {
+     let status = agent_status_from_event(&EventMsg::TurnAborted(TurnAbortedEvent {
+diff --git a/codex-rs/core/src/agent/mod.rs b/codex-rs/core/src/agent/mod.rs
+index 350962dc08..0f8915e431 100644
+--- a/codex-rs/core/src/agent/mod.rs
++++ b/codex-rs/core/src/agent/mod.rs
+@@ -8,4 +8,3 @@ pub(crate) use codex_protocol::protocol::AgentStatus;
+ pub(crate) use control::AgentControl;
+ pub(crate) use registry::exceeds_thread_spawn_depth_limit;
+ pub(crate) use registry::next_thread_spawn_depth;
+-pub(crate) use status::agent_status_from_event;
+diff --git a/codex-rs/core/src/agent/status.rs b/codex-rs/core/src/agent/status.rs
+index 43be718865..3e7dfebf1c 100644
+--- a/codex-rs/core/src/agent/status.rs
++++ b/codex-rs/core/src/agent/status.rs
+@@ -20,6 +20,14 @@ pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
+     }
+ }
+ 
++pub(crate) fn agent_status_update(current: &AgentStatus, msg: &EventMsg) -> Option<AgentStatus> {
++    let next = agent_status_from_event(msg)?;
++    if matches!(current, AgentStatus::Errored(_)) && matches!(next, AgentStatus::Completed(None)) {
++        return None;
++    }
++    Some(next)
++}
++
+ pub(crate) fn is_final(status: &AgentStatus) -> bool {
+     !matches!(
+         status,
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index dcbdf5ad38..9a900c24ed 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -734,7 +734,9 @@ impl ModelClient {
+                 effort: effort
+                     .or_else(|| model_info.default_reasoning_level.clone())
+                     .map(reasoning_effort_for_request),
+-                summary: if summary == ReasoningSummaryConfig::None {
++                summary: if summary == ReasoningSummaryConfig::None
++                    || model_info.slug == "gpt-5.3-codex-spark"
++                {
+                     None
+                 } else {
+                     Some(summary)
+diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.rs
+index 5311a55e36..0f093e0a38 100644
+--- a/codex-rs/core/src/client_tests.rs
++++ b/codex-rs/core/src/client_tests.rs
+@@ -28,6 +28,7 @@ use codex_model_provider_info::WireApi;
+ use codex_model_provider_info::create_oss_provider_with_base_url;
+ use codex_otel::SessionTelemetry;
+ use codex_protocol::ThreadId;
++use codex_protocol::config_types::ReasoningSummary;
+ use codex_protocol::models::ContentItem;
+ use codex_protocol::models::ResponseItem;
+ use codex_protocol::openai_models::ModelInfo;
+@@ -139,6 +140,22 @@ fn test_model_info() -> ModelInfo {
+     .expect("deserialize test model info")
+ }
+ 
++#[test]
++fn build_reasoning_omits_spark_summary_even_when_configured() {
++    let mut model_info = test_model_info();
++    model_info.slug = "gpt-5.3-codex-spark".to_string();
++    model_info.supports_reasoning_summaries = true;
++
++    let reasoning = ModelClient::build_reasoning(
++        &model_info,
++        /*effort*/ None,
++        ReasoningSummary::Detailed,
++    )
++    .expect("reasoning should be built");
++
++    assert_eq!(reasoning.summary, None);
++}
++
+ fn test_session_telemetry() -> SessionTelemetry {
+     SessionTelemetry::new(
+         ThreadId::new(),
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 8467a78e5e..22deb95594 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -12,7 +12,8 @@ use std::time::UNIX_EPOCH;
+ 
+ use crate::agent::AgentControl;
+ use crate::agent::AgentStatus;
+-use crate::agent::agent_status_from_event;
++use crate::agent::status::agent_status_from_event;
++use crate::agent::status::agent_status_update;
+ use crate::agent::status::is_final;
+ use crate::agents_md::LoadedAgentsMd;
+ use crate::attestation::AttestationProvider;
+@@ -1897,7 +1898,8 @@ impl Session {
+ 
+     async fn deliver_event_raw(&self, event: Event) {
+         // Record the last known agent status.
+-        if let Some(status) = agent_status_from_event(&event.msg) {
++        let current_status = self.agent_status.borrow().clone();
++        if let Some(status) = agent_status_update(&current_status, &event.msg) {
+             self.agent_status.send_replace(status);
+         }
+         if let Err(e) = self.tx_event.send(event).await {
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index 70fa94aa8a..d965cc18c5 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -991,6 +991,10 @@ async fn run_auto_compact(
+     reason: CompactionReason,
+     phase: CompactionPhase,
+ ) -> CodexResult<()> {
++    if let Err(err) = ensure_auto_compact_allowed(turn_context.as_ref()) {
++        emit_visible_turn_error(sess, turn_context, &err).await;
++        return Err(err);
++    }
+     if should_use_remote_compact_task(turn_context.provider.info()) {
+         if turn_context
+             .config
+@@ -1045,6 +1049,46 @@ async fn run_auto_compact(
+     Ok(())
+ }
+ 
++async fn emit_visible_turn_error(
++    sess: &Arc<Session>,
++    turn_context: &Arc<TurnContext>,
++    err: &CodexErr,
++) {
++    let error = err.to_codex_protocol_error();
++    sess.emit_turn_error_lifecycle(turn_context.as_ref(), error)
++        .await;
++    sess.track_turn_codex_error(turn_context.as_ref(), err);
++    sess.send_event(
++        turn_context,
++        EventMsg::Error(err.to_error_event(/*message_prefix*/ None)),
++    )
++    .await;
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum AutoCompactPolicy {
++    Allow,
++    ErrorOnLimit,
++}
++
++fn auto_compact_policy(model_slug: &str) -> AutoCompactPolicy {
++    if model_slug == "gpt-5.3-codex-spark" {
++        AutoCompactPolicy::ErrorOnLimit
++    } else {
++        AutoCompactPolicy::Allow
++    }
++}
++
++fn ensure_auto_compact_allowed(turn_context: &TurnContext) -> CodexResult<()> {
++    match auto_compact_policy(turn_context.model_info.slug.as_str()) {
++        AutoCompactPolicy::Allow => Ok(()),
++        AutoCompactPolicy::ErrorOnLimit => Err(CodexErr::UnsupportedOperation(format!(
++            "automatic compaction is disabled for {} after reaching the model context threshold; start a new thread or split the task",
++            turn_context.model_info.slug
++        ))),
++    }
++}
++
+ pub(super) fn collect_explicit_app_ids_from_skill_items(
+     skill_items: &[ResponseItem],
+     connectors: &[connectors::AppInfo],
+diff --git a/codex-rs/core/src/session/turn_tests.rs b/codex-rs/core/src/session/turn_tests.rs
+index 051799cf85..dd75a26221 100644
+--- a/codex-rs/core/src/session/turn_tests.rs
++++ b/codex-rs/core/src/session/turn_tests.rs
+@@ -65,3 +65,15 @@ async fn plan_mode_uses_contributed_turn_item_for_last_agent_message() {
+         Some("plan contributed assistant text")
+     );
+ }
++
++#[test]
++fn auto_compact_policy_errors_only_for_spark() {
++    assert_eq!(
++        auto_compact_policy("gpt-5.3-codex-spark"),
++        AutoCompactPolicy::ErrorOnLimit
++    );
++    assert_eq!(
++        auto_compact_policy("gpt-5.3-codex"),
++        AutoCompactPolicy::Allow
++    );
++}

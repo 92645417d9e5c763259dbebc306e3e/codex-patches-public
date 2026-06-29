@@ -1,0 +1,2461 @@
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+index 5715ef72a6..9d85848739 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+@@ -151,6 +151,7 @@ use ratatui::style::Stylize;
+ use ratatui::text::Line;
+ use ratatui::text::Span;
+ use ratatui::widgets::Block;
++use ratatui::widgets::Borders;
+ use ratatui::widgets::Paragraph;
+ use ratatui::widgets::StatefulWidgetRef;
+ use ratatui::widgets::WidgetRef;
+@@ -4421,6 +4422,15 @@ impl ChatComposer {
+         }
+         let style = user_input_style();
+         Block::default().style(style).render_ref(composer_rect, buf);
++        let composer_border_style = match self.footer.collaboration_mode_indicator {
++            Some(CollaborationModeIndicator::Plan) => style.magenta(),
++            _ => style,
++        };
++        Block::default()
++            .style(style)
++            .borders(Borders::ALL)
++            .border_style(composer_border_style)
++            .render_ref(composer_rect, buf);
+         if !remote_images_rect.is_empty() {
+             Paragraph::new(self.attachments.remote_image_lines())
+                 .style(style)
+@@ -4520,7 +4530,7 @@ mod tests {
+     use tokio::sync::mpsc::unbounded_channel;
+ 
+     #[test]
+-    fn footer_hint_row_is_separated_from_composer() {
++    fn footer_hint_row_is_separated_from_composer_border() {
+         let (tx, _rx) = unbounded_channel::<AppEvent>();
+         let sender = AppEventSender::new(tx);
+         let composer = ChatComposer::new(
+@@ -4565,11 +4575,11 @@ mod tests {
+             "expected a spacing row above the footer hints",
+         );
+ 
+-        let spacing_row = row_to_string(hint_row_idx - 1);
++        let border_row = row_to_string(hint_row_idx - 1);
+         assert_eq!(
+-            spacing_row.trim(),
+-            "",
+-            "expected blank spacing row above hints but saw: {spacing_row:?}",
++            (border_row.starts_with('└'), border_row.ends_with('┘')),
++            (true, true),
++            "expected composer bottom border above hints but saw: {border_row:?}",
+         );
+     }
+ 
+@@ -5389,6 +5399,100 @@ mod tests {
+         assert!(!composer.footer.esc_backtrack_hint);
+     }
+ 
++    #[test]
++    fn composer_draws_border() {
++        use ratatui::Terminal;
++        use ratatui::backend::TestBackend;
++
++        let (tx, _rx) = unbounded_channel::<AppEvent>();
++        let sender = AppEventSender::new(tx);
++        let mut composer = ChatComposer::new(
++            /*has_input_focus*/ true,
++            sender,
++            /*enhanced_keys_supported*/ true,
++            "Ask Codex to do anything".to_string(),
++            /*disable_paste_burst*/ false,
++        );
++        composer.set_collaboration_mode_indicator(Some(CollaborationModeIndicator::Plan));
++
++        let mut terminal = Terminal::new(TestBackend::new(48, 6)).unwrap();
++        terminal
++            .draw(|f| composer.render(f.area(), f.buffer_mut()))
++            .unwrap();
++
++        let buf = terminal.backend().buffer();
++        assert_eq!(buf[(0, 0)].symbol(), "┌");
++        assert_eq!(buf[(0, 0)].style().fg, Some(Color::Magenta));
++        assert_eq!(buf[(47, 0)].symbol(), "┐");
++        assert_eq!(buf[(47, 0)].style().fg, Some(Color::Magenta));
++        insta::assert_snapshot!("composer_input_border", terminal.backend());
++    }
++
++    #[test]
++    fn composer_draws_normal_mode_border() {
++        use ratatui::Terminal;
++        use ratatui::backend::TestBackend;
++
++        let (tx, _rx) = unbounded_channel::<AppEvent>();
++        let sender = AppEventSender::new(tx);
++        let composer = ChatComposer::new(
++            /*has_input_focus*/ true,
++            sender,
++            /*enhanced_keys_supported*/ true,
++            "Ask Codex to do anything".to_string(),
++            /*disable_paste_burst*/ false,
++        );
++
++        let mut terminal = Terminal::new(TestBackend::new(48, 6)).unwrap();
++        terminal
++            .draw(|f| composer.render(f.area(), f.buffer_mut()))
++            .unwrap();
++
++        let buf = terminal.backend().buffer();
++        assert_eq!(buf[(0, 0)].symbol(), "┌");
++        assert_eq!(buf[(0, 0)].style().fg, Some(Color::Reset));
++        assert_eq!(buf[(47, 0)].symbol(), "┐");
++        assert_eq!(buf[(47, 0)].style().fg, Some(Color::Reset));
++        insta::assert_snapshot!("composer_normal_mode_input_border", terminal.backend());
++    }
++
++    #[test]
++    fn composer_keeps_trailing_text_visible_before_right_border() {
++        use ratatui::Terminal;
++        use ratatui::backend::TestBackend;
++
++        for mode in [None, Some(CollaborationModeIndicator::Plan)] {
++            let (tx, _rx) = unbounded_channel::<AppEvent>();
++            let sender = AppEventSender::new(tx);
++            let mut composer = ChatComposer::new(
++                /*has_input_focus*/ true,
++                sender,
++                /*enhanced_keys_supported*/ true,
++                "Ask Codex to do anything".to_string(),
++                /*disable_paste_burst*/ false,
++            );
++            composer.set_collaboration_mode_indicator(mode);
++            composer.set_text_content("abcdefg|".to_string(), Vec::new(), Vec::new());
++            composer
++                .draft
++                .textarea
++                .set_cursor(composer.draft.textarea.text().len());
++
++            let mut terminal = Terminal::new(TestBackend::new(12, 5)).unwrap();
++            terminal
++                .draw(|f| composer.render(f.area(), f.buffer_mut()))
++                .unwrap();
++
++            let buf = terminal.backend().buffer();
++            assert_eq!(buf[(9, 1)].symbol(), "|");
++            assert_eq!(composer.cursor_pos(Rect::new(0, 0, 12, 5)), Some((10, 1)));
++            assert_eq!(buf[(10, 1)].symbol(), " ");
++            assert_eq!(buf[(11, 1)].symbol(), "│");
++            assert_eq!(buf[(11, 2)].symbol(), "│");
++            assert_eq!(buf[(11, 3)].symbol(), "┘");
++        }
++    }
++
+     #[test]
+     fn empty_vim_insert_escape_enters_normal_without_esc_hint() {
+         use crossterm::event::KeyCode;
+diff --git a/codex-rs/tui/src/bottom_pane/request_user_input/mod.rs b/codex-rs/tui/src/bottom_pane/request_user_input/mod.rs
+index 467003993e..db91d5b105 100644
+--- a/codex-rs/tui/src/bottom_pane/request_user_input/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/request_user_input/mod.rs
+@@ -1715,6 +1715,7 @@ mod tests {
+             for x in 0..buf.area().width {
+                 row.push(buf[(x, y)].symbol().chars().next().unwrap_or(' '));
+             }
++            row.truncate(row.trim_end().len());
+             lines.push(row);
+         }
+         lines.join("\n")
+diff --git a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_auto_resolution_countdown.snap b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_auto_resolution_countdown.snap
+index 509bf40673..a041c43683 100644
+--- a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_auto_resolution_countdown.snap
++++ b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_auto_resolution_countdown.snap
+@@ -1,14 +1,14 @@
+ ---
+ source: tui/src/bottom_pane/request_user_input/mod.rs
+-assertion_line: 1854
++assertion_line: 1847
+ expression: "render_snapshot_at(&overlay, Rect::new(0, 0, 120, 16), now)"
+ ---
+-                                                                                                                        
+-  Question 1/3 (3 unanswered) · auto-resolves in 1m 00s                                                                 
+-  Choose an option.                                                                                                     
+-                                                                                                                        
+-  › 1. Option 1  First choice.                                                                                          
+-    2. Option 2  Second choice.                                                                                         
+-    3. Option 3  Third choice.                                                                                          
+-                                                                                                                        
++
++  Question 1/3 (3 unanswered) · auto-resolves in 1m 00s
++  Choose an option.
++
++  › 1. Option 1  First choice.
++    2. Option 2  Second choice.
++    3. Option 3  Third choice.
++
+   tab to add notes | enter to submit answer | ←/→ to navigate questions | esc to interrupt
+diff --git a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_footer_wrap.snap b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_footer_wrap.snap
+index 4fa267c654..08b09e16ed 100644
+--- a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_footer_wrap.snap
++++ b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_footer_wrap.snap
+@@ -2,13 +2,13 @@
+ source: tui/src/bottom_pane/request_user_input/mod.rs
+ expression: "render_snapshot(&overlay, area)"
+ ---
+-                                                    
+-  Question 1/2 (2 unanswered)                       
+-  Choose an option.                                 
+-                                                    
+-    1. Option 1  First choice.                      
+-  › 2. Option 2  Second choice.                     
+-    3. Option 3  Third choice.                      
+-                                                    
+-  tab to add notes | enter to submit answer         
++
++  Question 1/2 (2 unanswered)
++  Choose an option.
++
++    1. Option 1  First choice.
++  › 2. Option 2  Second choice.
++    3. Option 3  Third choice.
++
++  tab to add notes | enter to submit answer
+   ←/→ to navigate questions | esc to interrupt
+diff --git a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_freeform.snap b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_freeform.snap
+index 3ae7b9d624..67b42373f8 100644
+--- a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_freeform.snap
++++ b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_freeform.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/request_user_input/mod.rs
+ expression: "render_snapshot(&overlay, area)"
+ ---
+-                                                                                                                        
+-  Question 1/1 (1 unanswered)                                                                                           
+-  Share details.                                                                                                        
+-                                                                                                                        
+-  › Type your answer (optional)                                                                                         
+-                                                                                                                        
+-                                                                                                                        
+-                                                                                                                        
++
++  Question 1/1 (1 unanswered)
++  Share details.
++  ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
++  › Type your answer (optional)                                                                                      │
++  │                                                                                                                  │
++  │                                                                                                                  │
++  └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+   enter to submit answer | esc to interrupt
+diff --git a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_freeform_remapped_interrupt.snap b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_freeform_remapped_interrupt.snap
+index 0b26b354e3..71a3772cb0 100644
+--- a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_freeform_remapped_interrupt.snap
++++ b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_freeform_remapped_interrupt.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/request_user_input/mod.rs
+ expression: "render_snapshot(&overlay, area)"
+ ---
+-                                                                                                                        
+-  Question 1/1 (1 unanswered)                                                                                           
+-  Share details.                                                                                                        
+-                                                                                                                        
+-  › Type your answer (optional)                                                                                         
+-                                                                                                                        
+-                                                                                                                        
+-                                                                                                                        
++
++  Question 1/1 (1 unanswered)
++  Share details.
++  ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
++  › Type your answer (optional)                                                                                      │
++  │                                                                                                                  │
++  │                                                                                                                  │
++  └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+   enter to submit answer | f12 to interrupt
+diff --git a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_freeform_remapped_submit.snap b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_freeform_remapped_submit.snap
+index a2aeaa4d3e..ff14b352af 100644
+--- a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_freeform_remapped_submit.snap
++++ b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_freeform_remapped_submit.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/request_user_input/mod.rs
+ expression: "render_snapshot(&overlay, area)"
+ ---
+-                                                                                                                        
+-  Question 1/1 (1 unanswered)                                                                                           
+-  Share details.                                                                                                        
+-                                                                                                                        
+-  › Type your answer (optional)                                                                                         
+-                                                                                                                        
+-                                                                                                                        
+-                                                                                                                        
++
++  Question 1/1 (1 unanswered)
++  Share details.
++  ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
++  › Type your answer (optional)                                                                                      │
++  │                                                                                                                  │
++  │                                                                                                                  │
++  └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+   ctrl + j to submit answer | esc to interrupt
+diff --git a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_hidden_options_footer.snap b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_hidden_options_footer.snap
+index d643647f79..dfa172585a 100644
+--- a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_hidden_options_footer.snap
++++ b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_hidden_options_footer.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/request_user_input/mod.rs
+ expression: "render_snapshot(&overlay, area)"
+ ---
+-                                                                                
+-  Question 1/1 (1 unanswered)                                                   
+-  What would you like to do next?                                               
+-                                                                                
+-    2. Run tests      Pick a crate and run its tests.                           
+-    3. Review a diff  Summarize or review current changes.                      
+-  › 4. Refactor       Tighten structure and remove dead code.                   
+-                                                                                
++
++  Question 1/1 (1 unanswered)
++  What would you like to do next?
++
++    2. Run tests      Pick a crate and run its tests.
++    3. Review a diff  Summarize or review current changes.
++  › 4. Refactor       Tighten structure and remove dead code.
++
+   option 4/5 | tab to add notes | enter to submit answer | esc to interrupt
+diff --git a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_long_option_text.snap b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_long_option_text.snap
+index ae5e53b477..86a882c25b 100644
+--- a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_long_option_text.snap
++++ b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_long_option_text.snap
+@@ -2,16 +2,16 @@
+ source: tui/src/bottom_pane/request_user_input/mod.rs
+ expression: "render_snapshot(&overlay, area)"
+ ---
+-                                                                                                                        
+-  Question 1/1 (1 unanswered)                                                                                           
+-  Choose one option.                                                                                                    
+-                                                                                                                        
+-  › 1. Job: running/completed/failed/expired; Run/Experiment: succeeded/failed/    Keep async job statuses for          
+-       unknown (Recommended when triaging long-running background work and status  progress tracking and include        
+-       transitions)                                                                enough context for debugging         
+-                                                                                   retries, stale workers, and          
+-                                                                                   unexpected expiration paths.         
+-    2. Add a short status model                                                    Simpler labels with less detail for  
+-                                                                                   quick rollouts.                      
+-                                                                                                                        
++
++  Question 1/1 (1 unanswered)
++  Choose one option.
++
++  › 1. Job: running/completed/failed/expired; Run/Experiment: succeeded/failed/    Keep async job statuses for
++       unknown (Recommended when triaging long-running background work and status  progress tracking and include
++       transitions)                                                                enough context for debugging
++                                                                                   retries, stale workers, and
++                                                                                   unexpected expiration paths.
++    2. Add a short status model                                                    Simpler labels with less detail for
++                                                                                   quick rollouts.
++
+   tab to add notes | enter to submit answer | esc to interrupt
+diff --git a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_multi_question_first.snap b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_multi_question_first.snap
+index d39ee646e9..32bcf9f3f1 100644
+--- a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_multi_question_first.snap
++++ b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_multi_question_first.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/request_user_input/mod.rs
+ expression: "render_snapshot(&overlay, area)"
+ ---
+-                                                                                                                        
+-  Question 1/2 (2 unanswered)                                                                                           
+-  Choose an option.                                                                                                     
+-                                                                                                                        
+-  › 1. Option 1  First choice.                                                                                          
+-    2. Option 2  Second choice.                                                                                         
+-    3. Option 3  Third choice.                                                                                          
+-                                                                                                                        
++
++  Question 1/2 (2 unanswered)
++  Choose an option.
++
++  › 1. Option 1  First choice.
++    2. Option 2  Second choice.
++    3. Option 3  Third choice.
++
+   tab to add notes | enter to submit answer | ←/→ to navigate questions | esc to interrupt
+diff --git a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_multi_question_last.snap b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_multi_question_last.snap
+index ff3fb66ba6..ff3e64eb6b 100644
+--- a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_multi_question_last.snap
++++ b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_multi_question_last.snap
+@@ -2,14 +2,14 @@
+ source: tui/src/bottom_pane/request_user_input/mod.rs
+ expression: "render_snapshot(&overlay, area)"
+ ---
+-                                                                                                                        
+-  Question 2/2 (2 unanswered)                                                                                           
+-  Share details.                                                                                                        
+-                                                                                                                        
+-  › Type your answer (optional)                                                                                         
+-                                                                                                                        
+-                                                                                                                        
+-                                                                                                                        
+-                                                                                                                        
+-                                                                                                                        
++
++  Question 2/2 (2 unanswered)
++  Share details.
++  ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
++  › Type your answer (optional)                                                                                      │
++  │                                                                                                                  │
++  │                                                                                                                  │
++  │                                                                                                                  │
++  │                                                                                                                  │
++  └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+   enter to submit all | ctrl + p / ctrl + n change question | esc to interrupt
+diff --git a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_options.snap b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_options.snap
+index c93576246d..64d21e135a 100644
+--- a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_options.snap
++++ b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_options.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/request_user_input/mod.rs
+ expression: "render_snapshot(&overlay, area)"
+ ---
+-                                                                                                                        
+-  Question 1/1 (1 unanswered)                                                                                           
+-  Choose an option.                                                                                                     
+-                                                                                                                        
+-  › 1. Option 1  First choice.                                                                                          
+-    2. Option 2  Second choice.                                                                                         
+-    3. Option 3  Third choice.                                                                                          
+-                                                                                                                        
++
++  Question 1/1 (1 unanswered)
++  Choose an option.
++
++  › 1. Option 1  First choice.
++    2. Option 2  Second choice.
++    3. Option 3  Third choice.
++
+   tab to add notes | enter to submit answer | esc to interrupt
+diff --git a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_options_notes_visible.snap b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_options_notes_visible.snap
+index fef6903e66..058f54a849 100644
+--- a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_options_notes_visible.snap
++++ b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_options_notes_visible.snap
+@@ -2,18 +2,18 @@
+ source: tui/src/bottom_pane/request_user_input/mod.rs
+ expression: "render_snapshot(&overlay, area)"
+ ---
+-                                                                                                                        
+-  Question 1/1 (1 unanswered)                                                                                           
+-  Choose an option.                                                                                                     
+-                                                                                                                        
+-  › 1. Option 1  First choice.                                                                                          
+-    2. Option 2  Second choice.                                                                                         
+-    3. Option 3  Third choice.                                                                                          
+-                                                                                                                        
+-  › Add notes                                                                                                           
+-                                                                                                                        
+-                                                                                                                        
+-                                                                                                                        
+-                                                                                                                        
+-                                                                                                                        
++
++  Question 1/1 (1 unanswered)
++  Choose an option.
++
++  › 1. Option 1  First choice.
++    2. Option 2  Second choice.
++    3. Option 3  Third choice.
++  ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
++  › Add notes                                                                                                        │
++  │                                                                                                                  │
++  │                                                                                                                  │
++  │                                                                                                                  │
++  │                                                                                                                  │
++  └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+   tab or esc to clear notes | enter to submit answer
+diff --git a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_scrolling_options.snap b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_scrolling_options.snap
+index 2e8d120e44..c9c75925d9 100644
+--- a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_scrolling_options.snap
++++ b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_scrolling_options.snap
+@@ -2,14 +2,14 @@
+ source: tui/src/bottom_pane/request_user_input/mod.rs
+ expression: "render_snapshot(&overlay, area)"
+ ---
+-                                                                                                                        
+-  Question 1/1 (1 unanswered)                                                                                           
+-  What would you like to do next?                                                                                       
+-                                                                                                                        
+-    1. Discuss a code change (Recommended)  Walk through a plan and edit code together.                                 
+-    2. Run tests                            Pick a crate and run its tests.                                             
+-    3. Review a diff                        Summarize or review current changes.                                        
+-  › 4. Refactor                             Tighten structure and remove dead code.                                     
+-    5. Ship it                              Finalize and open a PR.                                                     
+-                                                                                                                        
++
++  Question 1/1 (1 unanswered)
++  What would you like to do next?
++
++    1. Discuss a code change (Recommended)  Walk through a plan and edit code together.
++    2. Run tests                            Pick a crate and run its tests.
++    3. Review a diff                        Summarize or review current changes.
++  › 4. Refactor                             Tighten structure and remove dead code.
++    5. Ship it                              Finalize and open a PR.
++
+   tab to add notes | enter to submit answer | esc to interrupt
+diff --git a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_tight_height.snap b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_tight_height.snap
+index c93576246d..64d21e135a 100644
+--- a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_tight_height.snap
++++ b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_tight_height.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/request_user_input/mod.rs
+ expression: "render_snapshot(&overlay, area)"
+ ---
+-                                                                                                                        
+-  Question 1/1 (1 unanswered)                                                                                           
+-  Choose an option.                                                                                                     
+-                                                                                                                        
+-  › 1. Option 1  First choice.                                                                                          
+-    2. Option 2  Second choice.                                                                                         
+-    3. Option 3  Third choice.                                                                                          
+-                                                                                                                        
++
++  Question 1/1 (1 unanswered)
++  Choose an option.
++
++  › 1. Option 1  First choice.
++    2. Option 2  Second choice.
++    3. Option 3  Third choice.
++
+   tab to add notes | enter to submit answer | esc to interrupt
+diff --git a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_unanswered_confirmation.snap b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_unanswered_confirmation.snap
+index dd689c7267..b48fac93aa 100644
+--- a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_unanswered_confirmation.snap
++++ b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_unanswered_confirmation.snap
+@@ -2,14 +2,14 @@
+ source: tui/src/bottom_pane/request_user_input/mod.rs
+ expression: "render_snapshot(&overlay, area)"
+ ---
+-                                                                                
+-  Submit with unanswered questions?                                             
+-  2 unanswered questions                                                        
+-                                                                                
+-  › 1. Proceed  Submit with 2 unanswered questions.                             
+-    2. Go back  Return to the first unanswered question.                        
+-                                                                                
+-                                                                                
+-                                                                                
+-                                                                                
++
++  Submit with unanswered questions?
++  2 unanswered questions
++
++  › 1. Proceed  Submit with 2 unanswered questions.
++    2. Go back  Return to the first unanswered question.
++
++
++
++
+   Press enter to confirm or esc to go back
+diff --git a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_wrapped_options.snap b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_wrapped_options.snap
+index 71d32c5abf..2ab9518dd3 100644
+--- a/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_wrapped_options.snap
++++ b/codex-rs/tui/src/bottom_pane/request_user_input/snapshots/codex_tui__bottom_pane__request_user_input__tests__request_user_input_wrapped_options.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/request_user_input/mod.rs
+ expression: "render_snapshot(&overlay, area)"
+ ---
+-                                                                                                              
+-  Question 1/1 (1 unanswered)                                                                                 
+-  Choose the next step for this task.                                                                         
+-                                                                                                              
+-  › 1. Discuss a code change  Walk through a plan, then implement it together with careful checks.            
+-    2. Run targeted tests     Pick the most relevant crate and validate the current behavior first.           
+-    3. Review the diff        Summarize the changes and highlight the most important risks and gaps.          
+-                                                                                                              
++
++  Question 1/1 (1 unanswered)
++  Choose the next step for this task.
++
++  › 1. Discuss a code change  Walk through a plan, then implement it together with careful checks.
++    2. Run targeted tests     Pick the most relevant crate and validate the current behavior first.
++    3. Review the diff        Summarize the changes and highlight the most important risks and gaps.
++
+   tab to add notes | enter to submit answer | esc to interrupt
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__backspace_after_pastes.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__backspace_after_pastes.snap
+index 029f7d9fc7..24d0285298 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__backspace_after_pastes.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__backspace_after_pastes.snap
+@@ -2,13 +2,13 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› [Pasted Content 1002 chars][Pasted Content 1004 chars]                                            "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› [Pasted Content 1002 chars][Pasted Content 1004 chars]                                           │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  enter to submit with UserPromptSubmit · tab to submit                          100% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__composer_input_border.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__composer_input_border.snap
+new file mode 100644
+index 0000000000..0d08425cb4
+--- /dev/null
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__composer_input_border.snap
+@@ -0,0 +1,10 @@
++---
++source: tui/src/bottom_pane/chat_composer.rs
++expression: terminal.backend()
++---
++"┌──────────────────────────────────────────────┐"
++"› Ask Codex to do anything                     │"
++"│                                              │"
++"│                                              │"
++"└──────────────────────────────────────────────┘"
++"  Plan mode (shift+tab to cycle)                "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__composer_normal_mode_input_border.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__composer_normal_mode_input_border.snap
+new file mode 100644
+index 0000000000..e7a3ea6660
+--- /dev/null
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__composer_normal_mode_input_border.snap
+@@ -0,0 +1,10 @@
++---
++source: tui/src/bottom_pane/chat_composer.rs
++expression: terminal.backend()
++---
++"┌──────────────────────────────────────────────┐"
++"› Ask Codex to do anything                     │"
++"│                                              │"
++"│                                              │"
++"└──────────────────────────────────────────────┘"
++"  ? for shortcuts            100% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__default_unified_mention_popup.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__default_unified_mention_popup.snap
+index bf21e4ea61..751806dd10 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__default_unified_mention_popup.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__default_unified_mention_popup.snap
+@@ -2,10 +2,10 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› @sa                                                                                               "
+-"                                                                                                    "
+-"> Sample Plugin  Plugin with skills and an MCP server                                         Plugin"
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› @sa                                                                                              │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
++"  Sample Plugin  Plugin with skills and an MCP server                                         Plugin"
+ "                                                                                                    "
+ "                                                                                                    "
+ "                                                                                                    "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__empty.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__empty.snap
+index 47c97c74d2..3e2b6cf7d9 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__empty.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__empty.snap
+@@ -2,13 +2,13 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› Ask Codex to do anything                                                                          "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                                         │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  ? for shortcuts                                                                100% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_empty_full.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_empty_full.snap
+index 4324d806e2..63e710f6cc 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_empty_full.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_empty_full.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                                        "
+-"› Ask Codex to do anything                                                                                              "
+-"                                                                                                                        "
+-"                                                                                                                        "
+-"                                                                                                                        "
+-"                                                                                                                        "
+-"                                                                                                                        "
+-"                                                                                                                        "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                                                             │"
++"│                                                                                                                      │"
++"│                                                                                                                      │"
++"│                                                                                                                      │"
++"│                                                                                                                      │"
++"│                                                                                                                      │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  ? for shortcuts                                                                                    100% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_empty_mode_cycle_with_context.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_empty_mode_cycle_with_context.snap
+index ecaeb58149..e7dae0605c 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_empty_mode_cycle_with_context.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_empty_mode_cycle_with_context.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                            "
+-"› Ask Codex to do anything                                  "
+-"                                                            "
+-"                                                            "
+-"                                                            "
+-"                                                            "
+-"                                                            "
+-"                                                            "
++"┌──────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                 │"
++"│                                                          │"
++"│                                                          │"
++"│                                                          │"
++"│                                                          │"
++"│                                                          │"
++"└──────────────────────────────────────────────────────────┘"
+ "  ? for shortcuts                        100% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_empty_mode_cycle_without_context.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_empty_mode_cycle_without_context.snap
+index 118ac25291..6bfe4b541c 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_empty_mode_cycle_without_context.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_empty_mode_cycle_without_context.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                            "
+-"› Ask Codex to do anything                  "
+-"                                            "
+-"                                            "
+-"                                            "
+-"                                            "
+-"                                            "
+-"                                            "
++"┌──────────────────────────────────────────┐"
++"› Ask Codex to do anything                 │"
++"│                                          │"
++"│                                          │"
++"│                                          │"
++"│                                          │"
++"│                                          │"
++"└──────────────────────────────────────────┘"
+ "  ? for shortcuts        100% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_empty_mode_only.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_empty_mode_only.snap
+index 9c95004785..c85b95ff03 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_empty_mode_only.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_empty_mode_only.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                          "
+-"› Ask Codex to do anythin "
+-"                          "
+-"                          "
+-"                          "
+-"                          "
+-"                          "
+-"                          "
++"┌────────────────────────┐"
++"› Ask Codex to do anythin│"
++"│                        │"
++"│                        │"
++"│                        │"
++"│                        │"
++"│                        │"
++"└────────────────────────┘"
+ "       100% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_empty_full.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_empty_full.snap
+index f39aefad64..729beb6a48 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_empty_full.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_empty_full.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                                        "
+-"› Ask Codex to do anything                                                                                              "
+-"                                                                                                                        "
+-"                                                                                                                        "
+-"                                                                                                                        "
+-"                                                                                                                        "
+-"                                                                                                                        "
+-"                                                                                                                        "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                                                             │"
++"│                                                                                                                      │"
++"│                                                                                                                      │"
++"│                                                                                                                      │"
++"│                                                                                                                      │"
++"│                                                                                                                      │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  ? for shortcuts · Plan mode (shift+tab to cycle)                                                   100% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_empty_mode_cycle_with_context.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_empty_mode_cycle_with_context.snap
+index 347ba31648..0ad066d51d 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_empty_mode_cycle_with_context.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_empty_mode_cycle_with_context.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                            "
+-"› Ask Codex to do anything                                  "
+-"                                                            "
+-"                                                            "
+-"                                                            "
+-"                                                            "
+-"                                                            "
+-"                                                            "
++"┌──────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                 │"
++"│                                                          │"
++"│                                                          │"
++"│                                                          │"
++"│                                                          │"
++"│                                                          │"
++"└──────────────────────────────────────────────────────────┘"
+ "  Plan mode (shift+tab to cycle)         100% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_empty_mode_cycle_without_context.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_empty_mode_cycle_without_context.snap
+index 006e2a1773..a5612c9dea 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_empty_mode_cycle_without_context.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_empty_mode_cycle_without_context.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                            "
+-"› Ask Codex to do anything                  "
+-"                                            "
+-"                                            "
+-"                                            "
+-"                                            "
+-"                                            "
+-"                                            "
++"┌──────────────────────────────────────────┐"
++"› Ask Codex to do anything                 │"
++"│                                          │"
++"│                                          │"
++"│                                          │"
++"│                                          │"
++"│                                          │"
++"└──────────────────────────────────────────┘"
+ "  Plan mode (shift+tab to cycle)            "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_empty_mode_only.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_empty_mode_only.snap
+index bea268c57e..f4eaaef901 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_empty_mode_only.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_empty_mode_only.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                          "
+-"› Ask Codex to do anythin "
+-"                          "
+-"                          "
+-"                          "
+-"                          "
+-"                          "
+-"                          "
++"┌────────────────────────┐"
++"› Ask Codex to do anythin│"
++"│                        │"
++"│                        │"
++"│                        │"
++"│                        │"
++"│                        │"
++"└────────────────────────┘"
+ "  Plan mode               "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_full.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_full.snap
+index 5f0f353822..72d8b338e9 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_full.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_full.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                                        "
+-"› Test                                                                                                                  "
+-"                                                                                                                        "
+-"                                                                                                                        "
+-"                                                                                                                        "
+-"                                                                                                                        "
+-"                                                                                                                        "
+-"                                                                                                                        "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› Test                                                                                                                 │"
++"│                                                                                                                      │"
++"│                                                                                                                      │"
++"│                                                                                                                      │"
++"│                                                                                                                      │"
++"│                                                                                                                      │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  tab to queue message · Plan mode                                                                    98% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_message_without_context.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_message_without_context.snap
+index 017e3eb2aa..dc4c2c03ae 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_message_without_context.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_message_without_context.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                        "
+-"› Test                                  "
+-"                                        "
+-"                                        "
+-"                                        "
+-"                                        "
+-"                                        "
+-"                                        "
++"┌──────────────────────────────────────┐"
++"› Test                                 │"
++"│                                      │"
++"│                                      │"
++"│                                      │"
++"│                                      │"
++"│                                      │"
++"└──────────────────────────────────────┘"
+ "  tab to queue message · Plan mode      "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_mode_only.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_mode_only.snap
+index 35a94ac73a..a2a208df76 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_mode_only.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_mode_only.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                    "
+-"› Test              "
+-"                    "
+-"                    "
+-"                    "
+-"                    "
+-"                    "
+-"                    "
++"┌──────────────────┐"
++"› Test             │"
++"│                  │"
++"│                  │"
++"│                  │"
++"│                  │"
++"│                  │"
++"└──────────────────┘"
+ "  Plan mode         "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_short_with_context.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_short_with_context.snap
+index 77f38dc4e7..87610746a5 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_short_with_context.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_short_with_context.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                  "
+-"› Test                                            "
+-"                                                  "
+-"                                                  "
+-"                                                  "
+-"                                                  "
+-"                                                  "
+-"                                                  "
++"┌────────────────────────────────────────────────┐"
++"› Test                                           │"
++"│                                                │"
++"│                                                │"
++"│                                                │"
++"│                                                │"
++"│                                                │"
++"└────────────────────────────────────────────────┘"
+ "  tab to queue · Plan mode      98% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_short_without_context.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_short_without_context.snap
+index 91f917e987..8d4e15e4f9 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_short_without_context.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_plan_queue_short_without_context.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                              "
+-"› Test                        "
+-"                              "
+-"                              "
+-"                              "
+-"                              "
+-"                              "
+-"                              "
++"┌────────────────────────────┐"
++"› Test                       │"
++"│                            │"
++"│                            │"
++"│                            │"
++"│                            │"
++"│                            │"
++"└────────────────────────────┘"
+ "  tab to queue · Plan mode    "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_full.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_full.snap
+index 1057803326..3d16202a97 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_full.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_full.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                                        "
+-"› Test                                                                                                                  "
+-"                                                                                                                        "
+-"                                                                                                                        "
+-"                                                                                                                        "
+-"                                                                                                                        "
+-"                                                                                                                        "
+-"                                                                                                                        "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› Test                                                                                                                 │"
++"│                                                                                                                      │"
++"│                                                                                                                      │"
++"│                                                                                                                      │"
++"│                                                                                                                      │"
++"│                                                                                                                      │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  tab to queue message                                                                                98% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_message_without_context.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_message_without_context.snap
+index 4f44c0424e..9c9ecff4fd 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_message_without_context.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_message_without_context.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                        "
+-"› Test                                  "
+-"                                        "
+-"                                        "
+-"                                        "
+-"                                        "
+-"                                        "
+-"                                        "
++"┌──────────────────────────────────────┐"
++"› Test                                 │"
++"│                                      │"
++"│                                      │"
++"│                                      │"
++"│                                      │"
++"│                                      │"
++"└──────────────────────────────────────┘"
+ "  tab to queue        98% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_mode_only.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_mode_only.snap
+index e2d1d2e282..b396e66d99 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_mode_only.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_mode_only.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                    "
+-"› Test              "
+-"                    "
+-"                    "
+-"                    "
+-"                    "
+-"                    "
+-"                    "
++"┌──────────────────┐"
++"› Test             │"
++"│                  │"
++"│                  │"
++"│                  │"
++"│                  │"
++"│                  │"
++"└──────────────────┘"
+ "  tab to queue      "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_short_with_context.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_short_with_context.snap
+index b7128fd415..c8f68bd5b9 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_short_with_context.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_short_with_context.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                  "
+-"› Test                                            "
+-"                                                  "
+-"                                                  "
+-"                                                  "
+-"                                                  "
+-"                                                  "
+-"                                                  "
++"┌────────────────────────────────────────────────┐"
++"› Test                                           │"
++"│                                                │"
++"│                                                │"
++"│                                                │"
++"│                                                │"
++"│                                                │"
++"└────────────────────────────────────────────────┘"
+ "  tab to queue message          98% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_short_without_context.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_short_without_context.snap
+index 3df7f74328..191f7c267e 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_short_without_context.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_collapse_queue_short_without_context.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                              "
+-"› Test                        "
+-"                              "
+-"                              "
+-"                              "
+-"                              "
+-"                              "
+-"                              "
++"┌────────────────────────────┐"
++"› Test                       │"
++"│                            │"
++"│                            │"
++"│                            │"
++"│                            │"
++"│                            │"
++"└────────────────────────────┘"
+ "  tab to queue message        "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_ctrl_c_interrupt.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_ctrl_c_interrupt.snap
+index 7ecc5bba71..39aae86b26 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_ctrl_c_interrupt.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_ctrl_c_interrupt.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› Ask Codex to do anything                                                                          "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                                         │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  ctrl + c again to quit                                                                            "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_ctrl_c_quit.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_ctrl_c_quit.snap
+index 7ecc5bba71..39aae86b26 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_ctrl_c_quit.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_ctrl_c_quit.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› Ask Codex to do anything                                                                          "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                                         │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  ctrl + c again to quit                                                                            "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_ctrl_c_then_esc_hint.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_ctrl_c_then_esc_hint.snap
+index 9cad17b864..ec757ce43d 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_ctrl_c_then_esc_hint.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_ctrl_c_then_esc_hint.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› Ask Codex to do anything                                                                          "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                                         │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  esc esc to edit previous message                                                                  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_esc_hint_backtrack.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_esc_hint_backtrack.snap
+index 2fce42cc26..a0df8e462f 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_esc_hint_backtrack.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_esc_hint_backtrack.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› Ask Codex to do anything                                                                          "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                                         │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  esc again to edit previous message                                                                "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_esc_hint_from_overlay.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_esc_hint_from_overlay.snap
+index 9cad17b864..ec757ce43d 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_esc_hint_from_overlay.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_esc_hint_from_overlay.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› Ask Codex to do anything                                                                          "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                                         │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  esc esc to edit previous message                                                                  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_hidden_while_typing.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_hidden_while_typing.snap
+index 13b5628fcd..39db4dacfa 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_hidden_while_typing.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_hidden_while_typing.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› h                                                                                                 "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› h                                                                                                │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  enter to submit with UserPromptSubmit · tab to submit                          100% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_history_search.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_history_search.snap
+index 90cfba24a9..18cbff10e0 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_history_search.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_history_search.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› cargo test                                                                                        "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› cargo test                                                                                       │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  reverse-i-search: c  enter accept · esc cancel                                                    "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_overlay_then_external_esc_hint.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_overlay_then_external_esc_hint.snap
+index 2fce42cc26..a0df8e462f 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_overlay_then_external_esc_hint.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_overlay_then_external_esc_hint.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› Ask Codex to do anything                                                                          "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                                         │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  esc again to edit previous message                                                                "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_shell_command_absorbs_bang.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_shell_command_absorbs_bang.snap
+index 662199753f..2f47e31de1 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_shell_command_absorbs_bang.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_shell_command_absorbs_bang.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"! git status                                                                                        "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"! git status                                                                                       │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  enter to submit with UserPromptSubmit · tab to submit                                 Shell mode  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_shell_command_escape_exits_empty_mode.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_shell_command_escape_exits_empty_mode.snap
+index dac77a38da..bcfe81b161 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_shell_command_escape_exits_empty_mode.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_shell_command_escape_exits_empty_mode.snap
+@@ -1,14 +1,13 @@
+ ---
+ source: tui/src/bottom_pane/chat_composer.rs
+-assertion_line: 4485
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› Ask Codex to do anything                                                                          "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                                         │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  gpt-5.4 high fast · ~/code/codex-1 · Context 0% used                                              "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_shortcut_overlay.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_shortcut_overlay.snap
+index 7c144cd8dd..ef6b398360 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_shortcut_overlay.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_shortcut_overlay.snap
+@@ -2,14 +2,14 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› Ask Codex to do anything                                                                          "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                                         │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  / for commands                             ! for shell commands                                   "
+ "  shift + enter for newline                  tab to submit message                                  "
+ "  @ for file paths                           ctrl + v to paste images                               "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_shortcut_overlay_queue_submissions.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_shortcut_overlay_queue_submissions.snap
+index 58ab1fea82..a74a07a1e3 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_shortcut_overlay_queue_submissions.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__footer_mode_shortcut_overlay_queue_submissions.snap
+@@ -2,14 +2,14 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› Ask Codex to do anything                                                                          "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                                         │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  / for commands                             ! for shell commands                                   "
+ "  shift + enter for newline                  tab to queue message                                   "
+ "  @ for file paths                           ctrl + v to paste images                               "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__image_placeholder_multiple.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__image_placeholder_multiple.snap
+index 193129cd6a..24549081fb 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__image_placeholder_multiple.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__image_placeholder_multiple.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› [Image #1][Image #2]                                                                              "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› [Image #1][Image #2]                                                                             │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  enter to submit with UserPromptSubmit · tab to submit                          100% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__image_placeholder_single.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__image_placeholder_single.snap
+index 32bdf9cb11..a96aa280c5 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__image_placeholder_single.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__image_placeholder_single.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› [Image #1]                                                                                        "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› [Image #1]                                                                                       │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  enter to submit with UserPromptSubmit · tab to submit                          100% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__large.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__large.snap
+index ee373692e2..bf0a1f1fc9 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__large.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__large.snap
+@@ -2,13 +2,13 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› [Pasted Content 1005 chars]                                                                       "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› [Pasted Content 1005 chars]                                                                      │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  enter to submit with UserPromptSubmit · tab to submit                          100% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__mention_popup_type_prefixes.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__mention_popup_type_prefixes.snap
+index a894bffcb2..3d145f412a 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__mention_popup_type_prefixes.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__mention_popup_type_prefixes.snap
+@@ -2,10 +2,10 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                        "
+-"› $goog                                                                 "
+-"                                                                        "
+-"                                                                        "
++"┌──────────────────────────────────────────────────────────────────────┐"
++"› $goog                                                                │"
++"│                                                                      │"
++"└──────────────────────────────────────────────────────────────────────┘"
+ "  Google Calendar  [Plugin] Connect Google Calendar for scheduling, ava…"
+ "  Google Calendar  [Skill] Find availability and plan event changes     "
+ "  Google Calendar  [App] Look up events and availability                "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__multiple_pastes.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__multiple_pastes.snap
+index bdc91c5e3e..a37009c75b 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__multiple_pastes.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__multiple_pastes.snap
+@@ -2,13 +2,13 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› [Pasted Content 1003 chars][Pasted Content 1007 chars] another short paste                        "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› [Pasted Content 1003 chars][Pasted Content 1007 chars] another short paste                       │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  enter to submit with UserPromptSubmit · tab to submit                          100% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__plugin_at_mentions_render_with_plugin_accent.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__plugin_at_mentions_render_with_plugin_accent.snap
+index 0f6c47dca0..6105296762 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__plugin_at_mentions_render_with_plugin_accent.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__plugin_at_mentions_render_with_plugin_accent.snap
+@@ -2,5 +2,5 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: "format!(\"text:    {text}\\nmagenta: {magenta}\")"
+ ---
+-text:    › @sample plugin
++text:    › @sample plugin                       │
+ magenta:   ^^^^^^^
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__plugin_mention_popup.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__plugin_mention_popup.snap
+index e46bc96cfa..86d981a81d 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__plugin_mention_popup.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__plugin_mention_popup.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› $sa                                                                                               "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› $sa                                                                                              │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  Sample Plugin  [Plugin] Plugin that includes the Figma MCP server and Skills for common workflows "
+ "                                                                                                    "
+ "  Press enter to insert or esc to close                                                             "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__remote_image_rows.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__remote_image_rows.snap
+index 8393b4ec62..5c90f00ed6 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__remote_image_rows.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__remote_image_rows.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"  [Image #1]                                                                                        "
+-"  [Image #2]                                                                                        "
+-"                                                                                                    "
+-"› describe these                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"│ [Image #1]                                                                                       │"
++"│ [Image #2]                                                                                       │"
++"│                                                                                                  │"
++"› describe these                                                                                   │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  enter to submit with UserPromptSubmit · tab to submit                          100% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__remote_image_rows_after_delete_first.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__remote_image_rows_after_delete_first.snap
+index bff62c63d8..7fd451279f 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__remote_image_rows_after_delete_first.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__remote_image_rows_after_delete_first.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"  [Image #1]                                                                                        "
+-"                                                                                                    "
+-"› describe these                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"│ [Image #1]                                                                                       │"
++"│                                                                                                  │"
++"› describe these                                                                                   │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  enter to submit with UserPromptSubmit · tab to submit                          100% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__remote_image_rows_selected.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__remote_image_rows_selected.snap
+index 8393b4ec62..5c90f00ed6 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__remote_image_rows_selected.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__remote_image_rows_selected.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"  [Image #1]                                                                                        "
+-"  [Image #2]                                                                                        "
+-"                                                                                                    "
+-"› describe these                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"│ [Image #1]                                                                                       │"
++"│ [Image #2]                                                                                       │"
++"│                                                                                                  │"
++"› describe these                                                                                   │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  enter to submit with UserPromptSubmit · tab to submit                          100% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__shutdown_in_progress.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__shutdown_in_progress.snap
+index 15703f0ade..61b0d6fa50 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__shutdown_in_progress.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__shutdown_in_progress.snap
+@@ -2,8 +2,8 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                        "
+-"› Shutting down...                      "
+-"                                        "
+-"                                        "
+-"                                        "
++"┌──────────────────────────────────────┐"
++"› Shutting down...                     │"
++"│                                      │"
++"│                                      │"
++"└──────────────────────────────────────┘"
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_ar.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_ar.snap
+index 5014c35d28..a43b9cd034 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_ar.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_ar.snap
+@@ -2,8 +2,8 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                            "
+-"› /ar                                                       "
+-"                                                            "
+-"                                                            "
++"┌──────────────────────────────────────────────────────────┐"
++"› /ar                                                      │"
++"│                                                          │"
++"└──────────────────────────────────────────────────────────┘"
+ "  /archive  archive this session and exit                   "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_bt.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_bt.snap
+index 5aee8ff4d8..47abf240b3 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_bt.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_bt.snap
+@@ -2,8 +2,8 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                            "
+-"› /bt                                                       "
+-"                                                            "
+-"                                                            "
++"┌──────────────────────────────────────────────────────────┐"
++"› /bt                                                      │"
++"│                                                          │"
++"└──────────────────────────────────────────────────────────┘"
+ "  /btw  start a side conversation in an ephemeral fork      "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_mo.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_mo.snap
+index 2d5b29038a..439e9ca0c6 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_mo.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_mo.snap
+@@ -2,8 +2,8 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                            "
+-"› /mo                                                       "
+-"                                                            "
+-"                                                            "
++"┌──────────────────────────────────────────────────────────┐"
++"› /mo                                                      │"
++"│                                                          │"
++"└──────────────────────────────────────────────────────────┘"
+ "  /model  choose what model and reasoning effort to use     "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_pet.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_pet.snap
+index 3ac116bb46..4ded81cd38 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_pet.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_pet.snap
+@@ -2,8 +2,8 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                            "
+-"› /pet                                                      "
+-"                                                            "
+-"                                                            "
++"┌──────────────────────────────────────────────────────────┐"
++"› /pet                                                     │"
++"│                                                          │"
++"└──────────────────────────────────────────────────────────┘"
+ "  /pets  choose or hide the terminal pet                    "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_res.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_res.snap
+index ff5628a2f3..51693c556b 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_res.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_res.snap
+@@ -2,9 +2,9 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                            "
+-"› /res                                                      "
+-"                                                            "
+-"                                                            "
+-"                                                            "
++"┌──────────────────────────────────────────────────────────┐"
++"› /res                                                     │"
++"│                                                          │"
++"│                                                          │"
++"└──────────────────────────────────────────────────────────┘"
+ "  /resume  resume a saved chat                              "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_si.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_si.snap
+index 50a89ae1ab..bb76d7de9b 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_si.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__slash_popup_si.snap
+@@ -2,8 +2,8 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                            "
+-"› /si                                                       "
+-"                                                            "
+-"                                                            "
++"┌──────────────────────────────────────────────────────────┐"
++"› /si                                                      │"
++"│                                                          │"
++"└──────────────────────────────────────────────────────────┘"
+ "  /side  start a side conversation in an ephemeral fork     "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__small.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__small.snap
+index 60547c7b8e..d0fec327aa 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__small.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__chat_composer__tests__small.snap
+@@ -2,13 +2,13 @@
+ source: tui/src/bottom_pane/chat_composer.rs
+ expression: terminal.backend()
+ ---
+-"                                                                                                    "
+-"› short                                                                                             "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
+-"                                                                                                    "
++"┌──────────────────────────────────────────────────────────────────────────────────────────────────┐"
++"› short                                                                                            │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"│                                                                                                  │"
++"└──────────────────────────────────────────────────────────────────────────────────────────────────┘"
+ "  enter to submit with UserPromptSubmit · tab to submit                          100% context left  "
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__queued_messages_visible_when_status_hidden_snapshot.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__queued_messages_visible_when_status_hidden_snapshot.snap
+index 887b050f66..8836d0fb1c 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__queued_messages_visible_when_status_hidden_snapshot.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__queued_messages_visible_when_status_hidden_snapshot.snap
+@@ -1,12 +1,11 @@
+ ---
+ source: tui/src/bottom_pane/mod.rs
+-assertion_line: 1858
+ expression: "render_snapshot(&pane, area)"
+ ---
+ ■ Queued follow-up inputs                       
+   > Queued follow-up question                   
+     - + ↑ edit last queued message              
+-                                                
+-› Ask Codex to do anything                      
+-                                                
++┌──────────────────────────────────────────────┐
++› Ask Codex to do anything                     │
++└──────────────────────────────────────────────┘
+   ? for shortcuts            100% context left
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_and_composer_fill_height_without_bottom_padding.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_and_composer_fill_height_without_bottom_padding.snap
+index 4bb5442715..ad86955d62 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_and_composer_fill_height_without_bottom_padding.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_and_composer_fill_height_without_bottom_padding.snap
+@@ -4,7 +4,7 @@ expression: "render_snapshot(&pane, area)"
+ ---
+ ■ Working (0s ■ esc to interr…
+                               
+-                              
+-› Ask Codex to do anything    
+-                              
++┌────────────────────────────┐
++› Ask Codex to do anything   │
++└────────────────────────────┘
+            100% context left
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_and_queued_messages_snapshot.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_and_queued_messages_snapshot.snap
+index 95a83d1e34..575927a96e 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_and_queued_messages_snapshot.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_and_queued_messages_snapshot.snap
+@@ -1,6 +1,5 @@
+ ---
+ source: tui/src/bottom_pane/mod.rs
+-assertion_line: 1889
+ expression: "render_snapshot(&pane, area)"
+ ---
+ ■ Working (0s ■ esc to interrupt)               
+@@ -8,7 +7,7 @@ expression: "render_snapshot(&pane, area)"
+ ■ Queued follow-up inputs                       
+   > Queued follow-up question                   
+     - + ↑ edit last queued message              
+-                                                
+-› Ask Codex to do anything                      
+-                                                
++┌──────────────────────────────────────────────┐
++› Ask Codex to do anything                     │
++└──────────────────────────────────────────────┘
+   ? for shortcuts            100% context left
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_only_snapshot.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_only_snapshot.snap
+index 1948e0fe3f..bfb3f7a270 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_only_snapshot.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_only_snapshot.snap
+@@ -4,7 +4,7 @@ expression: "render_snapshot(&pane, area)"
+ ---
+ ■ Working (0s ■ esc to interrupt)               
+                                                 
+-                                                
+-› Ask Codex to do anything                      
+-                                                
++┌──────────────────────────────────────────────┐
++› Ask Codex to do anything                     │
++└──────────────────────────────────────────────┘
+   ? for shortcuts            100% context left
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_with_details_and_queued_messages_snapshot.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_with_details_and_queued_messages_snapshot.snap
+index bea280b123..d704c6c543 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_with_details_and_queued_messages_snapshot.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_with_details_and_queued_messages_snapshot.snap
+@@ -1,6 +1,5 @@
+ ---
+ source: tui/src/bottom_pane/mod.rs
+-assertion_line: 1826
+ expression: "render_snapshot(&pane, area)"
+ ---
+ ■ Working (0s ■ esc to interrupt)               
+@@ -10,7 +9,7 @@ expression: "render_snapshot(&pane, area)"
+ ■ Queued follow-up inputs                       
+   > Queued follow-up question                   
+     - + ↑ edit last queued message              
+-                                                
+-› Ask Codex to do anything                      
+-                                                
++┌──────────────────────────────────────────────┐
++› Ask Codex to do anything                     │
++└──────────────────────────────────────────────┘
+   ? for shortcuts            100% context left
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_guardian_review_denied_renders_denied_request.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_guardian_review_denied_renders_denied_request.snap
+index 16a68e9b16..83a8d7439c 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_guardian_review_denied_renders_denied_request.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_guardian_review_denied_renders_denied_request.snap
+@@ -14,7 +14,7 @@ x Request denied for codex to run curl -sS -i -X POST --data-binary
+ 
+ ■ Working (0s ■ esc to interrupt)
+ 
+-
+-› Ask Codex to do anything
+-
++┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
++› Ask Codex to do anything                                                                                                                 │
++└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+   gpt-5.5 default · /tmp/project
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_guardian_review_timed_out_renders_timed_out_request.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_guardian_review_timed_out_renders_timed_out_request.snap
+index 120bdfc18b..4e425695e7 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_guardian_review_timed_out_renders_timed_out_request.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_guardian_review_timed_out_renders_timed_out_request.snap
+@@ -14,7 +14,7 @@ x Review timed out before codex could run curl -sS -i -X POST --data-binary
+ 
+ ■ Working (0s ■ esc to interrupt)
+ 
+-
+-› Ask Codex to do anything
+-
++┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
++› Ask Codex to do anything                                                                                                                 │
++└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+   gpt-5.5 default · /tmp/project
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_mcp_startup_failure_renders_warning_history.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_mcp_startup_failure_renders_warning_history.snap
+index 49a6db4e9d..96903c2f2c 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_mcp_startup_failure_renders_warning_history.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_mcp_startup_failure_renders_warning_history.snap
+@@ -8,7 +8,7 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
+ ! MCP client for `alpha` failed to start: handshake failed
+ ! MCP startup incomplete (failed: alpha)
+ 
+-
+-› Ask Codex to do anything
+-
++┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
++› Ask Codex to do anything                                                                                             │
++└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+   gpt-5.5 default · /tmp/project
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chat_small_idle_h2.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chat_small_idle_h2.snap
+index 7a04b0ef19..833a5d1e9f 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chat_small_idle_h2.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chat_small_idle_h2.snap
+@@ -1,6 +1,6 @@
+ ---
+-source: tui/src/chatwidget/tests.rs
+-expression: terminal.backend()
++source: tui/src/chatwidget/tests/status_and_layout.rs
++expression: normalized_backend_snapshot(terminal.backend())
+ ---
+ "                                        "
+-"                                        "
++"┌──────────────────────────────────────┐"
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chat_small_idle_h3.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chat_small_idle_h3.snap
+index 4487d0652e..ccd5b305eb 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chat_small_idle_h3.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chat_small_idle_h3.snap
+@@ -1,7 +1,7 @@
+ ---
+-source: tui/src/chatwidget/tests.rs
+-expression: terminal.backend()
++source: tui/src/chatwidget/tests/status_and_layout.rs
++expression: normalized_backend_snapshot(terminal.backend())
+ ---
+ "                                        "
+-"                                        "
+-"                                        "
++"┌──────────────────────────────────────┐"
++"└──────────────────────────────────────┘"
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chat_small_running_h2.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chat_small_running_h2.snap
+index 7a04b0ef19..833a5d1e9f 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chat_small_running_h2.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chat_small_running_h2.snap
+@@ -1,6 +1,6 @@
+ ---
+-source: tui/src/chatwidget/tests.rs
+-expression: terminal.backend()
++source: tui/src/chatwidget/tests/status_and_layout.rs
++expression: normalized_backend_snapshot(terminal.backend())
+ ---
+ "                                        "
+-"                                        "
++"┌──────────────────────────────────────┐"
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chat_small_running_h3.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chat_small_running_h3.snap
+index 19e8ac6003..ccd5b305eb 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chat_small_running_h3.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chat_small_running_h3.snap
+@@ -3,5 +3,5 @@ source: tui/src/chatwidget/tests/status_and_layout.rs
+ expression: normalized_backend_snapshot(terminal.backend())
+ ---
+ "                                        "
+-"                                        "
+-"                                        "
++"┌──────────────────────────────────────┐"
++"└──────────────────────────────────────┘"
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chatwidget_exec_and_status_layout_vt100_snapshot.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chatwidget_exec_and_status_layout_vt100_snapshot.snap
+index 88d549b84d..a648044b28 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chatwidget_exec_and_status_layout_vt100_snapshot.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chatwidget_exec_and_status_layout_vt100_snapshot.snap
+@@ -38,7 +38,7 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
+ 
+ ■ Investigating rendering code (0s ■ esc to interrupt)
+ 
+-
+-› Summarize recent commits
+-
++┌──────────────────────────────────────────────────────────────────────────────┐
++› Summarize recent commits                                                     │
++└──────────────────────────────────────────────────────────────────────────────┘
+   tab to queue message                                       100% context left
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chatwidget_tall.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chatwidget_tall.snap
+index d84b93b3e0..1687499b3e 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chatwidget_tall.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chatwidget_tall.snap
+@@ -1,6 +1,5 @@
+ ---
+ source: tui/src/chatwidget/tests/status_and_layout.rs
+-assertion_line: 2288
+ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
+ ---
+ 
+@@ -23,7 +22,7 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
+   > Hello, world! 13
+   > Hello, world! 14
+   > Hello, world! 15
+-
+-› Ask Codex to do anything
+-
++┌──────────────────────────────────────────────────────────────────────────────┐
++› Ask Codex to do anything                                                     │
++└──────────────────────────────────────────────────────────────────────────────┘
+   gpt-5.5 default · /tmp/project
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__compact_queues_user_messages_snapshot.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__compact_queues_user_messages_snapshot.snap
+index 15cc3b0488..7fd1f538e1 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__compact_queues_user_messages_snapshot.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__compact_queues_user_messages_snapshot.snap
+@@ -16,7 +16,7 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
+ 
+ ■ Messages to be submitted at end of turn
+   > Steer submitted while /compact was running.
+-
+-› Ask Codex to do anything
+-
++┌──────────────────────────────────────────────────────────────────────────────┐
++› Ask Codex to do anything                                                     │
++└──────────────────────────────────────────────────────────────────────────────┘
+   gpt-5.5 default · /tmp/project
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_approved_exec_renders_approved_request.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_approved_exec_renders_approved_request.snap
+index c00ba4a716..4007656230 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_approved_exec_renders_approved_request.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_approved_exec_renders_approved_request.snap
+@@ -10,7 +10,7 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
+ + Auto-reviewer approved codex to run rm -f /tmp/guardian-approved.sqlite this
+   time
+ 
+-
+-› Ask Codex to do anything
+-
++┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
++› Ask Codex to do anything                                                                                             │
++└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+   gpt-5.5 default · /tmp/project
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_approved_request_permissions_renders_request_summary.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_approved_request_permissions_renders_request_summary.snap
+index 4d589d52e8..f2dfd1a071 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_approved_request_permissions_renders_request_summary.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_approved_request_permissions_renders_request_summary.snap
+@@ -10,7 +10,7 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
+ 
+ ■ Working (0s ■ esc to interrupt)
+ 
+-
+-› Ask Codex to do anything
+-
++┌────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
++› Ask Codex to do anything                                                                                   │
++└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+   gpt-5.5 default · /tmp/project
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_denied_exec_renders_warning_and_denied_request.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_denied_exec_renders_warning_and_denied_request.snap
+index 516aeb4b05..f69079a860 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_denied_exec_renders_warning_and_denied_request.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_denied_exec_renders_warning_and_denied_request.snap
+@@ -18,7 +18,7 @@ x Request denied for codex to run curl -sS -i -X POST --data-binary
+ 
+ ■ Working (0s ■ esc to interrupt)
+ 
+-
+-› Ask Codex to do anything
+-
++┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
++› Ask Codex to do anything                                                                                                                 │
++└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+   gpt-5.5 default · /tmp/project
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_parallel_reviews_render_aggregate_status.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_parallel_reviews_render_aggregate_status.snap
+index 183c987008..fef6643670 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_parallel_reviews_render_aggregate_status.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_parallel_reviews_render_aggregate_status.snap
+@@ -6,7 +6,7 @@ expression: normalize_snapshot_paths(rendered)
+   └ ■ rm -rf '/tmp/guardian target 1'
+     ■ rm -rf '/tmp/guardian target 2'
+ 
+-
+-› Ask Codex to do anything
+-
++┌──────────────────────────────────────────────────────────────────────┐
++› Ask Codex to do anything                                             │
++└──────────────────────────────────────────────────────────────────────┘
+   gpt-5.5 default · /tmp/project
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_timed_out_exec_renders_warning_and_timed_out_request.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_timed_out_exec_renders_warning_and_timed_out_request.snap
+index 2db1d8b001..c0037dac90 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_timed_out_exec_renders_warning_and_timed_out_request.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_timed_out_exec_renders_warning_and_timed_out_request.snap
+@@ -18,7 +18,7 @@ x Review timed out before codex could run curl -sS -i -X POST --data-binary
+ 
+ ■ Working (0s ■ esc to interrupt)
+ 
+-
+-› Ask Codex to do anything
+-
++┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
++› Ask Codex to do anything                                                                                                                 │
++└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+   gpt-5.5 default · /tmp/project
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__mcp_startup_header_booting.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__mcp_startup_header_booting.snap
+index 9c44c08ab2..29431b5b77 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__mcp_startup_header_booting.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__mcp_startup_header_booting.snap
+@@ -5,7 +5,7 @@ expression: normalized_backend_snapshot(terminal.backend())
+ "                                                                                "
+ "■ Booting MCP server: alpha (0s ■ esc to interrupt)                             "
+ "                                                                                "
+-"                                                                                "
+-"› Ask Codex to do anything                                                      "
+-"                                                                                "
++"┌──────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                     │"
++"└──────────────────────────────────────────────────────────────────────────────┘"
+ "  gpt-5.5 default · /tmp/project                                                "
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__pending_token_activity_refresh_renders_above_composer_snapshot.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__pending_token_activity_refresh_renders_above_composer_snapshot.snap
+index 964f801c93..0f5c26e308 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__pending_token_activity_refresh_renders_above_composer_snapshot.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__pending_token_activity_refresh_renders_above_composer_snapshot.snap
+@@ -8,7 +8,7 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
+  Token activity
+    Loading...
+ 
+-
+-› Ask Codex to do anything
+-
++┌──────────────────────────────────────────────────────────────────────────────┐
++› Ask Codex to do anything                                                     │
++└──────────────────────────────────────────────────────────────────────────────┘
+   gpt-5.5 default · /tmp/project
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__plan_mode_nudge.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__plan_mode_nudge.snap
+index d3df6e6261..904ac307c7 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__plan_mode_nudge.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__plan_mode_nudge.snap
+@@ -2,6 +2,7 @@
+ source: tui/src/chatwidget/tests/plan_mode.rs
+ expression: "render_bottom_popup(&chat, 80)"
+ ---
+-› make a plan
+-
++┌──────────────────────────────────────────────────────────────────────────────┐
++› make a plan                                                                  │
++└──────────────────────────────────────────────────────────────────────────────┘
+   Create a plan?  shift + tab use Plan mode   esc dismiss
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__plan_mode_nudge_narrow.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__plan_mode_nudge_narrow.snap
+index eca4819e3d..fd0619a87b 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__plan_mode_nudge_narrow.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__plan_mode_nudge_narrow.snap
+@@ -2,6 +2,7 @@
+ source: tui/src/chatwidget/tests/plan_mode.rs
+ expression: "render_bottom_popup(&chat, 36)"
+ ---
+-› make a plan
+-
++┌──────────────────────────────────┐
++› make a plan                      │
++└──────────────────────────────────┘
+   Create a plan?  shift + tab use P…
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__preamble_keeps_working_status.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__preamble_keeps_working_status.snap
+index 61752e8df7..e4f8cbdf28 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__preamble_keeps_working_status.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__preamble_keeps_working_status.snap
+@@ -5,7 +5,7 @@ expression: normalized_backend_snapshot(terminal.backend())
+ "                                                                                "
+ "■ Working (0s ■ esc to interrupt)                                               "
+ "                                                                                "
+-"                                                                                "
+-"› Ask Codex to do anything                                                      "
+-"                                                                                "
++"┌──────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                     │"
++"└──────────────────────────────────────────────────────────────────────────────┘"
+ "  gpt-5.5 default · /tmp/project                                                "
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__renamed_thread_footer_title.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__renamed_thread_footer_title.snap
+index 2616a5981c..05cf835c76 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__renamed_thread_footer_title.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__renamed_thread_footer_title.snap
+@@ -3,7 +3,7 @@ source: tui/src/chatwidget/tests/status_and_layout.rs
+ expression: normalized_backend_snapshot(terminal.backend())
+ ---
+ "                                                                                "
+-"                                                                                "
+-"› Ask Codex to do anything                                                      "
+-"                                                                                "
++"┌──────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                     │"
++"└──────────────────────────────────────────────────────────────────────────────┘"
+ "  gpt-5.3-codex high · Roadmap cleanup                                          "
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__review_queues_user_messages_snapshot.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__review_queues_user_messages_snapshot.snap
+index cb344f8a9e..aab3330333 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__review_queues_user_messages_snapshot.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__review_queues_user_messages_snapshot.snap
+@@ -16,7 +16,7 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
+ 
+ ■ Messages to be submitted at end of turn
+   > Steer submitted while /review was running.
+-
+-› Ask Codex to do anything
+-
++┌──────────────────────────────────────────────────────────────────────────────┐
++› Ask Codex to do anything                                                     │
++└──────────────────────────────────────────────────────────────────────────────┘
+   gpt-5.5 default · /tmp/project
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__side_context_label_preserves_status_line.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__side_context_label_preserves_status_line.snap
+index 5757bf8dac..55c8a5beac 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__side_context_label_preserves_status_line.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__side_context_label_preserves_status_line.snap
+@@ -3,7 +3,7 @@ source: tui/src/chatwidget/tests/side.rs
+ expression: terminal.backend()
+ ---
+ "                                                                                "
+-"                                                                                "
+-"› Check recently modified functions for compatibility                           "
+-"                                                                                "
++"┌──────────────────────────────────────────────────────────────────────────────┐"
++"› Check recently modified functions for compatibility                          │"
++"└──────────────────────────────────────────────────────────────────────────────┘"
+ "  gpt-5.5                             Side from main thread · Ctrl+C to return  "
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__side_context_label_shows_parent_status.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__side_context_label_shows_parent_status.snap
+index a1b8af6052..540c13717f 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__side_context_label_shows_parent_status.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__side_context_label_shows_parent_status.snap
+@@ -3,7 +3,7 @@ source: tui/src/chatwidget/tests/side.rs
+ expression: terminal.backend()
+ ---
+ "                                                                                "
+-"                                                                                "
+-"› Check recently modified functions for compatibility                           "
+-"                                                                                "
++"┌──────────────────────────────────────────────────────────────────────────────┐"
++"› Check recently modified functions for compatibility                          │"
++"└──────────────────────────────────────────────────────────────────────────────┘"
+ "  gpt-5.5 default… Side from main thread · main needs input · Ctrl+C to return  "
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__slash_side_requests_forked_side_question_while_task_running.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__slash_side_requests_forked_side_question_while_task_running.snap
+index 0f8902888a..7d0e3544fe 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__slash_side_requests_forked_side_question_while_task_running.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__slash_side_requests_forked_side_question_while_task_running.snap
+@@ -5,7 +5,7 @@ expression: normalized_backend_snapshot(terminal.backend())
+ "                                                                                "
+ "■ Working (0s ■ esc to interrupt)                                               "
+ "                                                                                "
+-"                                                                                "
+-"› Ask Codex to do anything                                                      "
+-"                                                                                "
++"┌──────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                     │"
++"└──────────────────────────────────────────────────────────────────────────────┘"
+ "  gpt-5.5 default                                             Side starting...  "
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_fast_mode_footer.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_fast_mode_footer.snap
+index c558ac4726..4b3a67bf07 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_fast_mode_footer.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_fast_mode_footer.snap
+@@ -3,7 +3,7 @@ source: tui/src/chatwidget/tests/status_and_layout.rs
+ expression: normalized_backend_snapshot(terminal.backend())
+ ---
+ "                                                                                "
+-"                                                                                "
+-"› Ask Codex to do anything                                                      "
+-"                                                                                "
++"┌──────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                     │"
++"└──────────────────────────────────────────────────────────────────────────────┘"
+ "  Fast on                                                                       "
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_goal_active_token_budget_footer.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_goal_active_token_budget_footer.snap
+index bbf2f9dea7..08323de52a 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_goal_active_token_budget_footer.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_goal_active_token_budget_footer.snap
+@@ -3,7 +3,7 @@ source: tui/src/chatwidget/tests/status_and_layout.rs
+ expression: normalized_backend_snapshot(terminal.backend())
+ ---
+ "                                                                                "
+-"                                                                                "
+-"› Ask Codex to do anything                                                      "
+-"                                                                                "
++"┌──────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                     │"
++"└──────────────────────────────────────────────────────────────────────────────┘"
+ "  gpt-5.4                                            Pursuing goal (40K / 50K)  "
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_goal_complete_elapsed_footer.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_goal_complete_elapsed_footer.snap
+index 97253d2ec9..f696a1bb65 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_goal_complete_elapsed_footer.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_goal_complete_elapsed_footer.snap
+@@ -3,7 +3,7 @@ source: tui/src/chatwidget/tests/status_and_layout.rs
+ expression: normalized_backend_snapshot(terminal.backend())
+ ---
+ "                                                                                "
+-"                                                                                "
+-"› Ask Codex to do anything                                                      "
+-"                                                                                "
++"┌──────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                     │"
++"└──────────────────────────────────────────────────────────────────────────────┘"
+ "  gpt-5.4                                           Goal achieved (2d 23h 42m)  "
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_context_remaining_footer.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_context_remaining_footer.snap
+index 6200fdf108..858f63b5e7 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_context_remaining_footer.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_context_remaining_footer.snap
+@@ -3,7 +3,7 @@ source: tui/src/chatwidget/tests/status_and_layout.rs
+ expression: normalized_backend_snapshot(terminal.backend())
+ ---
+ "                                                                                "
+-"                                                                                "
+-"› Ask Codex to do anything                                                      "
+-"                                                                                "
++"┌──────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                     │"
++"└──────────────────────────────────────────────────────────────────────────────┘"
+ "  gpt-5.4 xhigh fast · Context 100% left · /tmp/project                         "
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_fast_footer.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_fast_footer.snap
+index 2ac794d2f0..b5dd527b07 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_fast_footer.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_fast_footer.snap
+@@ -3,7 +3,7 @@ source: tui/src/chatwidget/tests/status_and_layout.rs
+ expression: normalized_backend_snapshot(terminal.backend())
+ ---
+ "                                                                                "
+-"                                                                                "
+-"› Ask Codex to do anything                                                      "
+-"                                                                                "
++"┌──────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                     │"
++"└──────────────────────────────────────────────────────────────────────────────┘"
+ "  gpt-5.4 xhigh fast · Context 0% used · /tmp/project                           "
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_plan_mode_footer.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_plan_mode_footer.snap
+index fc82518882..4fd24d5bca 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_plan_mode_footer.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_plan_mode_footer.snap
+@@ -3,7 +3,7 @@ source: tui/src/chatwidget/tests/status_and_layout.rs
+ expression: normalized_backend_snapshot(terminal.backend())
+ ---
+ "                                                                                "
+-"                                                                                "
+-"› Ask Codex to do anything                                                      "
+-"                                                                                "
++"┌──────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                     │"
++"└──────────────────────────────────────────────────────────────────────────────┘"
+ "  gpt-5.3-codex medium                          Plan mode (shift+tab to cycle)  "
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_widget_active.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_widget_active.snap
+index 83b2280533..a2a45a9cfc 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_widget_active.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_widget_active.snap
+@@ -5,7 +5,7 @@ expression: normalized_backend_snapshot(terminal.backend())
+ "                                                                                "
+ "■ Analyzing (0s ■ esc to interrupt)                                             "
+ "                                                                                "
+-"                                                                                "
+-"› Ask Codex to do anything                                                      "
+-"                                                                                "
++"┌──────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                     │"
++"└──────────────────────────────────────────────────────────────────────────────┘"
+ "  gpt-5.5 default · /tmp/project                                                "
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__unified_exec_begin_restores_working_status.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__unified_exec_begin_restores_working_status.snap
+index 37e9fe93f6..3f15606420 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__unified_exec_begin_restores_working_status.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__unified_exec_begin_restores_working_status.snap
+@@ -5,7 +5,7 @@ expression: normalized_backend_snapshot(terminal.backend())
+ "                                                                                "
+ "■ Working (0s ■ esc to interrupt) · 1 background terminal running · /ps to view…"
+ "                                                                                "
+-"                                                                                "
+-"› Ask Codex to do anything                                                      "
+-"                                                                                "
++"┌──────────────────────────────────────────────────────────────────────────────┐"
++"› Ask Codex to do anything                                                     │"
++"└──────────────────────────────────────────────────────────────────────────────┘"
+ "  gpt-5.5 default · /tmp/project                                                "
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__unified_exec_wait_status_renders_command_in_single_details_row.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__unified_exec_wait_status_renders_command_in_single_details_row.snap
+index 7e082e875a..6f592eddb7 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__unified_exec_wait_status_renders_command_in_single_details_row.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__unified_exec_wait_status_renders_command_in_single_details_row.snap
+@@ -5,7 +5,7 @@ expression: normalize_snapshot_paths(rendered)
+ ■ Waiting for background terminal (0s ■ esc to …
+   └ cargo test -p codex-core -- --exact…
+ 
+-
+-› Ask Codex to do anything
+-
++┌──────────────────────────────────────────────┐
++› Ask Codex to do anything                     │
++└──────────────────────────────────────────────┘
+   gpt-5.5 default · /tmp/project
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index b5712e8a95..afb4cd9c2b 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -276,11 +276,12 @@ async fn live_app_server_user_message_item_completed_does_not_duplicate_rendered
+     }
+ 
+     let inserted = drain_insert_history(&mut rx);
+-    let rendered_prompt_count = inserted
++    let inserted_text = inserted
+         .iter()
+-        .filter(|lines| lines_to_single_string(lines).contains("Hi, are you there?"))
+-        .count();
+-    assert_eq!(rendered_prompt_count, 1);
++        .map(|lines| lines_to_single_string(lines))
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert_eq!(inserted_text.matches("Hi, are you there?").count(), 1);
+ 
+     chat.handle_server_notification(
+         ServerNotification::ItemCompleted(ItemCompletedNotification {
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index a9a7544283..d9abaaf8e9 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -1907,7 +1907,9 @@ async fn ambient_pet_reduces_stream_width_and_composer_text_width() {
+     let disabled_row = buffer_row_containing(disabled_terminal.backend().buffer(), "Minim")
+         .expect("disabled-pet composer row should render draft");
+ 
+-    assert!(row_tail_is_blank(&pet_row, /*start_col*/ 69));
++    let mut pet_tail = pet_row.chars().skip(69).collect::<Vec<_>>();
++    assert_eq!(pet_tail.pop(), Some('│'));
++    assert!(pet_tail.iter().all(|ch| ch.is_whitespace()));
+     assert!(!row_tail_is_blank(&disabled_row, /*start_col*/ 69));
+ }
+ 
