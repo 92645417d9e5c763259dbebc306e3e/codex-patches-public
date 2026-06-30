@@ -1,0 +1,213 @@
+diff --git a/codex-rs/app-server/src/request_processors/account_processor.rs b/codex-rs/app-server/src/request_processors/account_processor.rs
+index 6aa624153d..de1588cf6a 100644
+--- a/codex-rs/app-server/src/request_processors/account_processor.rs
++++ b/codex-rs/app-server/src/request_processors/account_processor.rs
+@@ -897,11 +897,9 @@ impl AccountRequestProcessor {
+             .rate_limits
+             .iter()
+             .cloned()
+-            .map(|snapshot| {
+-                let limit_id = snapshot
+-                    .limit_id
+-                    .clone()
+-                    .unwrap_or_else(|| "codex".to_string());
++            .enumerate()
++            .map(|(index, snapshot)| {
++                let limit_id = account_rate_limit_key(&snapshot, index);
+                 (limit_id, snapshot)
+             })
+             .collect();
+@@ -1125,6 +1123,29 @@ fn workspace_messages_feature_disabled(err: &BackendRequestError) -> bool {
+     err.status().is_some_and(|status| status.as_u16() == 404)
+ }
+ 
++fn account_rate_limit_key(snapshot: &CoreRateLimitSnapshot, index: usize) -> String {
++    if let Some(limit_id) = snapshot
++        .limit_id
++        .as_deref()
++        .map(str::trim)
++        .filter(|limit_id| !limit_id.is_empty())
++    {
++        return limit_id.to_string();
++    }
++
++    if let Some(limit_name) = snapshot
++        .limit_name
++        .as_deref()
++        .map(str::trim)
++        .filter(|limit_name| !limit_name.is_empty())
++        .filter(|limit_name| !limit_name.eq_ignore_ascii_case("codex"))
++    {
++        return limit_name.to_ascii_lowercase().replace(['-', ' '], "_");
++    }
++
++    format!("unknown_{index}")
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -1216,4 +1237,20 @@ mod tests {
+             assert_eq!(workspace_messages_feature_disabled(&err), expected);
+         }
+     }
++
++    #[test]
++    fn account_rate_limit_key_does_not_collapse_missing_id_to_codex() {
++        let snapshot = CoreRateLimitSnapshot {
++            limit_id: None,
++            limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
++            primary: None,
++            secondary: None,
++            credits: None,
++            individual_limit: None,
++            plan_type: None,
++            rate_limit_reached_type: None,
++        };
++
++        assert_eq!(account_rate_limit_key(&snapshot, 1), "gpt_5.3_codex_spark");
++    }
+ }
+diff --git a/codex-rs/codex-api/src/rate_limits.rs b/codex-rs/codex-api/src/rate_limits.rs
+index 91f96fc3b8..00a376cff4 100644
+--- a/codex-rs/codex-api/src/rate_limits.rs
++++ b/codex-rs/codex-api/src/rate_limits.rs
+@@ -153,7 +153,7 @@ pub fn parse_rate_limit_event(payload: &str) -> Option<RateLimitSnapshot> {
+         .or(event.limit_name)
+         .map(normalize_limit_id);
+     Some(RateLimitSnapshot {
+-        limit_id: Some(limit_id.unwrap_or_else(|| "codex".to_string())),
++        limit_id,
+         limit_name: None,
+         primary,
+         secondary,
+@@ -375,4 +375,18 @@ mod tests {
+         assert_eq!(updates[0].secondary, None);
+         assert_eq!(updates[0].credits, None);
+     }
++
++    #[test]
++    fn parse_rate_limit_event_preserves_missing_limit_id() {
++        let snapshot = parse_rate_limit_event(
++            r#"{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":42}}}"#,
++        )
++        .expect("snapshot");
++
++        assert_eq!(snapshot.limit_id, None);
++        assert_eq!(
++            snapshot.primary.map(|window| window.used_percent),
++            Some(42.0)
++        );
++    }
+ }
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index 65eccdb6e5..85e7941103 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -3616,7 +3616,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
+     assert_eq!(
+         state.latest_rate_limits,
+         Some(RateLimitSnapshot {
+-            limit_id: Some("codex".to_string()),
++            limit_id: None,
+             limit_name: None,
+             primary: update.primary,
+             secondary: update.secondary,
+diff --git a/codex-rs/core/src/state/session.rs b/codex-rs/core/src/state/session.rs
+index 6444dc8cf3..697b1714aa 100644
+--- a/codex-rs/core/src/state/session.rs
++++ b/codex-rs/core/src/state/session.rs
+@@ -303,14 +303,21 @@ impl SessionState {
+ }
+ 
+ // Sometimes new snapshots don't include credits or plan information.
+-// Preserve those from the previous snapshot when missing. For `limit_id`, treat
+-// missing values as the default `"codex"` bucket.
++// Preserve those from the previous snapshot when missing. For `limit_id`, keep
++// non-codex limit names distinct when the server omits the bucket id, but do not
++// collapse an unknown bucket into `codex`.
+ fn merge_rate_limit_fields(
+     previous: Option<&RateLimitSnapshot>,
+     mut snapshot: RateLimitSnapshot,
+ ) -> RateLimitSnapshot {
+     if snapshot.limit_id.is_none() {
+-        snapshot.limit_id = Some("codex".to_string());
++        snapshot.limit_id = snapshot
++            .limit_name
++            .as_deref()
++            .map(str::trim)
++            .filter(|limit_name| !limit_name.is_empty())
++            .filter(|limit_name| !limit_name.eq_ignore_ascii_case("codex"))
++            .map(|limit_name| limit_name.to_ascii_lowercase().replace(['-', ' '], "_"));
+     }
+     if snapshot.credits.is_none() {
+         snapshot.credits = previous.and_then(|prior| prior.credits.clone());
+diff --git a/codex-rs/core/src/state/session_tests.rs b/codex-rs/core/src/state/session_tests.rs
+index 0fbb92b958..d906f4a1f5 100644
+--- a/codex-rs/core/src/state/session_tests.rs
++++ b/codex-rs/core/src/state/session_tests.rs
+@@ -36,7 +36,7 @@ async fn clear_connector_selection_removes_entries() {
+ }
+ 
+ #[tokio::test]
+-async fn set_rate_limits_defaults_limit_id_to_codex_when_missing() {
++async fn set_rate_limits_preserves_missing_limit_id_without_name() {
+     let session_configuration = make_session_configuration_for_tests().await;
+     let mut state = SessionState::new(session_configuration);
+ 
+@@ -60,7 +60,36 @@ async fn set_rate_limits_defaults_limit_id_to_codex_when_missing() {
+             .latest_rate_limits
+             .as_ref()
+             .and_then(|v| v.limit_id.clone()),
+-        Some("codex".to_string())
++        None
++    );
++}
++
++#[tokio::test]
++async fn set_rate_limits_uses_non_codex_limit_name_when_id_is_missing() {
++    let session_configuration = make_session_configuration_for_tests().await;
++    let mut state = SessionState::new(session_configuration);
++
++    state.set_rate_limits(RateLimitSnapshot {
++        limit_id: None,
++        limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
++        primary: Some(RateLimitWindow {
++            used_percent: 12.0,
++            window_minutes: Some(60),
++            resets_at: Some(100),
++        }),
++        secondary: None,
++        credits: None,
++        individual_limit: None,
++        plan_type: None,
++        rate_limit_reached_type: None,
++    });
++
++    assert_eq!(
++        state
++            .latest_rate_limits
++            .as_ref()
++            .and_then(|v| v.limit_id.clone()),
++        Some("gpt_5.3_codex_spark".to_string())
+     );
+ }
+ 
+@@ -81,7 +110,7 @@ async fn replace_history_clears_auto_compact_window_prefill() {
+ }
+ 
+ #[tokio::test]
+-async fn set_rate_limits_defaults_to_codex_when_limit_id_missing_after_other_bucket() {
++async fn set_rate_limits_does_not_reuse_previous_bucket_when_limit_id_missing() {
+     let session_configuration = make_session_configuration_for_tests().await;
+     let mut state = SessionState::new(session_configuration);
+ 
+@@ -119,7 +148,7 @@ async fn set_rate_limits_defaults_to_codex_when_limit_id_missing_after_other_buc
+             .latest_rate_limits
+             .as_ref()
+             .and_then(|v| v.limit_id.clone()),
+-        Some("codex".to_string())
++        None
+     );
+ }
+ 

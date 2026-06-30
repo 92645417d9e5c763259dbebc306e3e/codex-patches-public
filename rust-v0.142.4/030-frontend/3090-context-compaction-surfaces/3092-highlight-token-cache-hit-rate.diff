@@ -1,493 +1,425 @@
-diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
-index 3a9c51bf73..cc4e6c0ae6 100644
---- a/codex-rs/tui/src/chatwidget.rs
-+++ b/codex-rs/tui/src/chatwidget.rs
-@@ -577,6 +577,7 @@ pub(crate) struct ChatWidget {
-     runtime_model_provider_base_url: Option<String>,
-     pub(crate) remote_connection: Option<RemoteConnectionStatus>,
-     token_info: Option<TokenUsageInfo>,
-+    context_compaction_started_at_ms: HashMap<String, i64>,
-     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
-     responses_stream_connection_status: Option<ResponsesStreamConnectionStatus>,
-     refreshing_status_outputs: Vec<(u64, StatusHistoryHandle)>,
-diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
-index 94dc4de4fe..2874cc4084 100644
---- a/codex-rs/tui/src/chatwidget/constructor.rs
-+++ b/codex-rs/tui/src/chatwidget/constructor.rs
-@@ -125,6 +125,7 @@ impl ChatWidget {
-             runtime_model_provider_base_url,
-             remote_connection: None,
-             token_info: None,
-+            context_compaction_started_at_ms: HashMap::new(),
-             rate_limit_snapshots_by_limit_id,
-             responses_stream_connection_status: None,
-             refreshing_status_outputs: Vec::new(),
-diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
-index c84f84c0b5..f308c09c40 100644
---- a/codex-rs/tui/src/chatwidget/protocol.rs
-+++ b/codex-rs/tui/src/chatwidget/protocol.rs
-@@ -318,7 +318,9 @@ impl ChatWidget {
-             ThreadItem::ImageGeneration { .. } => {
-                 self.on_image_generation_begin();
-             }
--            ThreadItem::ContextCompaction { .. } => {
-+            ThreadItem::ContextCompaction { id } => {
-+                self.context_compaction_started_at_ms
-+                    .insert(id, notification.started_at_ms);
-                 self.start_context_compaction_status();
-             }
-             ThreadItem::CollabAgentToolCall {
-@@ -355,10 +357,22 @@ impl ChatWidget {
-         notification: ItemCompletedNotification,
-         replay_kind: Option<ReplayKind>,
-     ) {
--        self.handle_thread_item(
--            notification.item,
--            notification.turn_id,
--            replay_kind.map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay),
--        );
-+        let render_source =
-+            replay_kind.map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay);
-+        match notification.item {
-+            ThreadItem::ContextCompaction { id } => {
-+                let duration_ms =
-+                    self.context_compaction_started_at_ms
-+                        .remove(&id)
-+                        .map(|started_at_ms| {
-+                            notification
-+                                .completed_at_ms
-+                                .saturating_sub(started_at_ms)
-+                                .max(0)
-+                        });
-+                self.handle_context_compaction_item(duration_ms, render_source);
-+            }
-+            item => self.handle_thread_item(item, notification.turn_id, render_source),
-+        }
-     }
- }
-diff --git a/codex-rs/tui/src/chatwidget/rendering.rs b/codex-rs/tui/src/chatwidget/rendering.rs
-index 710af6b7ea..e68ef88e6a 100644
---- a/codex-rs/tui/src/chatwidget/rendering.rs
-+++ b/codex-rs/tui/src/chatwidget/rendering.rs
-@@ -107,6 +107,9 @@ impl Renderable for TranscriptAreaRenderable<'_> {
-             u16::try_from(overflow).unwrap_or(u16::MAX)
-         };
-         Clear.render(area, buf);
-+        if let Some(style) = self.child.fill_background_style() {
-+            buf.set_style(area, style);
-+        }
-         paragraph.scroll((y, 0)).render(area, buf);
-     }
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+index 5f36807b06..a4d5b68ce0 100644
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -712,7 +712,10 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
  
-diff --git a/codex-rs/tui/src/chatwidget/replay.rs b/codex-rs/tui/src/chatwidget/replay.rs
-index 34c8db0471..8f5e02ca1f 100644
---- a/codex-rs/tui/src/chatwidget/replay.rs
-+++ b/codex-rs/tui/src/chatwidget/replay.rs
-@@ -167,10 +167,7 @@ impl ChatWidget {
-                 self.exit_review_mode_after_item();
-             }
-             ThreadItem::ContextCompaction { .. } => {
--                self.add_info_message("Context compacted".to_string(), /*hint*/ None);
--                if self.status_state.current_status.header == "Compacting" {
--                    self.set_status_header(String::from("Working"));
--                }
-+                self.handle_context_compaction_item(/*duration_ms*/ None, render_source);
-             }
-             ThreadItem::HookPrompt { .. } => {}
-             ThreadItem::CollabAgentToolCall {
-diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
-index ee054f4901..7d2c266372 100644
---- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
-+++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
-@@ -192,7 +192,7 @@ async fn thread_settings_updated_preserves_default_settings_for_plan_mode() {
- 
- #[tokio::test]
- async fn context_compaction_item_started_updates_status_header() {
--    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
-+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
- 
-     chat.handle_server_notification(
-         ServerNotification::ItemStarted(ItemStartedNotification {
-@@ -206,7 +206,12 @@ async fn context_compaction_item_started_updates_status_header() {
-         /*replay_kind*/ None,
-     );
- 
--    assert_eq!(chat.status_state.current_status.header, "Compacting");
-+    assert_eq!(chat.status_state.current_status.header, "Working");
-+    let cells = drain_insert_history(&mut rx);
-+    assert!(
-+        lines_to_single_string(&cells[0]).contains("Context compaction triggered"),
-+        "expected compaction trigger banner"
-+    );
- 
-     chat.handle_server_notification(
-         ServerNotification::ItemCompleted(ItemCompletedNotification {
-diff --git a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
-index cb556fd747..39d59e9d29 100644
---- a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
-+++ b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
-@@ -271,7 +271,10 @@ impl ChatWidget {
- 
-     pub(crate) fn start_context_compaction_status(&mut self) {
-         self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Working;
--        self.set_status_header(String::from("Compacting"));
-+        self.add_to_history(history_cell::new_context_compaction_triggered_event(
-+            self.context_compaction_trigger_usage(),
+     let mut lines = Vec::new();
+     if !token_usage.is_zero() {
+-        lines.push(token_usage.to_string());
++        lines.push(format_token_usage_for_terminal(
++            token_usage.to_string(),
++            color_enabled,
 +        ));
-+        self.set_status_header(String::from("Working"));
-         self.request_redraw();
      }
  
-@@ -287,8 +290,16 @@ impl ChatWidget {
-             post_compact_context_usage,
-         ));
-         self.request_redraw();
--        if !render_source.is_replay() && self.status_state.current_status.header == "Compacting" {
--            self.set_status_header(String::from("Working"));
-+    }
-+
-+    fn context_compaction_trigger_usage(&self) -> history_cell::ContextCompactionTriggerUsage {
-+        history_cell::ContextCompactionTriggerUsage {
-+            used_tokens: self
-+                .token_info
-+                .as_ref()
-+                .map(|info| info.last_token_usage.tokens_in_context_window().max(0)),
-+            context_window: self.status_line_context_window_size(),
-+            auto_compact_limit: self.config.model_auto_compact_token_limit,
-         }
-     }
- 
-diff --git a/codex-rs/tui/src/history_cell/mod.rs b/codex-rs/tui/src/history_cell/mod.rs
-index b7dd0b9475..43390c5271 100644
---- a/codex-rs/tui/src/history_cell/mod.rs
-+++ b/codex-rs/tui/src/history_cell/mod.rs
-@@ -282,6 +282,10 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
-         false
-     }
- 
-+    fn fill_background_style(&self) -> Option<Style> {
-+        None
-+    }
-+
-     /// Returns a coarse "animation tick" when transcript output is time-dependent.
-     ///
-     /// The transcript overlay caches the rendered output of the in-flight active cell, so cells
-@@ -313,6 +317,9 @@ impl Renderable for Box<dyn HistoryCell> {
-         // Active-cell content can reflow dramatically during resize/stream updates. Clear the
-         // entire draw area first so stale glyphs from previous frames never linger.
-         Clear.render(area, buf);
-+        if let Some(style) = self.fill_background_style() {
-+            buf.set_style(area, style);
-+        }
-         paragraph.scroll((y, 0)).render(area, buf);
-         mark_buffer_hyperlinks(buf, area, &hyperlink_lines, usize::from(y));
-     }
-diff --git a/codex-rs/tui/src/history_cell/notices.rs b/codex-rs/tui/src/history_cell/notices.rs
-index a33064fc04..071de14821 100644
---- a/codex-rs/tui/src/history_cell/notices.rs
-+++ b/codex-rs/tui/src/history_cell/notices.rs
-@@ -205,6 +205,11 @@ struct ContextCompactedHistoryCell {
-     post_compact_context_usage: Option<PostCompactContextUsage>,
+     if let Some(resume_cmd) = resume_hint {
+@@ -736,6 +739,34 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
+     lines
  }
  
-+#[derive(Debug)]
-+struct ContextCompactionTriggeredHistoryCell {
-+    trigger_context_usage: ContextCompactionTriggerUsage,
-+}
-+
- #[derive(Clone, Copy, Debug)]
- pub(crate) enum PostCompactContextUsage {
-     UnknownContextWindow { used_tokens: Option<i64> },
-@@ -212,45 +217,113 @@ pub(crate) enum PostCompactContextUsage {
-     Percent { percent: i64, used_tokens: i64 },
- }
- 
-+#[derive(Clone, Copy, Debug)]
-+pub(crate) struct ContextCompactionTriggerUsage {
-+    pub(crate) used_tokens: Option<i64>,
-+    pub(crate) context_window: Option<i64>,
-+    pub(crate) auto_compact_limit: Option<i64>,
-+}
-+
- impl HistoryCell for ContextCompactedHistoryCell {
-     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
--        let style = Self::banner_style();
--        let details = self.details_text();
--        let mut spans = vec![Span::styled("■ Context compacted", style)];
--        if let Some(details) = &details {
--            spans.push(Span::styled(format!(" {details}"), style));
-+        let label_text = self.label();
-+        let label = format!("─ {label_text} ─");
-+        let label_width = UnicodeWidthStr::width(label.as_str());
-+        if label_width > width as usize {
-+            let (label, _suffix, label_width) = take_prefix_by_width(&label, width as usize);
-+            return vec![
-+                Line::from_iter([
-+                    label,
-+                    "─".repeat((width as usize).saturating_sub(label_width)),
-+                ])
-+                .dim(),
-+            ];
-+        }
-+
-+        let mut spans = Vec::new();
-+        spans.push("─ ".dim());
-+        spans.push(
-+            "Context compacted"
-+                .fg(Color::Yellow)
-+                .add_modifier(Modifier::BOLD),
-+        );
-+        if let Some(details) = self.details_label() {
-+            spans.push(" ■ ".dim());
-+            spans.push(details.dim());
-+        }
-+        spans.push(" ─".dim());
-+        spans.push(
-+            "─"
-+                .repeat((width as usize).saturating_sub(label_width))
-+                .dim(),
-+        );
-+        vec![Line::from(spans)]
++fn format_token_usage_for_terminal(text: String, color_enabled: bool) -> String {
++    if !color_enabled {
++        return text;
 +    }
-+
-+    fn raw_lines(&self) -> Vec<Line<'static>> {
-+        vec![self.label().into()]
-+    }
-+}
-+
-+impl HistoryCell for ContextCompactionTriggeredHistoryCell {
-+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-+        let label_text = self.label();
-+        let label = format!("─ {label_text} ─");
-+        let label_width = UnicodeWidthStr::width(label.as_str());
-+        if label_width > width as usize {
-+            let (label, _suffix, label_width) = take_prefix_by_width(&label, width as usize);
-+            return vec![
-+                Line::from_iter([
-+                    label,
-+                    "─".repeat((width as usize).saturating_sub(label_width)),
-+                ])
-+                .dim(),
-+            ];
-         }
--        let line_width = "■ Context compacted".width()
--            + details
--                .as_ref()
--                .map(|details| 1 + details.width())
--                .unwrap_or_default();
--        let target_width = usize::from(width);
--        if target_width > line_width {
--            spans.push(Span::styled(" ".repeat(target_width - line_width), style));
-+
-+        let mut spans = Vec::new();
-+        spans.push("─ ".dim());
-+        spans.push(
-+            "Context compaction triggered"
-+                .fg(Color::Yellow)
-+                .add_modifier(Modifier::BOLD),
-+        );
-+        if let Some(details) = self.trigger_context_usage.label() {
-+            spans.push(" ■ ".dim());
-+            spans.push(details.dim());
-         }
--        vec![Line::from(spans).style(style)]
-+        spans.push(" ─".dim());
-+        spans.push(
-+            "─"
-+                .repeat((width as usize).saturating_sub(label_width))
-+                .dim(),
-+        );
-+        vec![Line::from(spans)]
-     }
- 
-     fn raw_lines(&self) -> Vec<Line<'static>> {
--        let mut text = "■ Context compacted".to_string();
--        if let Some(details) = self.details_text() {
--            text.push(' ');
--            text.push_str(&details);
-+        vec![Line::from(self.label())]
-+    }
-+}
-+
-+impl ContextCompactionTriggeredHistoryCell {
-+    fn label(&self) -> String {
-+        match self.trigger_context_usage.label() {
-+            Some(details) => format!("Context compaction triggered ■ {details}"),
-+            None => "Context compaction triggered".to_string(),
-         }
--        vec![text.into()]
-     }
- }
- 
- impl ContextCompactedHistoryCell {
--    fn banner_style() -> Style {
--        Style::default()
--            .fg(Color::Red)
--            .bg(Color::Yellow)
--            .add_modifier(Modifier::BOLD)
-+    fn label(&self) -> String {
-+        match self.details_label() {
-+            Some(details) => format!("Context compacted ■ {details}"),
-+            None => "Context compacted".to_string(),
++    let Some(hit_suffix_start) = text.find("% hit") else {
++        return text;
++    };
++    let mut marker_start = hit_suffix_start;
++    while marker_start > 0 {
++        let byte = text.as_bytes()[marker_start - 1];
++        if byte.is_ascii_digit() || byte == b'.' {
++            marker_start -= 1;
++        } else {
++            break;
 +        }
-     }
- 
--    fn details_text(&self) -> Option<String> {
-+    fn details_label(&self) -> Option<String> {
-         let mut details = Vec::new();
-         if let Some(duration_ms) = self.duration_ms {
-             let elapsed_seconds = u64::try_from(duration_ms.max(0))
-@@ -263,7 +336,39 @@ impl ContextCompactedHistoryCell {
-         if let Some(usage) = self.post_compact_context_usage {
-             details.push(usage.label());
-         }
--        (!details.is_empty()).then(|| format!("· {}", details.join(" · ")))
-+        (!details.is_empty()).then(|| details.join(" ■ "))
 +    }
++    let marker_end = hit_suffix_start + "% hit".len();
++    if marker_start == hit_suffix_start {
++        return text;
++    }
++    format!(
++        "{}\u{1b}[33m{}\u{1b}[39m{}",
++        &text[..marker_start],
++        &text[marker_start..marker_end],
++        &text[marker_end..]
++    )
 +}
 +
-+impl ContextCompactionTriggerUsage {
-+    fn label(self) -> Option<String> {
-+        let mut details = Vec::new();
-+        match (self.used_tokens, self.context_window) {
-+            (Some(used_tokens), Some(context_window)) if context_window > 0 => {
-+                let percent =
-+                    (used_tokens.saturating_mul(100) + context_window / 2) / context_window;
-+                details.push(format!(
-+                    "{}% Used ({} / {})",
-+                    percent.clamp(0, 100),
-+                    compact_token_count(used_tokens),
-+                    compact_token_count(context_window)
-+                ));
-+            }
-+            (Some(used_tokens), _) => {
-+                details.push(format!(
-+                    "{} Used (window unknown)",
-+                    compact_token_count(used_tokens)
-+                ));
-+            }
-+            (None, Some(context_window)) => {
-+                details.push(format!("Window {}", compact_token_count(context_window)));
-+            }
-+            (None, None) => {}
-+        }
-+        if let Some(limit) = self.auto_compact_limit.filter(|limit| *limit > 0) {
-+            details.push(format!("Auto limit {}", compact_token_count(limit)));
-+        }
-+        (!details.is_empty()).then(|| details.join(" ■ "))
-     }
- }
- 
-@@ -309,6 +414,14 @@ pub(crate) fn new_context_compacted_event(
-     }
- }
- 
-+pub(crate) fn new_context_compaction_triggered_event(
-+    trigger_context_usage: ContextCompactionTriggerUsage,
-+) -> impl HistoryCell {
-+    ContextCompactionTriggeredHistoryCell {
-+        trigger_context_usage,
-+    }
-+}
-+
- pub(crate) fn new_error_event(message: String) -> PlainHistoryCell {
-     // Use a hair space (U+200A) to create a subtle, near-invisible separation
-     // before the text. VS16 is intentionally omitted to keep spacing tighter
-@@ -325,7 +438,7 @@ mod tests {
-     use super::*;
- 
-     #[test]
--    fn context_compacted_event_renders_full_width_yellow_banner() {
-+    fn context_compacted_event_renders_separator_banner() {
-         let cell = new_context_compacted_event(
-             Some(84_000),
-             Some(PostCompactContextUsage::Percent {
-@@ -333,27 +446,40 @@ mod tests {
-                 used_tokens: 84_000,
-             }),
+ /// Handle the app exit and print the results. Optionally run the update action.
+ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
+     let is_fatal = match &exit_info.exit_reason {
+@@ -3220,6 +3251,24 @@ mod tests {
          );
--        let lines = cell.display_lines(60);
-+        let lines = cell.display_lines(100);
+     }
  
-         assert_eq!(lines.len(), 1);
--        assert!(
--            lines[0]
--                .to_string()
--                .starts_with("■ Context compacted · Worked 1m 24s · 14% Used (84K tokens")
++    #[test]
++    fn format_exit_messages_highlights_cache_hit_rate_when_color_enabled() {
++        let mut exit_info =
++            sample_exit_info(/*conversation_id*/ None, /*thread_name*/ None);
++        exit_info.token_usage = TokenUsage {
++            input_tokens: 740_625_103,
++            cached_input_tokens: 714_727_936,
++            output_tokens: 1_803_629,
++            reasoning_output_tokens: 519_362,
++            total_tokens: 27_700_796,
++        };
++
++        let lines = format_exit_messages(exit_info, /*color_enabled*/ true);
++
++        assert_eq!(lines.len(), 1);
++        assert!(lines[0].contains("\u{1b}[33m96.5% hit\u{1b}[39m"));
++    }
++
+     #[test]
+     fn resume_model_flag_applies_when_no_root_flags() {
+         let interactive =
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index 115bc64a3f..b89515e839 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -173,6 +173,7 @@ use ratatui::backend::Backend;
+ use ratatui::layout::Rect;
+ use ratatui::style::Stylize;
+ use ratatui::text::Line;
++use ratatui::text::Span;
+ use ratatui::widgets::Paragraph;
+ use ratatui::widgets::Wrap;
+ use std::collections::BTreeMap;
+@@ -438,7 +439,7 @@ fn session_summary(
+     thread_name: Option<String>,
+     rollout_path: Option<&Path>,
+ ) -> Option<SessionSummary> {
+-    let usage_line = (!token_usage.is_zero()).then(|| token_usage.to_string());
++    let usage_line = (!token_usage.is_zero()).then(|| token_usage_summary_line(&token_usage));
+     let resume_hint = resume_hint_for_resumable_thread(thread_id, thread_name, rollout_path);
+ 
+     if usage_line.is_none() && resume_hint.is_none() {
+@@ -451,6 +452,17 @@ fn session_summary(
+     })
+ }
+ 
++impl App {
++    fn current_session_summary(&self) -> Option<SessionSummary> {
++        session_summary(
++            self.chat_widget.token_usage(),
++            self.chat_widget.thread_id(),
++            self.chat_widget.thread_name(),
++            self.chat_widget.rollout_path().as_deref(),
++        )
++    }
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ struct ResumableThread {
+     thread_id: ThreadId,
+@@ -494,10 +506,28 @@ fn errors_for_cwd(cwd: &Path, response: &SkillsListResponse) -> Vec<SkillErrorIn
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ struct SessionSummary {
+-    usage_line: Option<String>,
++    usage_line: Option<Line<'static>>,
+     resume_hint: Option<String>,
+ }
+ 
++fn token_usage_summary_line(token_usage: &TokenUsage) -> Line<'static> {
++    let Some(cache_hit_rate) = token_usage.cache_hit_rate_percent() else {
++        return token_usage.to_string().into();
++    };
++
++    let text = token_usage.to_string();
++    let marker = format!("{cache_hit_rate:.1}% hit");
++    let Some(start) = text.find(&marker) else {
++        return text.into();
++    };
++    let end = start + marker.len();
++    Line::from(vec![
++        Span::from(text[..start].to_string()),
++        Span::from(marker).yellow(),
++        Span::from(text[end..].to_string()),
++    ])
++}
++
+ #[derive(Debug, Default)]
+ struct InitialHistoryReplayBuffer {
+     retained_lines: VecDeque<crate::terminal_hyperlinks::HyperlinkLine>,
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index 1237bbd4ed..0f473a6ba9 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -33,14 +33,16 @@ impl App {
+                     .await?;
+             }
+             AppEvent::ClearUi => {
++                let summary = self.current_session_summary();
+                 self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
+                 self.reset_app_ui_state_after_clear();
+ 
+-                self.start_fresh_session_with_summary_hint(
++                self.start_fresh_session_with_summary(
+                     tui,
+                     app_server,
+                     Some(ThreadStartSource::Clear),
+                     /*initial_user_message*/ None,
++                    summary,
+                 )
+                 .await;
+             }
+@@ -48,10 +50,11 @@ impl App {
+                 self.apply_raw_output_mode(tui, enabled, /*notify*/ false);
+             }
+             AppEvent::ClearUiAndSubmitUserMessage { text } => {
++                let summary = self.current_session_summary();
+                 self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
+                 self.reset_app_ui_state_after_clear();
+ 
+-                self.start_fresh_session_with_summary_hint(
++                self.start_fresh_session_with_summary(
+                     tui,
+                     app_server,
+                     Some(ThreadStartSource::Clear),
+@@ -60,6 +63,7 @@ impl App {
+                         Vec::new(),
+                         Vec::new(),
+                     ),
++                    summary,
+                 )
+                 .await;
+             }
+@@ -187,7 +191,7 @@ impl App {
+                                     if let Some(summary) = summary {
+                                         let mut lines: Vec<Line<'static>> = Vec::new();
+                                         if let Some(usage_line) = summary.usage_line {
+-                                            lines.push(usage_line.into());
++                                            lines.push(usage_line);
+                                         }
+                                         if let Some(command) = summary.resume_hint {
+                                             let spans = vec![
+diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
+index 3b587560c7..89dbce870d 100644
+--- a/codex-rs/tui/src/app/session_lifecycle.rs
++++ b/codex-rs/tui/src/app/session_lifecycle.rs
+@@ -542,6 +542,25 @@ impl App {
+         app_server: &mut AppServerSession,
+         session_start_source: Option<ThreadStartSource>,
+         initial_user_message: Option<crate::chatwidget::UserMessage>,
++    ) {
++        let summary = self.current_session_summary();
++        self.start_fresh_session_with_summary(
++            tui,
++            app_server,
++            session_start_source,
++            initial_user_message,
++            summary,
++        )
++        .await;
++    }
++
++    pub(super) async fn start_fresh_session_with_summary(
++        &mut self,
++        tui: &mut tui::Tui,
++        app_server: &mut AppServerSession,
++        session_start_source: Option<ThreadStartSource>,
++        initial_user_message: Option<crate::chatwidget::UserMessage>,
++        summary: Option<SessionSummary>,
+     ) {
+         // Start a fresh in-memory session while preserving resumability via persisted rollout
+         // history. If an initial message is provided, `enqueue_primary_thread_session` suppresses it
+@@ -550,12 +569,6 @@ impl App {
+             .await;
+         let model = self.chat_widget.current_model().to_string();
+         let config = self.fresh_session_config();
+-        let summary = session_summary(
+-            self.chat_widget.token_usage(),
+-            self.chat_widget.thread_id(),
+-            self.chat_widget.thread_name(),
+-            self.chat_widget.rollout_path().as_deref(),
 -        );
-+        let rendered = lines[0].to_string();
-+        assert!(rendered.starts_with("─ Context compacted ■ Worked 1m 24s"));
-+        assert!(rendered.contains("■ 14% Used (84K tokens"));
-+        assert!(!rendered.contains("■ Context compacted"));
-         let rendered_width: usize = lines[0]
-             .spans
-             .iter()
-             .map(ratatui::prelude::Span::width)
-             .sum();
--        assert_eq!(rendered_width, 60);
--        for span in &lines[0].spans {
--            assert_eq!(span.style.bg, Some(Color::Yellow));
--            assert_eq!(span.style.fg, Some(Color::Red));
--            assert!(span.style.add_modifier.contains(Modifier::BOLD));
--        }
--        assert_eq!(lines[0].style.fg, Some(Color::Red));
--        assert_eq!(lines[0].style.bg, Some(Color::Yellow));
-+        assert_eq!(rendered_width, 100);
-+        assert_eq!(lines[0].spans[1].style.fg, Some(Color::Yellow));
-+        assert!(
-+            lines[0].spans[1]
-+                .style
-+                .add_modifier
-+                .contains(Modifier::BOLD)
+         self.shutdown_current_thread(app_server).await;
+         let tracked_thread_ids: Vec<ThreadId> =
+             self.thread_event_channels.keys().copied().collect();
+@@ -585,7 +598,7 @@ impl App {
+                 } else if let Some(summary) = summary {
+                     let mut lines: Vec<Line<'static>> = Vec::new();
+                     if let Some(usage_line) = summary.usage_line {
+-                        lines.push(usage_line.into());
++                        lines.push(usage_line);
+                     }
+                     if let Some(command) = summary.resume_hint {
+                         let spans = vec!["To continue this session, run ".into(), command.cyan()];
+@@ -822,7 +835,7 @@ impl App {
+                         if let Some(summary) = summary {
+                             let mut lines: Vec<Line<'static>> = Vec::new();
+                             if let Some(usage_line) = summary.usage_line {
+-                                lines.push(usage_line.into());
++                                lines.push(usage_line);
+                             }
+                             if let Some(command) = summary.resume_hint {
+                                 let spans =
+diff --git a/codex-rs/tui/src/app/tests/session_summary.rs b/codex-rs/tui/src/app/tests/session_summary.rs
+index 63ff92a097..622a7418e9 100644
+--- a/codex-rs/tui/src/app/tests/session_summary.rs
++++ b/codex-rs/tui/src/app/tests/session_summary.rs
+@@ -53,7 +53,7 @@ async fn session_summary_includes_resume_hint_for_persisted_rollout() {
+     )
+     .expect("summary");
+     assert_eq!(
+-        summary.usage_line,
++        summary.usage_line.as_ref().map(ToString::to_string),
+         Some("Token usage: total=12 input=10 output=2".to_string())
+     );
+     assert_eq!(
+@@ -62,6 +62,40 @@ async fn session_summary_includes_resume_hint_for_persisted_rollout() {
+     );
+ }
+ 
++#[tokio::test]
++async fn session_summary_highlights_cached_input_hit_rate() {
++    let usage = TokenUsage {
++        input_tokens: 1_030_732,
++        cached_input_tokens: 987_264,
++        output_tokens: 18_345,
++        reasoning_output_tokens: 5_262,
++        total_tokens: 1_049_077,
++    };
++    let temp_dir = tempdir().expect("temp dir");
++    let rollout_path = temp_dir.path().join("rollout.jsonl");
++    std::fs::write(&rollout_path, "{}\n").expect("write rollout");
++
++    let summary = session_summary(
++        usage,
++        Some(ThreadId::new()),
++        /*thread_name*/ None,
++        Some(&rollout_path),
++    )
++    .expect("summary");
++    let usage_line = summary.usage_line.expect("usage line");
++
++    assert_eq!(
++        usage_line.to_string(),
++        "Token usage: total=61,813 input=43,468 (+ 987,264 cached, 95.8% hit) output=18,345 (reasoning 5,262)"
++    );
++    let hit_rate = usage_line
++        .spans
++        .iter()
++        .find(|span| span.content.as_ref() == "95.8% hit")
++        .expect("hit-rate span");
++    assert_eq!(hit_rate.style.fg, Some(ratatui::style::Color::Yellow));
++}
++
+ #[tokio::test]
+ async fn session_summary_names_picker_item_when_thread_has_name() {
+     let usage = TokenUsage {
+diff --git a/codex-rs/tui/src/main.rs b/codex-rs/tui/src/main.rs
+index d20139b42a..a9196a9efe 100644
+--- a/codex-rs/tui/src/main.rs
++++ b/codex-rs/tui/src/main.rs
+@@ -22,7 +22,10 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
+ 
+     let mut lines = Vec::new();
+     if !token_usage.is_zero() {
+-        lines.push(token_usage.to_string());
++        lines.push(format_token_usage_for_terminal(
++            token_usage.to_string(),
++            color_enabled,
++        ));
+     }
+ 
+     if let Some(resume_cmd) = resume_hint {
+@@ -46,6 +49,34 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
+     lines
+ }
+ 
++fn format_token_usage_for_terminal(text: String, color_enabled: bool) -> String {
++    if !color_enabled {
++        return text;
++    }
++    let Some(hit_suffix_start) = text.find("% hit") else {
++        return text;
++    };
++    let mut marker_start = hit_suffix_start;
++    while marker_start > 0 {
++        let byte = text.as_bytes()[marker_start - 1];
++        if byte.is_ascii_digit() || byte == b'.' {
++            marker_start -= 1;
++        } else {
++            break;
++        }
++    }
++    let marker_end = hit_suffix_start + "% hit".len();
++    if marker_start == hit_suffix_start {
++        return text;
++    }
++    format!(
++        "{}\u{1b}[33m{}\u{1b}[39m{}",
++        &text[..marker_start],
++        &text[marker_start..marker_end],
++        &text[marker_end..]
++    )
++}
++
+ #[derive(Parser, Debug)]
+ struct TopCli {
+     #[clap(flatten)]
+diff --git a/codex-rs/tui/src/token_usage.rs b/codex-rs/tui/src/token_usage.rs
+index f14b055499..d84f75af9c 100644
+--- a/codex-rs/tui/src/token_usage.rs
++++ b/codex-rs/tui/src/token_usage.rs
+@@ -76,10 +76,11 @@ impl fmt::Display for TokenUsage {
+             "Token usage: total={} input={}{} output={}{}",
+             format_with_separators(self.blended_total()),
+             format_with_separators(self.non_cached_input()),
+-            if self.cached_input() > 0 {
++            if let Some(cache_hit_rate) = self.cache_hit_rate_percent() {
+                 format!(
+-                    " (+ {} cached)",
+-                    format_with_separators(self.cached_input())
++                    " (+ {} cached, {:.1}% hit)",
++                    format_with_separators(self.cached_input()),
++                    cache_hit_rate
+                 )
+             } else {
+                 String::new()
+@@ -96,3 +97,42 @@ impl fmt::Display for TokenUsage {
+         )
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use pretty_assertions::assert_eq;
++
++    #[test]
++    fn token_usage_display_includes_cache_hit_rate() {
++        let usage = TokenUsage {
++            input_tokens: 1_030_732,
++            cached_input_tokens: 987_264,
++            output_tokens: 18_345,
++            reasoning_output_tokens: 5_262,
++            total_tokens: 1_049_077,
++        };
++
++        assert_eq!(
++            usage.to_string(),
++            "Token usage: total=61,813 input=43,468 (+ 987,264 cached, 95.8% hit) output=18,345 (reasoning 5,262)"
 +        );
 +    }
 +
 +    #[test]
-+    fn context_compaction_triggered_event_renders_separator_banner() {
-+        let cell = new_context_compaction_triggered_event(ContextCompactionTriggerUsage {
-+            used_tokens: Some(244_000),
-+            context_window: Some(258_000),
-+            auto_compact_limit: Some(220_000),
-+        });
-+        let rendered = cell.display_lines(100)[0].to_string();
++    fn cache_hit_rate_is_absent_without_cached_input() {
++        let usage = TokenUsage {
++            input_tokens: 100,
++            cached_input_tokens: 0,
++            output_tokens: 10,
++            reasoning_output_tokens: 0,
++            total_tokens: 110,
++        };
 +
-+        assert!(rendered.contains("Context compaction triggered"));
-+        assert!(rendered.contains("95% Used (244K tokens / 258K tokens)"));
-+        assert!(rendered.contains("Auto limit 220K tokens"));
-     }
- 
-     #[test]
-@@ -366,7 +492,7 @@ mod tests {
-         );
-         assert_eq!(
-             unknown.raw_lines()[0].to_string(),
--            "■ Context compacted · 512 tokens Used (window unknown)"
-+            "Context compacted ■ 512 tokens Used (window unknown)"
-         );
- 
-         let tiny = new_context_compacted_event(
-@@ -375,12 +501,12 @@ mod tests {
-         );
-         assert_eq!(
-             tiny.raw_lines()[0].to_string(),
--            "■ Context compacted · <1% Used (512 tokens)"
-+            "Context compacted ■ <1% Used (512 tokens)"
-         );
-     }
- 
-     #[test]
--    fn context_compacted_event_fills_render_area_background() {
-+    fn context_compacted_event_uses_separator_line_background() {
-         use crate::render::renderable::Renderable;
-         use ratatui::buffer::Buffer;
-         use ratatui::layout::Rect;
-@@ -395,8 +521,7 @@ mod tests {
- 
-         for x in 0..area.width {
-             let cell = buf.cell((x, 0)).expect("cell should exist");
--            assert_eq!(cell.bg, Color::Yellow);
--            assert_eq!(cell.fg, Color::Red);
-+            assert_ne!(cell.bg, Color::Yellow);
-         }
-     }
- }
++        assert_eq!(usage.cache_hit_rate_percent(), None);
++        assert_eq!(
++            usage.to_string(),
++            "Token usage: total=110 input=100 output=10"
++        );
++    }
++}

@@ -1,0 +1,218 @@
+diff --git a/codex-rs/app-server-daemon/src/client.rs b/codex-rs/app-server-daemon/src/client.rs
+index b926780f8d..ddc398e9e4 100644
+--- a/codex-rs/app-server-daemon/src/client.rs
++++ b/codex-rs/app-server-daemon/src/client.rs
+@@ -31,8 +31,8 @@ const INTERNAL_DAEMON_STATUS_METHOD: &str = "internal/daemon/status";
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub(crate) struct ProbeInfo {
+     pub(crate) app_server_version: String,
+-    pub(crate) active_client_count: usize,
+-    pub(crate) running_assistant_turn_count: usize,
++    pub(crate) active_client_count: Option<usize>,
++    pub(crate) running_assistant_turn_count: Option<usize>,
+ }
+ 
+ pub(crate) async fn probe(socket_path: &Path) -> Result<ProbeInfo> {
+@@ -57,18 +57,13 @@ async fn probe_inner(socket_path: &Path) -> Result<ProbeInfo> {
+     send_message(&mut websocket, &initialized)
+         .await
+         .context("failed to send initialized notification")?;
+-    let status = daemon_status(&mut websocket)
+-        .await
+-        .unwrap_or(DaemonStatusResponse {
+-            active_client_count: 0,
+-            running_assistant_turn_count: 0,
+-        });
++    let status = daemon_status(&mut websocket).await.ok();
+     websocket.close(None).await.ok();
+ 
+     Ok(ProbeInfo {
+         app_server_version: parse_version_from_user_agent(&initialize_response.user_agent)?,
+-        active_client_count: status.active_client_count,
+-        running_assistant_turn_count: status.running_assistant_turn_count,
++        active_client_count: status.as_ref().map(|status| status.active_client_count),
++        running_assistant_turn_count: status.map(|status| status.running_assistant_turn_count),
+     })
+ }
+ 
+diff --git a/codex-rs/app-server-daemon/src/lib.rs b/codex-rs/app-server-daemon/src/lib.rs
+index 862b46919f..3742bca65e 100644
+--- a/codex-rs/app-server-daemon/src/lib.rs
++++ b/codex-rs/app-server-daemon/src/lib.rs
+@@ -316,8 +316,8 @@ impl Daemon {
+                             Some(BackendKind::Pid),
+                             pid,
+                             Some(info.app_server_version),
+-                            Some(info.active_client_count),
+-                            Some(info.running_assistant_turn_count),
++                            info.active_client_count,
++                            info.running_assistant_turn_count,
+                         )
+                         .await);
+                 }
+@@ -334,8 +334,8 @@ impl Daemon {
+                             Some(BackendKind::Pid),
+                             pid,
+                             Some(info.app_server_version),
+-                            Some(info.active_client_count),
+-                            Some(info.running_assistant_turn_count),
++                            info.active_client_count,
++                            info.running_assistant_turn_count,
+                         )
+                         .await);
+                 }
+@@ -347,8 +347,8 @@ impl Daemon {
+                     self.running_backend(&settings).await?,
+                     /*pid*/ None,
+                     Some(info.app_server_version),
+-                    Some(info.active_client_count),
+-                    Some(info.running_assistant_turn_count),
++                    info.active_client_count,
++                    info.running_assistant_turn_count,
+                 )
+                 .await);
+         }
+@@ -361,8 +361,8 @@ impl Daemon {
+                     Some(BackendKind::Pid),
+                     /*pid*/ None,
+                     Some(info.app_server_version),
+-                    Some(info.active_client_count),
+-                    Some(info.running_assistant_turn_count),
++                    info.active_client_count,
++                    info.running_assistant_turn_count,
+                 )
+                 .await);
+         }
+@@ -376,8 +376,8 @@ impl Daemon {
+                 Some(BackendKind::Pid),
+                 pid,
+                 Some(info.app_server_version),
+-                Some(info.active_client_count),
+-                Some(info.running_assistant_turn_count),
++                info.active_client_count,
++                info.running_assistant_turn_count,
+             )
+             .await)
+     }
+@@ -405,8 +405,8 @@ impl Daemon {
+                 Some(BackendKind::Pid),
+                 pid,
+                 Some(info.app_server_version),
+-                Some(info.active_client_count),
+-                Some(info.running_assistant_turn_count),
++                info.active_client_count,
++                info.running_assistant_turn_count,
+             )
+             .await)
+     }
+@@ -501,8 +501,8 @@ impl Daemon {
+                 self.running_backend(&settings).await?,
+                 /*pid*/ None,
+                 Some(info.app_server_version),
+-                Some(info.active_client_count),
+-                Some(info.running_assistant_turn_count),
++                info.active_client_count,
++                info.running_assistant_turn_count,
+             )
+             .await)
+     }
+@@ -893,7 +893,8 @@ fn should_reexec_updater(
+ 
+ #[cfg(unix)]
+ fn should_restart_running_backend_for_start(info: &client::ProbeInfo) -> bool {
+-    info.active_client_count == 0 && info.running_assistant_turn_count == 0
++    info.active_client_count.unwrap_or(0) == 0
++        && info.running_assistant_turn_count.unwrap_or(0) == 0
+ }
+ 
+ fn ensure_running_version_is_current_for_attach(
+@@ -1108,8 +1109,8 @@ mod tests {
+     fn restart_decision_preserves_forced_refreshes() {
+         let current_info = ProbeInfo {
+             app_server_version: "0.1.0".to_string(),
+-            active_client_count: 1,
+-            running_assistant_turn_count: 0,
++            active_client_count: Some(1),
++            running_assistant_turn_count: Some(0),
+         };
+ 
+         assert_eq!(
+@@ -1144,18 +1145,18 @@ mod tests {
+     fn start_restarts_running_backend_only_when_idle_without_active_clients() {
+         let idle_no_active_clients = ProbeInfo {
+             app_server_version: "0.1.0".to_string(),
+-            active_client_count: 0,
+-            running_assistant_turn_count: 0,
++            active_client_count: Some(0),
++            running_assistant_turn_count: Some(0),
+         };
+         let detached_running_turn = ProbeInfo {
+             app_server_version: "0.1.0".to_string(),
+-            active_client_count: 0,
+-            running_assistant_turn_count: 1,
++            active_client_count: Some(0),
++            running_assistant_turn_count: Some(1),
+         };
+         let active_clients = ProbeInfo {
+             app_server_version: "0.1.0".to_string(),
+-            active_client_count: 1,
+-            running_assistant_turn_count: 0,
++            active_client_count: Some(1),
++            running_assistant_turn_count: Some(0),
+         };
+ 
+         assert_eq!(
+@@ -1172,8 +1173,8 @@ mod tests {
+     fn start_restarts_idle_backend_before_stale_attach_check() {
+         let idle_stale = ProbeInfo {
+             app_server_version: "0.1.0".to_string(),
+-            active_client_count: 0,
+-            running_assistant_turn_count: 0,
++            active_client_count: Some(0),
++            running_assistant_turn_count: Some(0),
+         };
+ 
+         assert!(
+@@ -1182,6 +1183,20 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn start_restarts_backend_when_client_counts_are_unknown() {
++        let unknown_counts = ProbeInfo {
++            app_server_version: "0.1.0".to_string(),
++            active_client_count: None,
++            running_assistant_turn_count: None,
++        };
++
++        assert!(
++            should_restart_running_backend_for_start(&unknown_counts),
++            "older daemons without client-count status should be replaced"
++        );
++    }
++
+     #[cfg(target_os = "linux")]
+     #[test]
+     fn linux_unix_socket_inode_parser_matches_exact_path() {
+@@ -1201,8 +1216,8 @@ mod tests {
+     fn start_refuses_active_stale_backend() {
+         let active_stale = ProbeInfo {
+             app_server_version: "0.1.0".to_string(),
+-            active_client_count: 1,
+-            running_assistant_turn_count: 0,
++            active_client_count: Some(1),
++            running_assistant_turn_count: Some(0),
+         };
+ 
+         let err = ensure_running_version_is_current_for_attach(&active_stale, Some("0.2.0"))
+@@ -1214,8 +1229,8 @@ mod tests {
+     fn start_refuses_stale_backend_with_running_turn() {
+         let running_turn_stale = ProbeInfo {
+             app_server_version: "0.1.0".to_string(),
+-            active_client_count: 0,
+-            running_assistant_turn_count: 1,
++            active_client_count: Some(0),
++            running_assistant_turn_count: Some(1),
+         };
+ 
+         let err = ensure_running_version_is_current_for_attach(&running_turn_stale, Some("0.2.0"))
