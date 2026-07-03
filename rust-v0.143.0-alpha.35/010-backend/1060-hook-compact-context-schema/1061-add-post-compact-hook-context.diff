@@ -1,0 +1,328 @@
+diff --git a/codex-rs/core/src/hook_runtime.rs b/codex-rs/core/src/hook_runtime.rs
+index 342e4d4b8f..99e07b6410 100644
+--- a/codex-rs/core/src/hook_runtime.rs
++++ b/codex-rs/core/src/hook_runtime.rs
+@@ -422,6 +422,7 @@ pub(crate) async fn run_post_compact_hooks(
+ 
+     let outcome = sess.hooks().run_post_compact(request).await;
+     emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
++    record_additional_contexts(sess, turn_context, outcome.additional_contexts).await;
+     if outcome.should_stop {
+         PostCompactHookOutcome::Stopped
+     } else {
+diff --git a/codex-rs/hooks/schema/generated/post-compact.command.output.schema.json b/codex-rs/hooks/schema/generated/post-compact.command.output.schema.json
+index 0221ac29b4..3acdddc6d9 100644
+--- a/codex-rs/hooks/schema/generated/post-compact.command.output.schema.json
++++ b/codex-rs/hooks/schema/generated/post-compact.command.output.schema.json
+@@ -1,11 +1,38 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "additionalProperties": false,
++  "definitions": {
++    "PostCompactHookSpecificOutputWire": {
++      "additionalProperties": false,
++      "properties": {
++        "additionalContext": {
++          "default": null,
++          "type": "string"
++        },
++        "hookEventName": {
++          "const": "PostCompact",
++          "type": "string"
++        }
++      },
++      "required": [
++        "hookEventName"
++      ],
++      "type": "object"
++    }
++  },
+   "properties": {
+     "continue": {
+       "default": true,
+       "type": "boolean"
+     },
++    "hookSpecificOutput": {
++      "allOf": [
++        {
++          "$ref": "#/definitions/PostCompactHookSpecificOutputWire"
++        }
++      ],
++      "default": null
++    },
+     "stopReason": {
+       "default": null,
+       "type": "string"
+diff --git a/codex-rs/hooks/src/engine/output_parser.rs b/codex-rs/hooks/src/engine/output_parser.rs
+index b4f214146a..038e26a7a6 100644
+--- a/codex-rs/hooks/src/engine/output_parser.rs
++++ b/codex-rs/hooks/src/engine/output_parser.rs
+@@ -70,6 +70,7 @@ pub(crate) struct PreCompactOutput {
+ #[derive(Debug, Clone)]
+ pub(crate) struct StatelessHookOutput {
+     pub universal: UniversalOutput,
++    pub additional_context: Option<String>,
+     pub invalid_reason: Option<String>,
+ }
+ 
+@@ -250,8 +251,12 @@ pub(crate) fn parse_pre_compact(stdout: &str) -> Option<PreCompactOutput> {
+ pub(crate) fn parse_post_compact(stdout: &str) -> Option<StatelessHookOutput> {
+     let wire: PostCompactCommandOutputWire = parse_json(stdout)?;
+     let universal = UniversalOutput::from(wire.universal);
++    let additional_context = wire
++        .hook_specific_output
++        .and_then(|output| output.additional_context);
+     Some(StatelessHookOutput {
+         universal,
++        additional_context,
+         invalid_reason: None,
+     })
+ }
+diff --git a/codex-rs/hooks/src/events/common.rs b/codex-rs/hooks/src/events/common.rs
+index 997eac139f..85a81087e1 100644
+--- a/codex-rs/hooks/src/events/common.rs
++++ b/codex-rs/hooks/src/events/common.rs
+@@ -8,6 +8,10 @@ use codex_protocol::protocol::HookRunSummary;
+ use crate::engine::ConfiguredHandler;
+ use crate::engine::dispatcher;
+ 
++const MAX_ADDITIONAL_CONTEXTS_FOR_MODEL: usize = 8;
++const MAX_ADDITIONAL_CONTEXT_CHARS: usize = 10_000;
++const ADDITIONAL_CONTEXT_TRUNCATED_MARKER: &str = "\n\n[additional context truncated]";
++
+ /// Identifies a thread-spawned subagent when a normal hook runs inside it.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct SubagentHookContext {
+@@ -39,7 +43,7 @@ pub(crate) fn append_additional_context(
+ ) {
+     entries.push(HookOutputEntry {
+         kind: HookOutputEntryKind::Context,
+-        text: additional_context.clone(),
++        text: bounded_additional_context(additional_context.clone()),
+     });
+     additional_contexts_for_model.push(additional_context);
+ }
+@@ -50,9 +54,23 @@ pub(crate) fn flatten_additional_contexts<'a>(
+     additional_contexts
+         .into_iter()
+         .flat_map(|chunk| chunk.iter().cloned())
++        .take(MAX_ADDITIONAL_CONTEXTS_FOR_MODEL)
+         .collect()
+ }
+ 
++fn bounded_additional_context(additional_context: String) -> String {
++    if additional_context.chars().count() <= MAX_ADDITIONAL_CONTEXT_CHARS {
++        return additional_context;
++    }
++
++    let mut truncated = additional_context
++        .chars()
++        .take(MAX_ADDITIONAL_CONTEXT_CHARS)
++        .collect::<String>();
++    truncated.push_str(ADDITIONAL_CONTEXT_TRUNCATED_MARKER);
++    truncated
++}
++
+ pub(crate) fn serialization_failure_hook_events(
+     handlers: Vec<ConfiguredHandler>,
+     turn_id: Option<String>,
+@@ -169,6 +187,11 @@ mod tests {
+     use codex_protocol::protocol::HookEventName;
+     use pretty_assertions::assert_eq;
+ 
++    use super::ADDITIONAL_CONTEXT_TRUNCATED_MARKER;
++    use super::MAX_ADDITIONAL_CONTEXT_CHARS;
++    use super::MAX_ADDITIONAL_CONTEXTS_FOR_MODEL;
++    use super::append_additional_context;
++    use super::flatten_additional_contexts;
+     use super::matcher_pattern_for_event;
+     use super::matches_matcher;
+     use super::validate_matcher_pattern;
+@@ -287,4 +310,35 @@ mod tests {
+             Some("manual|auto")
+         );
+     }
++
++    #[test]
++    fn additional_contexts_for_model_are_bounded() {
++        let mut entries = Vec::new();
++        let mut additional_contexts_for_model = Vec::new();
++        append_additional_context(
++            &mut entries,
++            &mut additional_contexts_for_model,
++            "x".repeat(MAX_ADDITIONAL_CONTEXT_CHARS + 1),
++        );
++
++        assert_eq!(entries.len(), 1);
++        assert!(
++            entries[0]
++                .text
++                .ends_with(ADDITIONAL_CONTEXT_TRUNCATED_MARKER)
++        );
++        assert_eq!(
++            additional_contexts_for_model[0],
++            "x".repeat(MAX_ADDITIONAL_CONTEXT_CHARS + 1)
++        );
++
++        let chunks = [
++            vec!["a".to_string(); MAX_ADDITIONAL_CONTEXTS_FOR_MODEL],
++            vec!["dropped".to_string()],
++        ];
++        assert_eq!(
++            flatten_additional_contexts(chunks.iter().map(Vec::as_slice)).len(),
++            MAX_ADDITIONAL_CONTEXTS_FOR_MODEL,
++        );
++    }
+ }
+diff --git a/codex-rs/hooks/src/events/compact.rs b/codex-rs/hooks/src/events/compact.rs
+index cb3080219a..1bbd8e509b 100644
+--- a/codex-rs/hooks/src/events/compact.rs
++++ b/codex-rs/hooks/src/events/compact.rs
+@@ -44,6 +44,7 @@ pub struct PostCompactRequest {
+ #[derive(Debug)]
+ pub struct StatelessHookOutcome {
+     pub hook_events: Vec<HookCompletedEvent>,
++    pub additional_contexts: Vec<String>,
+     pub should_stop: bool,
+     pub stop_reason: Option<String>,
+ }
+@@ -164,6 +165,7 @@ pub(crate) async fn run_post(
+     if matched.is_empty() {
+         return StatelessHookOutcome {
+             hook_events: Vec::new(),
++            additional_contexts: Vec::new(),
+             should_stop: false,
+             stop_reason: None,
+         };
+@@ -178,6 +180,7 @@ pub(crate) async fn run_post(
+                     Some(request.turn_id),
+                     format!("failed to serialize post compact hook input: {error}"),
+                 ),
++                additional_contexts: Vec::new(),
+                 should_stop: false,
+                 stop_reason: None,
+             };
+@@ -197,8 +200,14 @@ pub(crate) async fn run_post(
+     let stop_reason = results
+         .iter()
+         .find_map(|result| result.data.stop_reason.clone());
++    let additional_contexts = common::flatten_additional_contexts(
++        results
++            .iter()
++            .map(|result| result.data.additional_contexts_for_model.as_slice()),
++    );
+     StatelessHookOutcome {
+         hook_events: results.into_iter().map(|result| result.completed).collect(),
++        additional_contexts,
+         should_stop,
+         stop_reason,
+     }
+@@ -223,6 +232,7 @@ fn post_command_input_json(request: &PostCompactRequest) -> Result<String, serde
+ struct CompactHandlerData {
+     should_stop: bool,
+     stop_reason: Option<String>,
++    additional_contexts_for_model: Vec<String>,
+ }
+ 
+ fn parse_pre_completed(
+@@ -307,6 +317,7 @@ fn parse_pre_completed(
+         data: CompactHandlerData {
+             should_stop,
+             stop_reason,
++            additional_contexts_for_model: Vec::new(),
+         },
+         completion_order: 0,
+     }
+@@ -337,6 +348,7 @@ fn parse_completed(
+     let mut status = HookRunStatus::Completed;
+     let mut should_stop = false;
+     let mut stop_reason = None;
++    let mut additional_contexts_for_model = Vec::new();
+ 
+     match run_result.error.as_deref() {
+         Some(error) => {
+@@ -358,6 +370,13 @@ fn parse_completed(
+                         });
+                     }
+                     let _ = parsed.universal.suppress_output;
++                    if let Some(additional_context) = parsed.additional_context {
++                        common::append_additional_context(
++                            &mut entries,
++                            &mut additional_contexts_for_model,
++                            additional_context,
++                        );
++                    }
+                     if !parsed.universal.continue_processing {
+                         status = HookRunStatus::Stopped;
+                         should_stop = true;
+@@ -410,6 +429,7 @@ fn parse_completed(
+         data: CompactHandlerData {
+             should_stop,
+             stop_reason,
++            additional_contexts_for_model,
+         },
+         completion_order: 0,
+     }
+@@ -567,6 +587,32 @@ mod tests {
+         assert_eq!(parsed.completed.run.entries, Vec::new());
+     }
+ 
++    #[test]
++    fn post_compact_adds_hook_specific_context() {
++        let parsed = parse_post_completed(
++            &handler(HookEventName::PostCompact),
++            run_result(
++                Some(0),
++                r#"{"hookSpecificOutput":{"hookEventName":"PostCompact","additionalContext":"reload workflow execution surface"}}"#,
++                "",
++            ),
++            Some("turn-1".to_string()),
++        );
++
++        assert_eq!(parsed.completed.run.status, HookRunStatus::Completed);
++        assert_eq!(
++            parsed.completed.run.entries,
++            vec![HookOutputEntry {
++                kind: HookOutputEntryKind::Context,
++                text: "reload workflow execution surface".to_string(),
++            }]
++        );
++        assert_eq!(
++            parsed.data.additional_contexts_for_model,
++            vec!["reload workflow execution surface".to_string()]
++        );
++    }
++
+     fn pre_request() -> super::PreCompactRequest {
+         super::PreCompactRequest {
+             session_id: ThreadId::from_string("00000000-0000-4000-8000-000000000001")
+diff --git a/codex-rs/hooks/src/schema.rs b/codex-rs/hooks/src/schema.rs
+index d90d8a3e52..3f8976db83 100644
+--- a/codex-rs/hooks/src/schema.rs
++++ b/codex-rs/hooks/src/schema.rs
+@@ -176,6 +176,8 @@ pub(crate) struct PreCompactCommandOutputWire {
+ pub(crate) struct PostCompactCommandOutputWire {
+     #[serde(flatten)]
+     pub universal: HookUniversalOutputWire,
++    #[serde(default)]
++    pub hook_specific_output: Option<PostCompactHookSpecificOutputWire>,
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+@@ -212,6 +214,16 @@ pub(crate) struct PermissionRequestDecisionWire {
+     pub interrupt: bool,
+ }
+ 
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
++#[serde(rename_all = "camelCase")]
++#[serde(deny_unknown_fields)]
++pub(crate) struct PostCompactHookSpecificOutputWire {
++    #[schemars(schema_with = "post_compact_hook_event_name_schema")]
++    pub hook_event_name: HookEventNameWire,
++    #[serde(default)]
++    pub additional_context: Option<String>,
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+ pub(crate) enum PermissionRequestBehaviorWire {
+     #[serde(rename = "allow")]

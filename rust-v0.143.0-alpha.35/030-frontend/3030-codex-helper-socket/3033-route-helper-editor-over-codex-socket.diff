@@ -1,0 +1,212 @@
+diff --git a/codex-rs/tui/src/app/input.rs b/codex-rs/tui/src/app/input.rs
+index 5d891c128b..5d01d32610 100644
+--- a/codex-rs/tui/src/app/input.rs
++++ b/codex-rs/tui/src/app/input.rs
+@@ -8,6 +8,33 @@ use crate::app_backtrack::SIDE_EDIT_PREVIOUS_UNAVAILABLE_MESSAGE;
+ 
+ impl App {
+     pub(super) async fn launch_external_editor(&mut self, tui: &mut tui::Tui) {
++        let seed = self.chat_widget.composer_text_with_pending();
++        let session_id = self.chat_widget.thread_id().map(|id| id.to_string());
++        let helper_result = tui
++            .with_restored(tui::RestoreMode::KeepRaw, || async {
++                crate::codex_socket::edit_with_helper(&seed, session_id.as_deref()).await
++            })
++            .await;
++        match helper_result {
++            Ok(Some(new_text)) => {
++                self.reset_external_editor_state(tui);
++                self.chat_widget
++                    .apply_external_edit(new_text.trim_end().to_string());
++                tui.frame_requester().schedule_frame();
++                return;
++            }
++            Ok(None) => {}
++            Err(err) => {
++                self.reset_external_editor_state(tui);
++                self.chat_widget
++                    .add_to_history(history_cell::new_error_event(format!(
++                        "Failed to open helper editor: {err}",
++                    )));
++                tui.frame_requester().schedule_frame();
++                return;
++            }
++        }
++
+         let editor_cmd = match external_editor::resolve_editor_command() {
+             Ok(cmd) => cmd,
+             Err(external_editor::EditorError::MissingEditor) => {
+@@ -29,7 +56,6 @@ impl App {
+             }
+         };
+ 
+-        let seed = self.chat_widget.composer_text_with_pending();
+         let editor_result = tui
+             .with_restored(tui::RestoreMode::KeepRaw, || async {
+                 external_editor::run_editor(&seed, &editor_cmd).await
+diff --git a/codex-rs/tui/src/codex_socket.rs b/codex-rs/tui/src/codex_socket.rs
+index 6d01c094a3..6c91060a11 100644
+--- a/codex-rs/tui/src/codex_socket.rs
++++ b/codex-rs/tui/src/codex_socket.rs
+@@ -19,6 +19,7 @@ const SOCKET_IO_TIMEOUT: Duration = Duration::from_millis(500);
+ const CXU_RUNTIME_EPHEMERAL_ROOT_ENV: &str = "RUNTIME_EPHEMERAL_ROOT";
+ const CXU_RUNTIME_ROOT_NAME: &str = "cxu";
+ const CODEX_SOCKET_NAME: &str = "codex.sock";
++const CXU_EDITOR_DISABLED_ERROR: &str = "helper editor disabled";
+ 
+ #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+ struct CompletionPayload {
+@@ -44,6 +45,18 @@ struct CompletionPayload {
+     created_at: String,
+ }
+ 
++#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
++struct EditorPayload {
++    #[serde(rename = "Type")]
++    kind: &'static str,
++    #[serde(rename = "Source")]
++    source: &'static str,
++    #[serde(rename = "SessionID", skip_serializing_if = "Option::is_none")]
++    session_id: Option<String>,
++    #[serde(rename = "Seed")]
++    seed: String,
++}
++
+ #[derive(Debug, Deserialize)]
+ struct CodexSocketResponse {
+     #[serde(rename = "OK")]
+@@ -65,6 +78,40 @@ pub(crate) fn notify_turn_completed(notification: &TurnCompletedNotification, wo
+     });
+ }
+ 
++pub(crate) async fn edit_with_helper(
++    seed: &str,
++    session_id: Option<&str>,
++) -> Result<Option<String>, String> {
++    let payload = EditorPayload {
++        kind: "Editor",
++        source: "codex",
++        session_id: session_id.map(str::to_string),
++        seed: seed.to_string(),
++    };
++    let response = tokio::task::spawn_blocking(move || {
++        send_payload_to_path_with_read_timeout(&payload, &codex_socket_path(), None)
++    })
++    .await
++    .map_err(|err| err.to_string())?;
++
++    match response {
++        Ok(response) => editor_response_content(response),
++        Err(err) if is_helper_unavailable(&err) => Ok(None),
++        Err(err) => Err(err),
++    }
++}
++
++fn editor_response_content(response: CodexSocketResponse) -> Result<Option<String>, String> {
++    let content = response
++        .content
++        .ok_or_else(|| "codex helper editor response did not include Content".to_string())?;
++    if content.is_empty() {
++        Ok(None)
++    } else {
++        Ok(Some(content))
++    }
++}
++
+ fn codex_socket_path() -> PathBuf {
+     std::env::var_os(CXU_RUNTIME_EPHEMERAL_ROOT_ENV)
+         .filter(|value| !value.is_empty())
+@@ -196,6 +243,7 @@ fn is_helper_unavailable(err: &str) -> bool {
+     err.contains("No such file or directory")
+         || err.contains("Connection refused")
+         || err.contains("codex helper socket is only supported on Unix")
++        || err.contains(CXU_EDITOR_DISABLED_ERROR)
+ }
+ 
+ #[cfg(test)]
+@@ -204,6 +252,12 @@ mod tests {
+     use codex_app_server_protocol::Turn;
+     use codex_app_server_protocol::TurnItemsView;
+     use serial_test::serial;
++    #[cfg(unix)]
++    use std::os::unix::net::UnixListener;
++    #[cfg(unix)]
++    use std::thread;
++    #[cfg(unix)]
++    use tempfile::TempDir;
+ 
+     fn notification(
+         status: TurnStatus,
+@@ -278,6 +332,35 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn editor_payload_serializes_transport_schema_without_editor_details() {
++        let payload = EditorPayload {
++            kind: "Editor",
++            source: "codex",
++            session_id: Some("123e4567-e89b-12d3-a456-426614174000".to_string()),
++            seed: "draft".to_string(),
++        };
++
++        let json = serde_json::to_value(payload).expect("serialize");
++        assert_eq!(json["Type"], "Editor");
++        assert_eq!(json["Source"], "codex");
++        assert_eq!(json["SessionID"], "123e4567-e89b-12d3-a456-426614174000");
++        assert_eq!(json["Seed"], "draft");
++        assert!(json.get("Editor").is_none());
++        assert!(json.get("Display").is_none());
++    }
++
++    #[test]
++    fn empty_helper_editor_content_falls_back_to_default_editor() {
++        let response = CodexSocketResponse {
++            ok: true,
++            error: None,
++            content: Some(String::new()),
++        };
++
++        assert_eq!(editor_response_content(response).expect("response"), None);
++    }
++
+     #[test]
+     fn socket_path_uses_system_temp_root() {
+         let path = codex_socket_path();
+@@ -301,6 +384,36 @@ mod tests {
+         assert_eq!(path, Path::new("/tmp/custom-cxu").join("codex.sock"));
+     }
+ 
++    #[cfg(unix)]
++    #[test]
++    fn editor_socket_read_waits_for_helper_response() {
++        let temp_dir = TempDir::new().expect("temp dir");
++        let socket_path = temp_dir.path().join("codex.sock");
++        let listener = UnixListener::bind(&socket_path).expect("bind");
++        let handle = thread::spawn(move || {
++            let (mut stream, _) = listener.accept().expect("accept");
++            let mut request = String::new();
++            stream.read_to_string(&mut request).expect("read request");
++            assert!(request.contains("\"Type\":\"Editor\""));
++            thread::sleep(SOCKET_IO_TIMEOUT + Duration::from_millis(200));
++            stream
++                .write_all(br#"{"OK":true,"Content":"edited"}"#)
++                .expect("write response");
++        });
++        let payload = EditorPayload {
++            kind: "Editor",
++            source: "codex",
++            session_id: None,
++            seed: "draft".to_string(),
++        };
++
++        let response =
++            send_payload_to_path_with_read_timeout(&payload, &socket_path, None).expect("response");
++
++        assert_eq!(response.content.as_deref(), Some("edited"));
++        handle.join().expect("server thread");
++    }
++
+     #[test]
+     fn positive_turn_id_handles_numeric_tail_and_hash_fallback() {
+         assert_eq!(positive_turn_id("42"), 42);

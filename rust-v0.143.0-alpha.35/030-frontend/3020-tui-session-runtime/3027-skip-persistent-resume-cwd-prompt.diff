@@ -1,0 +1,519 @@
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index 3c8ff2f4c8..57ff18f524 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -5321,6 +5321,7 @@ fn session_start_error_surfaces_archived_guidance_without_rollout_path() {
+             "/Users/me/.codex/archived_sessions/rollout.jsonl",
+         )),
+         thread_id,
++        status: None,
+     };
+     let expected = format!(
+         "session {thread_id} is archived. Run `codex unarchive {thread_id}` to unarchive it first."
+diff --git a/codex-rs/tui/src/app/tests/startup.rs b/codex-rs/tui/src/app/tests/startup.rs
+index 3d9b199d78..87ad6d454a 100644
+--- a/codex-rs/tui/src/app/tests/startup.rs
++++ b/codex-rs/tui/src/app/tests/startup.rs
+@@ -19,6 +19,7 @@ fn startup_waiting_gate_is_only_for_fresh_or_exit_session_selection() {
+             crate::resume_picker::SessionTarget {
+                 path: Some(PathBuf::from("/tmp/restore")),
+                 thread_id: ThreadId::new(),
++                status: None,
+             }
+         )),
+         false
+@@ -28,6 +29,7 @@ fn startup_waiting_gate_is_only_for_fresh_or_exit_session_selection() {
+             crate::resume_picker::SessionTarget {
+                 path: Some(PathBuf::from("/tmp/fork")),
+                 thread_id: ThreadId::new(),
++                status: None,
+             }
+         )),
+         false
+@@ -39,10 +41,12 @@ fn startup_paused_goal_prompt_gate_is_only_for_quiet_resume() {
+     let resume = SessionSelection::Resume(crate::resume_picker::SessionTarget {
+         path: Some(PathBuf::from("/tmp/restore")),
+         thread_id: ThreadId::new(),
++        status: None,
+     });
+     let fork = SessionSelection::Fork(crate::resume_picker::SessionTarget {
+         path: Some(PathBuf::from("/tmp/fork")),
+         thread_id: ThreadId::new(),
++        status: None,
+     });
+     let no_images: Vec<PathBuf> = Vec::new();
+     let initial_images = vec![PathBuf::from("/tmp/image.png")];
+@@ -111,6 +115,7 @@ fn startup_waiting_gate_not_applied_for_resume_or_fork_session_selection() {
+         crate::resume_picker::SessionTarget {
+             path: Some(PathBuf::from("/tmp/restore")),
+             thread_id: ThreadId::new(),
++            status: None,
+         },
+     ));
+     assert_eq!(
+@@ -124,6 +129,7 @@ fn startup_waiting_gate_not_applied_for_resume_or_fork_session_selection() {
+         crate::resume_picker::SessionTarget {
+             path: Some(PathBuf::from("/tmp/fork")),
+             thread_id: ThreadId::new(),
++            status: None,
+         },
+     ));
+     assert_eq!(
+@@ -268,6 +274,7 @@ async fn ignore_same_thread_resume_reports_noop_for_current_thread() {
+     let ignored = app.ignore_same_thread_resume(&crate::resume_picker::SessionTarget {
+         path: Some(test_path_buf("/tmp/project")),
+         thread_id,
++        status: None,
+     });
+ 
+     assert!(ignored);
+@@ -292,6 +299,7 @@ async fn ignore_same_thread_resume_allows_reattaching_displayed_inactive_thread(
+     let ignored = app.ignore_same_thread_resume(&crate::resume_picker::SessionTarget {
+         path: Some(test_path_buf("/tmp/project")),
+         thread_id,
++        status: None,
+     });
+ 
+     assert!(!ignored);
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index 34b226c73b..e58ae38027 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -38,6 +38,7 @@ use codex_app_server_protocol::ThreadListCwdFilter;
+ use codex_app_server_protocol::ThreadListParams;
+ use codex_app_server_protocol::ThreadSortKey as AppServerThreadSortKey;
+ use codex_app_server_protocol::ThreadSourceKind;
++use codex_app_server_protocol::ThreadStatus;
+ use codex_cloud_config::cloud_config_bundle_loader_for_storage;
+ use codex_config::CloudConfigBundleLoader;
+ use codex_config::ConfigLoadError;
+@@ -579,6 +580,7 @@ fn session_target_from_app_server_thread(
+         Ok(thread_id) => Some(resume_picker::SessionTarget {
+             path: thread.path,
+             thread_id,
++            status: Some(thread.status),
+         }),
+         Err(err) => {
+             warn!(
+@@ -788,6 +790,40 @@ fn latest_session_cwd_filter<'a>(
+     }
+ }
+ 
++fn is_active_app_server_resume(
++    app_server_target: &AppServerTarget,
++    session_selection: &resume_picker::SessionSelection,
++) -> bool {
++    is_persistent_app_server_resume(app_server_target, session_selection)
++        && matches!(
++            session_selection,
++            resume_picker::SessionSelection::Resume(resume_picker::SessionTarget {
++                status: Some(ThreadStatus::Active { .. }),
++                ..
++            })
++        )
++}
++
++fn is_persistent_app_server_resume(
++    app_server_target: &AppServerTarget,
++    session_selection: &resume_picker::SessionSelection,
++) -> bool {
++    !matches!(app_server_target, AppServerTarget::Embedded)
++        && matches!(
++            session_selection,
++            resume_picker::SessionSelection::Resume(_)
++        )
++}
++
++fn persistent_app_server_resume_fallback_cwd(
++    app_server_target: &AppServerTarget,
++    session_selection: &resume_picker::SessionSelection,
++    current_cwd: &Path,
++) -> Option<PathBuf> {
++    is_active_app_server_resume(app_server_target, session_selection)
++        .then(|| current_cwd.to_path_buf())
++}
++
+ fn app_server_target_for_launch(
+     explicit_remote_endpoint: Option<RemoteAppServerEndpoint>,
+     explicit_remote_endpoint_is_default_local_daemon: bool,
+@@ -1628,9 +1664,17 @@ async fn run_ratatui_app(
+         }
+         _ => None,
+     };
++    let is_persistent_resume =
++        is_persistent_app_server_resume(&app_server_target, &session_selection);
+     let fallback_cwd = match action_and_target_session_if_resume_or_fork {
+         Some((action, target_session)) => {
+-            if uses_remote_workspace {
++            if let Some(cwd) = persistent_app_server_resume_fallback_cwd(
++                &app_server_target,
++                &session_selection,
++                current_cwd.as_path(),
++            ) {
++                Some(cwd)
++            } else if uses_remote_workspace {
+                 Some(current_cwd.to_path_buf())
+             } else {
+                 match resolve_cwd_for_resume_or_fork(
+@@ -1764,11 +1808,6 @@ async fn run_ratatui_app(
+ 
+     // Persistent app-server resumes may attach to an already-running thread,
+     // where resume config overrides are ignored.
+-    let is_persistent_resume = !matches!(&app_server_target, AppServerTarget::Embedded)
+-        && matches!(
+-            &session_selection,
+-            resume_picker::SessionSelection::Resume(_)
+-        );
+     let bypass_hook_trust_for_startup_review = config.bypass_hook_trust && !is_persistent_resume;
+     let hooks_request_handle = app_server.request_handle();
+     let hooks_cwd = config.cwd.to_path_buf();
+@@ -2187,6 +2226,7 @@ mod tests {
+         let target = crate::resume_picker::SessionTarget {
+             path: None,
+             thread_id,
++            status: None,
+         };
+ 
+         assert_eq!(target.display_label(), format!("thread {thread_id}"));
+@@ -2474,6 +2514,56 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[test]
++    fn active_app_server_resume_skips_cwd_prompt() -> color_eyre::Result<()> {
++        let active_session = resume_picker::SessionTarget {
++            path: Some(PathBuf::from(
++                "/tmp/codex/sessions/2026/06/05/rollout.jsonl",
++            )),
++            thread_id: ThreadId::new(),
++            status: Some(ThreadStatus::Active {
++                active_flags: Vec::new(),
++            }),
++        };
++        let idle_session = resume_picker::SessionTarget {
++            path: None,
++            thread_id: ThreadId::new(),
++            status: Some(ThreadStatus::Idle),
++        };
++        let current_cwd = PathBuf::from("/workspace/project");
++        let local_daemon = AppServerTarget::LocalDaemon {
++            endpoint: RemoteAppServerEndpoint::UnixSocket {
++                socket_path: AbsolutePathBuf::relative_to_current_dir("codex.sock")?,
++            },
++        };
++
++        assert!(is_active_app_server_resume(
++            &local_daemon,
++            &resume_picker::SessionSelection::Resume(active_session.clone())
++        ));
++        assert_eq!(
++            persistent_app_server_resume_fallback_cwd(
++                &local_daemon,
++                &resume_picker::SessionSelection::Resume(active_session.clone()),
++                current_cwd.as_path()
++            ),
++            Some(current_cwd.clone())
++        );
++        assert!(!is_active_app_server_resume(
++            &local_daemon,
++            &resume_picker::SessionSelection::Resume(idle_session)
++        ));
++        assert!(!is_active_app_server_resume(
++            &AppServerTarget::Embedded,
++            &resume_picker::SessionSelection::Resume(active_session.clone())
++        ));
++        assert!(!is_active_app_server_resume(
++            &local_daemon,
++            &resume_picker::SessionSelection::Fork(active_session)
++        ));
++        Ok(())
++    }
++
+     #[tokio::test]
+     async fn latest_session_lookup_params_omit_local_filters_for_remote_sessions()
+     -> std::io::Result<()> {
+diff --git a/codex-rs/tui/src/resume_picker.rs b/codex-rs/tui/src/resume_picker.rs
+index 43220d4d9b..fc6c0ba1de 100644
+--- a/codex-rs/tui/src/resume_picker.rs
++++ b/codex-rs/tui/src/resume_picker.rs
+@@ -38,6 +38,7 @@ use codex_app_server_protocol::ThreadItem;
+ use codex_app_server_protocol::ThreadListCwdFilter;
+ use codex_app_server_protocol::ThreadListParams;
+ use codex_app_server_protocol::ThreadSortKey;
++use codex_app_server_protocol::ThreadStatus;
+ use codex_config::types::SessionPickerViewMode;
+ use codex_protocol::ThreadId;
+ use codex_utils_path as path_utils;
+@@ -82,6 +83,7 @@ const PICKER_LIST_HORIZONTAL_INSET: u16 = 4;
+ pub struct SessionTarget {
+     pub path: Option<PathBuf>,
+     pub thread_id: ThreadId,
++    pub status: Option<ThreadStatus>,
+ }
+ 
+ impl SessionTarget {
+@@ -128,8 +130,17 @@ impl SessionPickerAction {
+         }
+     }
+ 
+-    fn selection(self, path: Option<PathBuf>, thread_id: ThreadId) -> SessionSelection {
+-        let target_session = SessionTarget { path, thread_id };
++    fn selection(
++        self,
++        path: Option<PathBuf>,
++        thread_id: ThreadId,
++        status: Option<ThreadStatus>,
++    ) -> SessionSelection {
++        let target_session = SessionTarget {
++            path,
++            thread_id,
++            status,
++        };
+         match self {
+             SessionPickerAction::Resume => SessionSelection::Resume(target_session),
+             SessionPickerAction::Fork => SessionSelection::Fork(target_session),
+@@ -832,6 +843,7 @@ struct Row {
+     path: Option<PathBuf>,
+     preview: String,
+     thread_id: Option<ThreadId>,
++    status: Option<ThreadStatus>,
+     thread_name: Option<String>,
+     created_at: Option<DateTime<Utc>>,
+     updated_at: Option<DateTime<Utc>>,
+@@ -1118,7 +1130,11 @@ impl PickerState {
+                         },
+                     };
+                     if let Some(thread_id) = thread_id {
+-                        return Ok(Some(self.action.selection(path, thread_id)));
++                        return Ok(Some(self.action.selection(
++                            path,
++                            thread_id,
++                            row.status.clone(),
++                        )));
+                     }
+                     self.inline_error = Some(match path {
+                         Some(path) => {
+@@ -1793,6 +1809,7 @@ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
+             preview.to_string()
+         },
+         thread_id: Some(thread_id),
++        status: Some(thread.status),
+         thread_name: thread.name,
+         created_at: chrono::DateTime::from_timestamp(thread.created_at, 0)
+             .map(|dt| dt.with_timezone(&Utc)),
+@@ -3243,6 +3260,7 @@ mod tests {
+             path: Some(PathBuf::from(path)),
+             preview: preview.to_string(),
+             thread_id: None,
++            status: None,
+             thread_name: None,
+             created_at: Some(timestamp),
+             updated_at: Some(timestamp),
+@@ -3289,6 +3307,7 @@ mod tests {
+             path: Some(PathBuf::from("/tmp/a.jsonl")),
+             preview: String::from("first message"),
+             thread_id: None,
++            status: None,
+             thread_name: Some(String::from("My session")),
+             created_at: None,
+             updated_at: None,
+@@ -3329,6 +3348,7 @@ mod tests {
+             path: Some(PathBuf::from("/tmp/a.jsonl")),
+             preview: String::from("first message"),
+             thread_id: Some(thread_id),
++            status: None,
+             thread_name: Some(String::from("My session")),
+             created_at: None,
+             updated_at: None,
+@@ -3389,6 +3409,7 @@ mod tests {
+             path: Some(PathBuf::from("/tmp/a.jsonl")),
+             preview: String::from("first message"),
+             thread_id: Some(thread_id),
++            status: None,
+             thread_name: Some(String::from("feat(tui): add raw scrollback mode")),
+             created_at: parse_timestamp_str("2026-05-02T14:31:08Z"),
+             updated_at: parse_timestamp_str("2026-05-02T14:48:19Z"),
+@@ -3599,6 +3620,7 @@ mod tests {
+             path: None,
+             preview: String::from("remote session"),
+             thread_id: Some(ThreadId::new()),
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -3624,6 +3646,7 @@ mod tests {
+             path: None,
+             preview: String::from("remote session"),
+             thread_id: Some(ThreadId::new()),
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -3655,6 +3678,7 @@ mod tests {
+                 path: Some(PathBuf::from("/tmp/a.jsonl")),
+                 preview: String::from("Fix resume picker timestamps"),
+                 thread_id: None,
++                status: None,
+                 thread_name: None,
+                 created_at: Some(now - Duration::minutes(16)),
+                 updated_at: Some(now - Duration::seconds(42)),
+@@ -3665,6 +3689,7 @@ mod tests {
+                 path: Some(PathBuf::from("/tmp/b.jsonl")),
+                 preview: String::from("Investigate lazy pagination cap"),
+                 thread_id: None,
++                status: None,
+                 thread_name: None,
+                 created_at: Some(now - Duration::hours(1)),
+                 updated_at: Some(now - Duration::minutes(35)),
+@@ -3675,6 +3700,7 @@ mod tests {
+                 path: Some(PathBuf::from("/tmp/c.jsonl")),
+                 preview: String::from("Explain the codebase"),
+                 thread_id: None,
++                status: None,
+                 thread_name: None,
+                 created_at: Some(now - Duration::hours(2)),
+                 updated_at: Some(now - Duration::hours(2)),
+@@ -4103,6 +4129,7 @@ mod tests {
+             path: None,
+             preview: String::from("preview"),
+             thread_id: Some(thread_id),
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -4141,6 +4168,7 @@ mod tests {
+                 path: None,
+                 preview: String::from("one"),
+                 thread_id: Some(ThreadId::new()),
++                status: None,
+                 thread_name: None,
+                 created_at: None,
+                 updated_at: None,
+@@ -4151,6 +4179,7 @@ mod tests {
+                 path: None,
+                 preview: String::from("two"),
+                 thread_id: Some(ThreadId::new()),
++                status: None,
+                 thread_name: None,
+                 created_at: None,
+                 updated_at: None,
+@@ -4220,6 +4249,7 @@ mod tests {
+                 path: None,
+                 preview: String::from("Find pending threads and emails"),
+                 thread_id: Some(thread_id),
++                status: None,
+                 thread_name: None,
+                 created_at: None,
+                 updated_at: None,
+@@ -4230,6 +4260,7 @@ mod tests {
+                 path: None,
+                 preview: String::from("Plan raw scrollback mode"),
+                 thread_id: Some(ThreadId::new()),
++                status: None,
+                 thread_name: None,
+                 created_at: None,
+                 updated_at: None,
+@@ -4285,6 +4316,7 @@ mod tests {
+             path: None,
+             preview: String::from("preview"),
+             thread_id: Some(thread_id),
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -4315,6 +4347,7 @@ mod tests {
+             path: Some(PathBuf::from("/tmp/a.jsonl")),
+             preview: String::from("preview"),
+             thread_id: None,
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -4391,6 +4424,7 @@ mod tests {
+             path: None,
+             preview: String::from("preview"),
+             thread_id: Some(thread_id),
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -4555,6 +4589,7 @@ session_picker_view = "dense"
+             path: None,
+             preview: String::from("preview"),
+             thread_id: Some(thread_id),
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -4594,6 +4629,7 @@ session_picker_view = "dense"
+             path: None,
+             preview: String::from("preview"),
+             thread_id: Some(thread_id),
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -4670,6 +4706,7 @@ session_picker_view = "dense"
+             thread_id: Some(
+                 ThreadId::from_string("019dabc1-0ef5-7431-b81c-03037f51f62c").expect("thread id"),
+             ),
++            status: None,
+             thread_name: None,
+             created_at: parse_timestamp_str("2026-04-28T16:30:00Z"),
+             updated_at: parse_timestamp_str("2026-04-28T17:45:00Z"),
+@@ -4924,6 +4961,7 @@ session_picker_view = "dense"
+             path: Some(PathBuf::from("/tmp/a.jsonl")),
+             preview: String::from("Investigate picker expansion"),
+             thread_id: Some(thread_id),
++            status: None,
+             thread_name: None,
+             created_at: parse_timestamp_str("2026-04-28T16:30:00Z"),
+             updated_at: parse_timestamp_str("2026-04-28T17:45:00Z"),
+@@ -4993,6 +5031,7 @@ session_picker_view = "dense"
+             thread_id: Some(
+                 ThreadId::from_string("019dabc1-0ef5-7431-b81c-03037f51f62c").expect("thread id"),
+             ),
++            status: None,
+             thread_name: None,
+             created_at: parse_timestamp_str("2026-04-28T16:30:00Z"),
+             updated_at: parse_timestamp_str("2026-04-28T17:45:00Z"),
+@@ -5051,6 +5090,7 @@ session_picker_view = "dense"
+                 path: Some(PathBuf::from(format!("/tmp/{idx}.jsonl"))),
+                 preview: format!("item-{idx}"),
+                 thread_id: None,
++                status: None,
+                 thread_name: None,
+                 created_at: Some(now - Duration::hours(idx)),
+                 updated_at: Some(now - Duration::minutes(idx * 5)),
+@@ -5103,6 +5143,7 @@ session_picker_view = "dense"
+                 path: Some(PathBuf::from(format!("/tmp/{idx}.jsonl"))),
+                 preview: format!("item-{idx}"),
+                 thread_id: None,
++                status: None,
+                 thread_name: None,
+                 created_at: Some(now - Duration::hours(idx)),
+                 updated_at: Some(now - Duration::minutes(idx * 5)),
+@@ -5654,6 +5695,7 @@ session_picker_view = "dense"
+             path: Some(PathBuf::from("/tmp/missing.jsonl")),
+             preview: String::from("missing metadata"),
+             thread_id: None,
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -5693,6 +5735,7 @@ session_picker_view = "dense"
+             path: None,
+             preview: String::from("pathless thread"),
+             thread_id: Some(thread_id),
++            status: None,
+             thread_name: None,
+             created_at: None,
+             updated_at: None,
+@@ -5711,6 +5754,7 @@ session_picker_view = "dense"
+             Some(SessionSelection::Resume(SessionTarget {
+                 path: None,
+                 thread_id: selected_thread_id,
++                status: None,
+             })) => assert_eq!(selected_thread_id, thread_id),
+             other => panic!("unexpected selection: {other:?}"),
+         }

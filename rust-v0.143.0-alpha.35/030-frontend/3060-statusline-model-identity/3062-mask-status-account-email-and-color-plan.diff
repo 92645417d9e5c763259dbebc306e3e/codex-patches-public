@@ -1,0 +1,408 @@
+diff --git a/codex-rs/tui/src/chatwidget/input_submission.rs b/codex-rs/tui/src/chatwidget/input_submission.rs
+index ef5ea9bd2d..ddc59bc5b4 100644
+--- a/codex-rs/tui/src/chatwidget/input_submission.rs
++++ b/codex-rs/tui/src/chatwidget/input_submission.rs
+@@ -366,13 +366,15 @@ impl ChatWidget {
+             .filter(|_| self.current_model_supports_personality());
+         let service_tier = self.service_tier_update_for_core();
+         let active_permission_profile = self.config.permissions.active_permission_profile();
++        let submitted_model = effective_mode.model().to_string();
++        let submitted_effort = effective_mode.reasoning_effort();
+         let op = AppCommand::user_turn(
+             items,
+             self.config.cwd.to_path_buf(),
+             AskForApproval::from(self.config.permissions.approval_policy.value()),
+             active_permission_profile,
+-            effective_mode.model().to_string(),
+-            effective_mode.reasoning_effort(),
++            submitted_model.clone(),
++            submitted_effort.clone(),
+             /*summary*/ None,
+             service_tier,
+             /*final_output_json_schema*/ None,
+@@ -387,9 +389,10 @@ impl ChatWidget {
+         if render_in_history {
+             self.input_queue.user_turn_pending_start = true;
+             self.input_queue.submitted_turn_context = Some(SubmittedTurnContext {
+-                model: effective_mode.model().to_string(),
+-                reasoning_effort: effective_mode.reasoning_effort(),
++                model: submitted_model,
++                reasoning_effort: submitted_effort,
+             });
++            self.refresh_model_dependent_surfaces();
+         }
+ 
+         // Persist the submitted text to cross-session message history. Mentions are encoded into
+diff --git a/codex-rs/tui/src/chatwidget/session_flow.rs b/codex-rs/tui/src/chatwidget/session_flow.rs
+index 6d913a21a5..b53ecf80d5 100644
+--- a/codex-rs/tui/src/chatwidget/session_flow.rs
++++ b/codex-rs/tui/src/chatwidget/session_flow.rs
+@@ -28,6 +28,7 @@ impl ChatWidget {
+         self.refresh_plan_mode_nudge();
+         self.turn_lifecycle.reset_thread();
+         self.clear_safety_buffering();
++        self.input_queue.submitted_turn_context = None;
+         self.thread_name = session.thread_name.clone();
+         self.current_goal_status_indicator = None;
+         self.current_goal_status = None;
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 5a692fceaf..7d5e384d88 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -924,13 +924,22 @@ impl ChatWidget {
+     }
+ 
+     fn model_with_reasoning_display_name(&self) -> String {
++        let fallback_effort;
+         let (model, reasoning_effort) =
+             if let Some(context) = self.input_queue.submitted_turn_context.as_ref() {
+-                (context.model.as_str(), context.reasoning_effort.clone())
++                (context.model.as_str(), context.reasoning_effort.as_ref())
+             } else {
+-                (self.model_display_name(), self.effective_reasoning_effort())
++                fallback_effort = self.effective_reasoning_effort();
++                (self.model_display_name(), fallback_effort.as_ref())
+             };
+-        let label = Self::status_line_reasoning_effort_label(reasoning_effort.as_ref());
++        let reasoning_label = reasoning_effort
++            .map(|effort| {
++                format!(
++                    " {}",
++                    Self::status_line_reasoning_effort_label(Some(effort))
++                )
++            })
++            .unwrap_or_default();
+         let service_tier_label = self
+             .current_service_tier()
+             .and_then(|service_tier| {
+@@ -942,7 +951,7 @@ impl ChatWidget {
+             .filter(|_| self.has_chatgpt_account)
+             .map(|tier| format!(" {tier}"))
+             .unwrap_or_default();
+-        format!("{model} {label}{service_tier_label}")
++        format!("{model}{reasoning_label}{service_tier_label}")
+     }
+ 
+     fn model_display_line(&self) -> Line<'static> {
+@@ -964,7 +973,6 @@ impl ChatWidget {
+             fallback_effort = self.effective_reasoning_effort();
+             (self.model_display_name(), fallback_effort.as_ref())
+         };
+-        let label = Self::status_line_reasoning_effort_label(effort);
+         let service_tier_label = self
+             .current_service_tier()
+             .and_then(|service_tier| {
+@@ -976,11 +984,12 @@ impl ChatWidget {
+             .filter(|_| self.has_chatgpt_account)
+             .map(|tier| format!(" {tier}"))
+             .unwrap_or_default();
+-        let mut line = Line::from(vec![
+-            Span::styled(model.to_string(), model_style(model)),
+-            " ".into(),
+-        ]);
+-        line.extend(Self::status_line_reasoning_effort_line(label, effort).spans);
++        let mut line = Line::from(vec![Span::styled(model.to_string(), model_style(model))]);
++        if let Some(effort) = effort {
++            let label = Self::status_line_reasoning_effort_label(Some(effort));
++            line.spans.push(" ".into());
++            line.extend(Self::status_line_reasoning_effort_line(label, Some(effort)).spans);
++        }
+         line.spans.push(Span::from(service_tier_label));
+         line
+     }
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index 89e7bbfdc2..c3ad5d73bc 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -2815,6 +2815,19 @@ async fn status_line_model_with_reasoning_includes_fast_for_fast_capable_models(
+     );
+ }
+ 
++#[tokio::test]
++async fn status_line_model_with_reasoning_omits_unknown_reasoning() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.5")).await;
++    chat.config.tui_status_line = Some(vec!["model-with-reasoning".to_string()]);
++    chat.input_queue.submitted_turn_context = Some(crate::chatwidget::input_queue::SubmittedTurnContext {
++        model: "gpt-5.5".to_string(),
++        reasoning_effort: None,
++    });
++    chat.refresh_status_line();
++
++    assert_eq!(status_line_text(&chat), Some("gpt-5.5".to_string()));
++}
++
+ #[tokio::test]
+ async fn terminal_title_model_updates_on_model_change_without_manual_refresh() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+index a86292f688..c8d06e7cc4 100644
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -56,6 +56,7 @@ impl ChatWidget {
+ 
+     pub(super) fn on_task_started_at(&mut self, started_at: Option<Instant>) {
+         self.input_queue.user_turn_pending_start = false;
++        self.input_queue.submitted_turn_context = None;
+         self.reset_safety_buffering_for_turn_start();
+         let started_at = started_at.unwrap_or_else(Instant::now);
+         self.turn_lifecycle.start(started_at);
+diff --git a/codex-rs/tui/src/history_cell/session.rs b/codex-rs/tui/src/history_cell/session.rs
+index d14c515c38..448c56e905 100644
+--- a/codex-rs/tui/src/history_cell/session.rs
++++ b/codex-rs/tui/src/history_cell/session.rs
+@@ -366,8 +366,8 @@ impl HistoryCell for SessionHeaderHistoryCell {
+                 spans.push(Span::from(reasoning.to_owned()));
+             }
+             if self.show_fast_status {
+-                spans.push("   ".into());
+-                spans.push(Span::styled("fast", self.model_style.magenta()));
++                spans.push(" ".into());
++                spans.push("fast".red());
+             }
+             spans.push("   ".dim());
+             spans.push(CHANGE_MODEL_HINT_COMMAND.cyan());
+diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
+index 2bcd76019d..14d0705005 100644
+--- a/codex-rs/tui/src/history_cell/tests.rs
++++ b/codex-rs/tui/src/history_cell/tests.rs
+@@ -1571,8 +1571,24 @@ fn session_header_includes_reasoning_level_when_present() {
+         .find(|line| line.contains("model:"))
+         .expect("model line");
+ 
+-    assert!(model_line.contains("gpt-4o high   fast"));
++    assert!(model_line.contains("gpt-4o high fast"));
+     assert!(model_line.contains("/model to change"));
++
++    let display_lines = cell.display_lines(/*width*/ 80);
++    let model_line = display_lines
++        .iter()
++        .find(|line| {
++            line.spans
++                .iter()
++                .any(|span| span.content.contains("model:"))
++        })
++        .expect("styled model line");
++    let fast_span = model_line
++        .spans
++        .iter()
++        .find(|span| span.content.as_ref() == "fast")
++        .expect("fast span");
++    assert_eq!(fast_span.style.fg, Some(Color::Red));
+ }
+ 
+ #[test]
+diff --git a/codex-rs/tui/src/snapshots/codex_tui__app__tests__clear_ui_header_fast_status_fast_capable_models.snap b/codex-rs/tui/src/snapshots/codex_tui__app__tests__clear_ui_header_fast_status_fast_capable_models.snap
+index 841376c94f..8718e663ec 100644
+--- a/codex-rs/tui/src/snapshots/codex_tui__app__tests__clear_ui_header_fast_status_fast_capable_models.snap
++++ b/codex-rs/tui/src/snapshots/codex_tui__app__tests__clear_ui_header_fast_status_fast_capable_models.snap
+@@ -2,9 +2,9 @@
+ source: tui/src/app/tests.rs
+ expression: rendered
+ ---
+-┌────────────────────────────────────────────────────┐
+-│ >_ OpenAI Codex (v<VERSION>)                       │
+-│                                                    │
+-│ model:     gpt-5.4 xhigh   fast   /model to change │
+-│ directory: /tmp/project                            │
+-└────────────────────────────────────────────────────┘
++┌──────────────────────────────────────────────────┐
++│ >_ OpenAI Codex (v<VERSION>)                     │
++│                                                  │
++│ model:     gpt-5.4 xhigh fast   /model to change │
++│ directory: /tmp/project                          │
++└──────────────────────────────────────────────────┘
+diff --git a/codex-rs/tui/src/status/card.rs b/codex-rs/tui/src/status/card.rs
+index 61ffd3da7d..b6fc46827d 100644
+--- a/codex-rs/tui/src/status/card.rs
++++ b/codex-rs/tui/src/status/card.rs
+@@ -34,6 +34,7 @@ use super::format::FieldFormatter;
+ use super::format::line_display_width;
+ use super::format::push_label;
+ use super::format::truncate_line_to_width;
++use super::helpers::account_plan_style;
+ use super::helpers::compose_account_display;
+ use super::helpers::compose_model_display;
+ use super::helpers::format_directory_display;
+@@ -705,6 +706,53 @@ fn status_approval_label(
+     approval.to_string()
+ }
+ 
++fn account_display_spans(account: &StatusAccountDisplay) -> Vec<Span<'static>> {
++    match account {
++        StatusAccountDisplay::ChatGpt { email, plan } => match (email, plan) {
++            (Some(email), Some(plan)) => vec![
++                Span::from(mask_email(email)),
++                Span::from(" "),
++                Span::styled(plan.clone(), account_plan_style(plan)),
++            ],
++            (Some(email), None) => vec![Span::from(mask_email(email))],
++            (None, Some(plan)) => vec![Span::styled(plan.clone(), account_plan_style(plan))],
++            (None, None) => vec![Span::from("ChatGPT")],
++        },
++        StatusAccountDisplay::ApiKey => {
++            vec![Span::from(
++                "API key configured (run codex login to use ChatGPT)",
++            )]
++        }
++    }
++}
++
++fn mask_email(email: &str) -> String {
++    let Some((local, domain)) = email.split_once('@') else {
++        return email.to_string();
++    };
++    let Some((domain_name, suffix)) = domain.rsplit_once('.') else {
++        return email.to_string();
++    };
++    format!(
++        "{}@{}.{}",
++        mask_email_part(local),
++        mask_email_part(domain_name),
++        suffix
++    )
++}
++
++fn mask_email_part(part: &str) -> String {
++    let mut chars = part.chars();
++    let Some(first) = chars.next() else {
++        return String::new();
++    };
++    let last = chars.next_back();
++    match last {
++        Some(last) => format!("{first}***{last}"),
++        None => format!("{first}***"),
++    }
++}
++
+ impl HistoryCell for StatusHistoryCell {
+     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+         let mut lines: Vec<Line<'static>> = Vec::new();
+@@ -720,17 +768,7 @@ impl HistoryCell for StatusHistoryCell {
+             return Vec::new();
+         }
+ 
+-        let account_value = self.account.as_ref().map(|account| match account {
+-            StatusAccountDisplay::ChatGpt { email, plan } => match (email, plan) {
+-                (Some(email), Some(plan)) => format!("{email} ({plan})"),
+-                (Some(email), None) => email.clone(),
+-                (None, Some(plan)) => plan.clone(),
+-                (None, None) => "ChatGPT".to_string(),
+-            },
+-            StatusAccountDisplay::ApiKey => {
+-                "API key configured (run codex login to use ChatGPT)".to_string()
+-            }
+-        });
++        let account_value = self.account.as_ref().map(account_display_spans);
+ 
+         let mut labels: Vec<String> = vec!["Model", "Directory", "Permissions", "Agents.md"]
+             .into_iter()
+@@ -833,7 +871,7 @@ impl HistoryCell for StatusHistoryCell {
+         lines.push(formatter.line("Agents.md", vec![Span::from(agents_summary)]));
+ 
+         if let Some(account_value) = account_value {
+-            lines.push(formatter.line("Account", vec![Span::from(account_value)]));
++            lines.push(formatter.line("Account", account_value));
+         }
+ 
+         if let Some(thread_name) = thread_name {
+diff --git a/codex-rs/tui/src/status/helpers.rs b/codex-rs/tui/src/status/helpers.rs
+index f03336a4b0..e8d51edd2e 100644
+--- a/codex-rs/tui/src/status/helpers.rs
++++ b/codex-rs/tui/src/status/helpers.rs
+@@ -7,6 +7,8 @@ use chrono::Local;
+ use codex_protocol::account::PlanType;
+ use codex_utils_path_uri::PathConvention;
+ use codex_utils_path_uri::PathUri;
++use ratatui::style::Color;
++use ratatui::style::Style;
+ use std::path::Path;
+ use unicode_width::UnicodeWidthStr;
+ 
+@@ -108,6 +110,22 @@ pub(crate) fn plan_type_display_name(plan_type: PlanType) -> String {
+     }
+ }
+ 
++#[allow(clippy::disallowed_methods)]
++pub(crate) fn account_plan_style(plan: &str) -> Style {
++    match plan
++        .to_ascii_lowercase()
++        .replace([' ', '-', '_'], "")
++        .as_str()
++    {
++        "free" => Style::default().fg(Color::DarkGray),
++        "plus" => Style::default().fg(Color::Green),
++        "business" | "team" | "enterprise" => Style::default().fg(Color::Cyan),
++        "prolite" => Style::default().fg(Color::Yellow),
++        "pro" => Style::default().fg(Color::Magenta),
++        _ => Style::default().fg(Color::Blue),
++    }
++}
++
+ pub(crate) fn format_tokens_compact(value: i64) -> String {
+     let value = value.max(0);
+     if value == 0 {
+diff --git a/codex-rs/tui/src/status/tests.rs b/codex-rs/tui/src/status/tests.rs
+index c0365a5247..a84676fb50 100644
+--- a/codex-rs/tui/src/status/tests.rs
++++ b/codex-rs/tui/src/status/tests.rs
+@@ -1901,6 +1901,60 @@ async fn status_snapshot_shows_stale_limits_message() {
+     assert_snapshot!(sanitized);
+ }
+ 
++#[tokio::test]
++async fn status_account_line_masks_email_and_colors_plan() {
++    let temp_home = TempDir::new().expect("temp home");
++    let mut config = test_config(&temp_home).await;
++    config.cwd = test_path_buf("/workspace/tests").abs();
++    let account_display = StatusAccountDisplay::ChatGpt {
++        email: Some("sydney@gmail.com".to_string()),
++        plan: Some("Pro Lite".to_string()),
++    };
++    let usage = TokenUsage::default();
++    let model_slug = get_model_offline_for_tests(config.model.as_deref());
++    let composite = new_status_output(
++        &config,
++        Some(&account_display),
++        /*token_info*/ None,
++        &usage,
++        &None,
++        /*thread_name*/ None,
++        /*forked_from*/ None,
++        /*rate_display*/ None,
++        None,
++        chrono::Local
++            .with_ymd_and_hms(2024, 1, 2, 3, 4, 5)
++            .single()
++            .expect("timestamp"),
++        &model_slug,
++        /*collaboration_mode*/ None,
++        /*reasoning_effort_override*/ None,
++    );
++    let lines = composite.display_lines(/*width*/ 80);
++    let rendered_lines = render_lines(&lines);
++    assert!(
++        rendered_lines
++            .iter()
++            .any(|line| line.contains("Account:") && line.contains("s***y@g***l.com Pro Lite")),
++        "missing formatted account line: {rendered_lines:?}"
++    );
++
++    let account_line = lines
++        .iter()
++        .find(|line| {
++            line.spans
++                .iter()
++                .any(|span| span.content.as_ref() == "Pro Lite")
++        })
++        .expect("account line");
++    let plan_span = account_line
++        .spans
++        .iter()
++        .find(|span| span.content.as_ref() == "Pro Lite")
++        .expect("plan span");
++    assert_eq!(plan_span.style.fg, Some(Color::Yellow));
++}
++
+ #[tokio::test]
+ async fn status_snapshot_cached_limits_hide_credits_without_flag() {
+     let temp_home = TempDir::new().expect("temp home");
