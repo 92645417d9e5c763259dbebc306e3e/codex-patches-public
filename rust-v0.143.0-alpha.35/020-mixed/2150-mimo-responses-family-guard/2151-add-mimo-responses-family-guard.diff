@@ -83,10 +83,10 @@ index 7de83f7295..ea4e225b68 100644
          /*include_timing_metrics*/ false,
          /*beta_features_header*/ None,
 diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
-index 49fd0a238a..ee6e3a0c4f 100644
+index 49fd0a238a..0b21a928ef 100644
 --- a/codex-rs/core/src/config/config_tests.rs
 +++ b/codex-rs/core/src/config/config_tests.rs
-@@ -148,6 +148,75 @@ fn stdio_mcp_with_args(command: &str, args: &[&str]) -> McpServerConfig {
+@@ -148,6 +148,101 @@ fn stdio_mcp_with_args(command: &str, args: &[&str]) -> McpServerConfig {
      }
  }
  
@@ -99,6 +99,32 @@ index 49fd0a238a..ee6e3a0c4f 100644
 +    assert!(config.provider.is_none());
 +    assert!(config.model_infos().is_empty());
 +    assert!(!config.is_mimo_model("mimo-2.5"));
++}
++
++#[tokio::test]
++async fn missing_mimo_toml_creates_runnable_template_inactive_with_dummy_key() {
++    let codex_home = TempDir::new().unwrap();
++    let mimo_toml = codex_home.path().join("mimo.toml");
++
++    let config = load_mimo_config(LOCAL_FS.as_ref(), &codex_home.abs())
++        .await
++        .unwrap();
++
++    assert_eq!(config, MimoConfig::default());
++    assert_eq!(
++        std::fs::read_to_string(&mimo_toml).unwrap(),
++        MIMO_DEFAULT_TOML
++    );
++
++    let mut runnable = std::fs::read_to_string(&mimo_toml).unwrap();
++    runnable = runnable.replace(MIMO_DUMMY_API_KEY, "sk-real");
++    std::fs::write(&mimo_toml, runnable).unwrap();
++
++    let config = load_mimo_config(LOCAL_FS.as_ref(), &codex_home.abs())
++        .await
++        .unwrap();
++    assert!(config.enabled);
++    assert!(config.is_mimo_model("mimo-2.5"));
 +}
 +
 +#[test]
@@ -162,7 +188,7 @@ index 49fd0a238a..ee6e3a0c4f 100644
  struct EnvVarGuard {
      key: &'static str,
      old: Option<std::ffi::OsString>,
-@@ -907,7 +976,10 @@ websocket_connect_timeout_ms = 4321
+@@ -907,7 +1002,10 @@ websocket_connect_timeout_ms = 4321
      assert_eq!(config.model_provider.request_max_retries, Some(3));
      assert_eq!(config.model_provider.stream_max_retries, Some(7));
      assert_eq!(config.model_provider.stream_idle_timeout_ms, Some(1234));
@@ -175,10 +201,18 @@ index 49fd0a238a..ee6e3a0c4f 100644
      assert!(config.model_provider.requires_openai_auth);
  }
 diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
-index 7041641343..da917ff506 100644
+index 7041641343..d604cea378 100644
 --- a/codex-rs/core/src/config/mod.rs
 +++ b/codex-rs/core/src/config/mod.rs
-@@ -80,6 +80,7 @@ use codex_memories_read::memory_root;
+@@ -53,6 +53,7 @@ use codex_config::types::TuiPetAnchor;
+ use codex_config::types::UriBasedFileOpener;
+ use codex_config::types::WindowsSandboxModeToml;
+ use codex_core_plugins::PluginsConfigInput;
++use codex_exec_server::CreateDirectoryOptions;
+ use codex_exec_server::ExecutorFileSystem;
+ use codex_exec_server::LOCAL_FS;
+ use codex_features::CodeModeConfigToml;
+@@ -80,6 +81,7 @@ use codex_memories_read::memory_root;
  use codex_model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
  use codex_model_provider_info::ModelProviderInfo;
  use codex_model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
@@ -186,7 +220,7 @@ index 7041641343..da917ff506 100644
  use codex_model_provider_info::built_in_model_providers;
  use codex_model_provider_info::merge_configured_model_providers;
  use codex_models_manager::ModelsManagerConfig;
-@@ -102,6 +103,10 @@ use codex_protocol::models::PermissionProfile;
+@@ -102,6 +104,10 @@ use codex_protocol::models::PermissionProfile;
  use codex_protocol::models::SandboxEnforcement;
  use codex_protocol::openai_models::ModelsResponse;
  use codex_protocol::openai_models::ReasoningEffort;
@@ -197,7 +231,7 @@ index 7041641343..da917ff506 100644
  use codex_protocol::permissions::FileSystemSandboxPolicy;
  use codex_protocol::permissions::NetworkSandboxPolicy;
  use codex_protocol::protocol::AskForApproval;
-@@ -1081,6 +1086,293 @@ pub struct Config {
+@@ -1081,6 +1087,323 @@ pub struct Config {
  
      /// OTEL configuration (exporter type, endpoint, headers, etc.).
      pub otel: codex_config::types::OtelConfig,
@@ -207,6 +241,18 @@ index 7041641343..da917ff506 100644
 +}
 +
 +pub(crate) const MIMO_PROVIDER_ID: &str = "mimo";
++const MIMO_DUMMY_API_KEY: &str = "sk-dummy";
++const MIMO_DEFAULT_TOML: &str = r#"enabled = true
++api_key = "sk-dummy"
++base_url = "https://api.mimo.ai/v1"
++
++[[models]]
++id = "mimo-2.5"
++model = "mimo-2.5"
++display_name = "MiMo 2.5"
++supports_image = false
++supports_web_search = false
++"#;
 +
 +#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 +pub(crate) struct MimoConfig {
@@ -371,7 +417,22 @@ index 7041641343..da917ff506 100644
 +    let path_uri = PathUri::from_abs_path(&abs_path);
 +    let contents = match fs.read_file_text(&path_uri, /*sandbox*/ None).await {
 +        Ok(contents) => contents,
-+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(MimoConfig::default()),
++        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
++            let codex_home_uri = PathUri::from_abs_path(codex_home);
++            fs.create_directory(
++                &codex_home_uri,
++                CreateDirectoryOptions { recursive: true },
++                /*sandbox*/ None,
++            )
++            .await?;
++            fs.write_file(
++                &path_uri,
++                MIMO_DEFAULT_TOML.as_bytes().to_vec(),
++                /*sandbox*/ None,
++            )
++            .await?;
++            return Ok(MimoConfig::default());
++        }
 +        Err(err) => {
 +            return Err(std::io::Error::new(
 +                err.kind(),
@@ -402,6 +463,9 @@ index 7041641343..da917ff506 100644
 +                "mimo.toml requires api_key when enabled is true",
 +            )
 +        })?;
++    if api_key == MIMO_DUMMY_API_KEY {
++        return Ok(MimoConfig::default());
++    }
 +    let base_url = parsed
 +        .base_url
 +        .unwrap_or_else(|| "https://api.mimo.ai/v1".to_string());
@@ -491,7 +555,7 @@ index 7041641343..da917ff506 100644
  }
  
  #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-@@ -1481,6 +1773,23 @@ impl Config {
+@@ -1481,6 +1804,23 @@ impl Config {
          }
      }
  
@@ -515,7 +579,7 @@ index 7041641343..da917ff506 100644
      pub fn auth_route_config(&self) -> Option<AuthRouteConfig> {
          self.respect_system_proxy
              .then(AuthRouteConfig::respect_system_proxy)
-@@ -3411,9 +3720,13 @@ impl Config {
+@@ -3411,9 +3751,13 @@ impl Config {
              .clone()
              .filter(|value| !value.is_empty());
  
@@ -530,7 +594,7 @@ index 7041641343..da917ff506 100644
  
          let model_provider_id = model_provider
              .or(cfg.model_provider)
-@@ -4002,6 +4315,7 @@ impl Config {
+@@ -4002,6 +4346,7 @@ impl Config {
                  .map(|t| t.keymap.clone())
                  .unwrap_or_default(),
              otel,
