@@ -1,0 +1,318 @@
+diff --git a/codex-rs/app-server/tests/suite/v2/remote_thread_store.rs b/codex-rs/app-server/tests/suite/v2/remote_thread_store.rs
+index 2002b08a88..e228ae5789 100644
+--- a/codex-rs/app-server/tests/suite/v2/remote_thread_store.rs
++++ b/codex-rs/app-server/tests/suite/v2/remote_thread_store.rs
+@@ -380,9 +380,11 @@ fn assert_no_local_persistence_artifacts(codex_home: &Path) -> Result<()> {
+     );
+     let mut entries = codex_home_entries(codex_home)?;
+     // Bazel test runs may initialize shell snapshot storage under codex_home.
++    // Chat Completions provider setup may create model-provider config/cache.
+     // That is not thread persistence; keep the assertion focused on rollout,
+     // session, sqlite, and other unexpected thread-store artifacts.
+     entries.remove("shell_snapshots");
++    entries.remove("chat-completions");
+     assert_eq!(
+         entries,
+         BTreeSet::from([
+diff --git a/codex-rs/models-manager/src/cache_overlay.rs b/codex-rs/models-manager/src/cache_overlay.rs
+new file mode 100644
+index 0000000000..b143a3c006
+--- /dev/null
++++ b/codex-rs/models-manager/src/cache_overlay.rs
+@@ -0,0 +1,95 @@
++use codex_protocol::openai_models::ModelInfo;
++use serde_json::Map;
++use serde_json::Value;
++use std::fs;
++use std::io;
++use std::io::ErrorKind;
++use std::path::Path;
++use std::path::PathBuf;
++use tracing::warn;
++
++pub(crate) const INSTRUCTIONS_OVERLAY_FILE: &str = "instructions.json";
++
++#[derive(Debug, Clone)]
++pub(crate) struct ModelsCacheOverlay {
++    path: PathBuf,
++}
++
++impl ModelsCacheOverlay {
++    pub(crate) fn new(path: PathBuf) -> Self {
++        Self { path }
++    }
++
++    pub(crate) fn apply(&self, mut models: Vec<ModelInfo>) -> Vec<ModelInfo> {
++        let Some(overlay) = (match load_overlay(&self.path) {
++            Ok(overlay) => overlay,
++            Err(err) => {
++                warn!(
++                    path = %self.path.display(),
++                    "failed to load instructions overlay: {err}"
++                );
++                return models;
++            }
++        }) else {
++            return models;
++        };
++        for model in &mut models {
++            let Some(overlay_model) = overlay_model(&overlay, &model.slug) else {
++                continue;
++            };
++            apply_overlay_model(model, overlay_model, &self.path);
++        }
++        models
++    }
++}
++
++fn load_overlay(path: &Path) -> io::Result<Option<Value>> {
++    match fs::read(path) {
++        Ok(contents) => serde_json::from_slice::<Value>(&contents)
++            .map(Some)
++            .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string())),
++        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
++        Err(err) => Err(err),
++    }
++}
++
++fn overlay_model<'a>(overlay: &'a Value, slug: &str) -> Option<&'a Map<String, Value>> {
++    overlay
++        .get("models")
++        .and_then(Value::as_object)
++        .and_then(|models| models.get(slug))
++        .and_then(Value::as_object)
++}
++
++fn template_value(model: &Map<String, Value>) -> Option<&Value> {
++    model
++        .get("model_messages")
++        .and_then(Value::as_object)
++        .and_then(|messages| messages.get("instructions_template"))
++}
++
++fn apply_overlay_model(model: &mut ModelInfo, overlay_model: &Map<String, Value>, path: &Path) {
++    let Some(messages) = model.model_messages.as_mut() else {
++        return;
++    };
++    let Some(template) = template_value(overlay_model) else {
++        return;
++    };
++    let Some(template) = template.as_str() else {
++        warn!(
++            model = %model.slug,
++            path = %path.display(),
++            "instructions overlay instructions_template must be a string"
++        );
++        return;
++    };
++    if template.is_empty() {
++        warn!(
++            model = %model.slug,
++            path = %path.display(),
++            "instructions overlay instructions_template must not be empty"
++        );
++        return;
++    }
++    messages.instructions_template = Some(template.to_string());
++}
+diff --git a/codex-rs/models-manager/src/lib.rs b/codex-rs/models-manager/src/lib.rs
+index 4a4c590afe..c1d22101a6 100644
+--- a/codex-rs/models-manager/src/lib.rs
++++ b/codex-rs/models-manager/src/lib.rs
+@@ -1,4 +1,5 @@
+ pub(crate) mod cache;
++pub(crate) mod cache_overlay;
+ pub mod collaboration_mode_presets;
+ pub(crate) mod config;
+ pub mod manager;
+diff --git a/codex-rs/models-manager/src/manager.rs b/codex-rs/models-manager/src/manager.rs
+index 4cabb38d88..1996e1c178 100644
+--- a/codex-rs/models-manager/src/manager.rs
++++ b/codex-rs/models-manager/src/manager.rs
+@@ -1,4 +1,6 @@
+ use super::cache::ModelsCacheManager;
++use crate::cache_overlay::INSTRUCTIONS_OVERLAY_FILE;
++use crate::cache_overlay::ModelsCacheOverlay;
+ use crate::collaboration_mode_presets::builtin_collaboration_mode_presets;
+ use crate::config::ModelsManagerConfig;
+ use crate::model_info;
+@@ -205,6 +207,7 @@ pub struct OpenAiModelsManager {
+     remote_models: Arc<RwLock<Vec<ModelInfo>>>,
+     etag: Arc<RwLock<Option<String>>>,
+     cache_manager: ModelsCacheManager,
++    cache_overlay: ModelsCacheOverlay,
+     endpoint_client: SharedModelsEndpointClient,
+     auth_manager: Option<Arc<AuthManager>>,
+     refresh_in_progress: Arc<AtomicBool>,
+@@ -225,12 +228,14 @@ impl OpenAiModelsManager {
+         auth_manager: Option<Arc<AuthManager>>,
+     ) -> Self {
+         let cache_path = codex_home.join(MODEL_CACHE_FILE);
++        let cache_overlay = ModelsCacheOverlay::new(codex_home.join(INSTRUCTIONS_OVERLAY_FILE));
+         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
+         let remote_models = load_remote_models_from_file().unwrap_or_default();
+         Self {
+             remote_models: Arc::new(RwLock::new(remote_models)),
+             etag: Arc::new(RwLock::new(None)),
+             cache_manager,
++            cache_overlay,
+             endpoint_client,
+             auth_manager,
+             refresh_in_progress: Arc::new(AtomicBool::new(false)),
+@@ -260,11 +265,15 @@ impl ModelsManager for OpenAiModelsManager {
+     }
+ 
+     fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {
+-        Box::pin(async move { self.remote_models.read().await.clone() })
++        Box::pin(async move {
++            let models = self.remote_models.read().await.clone();
++            self.cache_overlay.apply(models)
++        })
+     }
+ 
+     fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, TryLockError> {
+-        Ok(self.remote_models.try_read()?.clone())
++        let models = self.remote_models.try_read()?.clone();
++        Ok(self.cache_overlay.apply(models))
+     }
+ 
+     fn auth_manager(&self) -> Option<&AuthManager> {
+diff --git a/codex-rs/models-manager/src/manager_tests.rs b/codex-rs/models-manager/src/manager_tests.rs
+index 5b4f7bede1..56330a92bc 100644
+--- a/codex-rs/models-manager/src/manager_tests.rs
++++ b/codex-rs/models-manager/src/manager_tests.rs
+@@ -10,6 +10,7 @@ use codex_login::ExternalAuthRefreshContext;
+ use codex_login::ExternalAuthTokens;
+ use codex_login::TokenData;
+ use codex_protocol::auth::AuthMode;
++use codex_protocol::openai_models::ModelMessages;
+ use codex_protocol::openai_models::ModelsResponse;
+ use pretty_assertions::assert_eq;
+ use serde_json::json;
+@@ -31,6 +32,15 @@ fn remote_model(slug: &str, display: &str, priority: i32) -> ModelInfo {
+     remote_model_with_visibility(slug, display, priority, "list")
+ }
+ 
++fn remote_model_with_prompt(slug: &str, display: &str, priority: i32, prompt: &str) -> ModelInfo {
++    let mut model = remote_model(slug, display, priority);
++    model.model_messages = Some(ModelMessages {
++        instructions_template: Some(prompt.to_string()),
++        instructions_variables: None,
++    });
++    model
++}
++
+ fn remote_model_with_visibility(
+     slug: &str,
+     display: &str,
+@@ -333,6 +343,18 @@ fn static_manager_for_tests(model_catalog: ModelsResponse) -> StaticModelsManage
+     StaticModelsManager::new(/*auth_manager*/ None, model_catalog)
+ }
+ 
++fn instructions_overlay_path(codex_home: &Path) -> std::path::PathBuf {
++    codex_home.join(crate::cache_overlay::INSTRUCTIONS_OVERLAY_FILE)
++}
++
++fn write_instructions_overlay(codex_home: &Path, value: serde_json::Value) {
++    std::fs::write(
++        instructions_overlay_path(codex_home),
++        serde_json::to_vec_pretty(&value).expect("overlay should serialize"),
++    )
++    .expect("overlay should be written");
++}
++
+ async fn chatgpt_auth_tokens_for_tests(codex_home: &Path) -> CodexAuth {
+     let auth_dot_json = codex_login::AuthDotJson {
+         auth_mode: Some(AuthMode::ChatgptAuthTokens),
+@@ -788,6 +810,91 @@ async fn refresh_available_models_uses_cache_when_fresh() {
+     );
+ }
+ 
++#[tokio::test]
++async fn instructions_overlay_missing_file_does_not_write() {
++    let prompted = remote_model_with_prompt(
++        "prompted-cache-model",
++        "Prompted Cache Model",
++        /*priority*/ 1,
++        "upstream prompt\nwith newline",
++    );
++    let codex_home = tempdir().expect("temp dir");
++    let endpoint = TestModelsEndpoint::new(vec![vec![prompted.clone()]]);
++    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
++
++    manager
++        .refresh_available_models(RefreshStrategy::OnlineIfUncached)
++        .await
++        .expect("refresh succeeds");
++    assert_models_contain(&manager.get_remote_models().await, &[prompted]);
++    assert!(!instructions_overlay_path(codex_home.path()).exists());
++}
++
++#[tokio::test]
++async fn instructions_overlay_overrides_prompt_and_reloads_file() {
++    let remote = remote_model_with_prompt(
++        "overlay-cache-model",
++        "Overlay Cache Model",
++        /*priority*/ 1,
++        "upstream prompt",
++    );
++    let codex_home = tempdir().expect("temp dir");
++    write_instructions_overlay(
++        codex_home.path(),
++        json!({
++            "models": {
++                "overlay-cache-model": {
++                    "model_messages": {
++                        "instructions_template": "local prompt one"
++                    }
++                }
++            }
++        }),
++    );
++    let endpoint = TestModelsEndpoint::new(vec![vec![remote]]);
++    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
++
++    manager
++        .refresh_available_models(RefreshStrategy::OnlineIfUncached)
++        .await
++        .expect("refresh succeeds");
++    let config = ModelsManagerConfig {
++        personality_enabled: true,
++        ..Default::default()
++    };
++    let model_info = manager.get_model_info("overlay-cache-model", &config).await;
++    assert_eq!(
++        model_info
++            .model_messages
++            .as_ref()
++            .and_then(|messages| messages.instructions_template.as_deref()),
++        Some("local prompt one")
++    );
++    assert_eq!(model_info.display_name, "Overlay Cache Model");
++    assert_eq!(model_info.base_instructions, "base instructions");
++
++    write_instructions_overlay(
++        codex_home.path(),
++        json!({
++            "models": {
++                "overlay-cache-model": {
++                    "model_messages": {
++                        "instructions_template": "local prompt two"
++                    }
++                }
++            }
++        }),
++    );
++    let updated = manager.get_model_info("overlay-cache-model", &config).await;
++    assert_eq!(
++        updated
++            .model_messages
++            .as_ref()
++            .and_then(|messages| messages.instructions_template.as_deref()),
++        Some("local prompt two")
++    );
++}
++
+ #[tokio::test]
+ async fn refresh_available_models_uses_stale_cache_without_refetching() {
+     let initial_models = vec![remote_model("stale", "Stale", /*priority*/ 1)];

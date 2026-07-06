@@ -1,0 +1,225 @@
+diff --git a/codex-rs/hooks/src/engine/discovery.rs b/codex-rs/hooks/src/engine/discovery.rs
+index 6edf8cb46d..4ae1d5a888 100644
+--- a/codex-rs/hooks/src/engine/discovery.rs
++++ b/codex-rs/hooks/src/engine/discovery.rs
+@@ -1,5 +1,6 @@
+ use std::collections::HashMap;
+ use std::collections::HashSet;
++use std::ffi::OsStr;
+ use std::fs;
+ use std::path::Path;
+ 
+@@ -499,6 +500,7 @@ fn append_matcher_groups(
+                     let command = source.env.iter().fold(command, |command, (key, value)| {
+                         command.replace(&format!("${{{key}}}"), value)
+                     });
++                    let resolved_command = resolve_hook_command_path(source.path, &command);
+                     // TODO(abhinav): replace this positional suffix with a durable hook id.
+                     let key =
+                         crate::hook_key(&source.key_source, event_name, group_index, handler_index);
+@@ -534,7 +536,7 @@ fn append_matcher_groups(
+                         handlers.push(ConfiguredHandler {
+                             event_name,
+                             matcher: matcher.map(ToOwned::to_owned),
+-                            command,
++                            command: resolved_command,
+                             timeout_sec,
+                             status_message,
+                             source_path: source.path.clone(),
+@@ -558,6 +560,27 @@ fn append_matcher_groups(
+     }
+ }
+ 
++fn resolve_hook_command_path(source_path: &AbsolutePathBuf, command: &str) -> String {
++    let trimmed = command.trim();
++    if !is_relative_hooks_json_command(source_path, trimmed) {
++        return command.to_string();
++    }
++
++    source_path
++        .parent()
++        .map(|parent| parent.join(trimmed).display().to_string())
++        .unwrap_or_else(|| command.to_string())
++}
++
++fn is_relative_hooks_json_command(source_path: &AbsolutePathBuf, command: &str) -> bool {
++    source_path.file_name() == Some(OsStr::new("hooks.json"))
++        && !command.is_empty()
++        && !command.starts_with('~')
++        && !command.chars().any(char::is_whitespace)
++        && !Path::new(command).is_absolute()
++        && (command.contains('/') || command.contains('\\'))
++}
++
+ /// Hash a normalized, config-derived identity instead of source text so equivalent
+ /// hooks from config TOML and hooks.json converge on the same trust identity.
+ #[derive(Serialize)]
+@@ -1012,6 +1035,81 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn pre_tool_use_resolves_relative_hooks_json_command_against_source_dir() {
++        let mut handlers = Vec::new();
++        let mut hook_entries = Vec::new();
++        let mut warnings = Vec::new();
++        let mut display_order = 0;
++        let source_path = test_path_buf("/tmp/.codex/hooks.json").abs();
++        let hook_states = std::collections::HashMap::new();
++
++        append_matcher_groups(
++            &mut handlers,
++            &mut hook_entries,
++            &mut warnings,
++            &mut display_order,
++            &hook_handler_source(&source_path, &hook_states),
++            HookEventName::PreToolUse,
++            vec![MatcherGroup {
++                matcher: Some("^Bash$".to_string()),
++                hooks: vec![HookHandlerConfig::Command {
++                    command: "skills/workflow/bin".to_string(),
++                    command_windows: None,
++                    timeout_sec: None,
++                    r#async: false,
++                    status_message: None,
++                }],
++            }],
++        );
++
++        assert_eq!(warnings, Vec::<String>::new());
++        assert_eq!(
++            hook_entries[0].command.as_deref(),
++            Some("skills/workflow/bin")
++        );
++        assert_eq!(
++            handlers[0].command,
++            source_path
++                .parent()
++                .expect("hooks.json parent")
++                .join("skills/workflow/bin")
++                .display()
++                .to_string()
++        );
++    }
++
++    #[test]
++    fn pre_tool_use_keeps_relative_config_toml_command_unresolved() {
++        let mut handlers = Vec::new();
++        let mut warnings = Vec::new();
++        let mut display_order = 0;
++        let source_path = test_path_buf("/tmp/.codex/config.toml").abs();
++        let hook_states = std::collections::HashMap::new();
++
++        append_matcher_groups(
++            &mut handlers,
++            &mut Vec::new(),
++            &mut warnings,
++            &mut display_order,
++            &hook_handler_source(&source_path, &hook_states),
++            HookEventName::PreToolUse,
++            vec![MatcherGroup {
++                matcher: Some("^Bash$".to_string()),
++                hooks: vec![HookHandlerConfig::Command {
++                    command: "skills/workflow/bin".to_string(),
++                    command_windows: None,
++                    timeout_sec: None,
++                    r#async: false,
++                    status_message: None,
++                }],
++            }],
++        );
++
++        assert_eq!(warnings, Vec::<String>::new());
++        assert_eq!(handlers[0].command, "skills/workflow/bin");
++    }
++
+     fn config_with_malformed_state_and_session_start_hook() -> TomlValue {
+         serde_json::from_value(serde_json::json!({
+             "hooks": {
+diff --git a/codex-rs/hooks/src/engine/mod_tests.rs b/codex-rs/hooks/src/engine/mod_tests.rs
+index d170a09e3a..e564b3f029 100644
+--- a/codex-rs/hooks/src/engine/mod_tests.rs
++++ b/codex-rs/hooks/src/engine/mod_tests.rs
+@@ -1225,6 +1225,82 @@ fn profile_user_layers_load_shared_hooks_json_once() {
+     assert_eq!(listed.hooks[0].source_path, hooks_json_path);
+ }
+ 
++#[test]
++fn hooks_json_relative_command_resolves_from_hooks_file_dir() {
++    let temp = tempdir().expect("create temp dir");
++    let config_path =
++        AbsolutePathBuf::try_from(temp.path().join("config.toml")).expect("absolute config path");
++    let hooks_json_path =
++        AbsolutePathBuf::try_from(temp.path().join("hooks.json")).expect("absolute hooks path");
++    fs::write(
++        hooks_json_path.as_path(),
++        r#"{
++              "hooks": {
++                "PreToolUse": [
++                  {
++                    "matcher": "^Bash$",
++                    "hooks": [
++                      {
++                        "type": "command",
++                        "command": "skills/workflow/bin"
++                      }
++                    ]
++                  }
++                ]
++              }
++            }"#,
++    )
++    .expect("write hooks.json");
++    let config_layer_stack = ConfigLayerStack::new(
++        vec![ConfigLayerEntry::new(
++            ConfigLayerSource::User {
++                file: config_path,
++                profile: None,
++            },
++            TomlValue::Table(Default::default()),
++        )],
++        ConfigRequirements::default(),
++        ConfigRequirementsToml::default(),
++    )
++    .expect("config layer stack");
++
++    let engine = ClaudeHooksEngine::new(
++        /*enabled*/ true,
++        /*bypass_hook_trust*/ true,
++        Some(&config_layer_stack),
++        Vec::new(),
++        Vec::new(),
++        CommandShell {
++            program: String::new(),
++            args: Vec::new(),
++        },
++    );
++
++    assert!(engine.warnings().is_empty());
++    assert_eq!(engine.handlers.len(), 1);
++    assert_eq!(
++        engine.handlers[0].command,
++        hooks_json_path
++            .parent()
++            .expect("hooks.json parent")
++            .join("skills/workflow/bin")
++            .display()
++            .to_string()
++    );
++
++    let listed = crate::list_hooks(crate::HooksConfig {
++        feature_enabled: true,
++        bypass_hook_trust: true,
++        config_layer_stack: Some(config_layer_stack),
++        ..Default::default()
++    });
++    assert!(listed.warnings.is_empty());
++    assert_eq!(
++        listed.hooks[0].command.as_deref(),
++        Some("skills/workflow/bin")
++    );
++}
++
+ #[test]
+ fn malformed_hooks_json_is_reported_as_startup_warning() {
+     let temp = tempdir().expect("create temp dir");

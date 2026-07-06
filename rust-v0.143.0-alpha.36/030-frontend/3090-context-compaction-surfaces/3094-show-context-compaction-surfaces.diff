@@ -1,0 +1,491 @@
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index fd2287242b..cc4d57d1e7 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -582,6 +582,7 @@ pub(crate) struct ChatWidget {
+     runtime_model_provider_base_url: Option<String>,
+     pub(crate) remote_connection: Option<RemoteConnectionStatus>,
+     token_info: Option<TokenUsageInfo>,
++    context_compaction_started_at_ms: HashMap<String, i64>,
+     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
+     responses_stream_connection_status: Option<ResponsesStreamConnectionStatus>,
+     refreshing_status_outputs: Vec<(u64, StatusHistoryHandle)>,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 5e37056391..8e257970f3 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -126,6 +126,7 @@ impl ChatWidget {
+             runtime_model_provider_base_url,
+             remote_connection: None,
+             token_info: None,
++            context_compaction_started_at_ms: HashMap::new(),
+             rate_limit_snapshots_by_limit_id,
+             responses_stream_connection_status: None,
+             refreshing_status_outputs: Vec::new(),
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index 88c2e30eaf..2b9268c3df 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -334,7 +334,9 @@ impl ChatWidget {
+             ThreadItem::ImageGeneration { .. } => {
+                 self.on_image_generation_begin();
+             }
+-            ThreadItem::ContextCompaction { .. } => {
++            ThreadItem::ContextCompaction { id } => {
++                self.context_compaction_started_at_ms
++                    .insert(id, notification.started_at_ms);
+                 self.start_context_compaction_status();
+             }
+             ThreadItem::CollabAgentToolCall {
+@@ -371,10 +373,22 @@ impl ChatWidget {
+         notification: ItemCompletedNotification,
+         replay_kind: Option<ReplayKind>,
+     ) {
+-        self.handle_thread_item(
+-            notification.item,
+-            notification.turn_id,
+-            replay_kind.map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay),
+-        );
++        let render_source =
++            replay_kind.map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay);
++        match notification.item {
++            ThreadItem::ContextCompaction { id } => {
++                let duration_ms =
++                    self.context_compaction_started_at_ms
++                        .remove(&id)
++                        .map(|started_at_ms| {
++                            notification
++                                .completed_at_ms
++                                .saturating_sub(started_at_ms)
++                                .max(0)
++                        });
++                self.handle_context_compaction_item(duration_ms, render_source);
++            }
++            item => self.handle_thread_item(item, notification.turn_id, render_source),
++        }
+     }
+ }
+diff --git a/codex-rs/tui/src/chatwidget/rendering.rs b/codex-rs/tui/src/chatwidget/rendering.rs
+index 710af6b7ea..e68ef88e6a 100644
+--- a/codex-rs/tui/src/chatwidget/rendering.rs
++++ b/codex-rs/tui/src/chatwidget/rendering.rs
+@@ -107,6 +107,9 @@ impl Renderable for TranscriptAreaRenderable<'_> {
+             u16::try_from(overflow).unwrap_or(u16::MAX)
+         };
+         Clear.render(area, buf);
++        if let Some(style) = self.child.fill_background_style() {
++            buf.set_style(area, style);
++        }
+         paragraph.scroll((y, 0)).render(area, buf);
+     }
+ 
+diff --git a/codex-rs/tui/src/chatwidget/replay.rs b/codex-rs/tui/src/chatwidget/replay.rs
+index e58fa67d7a..11fe53c691 100644
+--- a/codex-rs/tui/src/chatwidget/replay.rs
++++ b/codex-rs/tui/src/chatwidget/replay.rs
+@@ -170,9 +170,6 @@ impl ChatWidget {
+             }
+             ThreadItem::ContextCompaction { .. } => {
+                 self.handle_context_compaction_item(/*duration_ms*/ None, render_source);
+-                if self.status_state.current_status.header == "Compacting" {
+-                    self.set_status_header(String::from("Working"));
+-                }
+             }
+             ThreadItem::HookPrompt { .. } => {}
+             ThreadItem::CollabAgentToolCall {
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index 4a2b125f73..91159ab29d 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -403,7 +403,7 @@ async fn thread_settings_updated_preserves_default_settings_for_plan_mode() {
+ 
+ #[tokio::test]
+ async fn context_compaction_item_started_updates_status_header() {
+-    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+ 
+     chat.handle_server_notification(
+         ServerNotification::ItemStarted(ItemStartedNotification {
+@@ -417,7 +417,12 @@ async fn context_compaction_item_started_updates_status_header() {
+         /*replay_kind*/ None,
+     );
+ 
+-    assert_eq!(chat.status_state.current_status.header, "Compacting");
++    assert_eq!(chat.status_state.current_status.header, "Working");
++    let cells = drain_insert_history(&mut rx);
++    assert!(
++        lines_to_single_string(&cells[0]).contains("Context compaction triggered"),
++        "expected compaction trigger banner"
++    );
+ 
+     chat.handle_server_notification(
+         ServerNotification::ItemCompleted(ItemCompletedNotification {
+diff --git a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+index b31a79009d..403407d5f4 100644
+--- a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
++++ b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+@@ -272,7 +272,10 @@ impl ChatWidget {
+ 
+     pub(crate) fn start_context_compaction_status(&mut self) {
+         self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Working;
+-        self.set_status_header(String::from("Compacting"));
++        self.add_to_history(history_cell::new_context_compaction_triggered_event(
++            self.context_compaction_trigger_usage(),
++        ));
++        self.set_status_header(String::from("Working"));
+         self.request_redraw();
+     }
+ 
+@@ -288,8 +291,16 @@ impl ChatWidget {
+             post_compact_context_usage,
+         ));
+         self.request_redraw();
+-        if !render_source.is_replay() && self.status_state.current_status.header == "Compacting" {
+-            self.set_status_header(String::from("Working"));
++    }
++
++    fn context_compaction_trigger_usage(&self) -> history_cell::ContextCompactionTriggerUsage {
++        history_cell::ContextCompactionTriggerUsage {
++            used_tokens: self
++                .token_info
++                .as_ref()
++                .map(|info| info.last_token_usage.tokens_in_context_window().max(0)),
++            context_window: self.status_line_context_window_size(),
++            auto_compact_limit: self.config.model_auto_compact_token_limit,
+         }
+     }
+ 
+diff --git a/codex-rs/tui/src/history_cell/mod.rs b/codex-rs/tui/src/history_cell/mod.rs
+index b7dd0b9475..43390c5271 100644
+--- a/codex-rs/tui/src/history_cell/mod.rs
++++ b/codex-rs/tui/src/history_cell/mod.rs
+@@ -282,6 +282,10 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
+         false
+     }
+ 
++    fn fill_background_style(&self) -> Option<Style> {
++        None
++    }
++
+     /// Returns a coarse "animation tick" when transcript output is time-dependent.
+     ///
+     /// The transcript overlay caches the rendered output of the in-flight active cell, so cells
+@@ -313,6 +317,9 @@ impl Renderable for Box<dyn HistoryCell> {
+         // Active-cell content can reflow dramatically during resize/stream updates. Clear the
+         // entire draw area first so stale glyphs from previous frames never linger.
+         Clear.render(area, buf);
++        if let Some(style) = self.fill_background_style() {
++            buf.set_style(area, style);
++        }
+         paragraph.scroll((y, 0)).render(area, buf);
+         mark_buffer_hyperlinks(buf, area, &hyperlink_lines, usize::from(y));
+     }
+diff --git a/codex-rs/tui/src/history_cell/notices.rs b/codex-rs/tui/src/history_cell/notices.rs
+index 5ed97508d8..e82a0f6b51 100644
+--- a/codex-rs/tui/src/history_cell/notices.rs
++++ b/codex-rs/tui/src/history_cell/notices.rs
+@@ -217,6 +217,11 @@ struct ContextCompactedHistoryCell {
+     post_compact_context_usage: Option<PostCompactContextUsage>,
+ }
+ 
++#[derive(Debug)]
++struct ContextCompactionTriggeredHistoryCell {
++    trigger_context_usage: ContextCompactionTriggerUsage,
++}
++
+ #[derive(Clone, Copy, Debug)]
+ pub(crate) enum PostCompactContextUsage {
+     UnknownContextWindow { used_tokens: Option<i64> },
+@@ -224,45 +229,113 @@ pub(crate) enum PostCompactContextUsage {
+     Percent { percent: i64, used_tokens: i64 },
+ }
+ 
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct ContextCompactionTriggerUsage {
++    pub(crate) used_tokens: Option<i64>,
++    pub(crate) context_window: Option<i64>,
++    pub(crate) auto_compact_limit: Option<i64>,
++}
++
+ impl HistoryCell for ContextCompactedHistoryCell {
+     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+-        let style = Self::banner_style();
+-        let details = self.details_text();
+-        let mut spans = vec![Span::styled("■ Context compacted", style)];
+-        if let Some(details) = &details {
+-            spans.push(Span::styled(format!(" {details}"), style));
++        let label_text = self.label();
++        let label = format!("─ {label_text} ─");
++        let label_width = UnicodeWidthStr::width(label.as_str());
++        if label_width > width as usize {
++            let (label, _suffix, label_width) = take_prefix_by_width(&label, width as usize);
++            return vec![
++                Line::from_iter([
++                    label,
++                    "─".repeat((width as usize).saturating_sub(label_width)),
++                ])
++                .dim(),
++            ];
++        }
++
++        let mut spans = Vec::new();
++        spans.push("─ ".dim());
++        spans.push(
++            "Context compacted"
++                .fg(Color::Yellow)
++                .add_modifier(Modifier::BOLD),
++        );
++        if let Some(details) = self.details_label() {
++            spans.push(" ■ ".dim());
++            spans.push(details.dim());
++        }
++        spans.push(" ─".dim());
++        spans.push(
++            "─"
++                .repeat((width as usize).saturating_sub(label_width))
++                .dim(),
++        );
++        vec![Line::from(spans)]
++    }
++
++    fn raw_lines(&self) -> Vec<Line<'static>> {
++        vec![self.label().into()]
++    }
++}
++
++impl HistoryCell for ContextCompactionTriggeredHistoryCell {
++    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
++        let label_text = self.label();
++        let label = format!("─ {label_text} ─");
++        let label_width = UnicodeWidthStr::width(label.as_str());
++        if label_width > width as usize {
++            let (label, _suffix, label_width) = take_prefix_by_width(&label, width as usize);
++            return vec![
++                Line::from_iter([
++                    label,
++                    "─".repeat((width as usize).saturating_sub(label_width)),
++                ])
++                .dim(),
++            ];
+         }
+-        let line_width = "■ Context compacted".width()
+-            + details
+-                .as_ref()
+-                .map(|details| 1 + details.width())
+-                .unwrap_or_default();
+-        let target_width = usize::from(width);
+-        if target_width > line_width {
+-            spans.push(Span::styled(" ".repeat(target_width - line_width), style));
++
++        let mut spans = Vec::new();
++        spans.push("─ ".dim());
++        spans.push(
++            "Context compaction triggered"
++                .fg(Color::Yellow)
++                .add_modifier(Modifier::BOLD),
++        );
++        if let Some(details) = self.trigger_context_usage.label() {
++            spans.push(" ■ ".dim());
++            spans.push(details.dim());
+         }
+-        vec![Line::from(spans).style(style)]
++        spans.push(" ─".dim());
++        spans.push(
++            "─"
++                .repeat((width as usize).saturating_sub(label_width))
++                .dim(),
++        );
++        vec![Line::from(spans)]
+     }
+ 
+     fn raw_lines(&self) -> Vec<Line<'static>> {
+-        let mut text = "■ Context compacted".to_string();
+-        if let Some(details) = self.details_text() {
+-            text.push(' ');
+-            text.push_str(&details);
++        vec![Line::from(self.label())]
++    }
++}
++
++impl ContextCompactionTriggeredHistoryCell {
++    fn label(&self) -> String {
++        match self.trigger_context_usage.label() {
++            Some(details) => format!("Context compaction triggered ■ {details}"),
++            None => "Context compaction triggered".to_string(),
+         }
+-        vec![text.into()]
+     }
+ }
+ 
+ impl ContextCompactedHistoryCell {
+-    fn banner_style() -> Style {
+-        Style::default()
+-            .fg(Color::Red)
+-            .bg(Color::Yellow)
+-            .add_modifier(Modifier::BOLD)
++    fn label(&self) -> String {
++        match self.details_label() {
++            Some(details) => format!("Context compacted ■ {details}"),
++            None => "Context compacted".to_string(),
++        }
+     }
+ 
+-    fn details_text(&self) -> Option<String> {
++    fn details_label(&self) -> Option<String> {
+         let mut details = Vec::new();
+         if let Some(duration_ms) = self.duration_ms {
+             let elapsed_seconds = u64::try_from(duration_ms.max(0))
+@@ -275,7 +348,39 @@ impl ContextCompactedHistoryCell {
+         if let Some(usage) = self.post_compact_context_usage {
+             details.push(usage.label());
+         }
+-        (!details.is_empty()).then(|| format!("· {}", details.join(" · ")))
++        (!details.is_empty()).then(|| details.join(" ■ "))
++    }
++}
++
++impl ContextCompactionTriggerUsage {
++    fn label(self) -> Option<String> {
++        let mut details = Vec::new();
++        match (self.used_tokens, self.context_window) {
++            (Some(used_tokens), Some(context_window)) if context_window > 0 => {
++                let percent =
++                    (used_tokens.saturating_mul(100) + context_window / 2) / context_window;
++                details.push(format!(
++                    "{}% Used ({} / {})",
++                    percent.clamp(0, 100),
++                    compact_token_count(used_tokens),
++                    compact_token_count(context_window)
++                ));
++            }
++            (Some(used_tokens), _) => {
++                details.push(format!(
++                    "{} Used (window unknown)",
++                    compact_token_count(used_tokens)
++                ));
++            }
++            (None, Some(context_window)) => {
++                details.push(format!("Window {}", compact_token_count(context_window)));
++            }
++            (None, None) => {}
++        }
++        if let Some(limit) = self.auto_compact_limit.filter(|limit| *limit > 0) {
++            details.push(format!("Auto limit {}", compact_token_count(limit)));
++        }
++        (!details.is_empty()).then(|| details.join(" ■ "))
+     }
+ }
+ 
+@@ -321,6 +426,14 @@ pub(crate) fn new_context_compacted_event(
+     }
+ }
+ 
++pub(crate) fn new_context_compaction_triggered_event(
++    trigger_context_usage: ContextCompactionTriggerUsage,
++) -> impl HistoryCell {
++    ContextCompactionTriggeredHistoryCell {
++        trigger_context_usage,
++    }
++}
++
+ pub(crate) fn new_error_event(message: String) -> PlainHistoryCell {
+     // Use a hair space (U+200A) to create a subtle, near-invisible separation
+     // before the text. VS16 is intentionally omitted to keep spacing tighter
+@@ -337,7 +450,7 @@ mod tests {
+     use super::*;
+ 
+     #[test]
+-    fn context_compacted_event_renders_full_width_yellow_banner() {
++    fn context_compacted_event_renders_separator_banner() {
+         let cell = new_context_compacted_event(
+             Some(84_000),
+             Some(PostCompactContextUsage::Percent {
+@@ -345,27 +458,40 @@ mod tests {
+                 used_tokens: 84_000,
+             }),
+         );
+-        let lines = cell.display_lines(60);
++        let lines = cell.display_lines(100);
+ 
+         assert_eq!(lines.len(), 1);
+-        assert!(
+-            lines[0]
+-                .to_string()
+-                .starts_with("■ Context compacted · Worked 1m 24s · 14% Used (84K tokens")
+-        );
++        let rendered = lines[0].to_string();
++        assert!(rendered.starts_with("─ Context compacted ■ Worked 1m 24s"));
++        assert!(rendered.contains("■ 14% Used (84K tokens"));
++        assert!(!rendered.contains("■ Context compacted"));
+         let rendered_width: usize = lines[0]
+             .spans
+             .iter()
+             .map(ratatui::prelude::Span::width)
+             .sum();
+-        assert_eq!(rendered_width, 60);
+-        for span in &lines[0].spans {
+-            assert_eq!(span.style.bg, Some(Color::Yellow));
+-            assert_eq!(span.style.fg, Some(Color::Red));
+-            assert!(span.style.add_modifier.contains(Modifier::BOLD));
+-        }
+-        assert_eq!(lines[0].style.fg, Some(Color::Red));
+-        assert_eq!(lines[0].style.bg, Some(Color::Yellow));
++        assert_eq!(rendered_width, 100);
++        assert_eq!(lines[0].spans[1].style.fg, Some(Color::Yellow));
++        assert!(
++            lines[0].spans[1]
++                .style
++                .add_modifier
++                .contains(Modifier::BOLD)
++        );
++    }
++
++    #[test]
++    fn context_compaction_triggered_event_renders_separator_banner() {
++        let cell = new_context_compaction_triggered_event(ContextCompactionTriggerUsage {
++            used_tokens: Some(244_000),
++            context_window: Some(258_000),
++            auto_compact_limit: Some(220_000),
++        });
++        let rendered = cell.display_lines(100)[0].to_string();
++
++        assert!(rendered.contains("Context compaction triggered"));
++        assert!(rendered.contains("95% Used (244K tokens / 258K tokens)"));
++        assert!(rendered.contains("Auto limit 220K tokens"));
+     }
+ 
+     #[test]
+@@ -378,7 +504,7 @@ mod tests {
+         );
+         assert_eq!(
+             unknown.raw_lines()[0].to_string(),
+-            "■ Context compacted · 512 tokens Used (window unknown)"
++            "Context compacted ■ 512 tokens Used (window unknown)"
+         );
+ 
+         let tiny = new_context_compacted_event(
+@@ -387,12 +513,12 @@ mod tests {
+         );
+         assert_eq!(
+             tiny.raw_lines()[0].to_string(),
+-            "■ Context compacted · <1% Used (512 tokens)"
++            "Context compacted ■ <1% Used (512 tokens)"
+         );
+     }
+ 
+     #[test]
+-    fn context_compacted_event_fills_render_area_background() {
++    fn context_compacted_event_uses_separator_line_background() {
+         use crate::render::renderable::Renderable;
+         use ratatui::buffer::Buffer;
+         use ratatui::layout::Rect;
+@@ -407,8 +533,7 @@ mod tests {
+ 
+         for x in 0..area.width {
+             let cell = buf.cell((x, 0)).expect("cell should exist");
+-            assert_eq!(cell.bg, Color::Yellow);
+-            assert_eq!(cell.fg, Color::Red);
++            assert_ne!(cell.bg, Color::Yellow);
+         }
+     }
+ }

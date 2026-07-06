@@ -1,0 +1,356 @@
+diff --git a/codex-rs/tui/src/status/card.rs b/codex-rs/tui/src/status/card.rs
+index fc7ac33fac..b48e1d4085 100644
+--- a/codex-rs/tui/src/status/card.rs
++++ b/codex-rs/tui/src/status/card.rs
+@@ -18,8 +18,11 @@ use codex_protocol::models::ActivePermissionProfile;
+ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
+ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
+ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
++use codex_protocol::models::ManagedFileSystemPermissions;
+ use codex_protocol::models::PermissionProfile;
+ use codex_protocol::openai_models::ReasoningEffort;
++use codex_protocol::permissions::FileSystemPath;
++use codex_protocol::permissions::FileSystemSpecialPath;
+ use codex_utils_absolute_path::AbsolutePathBuf;
+ use codex_utils_sandbox_summary::summarize_permission_profile;
+ use ratatui::prelude::*;
+@@ -55,6 +58,10 @@ use std::sync::Arc;
+ use std::sync::RwLock;
+ 
+ const CHATGPT_USAGE_URL: &str = "https://chatgpt.com/codex/settings/usage";
++const ASK_FOR_APPROVAL_LABEL: &str = "Ask For Approval";
++const APPROVE_FOR_ME_LABEL: &str = "Approve For Me";
++const FULL_ACCESS_AGENT_REVIEW_LABEL: &str = "Full Access + Agent Review";
++const YOLO_LABEL: &str = "YOLO";
+ 
+ #[derive(Debug, Clone)]
+ struct StatusContextWindowData {
+@@ -307,7 +314,7 @@ impl StatusHistoryCell {
+             .map(|(_, v)| v.clone())
+             .unwrap_or_else(|| "<unknown>".to_string());
+         let active_permission_profile = config.permissions.active_permission_profile();
+-        let sandbox =
++        let permission_summary =
+             status_permission_summary(&permission_profile, &config.cwd, workspace_roots.as_slice());
+         let workspace_root_suffix = workspace_root_suffix(workspace_roots.as_slice(), &config.cwd);
+         let approval = status_approval_label(approval_policy, config.approvals_reviewer, &approval);
+@@ -315,8 +322,10 @@ impl StatusHistoryCell {
+             active_permission_profile.as_ref(),
+             &permission_profile,
+             approval_policy,
+-            &sandbox,
++            config.approvals_reviewer,
++            &permission_summary.sandbox,
+             &approval,
++            permission_summary.default_workspace,
+             workspace_root_suffix.as_deref(),
+         );
+         let model_provider = format_model_provider(config, runtime_model_provider_base_url);
+@@ -577,28 +586,79 @@ impl StatusHistoryCell {
+     }
+ }
+ 
++struct StatusPermissionSummary {
++    sandbox: String,
++    default_workspace: bool,
++}
++
+ fn status_permission_summary(
+     permission_profile: &PermissionProfile,
+     cwd: &AbsolutePathBuf,
+     workspace_roots: &[AbsolutePathBuf],
+-) -> String {
++) -> StatusPermissionSummary {
+     let summary = summarize_permission_profile(permission_profile, cwd, workspace_roots);
++    let default_workspace = workspace_profile_has_only_default_writes(permission_profile, cwd);
+     if let Some(details) = summary.strip_prefix("read-only") {
+         if details.contains("(network access enabled)") {
+-            return "read-only with network access".to_string();
++            return StatusPermissionSummary {
++                sandbox: "read-only with network access".to_string(),
++                default_workspace,
++            };
+         }
+-        return "read-only".to_string();
++        return StatusPermissionSummary {
++            sandbox: "read-only".to_string(),
++            default_workspace,
++        };
+     }
+     if let Some(details) = summary.strip_prefix("workspace-write") {
+         if details.contains("(network access enabled)") {
+-            return "workspace with network access".to_string();
++            return StatusPermissionSummary {
++                sandbox: "workspace with network access".to_string(),
++                default_workspace,
++            };
+         }
+-        return "workspace".to_string();
++        return StatusPermissionSummary {
++            sandbox: "workspace".to_string(),
++            default_workspace,
++        };
+     }
+     if summary == "custom permissions (network access enabled)" {
+-        return "custom permissions with network access".to_string();
++        return StatusPermissionSummary {
++            sandbox: "custom permissions with network access".to_string(),
++            default_workspace,
++        };
+     }
+-    summary
++    StatusPermissionSummary {
++        sandbox: summary,
++        default_workspace,
++    }
++}
++
++fn workspace_profile_has_only_default_writes(
++    permission_profile: &PermissionProfile,
++    cwd: &AbsolutePathBuf,
++) -> bool {
++    let PermissionProfile::Managed { file_system, .. } = permission_profile else {
++        return false;
++    };
++    let ManagedFileSystemPermissions::Restricted { entries, .. } = file_system else {
++        return false;
++    };
++    entries.iter().all(|entry| {
++        if !entry.access.can_write() {
++            return true;
++        }
++        match &entry.path {
++            FileSystemPath::Special {
++                value:
++                    FileSystemSpecialPath::ProjectRoots { subpath: None }
++                    | FileSystemSpecialPath::Tmpdir
++                    | FileSystemSpecialPath::SlashTmp,
++            } => true,
++            FileSystemPath::Path { path } => path == cwd,
++            _ => false,
++        }
++    })
+ }
+ 
+ fn workspace_root_suffix(
+@@ -621,8 +681,10 @@ fn status_permissions_label(
+     active_permission_profile: Option<&ActivePermissionProfile>,
+     permission_profile: &PermissionProfile,
+     approval_policy: AskForApproval,
++    approvals_reviewer: ApprovalsReviewer,
+     sandbox: &str,
+     approval: &str,
++    default_workspace: bool,
+     workspace_root_suffix: Option<&str>,
+ ) -> String {
+     let active_id = active_permission_profile.map(|active| active.id.as_str());
+@@ -637,6 +699,13 @@ fn status_permissions_label(
+         }
+         Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE) => match sandbox {
+             "workspace" => {
++                if default_workspace
++                    && workspace_root_suffix.is_none()
++                    && let Some(label) =
++                        builtin_workspace_profile_label(approval_policy, approvals_reviewer)
++                {
++                    return label.to_string();
++                }
+                 return format!(
+                     "Workspace{} ({approval})",
+                     workspace_root_suffix.unwrap_or("")
+@@ -653,11 +722,12 @@ fn status_permissions_label(
+         Some(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS)
+             if permission_profile == &PermissionProfile::Disabled =>
+         {
+-            return if approval_policy == AskForApproval::Never {
+-                "Full Access".to_string()
+-            } else {
+-                format!("No Sandbox ({approval})")
+-            };
++            if let Some(label) =
++                builtin_full_access_profile_label(approval_policy, approvals_reviewer)
++            {
++                return label.to_string();
++            }
++            return format!("No Sandbox ({approval})");
+         }
+         Some(id) => {
+             let sandbox = decorate_workspace_sandbox_label(sandbox, workspace_root_suffix);
+@@ -670,6 +740,12 @@ fn status_permissions_label(
+         return format!("Read Only ({approval})");
+     }
+     if approval_policy == AskForApproval::OnRequest && sandbox == "workspace" {
++        if workspace_root_suffix.is_none()
++            && let Some(label) =
++                builtin_workspace_profile_label(approval_policy, approvals_reviewer)
++        {
++            return label.to_string();
++        }
+         return format!(
+             "Workspace{} ({approval})",
+             workspace_root_suffix.unwrap_or("")
+@@ -678,12 +754,45 @@ fn status_permissions_label(
+     if approval_policy == AskForApproval::Never
+         && permission_profile == &PermissionProfile::Disabled
+     {
+-        return "Full Access".to_string();
++        if let Some(label) = builtin_full_access_profile_label(approval_policy, approvals_reviewer)
++        {
++            return label.to_string();
++        }
++    }
++    if permission_profile == &PermissionProfile::Disabled
++        && let Some(label) = builtin_full_access_profile_label(approval_policy, approvals_reviewer)
++    {
++        return label.to_string();
+     }
+     let sandbox = decorate_workspace_sandbox_label(sandbox, workspace_root_suffix);
+     format!("Custom ({sandbox}, {approval})")
+ }
+ 
++fn builtin_workspace_profile_label(
++    approval_policy: AskForApproval,
++    approvals_reviewer: ApprovalsReviewer,
++) -> Option<&'static str> {
++    match (approval_policy, approvals_reviewer) {
++        (AskForApproval::OnRequest, ApprovalsReviewer::User) => Some(ASK_FOR_APPROVAL_LABEL),
++        (AskForApproval::OnRequest, ApprovalsReviewer::AutoReview) => Some(APPROVE_FOR_ME_LABEL),
++        _ => None,
++    }
++}
++
++fn builtin_full_access_profile_label(
++    approval_policy: AskForApproval,
++    approvals_reviewer: ApprovalsReviewer,
++) -> Option<&'static str> {
++    match (approval_policy, approvals_reviewer) {
++        (AskForApproval::Never, ApprovalsReviewer::User) => Some("Full Access"),
++        (AskForApproval::OnRequest, ApprovalsReviewer::AutoReview) => {
++            Some(FULL_ACCESS_AGENT_REVIEW_LABEL)
++        }
++        (AskForApproval::Never, ApprovalsReviewer::AutoReview) => Some(YOLO_LABEL),
++        _ => None,
++    }
++}
++
+ fn decorate_workspace_sandbox_label(sandbox: &str, workspace_root_suffix: Option<&str>) -> String {
+     match workspace_root_suffix {
+         Some(suffix) if sandbox.starts_with("workspace") => format!("{sandbox}{suffix}"),
+diff --git a/codex-rs/tui/src/status/snapshots/codex_tui__status__tests__status_snapshot_includes_reasoning_details.snap b/codex-rs/tui/src/status/snapshots/codex_tui__status__tests__status_snapshot_includes_reasoning_details.snap
+index 1d176fef81..8fa740d6ef 100644
+--- a/codex-rs/tui/src/status/snapshots/codex_tui__status__tests__status_snapshot_includes_reasoning_details.snap
++++ b/codex-rs/tui/src/status/snapshots/codex_tui__status__tests__status_snapshot_includes_reasoning_details.snap
+@@ -1,5 +1,6 @@
+ ---
+ source: tui/src/status/tests.rs
++assertion_line: 324
+ expression: sanitized
+ ---
+ /status
+@@ -12,7 +13,7 @@ expression: sanitized
+ │                                                                           │
+ │  Model:            gpt-5.1-codex-max (reasoning high, summaries detailed) │
+ │  Directory: [[workspace]]                                                 │
+-│  Permissions:      Workspace (Ask for approval)                           │
++│  Permissions:      Ask For Approval                                       │
+ │  Agents.md:        <none>                                                 │
+ │                                                                           │
+ │  Token usage:      1.9K total  (1K input + 900 output)                    │
+diff --git a/codex-rs/tui/src/status/snapshots/codex_tui__status__tests__status_snapshot_shows_auto_review_permissions.snap b/codex-rs/tui/src/status/snapshots/codex_tui__status__tests__status_snapshot_shows_auto_review_permissions.snap
+index 922b03c1a0..d27a760c2b 100644
+--- a/codex-rs/tui/src/status/snapshots/codex_tui__status__tests__status_snapshot_shows_auto_review_permissions.snap
++++ b/codex-rs/tui/src/status/snapshots/codex_tui__status__tests__status_snapshot_shows_auto_review_permissions.snap
+@@ -1,5 +1,6 @@
+ ---
+ source: tui/src/status/tests.rs
++assertion_line: 900
+ expression: sanitized
+ ---
+ /status
+@@ -12,7 +13,7 @@ expression: sanitized
+ │                                                                       │
+ │  Model:            gpt-5.1-codex-max (reasoning none, summaries auto) │
+ │  Directory: [[workspace]]                                             │
+-│  Permissions:      Workspace (Approve for me)                         │
++│  Permissions:      Approve For Me                                     │
+ │  Agents.md:        <none>                                             │
+ │                                                                       │
+ │  Token usage:      0 total  (0 input + 0 output)                      │
+diff --git a/codex-rs/tui/src/status/tests.rs b/codex-rs/tui/src/status/tests.rs
+index c602a539e2..171a02486d 100644
+--- a/codex-rs/tui/src/status/tests.rs
++++ b/codex-rs/tui/src/status/tests.rs
+@@ -39,6 +39,7 @@ use codex_protocol::ThreadId;
+ use codex_protocol::config_types::ApprovalsReviewer;
+ use codex_protocol::config_types::ReasoningSummary;
+ use codex_protocol::models::ActivePermissionProfile;
++use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
+ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
+ use codex_protocol::models::ManagedFileSystemPermissions;
+ use codex_protocol::models::PermissionProfile;
+@@ -481,7 +482,7 @@ async fn status_permissions_named_workspace_profile_shows_builtin_label() {
+ 
+     assert_eq!(
+         permissions_text_for(&config).as_deref(),
+-        Some("Workspace (Ask for approval)")
++        Some("Ask For Approval")
+     );
+ }
+ 
+@@ -505,10 +506,55 @@ async fn status_permissions_workspace_auto_review_shows_reviewer_label() {
+ 
+     assert_eq!(
+         permissions_text_for(&config).as_deref(),
+-        Some("Workspace (Approve for me)")
++        Some("Approve For Me")
+     );
+ }
+ 
++#[tokio::test]
++async fn status_permissions_full_access_auto_review_shows_builtin_label() {
++    let temp_home = TempDir::new().expect("temp home");
++    let mut config = test_config(&temp_home).await;
++    config.approvals_reviewer = ApprovalsReviewer::AutoReview;
++    config
++        .permissions
++        .approval_policy
++        .set(AskForApproval::OnRequest.to_core())
++        .expect("set approval policy");
++    config
++        .permissions
++        .set_permission_profile_from_session_snapshot(PermissionProfileSnapshot::active(
++            PermissionProfile::Disabled,
++            ActivePermissionProfile::new(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS),
++        ))
++        .expect("set permission profile");
++
++    assert_eq!(
++        permissions_text_for(&config).as_deref(),
++        Some("Full Access + Agent Review")
++    );
++}
++
++#[tokio::test]
++async fn status_permissions_yolo_shows_builtin_label() {
++    let temp_home = TempDir::new().expect("temp home");
++    let mut config = test_config(&temp_home).await;
++    config.approvals_reviewer = ApprovalsReviewer::AutoReview;
++    config
++        .permissions
++        .approval_policy
++        .set(AskForApproval::Never.to_core())
++        .expect("set approval policy");
++    config
++        .permissions
++        .set_permission_profile_from_session_snapshot(PermissionProfileSnapshot::active(
++            PermissionProfile::Disabled,
++            ActivePermissionProfile::new(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS),
++        ))
++        .expect("set permission profile");
++
++    assert_eq!(permissions_text_for(&config).as_deref(), Some("YOLO"));
++}
++
+ #[tokio::test]
+ async fn status_permissions_named_profile_shows_additional_writable_roots() {
+     let temp_home = TempDir::new().expect("temp home");
