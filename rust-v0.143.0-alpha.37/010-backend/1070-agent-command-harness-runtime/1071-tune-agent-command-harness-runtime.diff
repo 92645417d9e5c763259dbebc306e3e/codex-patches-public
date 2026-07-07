@@ -1,0 +1,1793 @@
+diff --git a/codex-rs/code-mode-protocol/src/runtime.rs b/codex-rs/code-mode-protocol/src/runtime.rs
+index 147822063f..245974f6f3 100644
+--- a/codex-rs/code-mode-protocol/src/runtime.rs
++++ b/codex-rs/code-mode-protocol/src/runtime.rs
+@@ -8,8 +8,8 @@ use crate::CodeModeToolKind;
+ use crate::FunctionCallOutputContentItem;
+ use crate::ToolDefinition;
+ 
+-pub const DEFAULT_EXEC_YIELD_TIME_MS: u64 = 10_000;
+-pub const DEFAULT_WAIT_YIELD_TIME_MS: u64 = 10_000;
++pub const DEFAULT_EXEC_YIELD_TIME_MS: u64 = 300_000;
++pub const DEFAULT_WAIT_YIELD_TIME_MS: u64 = 300_000;
+ pub const DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 10_000;
+ 
+ #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+diff --git a/codex-rs/core/src/agent/builtins/awaiter.toml b/codex-rs/core/src/agent/builtins/awaiter.toml
+index a34583c0c9..63513a8fff 100644
+--- a/codex-rs/core/src/agent/builtins/awaiter.toml
++++ b/codex-rs/core/src/agent/builtins/awaiter.toml
+@@ -1,4 +1,4 @@
+-background_terminal_max_timeout = 3600000
++background_terminal_max_timeout = 300000
+ model_reasoning_effort = "low"
+ developer_instructions="""You are an awaiter.
+ Your role is to await the completion of a specific command or task and report its status only when it is finished.
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index df7b92f119..fdcbfbf7ea 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -10516,6 +10516,28 @@ enabled = true
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn multi_agent_v2_default_wait_timeouts_are_half_hour() -> std::io::Result<()> {
++    let codex_home = TempDir::new()?;
++    std::fs::write(
++        codex_home.path().join(CONFIG_TOML_FILE),
++        r#"[features.multi_agent_v2]
++enabled = true
++"#,
++    )?;
++
++    let config = ConfigBuilder::without_managed_config_for_tests()
++        .codex_home(codex_home.path().to_path_buf())
++        .fallback_cwd(Some(codex_home.path().to_path_buf()))
++        .build()
++        .await?;
++
++    assert_eq!(config.multi_agent_v2.min_wait_timeout_ms, 1_800_000);
++    assert_eq!(config.multi_agent_v2.default_wait_timeout_ms, 1_800_000);
++
++    Ok(())
++}
++
+ #[test]
+ fn multi_agent_v2_default_usage_hints_use_configured_thread_cap() {
+     let config_toml = toml::from_str(
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index 0554cd9505..b8efafbef3 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -204,9 +204,9 @@ impl Default for GhostSnapshotConfig {
+ pub(crate) const AGENTS_MD_MAX_BYTES: usize = DEFAULT_PROJECT_DOC_MAX_BYTES; // 32 KiB
+ pub(crate) const DEFAULT_AGENT_MAX_THREADS: Option<usize> = Some(6);
+ pub(crate) const DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION: usize = 4;
+-pub(crate) const DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
++pub(crate) const DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS: i64 = 1_800_000;
+ pub(crate) const DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS: i64 = 3600 * 1000;
+-pub(crate) const DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
++pub(crate) const DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS: i64 = 1_800_000;
+ const DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT: &str = r#"You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
+ 
+ At the start of your turn, you are the active agent.
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index 96bb533e97..b40bb423a1 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -8923,7 +8923,7 @@ async fn turn_context_item_omits_legacy_equivalent_file_system_sandbox_policy()
+ }
+ 
+ #[tokio::test]
+-async fn turn_context_item_stores_split_file_system_sandbox_policy_when_different() {
++async fn turn_context_item_omits_split_file_system_sandbox_policy_when_legacy_projection_matches() {
+     let (_session, mut turn_context) = make_session_and_context().await;
+     let file_system_sandbox_policy = file_system_policy_with_unreadable_glob(&turn_context);
+     turn_context.permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
+@@ -8934,10 +8934,7 @@ async fn turn_context_item_stores_split_file_system_sandbox_policy_when_differen
+ 
+     let item = turn_context.to_turn_context_item();
+ 
+-    assert_eq!(
+-        item.file_system_sandbox_policy,
+-        Some(file_system_sandbox_policy)
+-    );
++    assert_eq!(item.file_system_sandbox_policy, None);
+     assert_eq!(
+         item.permission_profile,
+         Some(turn_context.permission_profile())
+@@ -9075,7 +9072,7 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
+ }
+ 
+ #[tokio::test]
+-async fn record_context_updates_and_set_reference_context_item_persists_split_file_system_policy_to_rollout()
++async fn record_context_updates_and_set_reference_context_item_omits_redundant_split_file_system_policy_from_rollout()
+  {
+     let (mut session, mut turn_context) = make_session_and_context().await;
+     let file_system_sandbox_policy = file_system_policy_with_unreadable_glob(&turn_context);
+@@ -9100,13 +9097,19 @@ async fn record_context_updates_and_set_reference_context_item_persists_split_fi
+     else {
+         panic!("expected resumed rollout history");
+     };
+-    let persisted_file_system_sandbox_policy = resumed.history.iter().find_map(|item| match item {
+-        RolloutItem::TurnContext(ctx) => ctx.file_system_sandbox_policy.clone(),
++    let persisted_turn_context = resumed.history.iter().find_map(|item| match item {
++        RolloutItem::TurnContext(ctx) => Some(ctx.clone()),
+         _ => None,
+     });
+     assert_eq!(
+-        persisted_file_system_sandbox_policy,
+-        Some(file_system_sandbox_policy)
++        serde_json::to_value(persisted_turn_context.clone())
++            .expect("serialize persisted turn context item"),
++        serde_json::to_value(Some(turn_context.to_turn_context_item()))
++            .expect("serialize expected turn context item")
++    );
++    assert_eq!(
++        persisted_turn_context.and_then(|ctx| ctx.file_system_sandbox_policy),
++        None
+     );
+ }
+ 
+diff --git a/codex-rs/core/src/session/turn_context.rs b/codex-rs/core/src/session/turn_context.rs
+index b9bf42073b..f2eefb1747 100644
+--- a/codex-rs/core/src/session/turn_context.rs
++++ b/codex-rs/core/src/session/turn_context.rs
+@@ -340,14 +340,18 @@ impl TurnContext {
+         // while both fields exist; once callers consume only the split policy,
+         // this comparison and the legacy projection should go away.
+         let legacy_file_system_sandbox_policy =
+-            FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
++            FileSystemSandboxPolicy::from_legacy_sandbox_policy_preserving_deny_entries(
+                 &self.sandbox_policy(),
+                 #[allow(deprecated)]
+                 &self.cwd,
++                &self.file_system_sandbox_policy(),
+             );
+         let file_system_sandbox_policy = self.file_system_sandbox_policy();
+-        (file_system_sandbox_policy != legacy_file_system_sandbox_policy)
+-            .then_some(file_system_sandbox_policy)
++        #[allow(deprecated)]
++        let cwd = &self.cwd;
++        (!file_system_sandbox_policy
++            .is_semantically_equivalent_to(&legacy_file_system_sandbox_policy, cwd))
++        .then_some(file_system_sandbox_policy)
+     }
+ 
+     pub(crate) fn to_turn_context_item(&self) -> TurnContextItem {
+diff --git a/codex-rs/core/src/test_support.rs b/codex-rs/core/src/test_support.rs
+index 1db714fada..835a312cb4 100644
+--- a/codex-rs/core/src/test_support.rs
++++ b/codex-rs/core/src/test_support.rs
+@@ -63,6 +63,10 @@ pub fn set_deterministic_process_ids(enabled: bool) {
+     unified_exec::set_deterministic_process_ids_for_tests(enabled);
+ }
+ 
++pub fn set_min_unified_exec_yield_time_for_tests(value: Option<u64>) {
++    unified_exec::set_min_yield_time_ms_override_for_tests(value);
++}
++
+ pub fn auth_manager_from_auth(auth: CodexAuth) -> Arc<AuthManager> {
+     AuthManager::from_auth_for_testing(auth)
+ }
+diff --git a/codex-rs/core/src/tools/context.rs b/codex-rs/core/src/tools/context.rs
+index a6dd9e1a74..b1ec3e9639 100644
+--- a/codex-rs/core/src/tools/context.rs
++++ b/codex-rs/core/src/tools/context.rs
+@@ -336,7 +336,7 @@ impl ToolOutput for ExecCommandToolOutput {
+             call_id,
+             payload,
+             vec![FunctionCallOutputContentItem::InputText {
+-                text: self.response_text(),
++                text: self.response_text_for_call(call_id),
+             }],
+             Some(true),
+         )
+@@ -410,6 +410,10 @@ impl ExecCommandToolOutput {
+     }
+ 
+     fn response_text(&self) -> String {
++        self.response_text_for_call(&self.event_call_id)
++    }
++
++    fn response_text_for_call(&self, _call_id: &str) -> String {
+         let mut sections = Vec::new();
+ 
+         if !self.chunk_id.is_empty() {
+diff --git a/codex-rs/core/src/tools/context_tests.rs b/codex-rs/core/src/tools/context_tests.rs
+index 6ac5b6978f..cd4e9512c9 100644
+--- a/codex-rs/core/src/tools/context_tests.rs
++++ b/codex-rs/core/src/tools/context_tests.rs
+@@ -461,3 +461,97 @@ fn exec_command_tool_output_formats_truncated_response() {
+         other => panic!("expected FunctionCallOutput, got {other:?}"),
+     }
+ }
++
++#[test]
++fn exec_command_tool_output_reports_running_session_for_initial_call() {
++    let payload = ToolPayload::Function {
++        arguments: "{}".to_string(),
++    };
++    let response = ExecCommandToolOutput {
++        event_call_id: "call-42".to_string(),
++        chunk_id: "abc123".to_string(),
++        wall_time: std::time::Duration::from_millis(1250),
++        raw_output: Vec::new(),
++        truncation_policy: TruncationPolicy::Tokens(10_000),
++        max_output_tokens: None,
++        process_id: Some(42),
++        exit_code: None,
++        original_token_count: Some(0),
++        hook_command: Some("sleep 60".to_string()),
++    }
++    .to_response_item("call-42", &payload);
++
++    match response {
++        ResponseInputItem::FunctionCallOutput { output, .. } => {
++            let text = output
++                .body
++                .to_text()
++                .expect("exec output should serialize as text");
++            assert!(text.contains("Process running with session ID 42"));
++        }
++        other => panic!("expected FunctionCallOutput, got {other:?}"),
++    }
++}
++
++#[test]
++fn write_stdin_empty_followup_poll_keeps_running_status() {
++    let payload = ToolPayload::Function {
++        arguments: "{}".to_string(),
++    };
++    let response = ExecCommandToolOutput {
++        event_call_id: "exec-call-42".to_string(),
++        chunk_id: "abc123".to_string(),
++        wall_time: std::time::Duration::from_millis(1250),
++        raw_output: Vec::new(),
++        truncation_policy: TruncationPolicy::Tokens(10_000),
++        max_output_tokens: None,
++        process_id: Some(42),
++        exit_code: None,
++        original_token_count: Some(0),
++        hook_command: Some("sleep 60".to_string()),
++    }
++    .to_response_item("write-stdin-call", &payload);
++
++    match response {
++        ResponseInputItem::FunctionCallOutput { output, .. } => {
++            let text = output
++                .body
++                .to_text()
++                .expect("exec output should serialize as text");
++            assert!(text.contains("Process running with session ID 42"));
++        }
++        other => panic!("expected FunctionCallOutput, got {other:?}"),
++    }
++}
++
++#[test]
++fn write_stdin_followup_poll_with_output_keeps_running_status() {
++    let payload = ToolPayload::Function {
++        arguments: "{}".to_string(),
++    };
++    let response = ExecCommandToolOutput {
++        event_call_id: "exec-call-42".to_string(),
++        chunk_id: "abc123".to_string(),
++        wall_time: std::time::Duration::from_millis(1250),
++        raw_output: b"still working\n".to_vec(),
++        truncation_policy: TruncationPolicy::Tokens(10_000),
++        max_output_tokens: None,
++        process_id: Some(42),
++        exit_code: None,
++        original_token_count: Some(3),
++        hook_command: Some("sleep 60".to_string()),
++    }
++    .to_response_item("write-stdin-call", &payload);
++
++    match response {
++        ResponseInputItem::FunctionCallOutput { output, .. } => {
++            let text = output
++                .body
++                .to_text()
++                .expect("exec output should serialize as text");
++            assert!(text.contains("Process running with session ID 42"));
++            assert!(text.contains("still working"));
++        }
++        other => panic!("expected FunctionCallOutput, got {other:?}"),
++    }
++}
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs b/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs
+index 204385934e..d328b2eb55 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs
+@@ -1,5 +1,4 @@
+ use super::*;
+-use crate::agent::control::SpawnAgentForkMode;
+ use crate::agent::control::SpawnAgentOptions;
+ use crate::agent::control::render_input_preview;
+ use crate::agent::exceeds_thread_spawn_depth_limit;
+@@ -89,25 +88,19 @@ async fn handle_spawn_agent(
+     if let Some(service_tier) = args.service_tier.as_ref() {
+         config.service_tier = Some(service_tier.clone());
+     }
+-    if args.fork_context {
+-        reject_full_fork_spawn_overrides(
+-            role_name,
+-            args.model.as_deref(),
+-            args.reasoning_effort.clone(),
+-        )?;
+-    } else {
+-        apply_requested_spawn_agent_model_overrides(
+-            &session,
+-            turn.as_ref(),
+-            &mut config,
+-            args.model.as_deref(),
+-            args.reasoning_effort.clone(),
+-        )
+-        .await?;
+-        apply_role_to_config(&mut config, role_name)
+-            .await
+-            .map_err(FunctionCallError::RespondToModel)?;
+-    }
++    let _requested_fork_context = args.fork_context;
++    let fork_context = false;
++    apply_requested_spawn_agent_model_overrides(
++        &session,
++        turn.as_ref(),
++        &mut config,
++        args.model.as_deref(),
++        args.reasoning_effort.clone(),
++    )
++    .await?;
++    apply_role_to_config(&mut config, role_name)
++        .await
++        .map_err(FunctionCallError::RespondToModel)?;
+     apply_spawn_agent_service_tier(
+         &session,
+         &mut config,
+@@ -128,8 +121,8 @@ async fn handle_spawn_agent(
+             /*task_name*/ None,
+         )?),
+         SpawnAgentOptions {
+-            fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),
+-            fork_mode: args.fork_context.then_some(SpawnAgentForkMode::FullHistory),
++            fork_parent_spawn_call_id: fork_context.then(|| call_id.clone()),
++            fork_mode: None,
+             parent_thread_id: Some(session.thread_id),
+             environments: Some(turn.environments.to_selections()),
+         },
+@@ -216,6 +209,7 @@ impl CoreToolRuntime for Handler {
+ }
+ 
+ #[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
+ struct SpawnAgentArgs {
+     message: Option<String>,
+     items: Option<Vec<UserInput>>,
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents/wait.rs b/codex-rs/core/src/tools/handlers/multi_agents/wait.rs
+index be22b36908..ee6bcf8fb8 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents/wait.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents/wait.rs
+@@ -62,6 +62,7 @@ impl Handler {
+         } = invocation;
+         let arguments = function_arguments(payload)?;
+         let args: WaitArgs = parse_arguments(&arguments)?;
++        let timeout_ms = resolve_wait_timeout_ms(&args, self.options)?;
+         let receiver_thread_ids = parse_agent_id_targets(args.targets)?;
+         let mut receiver_agents = Vec::with_capacity(receiver_thread_ids.len());
+         let mut target_by_thread_id = HashMap::with_capacity(receiver_thread_ids.len());
+@@ -85,17 +86,6 @@ impl Handler {
+                 agent_role: agent_metadata.agent_role,
+             });
+         }
+-
+-        let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS);
+-        let timeout_ms = match timeout_ms {
+-            ms if ms <= 0 => {
+-                return Err(FunctionCallError::RespondToModel(
+-                    "timeout_ms must be greater than zero".to_owned(),
+-                ));
+-            }
+-            ms => ms.clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS),
+-        };
+-
+         session
+             .send_event(
+                 &turn,
+@@ -227,6 +217,19 @@ struct WaitArgs {
+     timeout_ms: Option<i64>,
+ }
+ 
++fn resolve_wait_timeout_ms(
++    args: &WaitArgs,
++    options: WaitAgentTimeoutOptions,
++) -> Result<i64, FunctionCallError> {
++    let timeout_ms = args.timeout_ms.unwrap_or(options.default_timeout_ms);
++    match timeout_ms {
++        ms if ms <= 0 => Err(FunctionCallError::RespondToModel(
++            "timeout_ms must be greater than zero".to_owned(),
++        )),
++        ms => Ok(ms.clamp(options.min_timeout_ms, options.max_timeout_ms)),
++    }
++}
++
+ #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+ pub(crate) struct WaitAgentResult {
+     pub(crate) status: HashMap<String, AgentStatus>,
+@@ -251,6 +254,24 @@ impl ToolOutput for WaitAgentResult {
+     }
+ }
+ 
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn v1_wait_agent_accepts_short_timeout_but_clamps_pending_wait_floor() {
++        let args = WaitArgs {
++            targets: vec!["agent".to_string()],
++            timeout_ms: Some(10),
++        };
++
++        assert_eq!(
++            resolve_wait_timeout_ms(&args, WaitAgentTimeoutOptions::default()).unwrap(),
++            MIN_WAIT_TIMEOUT_MS
++        );
++    }
++}
++
+ async fn wait_for_final_status(
+     session: Arc<Session>,
+     thread_id: ThreadId,
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_common.rs b/codex-rs/core/src/tools/handlers/multi_agents_common.rs
+index 12ec89d651..1a3eb63a44 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_common.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_common.rs
+@@ -1,6 +1,5 @@
+ use crate::agent::AgentStatus;
+ use crate::config::Config;
+-use crate::config::DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
+ use crate::config::HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
+ use crate::function_tool::FunctionCallError;
+ use crate::session::session::Session;
+@@ -26,8 +25,8 @@ use serde_json::Value as JsonValue;
+ use std::collections::HashMap;
+ 
+ /// Minimum wait timeout to prevent tight polling loops from burning CPU.
+-pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
+-pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
++pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = 1_800_000;
++pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 1_800_000;
+ pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
+ 
+ pub(crate) fn function_arguments(payload: ToolPayload) -> Result<String, FunctionCallError> {
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_spec.rs b/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
+index 23ac4e0bbc..3e11708b0b 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
+@@ -49,8 +49,7 @@ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
+         .then(|| spawn_agent_models_description(&options.available_models));
+     let inherited_model_guidance =
+         (!options.hide_agent_type_model_reasoning).then_some(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE);
+-    let return_value_description =
+-        "Returns the spawned agent id plus the user-facing nickname when available.";
++    let return_value_description = "Starts the new agent with only the initial task, not parent thread history. Returns the spawned agent id plus the user-facing nickname when available.";
+     let mut properties = spawn_agent_common_properties_v1(&options.agent_type_description);
+     if options.hide_agent_type_model_reasoning {
+         hide_spawn_agent_metadata_options(&mut properties);
+@@ -563,18 +562,9 @@ fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<St
+             "agent_type".to_string(),
+             JsonSchema::string(Some(agent_type_description.to_string())),
+         ),
+-        (
+-            "fork_context".to_string(),
+-            JsonSchema::boolean(Some(
+-                "True forks the current thread history into the new agent; false or omitted starts with only the initial prompt."
+-                    .to_string(),
+-            )),
+-        ),
+         (
+             "model".to_string(),
+-            JsonSchema::string(Some(
+-                SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION.to_string(),
+-            )),
++            JsonSchema::string(Some(SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION.to_string())),
+         ),
+         (
+             "reasoning_effort".to_string(),
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs b/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs
+index 0228f7acb9..ff1b166f15 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs
+@@ -115,7 +115,7 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
+ }
+ 
+ #[test]
+-fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
++fn spawn_agent_tool_v1_hides_legacy_fork_context_field() {
+     let tool = create_spawn_agent_tool_v1(SpawnAgentToolOptions {
+         available_models: Vec::new(),
+         agent_type_description: "role help".to_string(),
+@@ -141,7 +141,7 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
+         .as_ref()
+         .expect("spawn_agent should use object params");
+ 
+-    assert!(properties.contains_key("fork_context"));
++    assert!(!properties.contains_key("fork_context"));
+     assert!(!properties.contains_key("fork_turns"));
+     assert_eq!(
+         properties
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+index f313fcf0d9..f8e34e2043 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+@@ -10,6 +10,7 @@ use crate::session::tests::make_session_and_context;
+ use crate::session_prefix::format_inter_agent_completion_message;
+ use crate::thread_manager::thread_store_from_config;
+ use crate::tools::context::ToolOutput;
++use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
+ use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
+ use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
+ use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
+@@ -144,6 +145,18 @@ fn set_turn_config(turn: &mut TurnContext, config: crate::config::Config) {
+     turn.config = Arc::new(config);
+ }
+ 
++fn enable_multi_agent_v2_with_short_waits(turn: &mut TurnContext) {
++    let mut config = (*turn.config).clone();
++    config
++        .features
++        .enable(Feature::MultiAgentV2)
++        .expect("test config should allow feature update");
++    config.multi_agent_v2.min_wait_timeout_ms = 1;
++    config.multi_agent_v2.max_wait_timeout_ms = 10_000;
++    config.multi_agent_v2.default_wait_timeout_ms = 50;
++    set_turn_config(turn, config);
++}
++
+ fn expect_text_output<T>(output: T) -> (String, Option<bool>)
+ where
+     T: ToolOutput,
+@@ -311,7 +324,7 @@ async fn spawn_agent_uses_explorer_role_and_preserves_approval_policy() {
+ }
+ 
+ #[tokio::test]
+-async fn spawn_agent_fork_context_rejects_agent_type_override() {
++async fn spawn_agent_ignores_legacy_fork_context_with_agent_type_override() {
+     let (mut session, mut turn) = make_session_and_context().await;
+     let role_name = install_role_with_model_override(&mut turn).await;
+     let manager = thread_manager();
+@@ -321,7 +334,7 @@ async fn spawn_agent_fork_context_rejects_agent_type_override() {
+         .expect("root thread should start");
+     session.services.agent_control = manager.agent_control();
+     session.thread_id = root.thread_id;
+-    let err = SpawnAgentHandler::default()
++    let output = SpawnAgentHandler::default()
+         .handle(invocation(
+             Arc::new(session),
+             Arc::new(turn),
+@@ -333,19 +346,28 @@ async fn spawn_agent_fork_context_rejects_agent_type_override() {
+             })),
+         ))
+         .await
+-        .err()
+-        .expect("fork_context should reject agent_type overrides");
++        .expect("fork_context should be accepted but ignored for v1 spawns");
++    let (content, _) = expect_text_output(output);
++    let result: serde_json::Value =
++        serde_json::from_str(&content).expect("spawn_agent result should be json");
++    let snapshot = manager
++        .get_thread(parse_agent_id(
++            result["agent_id"]
++                .as_str()
++                .expect("agent_id should be string"),
++        ))
++        .await
++        .expect("spawned agent thread should exist")
++        .config_snapshot()
++        .await;
+ 
+-    assert_eq!(
+-        err,
+-        FunctionCallError::RespondToModel(
+-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
+-        )
+-    );
++    assert_eq!(snapshot.model, "gpt-5-role-override");
++    assert_eq!(snapshot.model_provider_id, "ollama");
++    assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::Minimal));
+ }
+ 
+ #[tokio::test]
+-async fn spawn_agent_fork_context_rejects_child_model_overrides() {
++async fn spawn_agent_ignores_legacy_fork_context_with_model_overrides() {
+     let (mut session, turn) = make_session_and_context().await;
+     let manager = thread_manager();
+     let root = manager
+@@ -355,28 +377,36 @@ async fn spawn_agent_fork_context_rejects_child_model_overrides() {
+     session.services.agent_control = manager.agent_control();
+     session.thread_id = root.thread_id;
+ 
+-    let err = SpawnAgentHandler::default()
++    let output = SpawnAgentHandler::default()
+         .handle(invocation(
+             Arc::new(session),
+             Arc::new(turn),
+             "spawn_agent",
+             function_payload(json!({
+                 "message": "inspect this repo",
+-                "model": "gpt-5-child-override",
++                "model": "gpt-5.4",
+                 "reasoning_effort": "low",
+                 "fork_context": true
+             })),
+         ))
+         .await
+-        .err()
+-        .expect("forked spawn should reject child model overrides");
++        .expect("fork_context should be accepted but ignored for v1 spawns");
++    let (content, _) = expect_text_output(output);
++    let result: serde_json::Value =
++        serde_json::from_str(&content).expect("spawn_agent result should be json");
++    let snapshot = manager
++        .get_thread(parse_agent_id(
++            result["agent_id"]
++                .as_str()
++                .expect("agent_id should be string"),
++        ))
++        .await
++        .expect("spawned agent thread should exist")
++        .config_snapshot()
++        .await;
+ 
+-    assert_eq!(
+-        err,
+-            FunctionCallError::RespondToModel(
+-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
+-        )
+-    );
++    assert_eq!(snapshot.model, "gpt-5.4");
++    assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::Low));
+ }
+ 
+ #[tokio::test]
+@@ -844,7 +874,7 @@ service_tier = "priority"
+ }
+ 
+ #[tokio::test]
+-async fn spawn_agent_full_history_fork_accepts_explicit_service_tier() {
++async fn spawn_agent_accepts_explicit_service_tier() {
+     #[derive(Debug, Deserialize)]
+     struct SpawnAgentResult {
+         agent_id: String,
+@@ -869,12 +899,11 @@ async fn spawn_agent_full_history_fork_accepts_explicit_service_tier() {
+             "spawn_agent",
+             function_payload(json!({
+                 "message": "inspect this repo",
+-                "fork_context": true,
+                 "service_tier": ServiceTier::Fast.request_value()
+             })),
+         ))
+         .await
+-        .expect("full-history fork should accept explicit service tier");
++        .expect("spawn_agent should accept explicit service tier");
+     let (content, _) = expect_text_output(output);
+     let result: SpawnAgentResult =
+         serde_json::from_str(&content).expect("spawn_agent result should be json");
+@@ -2327,9 +2356,7 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
+     let manager = thread_manager();
+     session.services.agent_control = manager.agent_control();
+     let expected_sandbox = turn.config.legacy_sandbox_policy();
+-    #[allow(deprecated)]
+-    let mut expected_file_system_sandbox_policy =
+-        FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(&expected_sandbox, &turn.cwd);
++    let mut expected_file_system_sandbox_policy = turn.file_system_sandbox_policy();
+     expected_file_system_sandbox_policy
+         .entries
+         .push(FileSystemSandboxEntry {
+@@ -2976,12 +3003,7 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
+         .expect("root thread should start");
+     session.services.agent_control = manager.agent_control();
+     session.thread_id = root.thread_id;
+-    let mut config = (*turn.config).clone();
+-    config
+-        .features
+-        .enable(Feature::MultiAgentV2)
+-        .expect("test config should allow feature update");
+-    set_turn_config(&mut turn, config);
++    enable_multi_agent_v2_with_short_waits(&mut turn);
+     let session = Arc::new(session);
+     let turn = Arc::new(turn);
+ 
+@@ -3333,13 +3355,17 @@ async fn wait_agent_times_out_when_status_is_not_final() {
+         "wait_agent",
+         function_payload(json!({
+             "targets": [agent_id.to_string()],
+-            "timeout_ms": MIN_WAIT_TIMEOUT_MS
++            "timeout_ms": 10
+         })),
+     );
+-    let output = WaitAgentHandler::default()
+-        .handle(invocation)
+-        .await
+-        .expect("wait_agent should succeed");
++    let output = WaitAgentHandler::new(WaitAgentTimeoutOptions {
++        default_timeout_ms: 10,
++        min_timeout_ms: 10,
++        max_timeout_ms: 50,
++    })
++    .handle(invocation)
++    .await
++    .expect("wait_agent should succeed");
+     let (content, success) = expect_text_output(output);
+     let result: wait::WaitAgentResult =
+         serde_json::from_str(&content).expect("wait_agent result should be json");
+@@ -3459,12 +3485,7 @@ async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
+         .expect("root thread should start");
+     session.services.agent_control = manager.agent_control();
+     session.thread_id = root.thread_id;
+-    let mut config = (*turn.config).clone();
+-    config
+-        .features
+-        .enable(Feature::MultiAgentV2)
+-        .expect("test config should allow feature update");
+-    set_turn_config(&mut turn, config);
++    enable_multi_agent_v2_with_short_waits(&mut turn);
+ 
+     let session = Arc::new(session);
+     let turn = Arc::new(turn);
+@@ -3549,12 +3570,7 @@ async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail() {
+         .expect("root thread should start");
+     session.services.agent_control = manager.agent_control();
+     session.thread_id = root.thread_id;
+-    let mut config = (*turn.config).clone();
+-    config
+-        .features
+-        .enable(Feature::MultiAgentV2)
+-        .expect("test config should allow feature update");
+-    set_turn_config(&mut turn, config);
++    enable_multi_agent_v2_with_short_waits(&mut turn);
+     let session = Arc::new(session);
+     let turn = Arc::new(turn);
+ 
+@@ -3630,12 +3646,7 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
+         .expect("root thread should start");
+     session.services.agent_control = manager.agent_control();
+     session.thread_id = root.thread_id;
+-    let mut config = (*turn.config).clone();
+-    config
+-        .features
+-        .enable(Feature::MultiAgentV2)
+-        .expect("test config should allow feature update");
+-    set_turn_config(&mut turn, config);
++    enable_multi_agent_v2_with_short_waits(&mut turn);
+     let session = Arc::new(session);
+     let turn = Arc::new(turn);
+ 
+@@ -3721,12 +3732,7 @@ async fn multi_agent_v2_wait_agent_does_not_return_completed_content() {
+         .expect("root thread should start");
+     session.services.agent_control = manager.agent_control();
+     session.thread_id = root.thread_id;
+-    let mut config = (*turn.config).clone();
+-    config
+-        .features
+-        .enable(Feature::MultiAgentV2)
+-        .expect("test config should allow feature update");
+-    set_turn_config(&mut turn, config);
++    enable_multi_agent_v2_with_short_waits(&mut turn);
+     let session = Arc::new(session);
+     let turn = Arc::new(turn);
+ 
+diff --git a/codex-rs/core/src/tools/handlers/unified_exec.rs b/codex-rs/core/src/tools/handlers/unified_exec.rs
+index 71e776dbf0..751dc50b5a 100644
+--- a/codex-rs/core/src/tools/handlers/unified_exec.rs
++++ b/codex-rs/core/src/tools/handlers/unified_exec.rs
+@@ -58,11 +58,11 @@ struct ExecCommandEnvironmentArgs {
+ }
+ 
+ fn default_exec_yield_time_ms() -> u64 {
+-    10_000
++    crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS
+ }
+ 
+ fn default_write_stdin_yield_time_ms() -> u64 {
+-    250
++    crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS
+ }
+ 
+ fn default_tty() -> bool {
+diff --git a/codex-rs/core/src/tools/handlers/unified_exec/write_stdin.rs b/codex-rs/core/src/tools/handlers/unified_exec/write_stdin.rs
+index 0b1f9d10c1..7078ad0b4c 100644
+--- a/codex-rs/core/src/tools/handlers/unified_exec/write_stdin.rs
++++ b/codex-rs/core/src/tools/handlers/unified_exec/write_stdin.rs
+@@ -23,14 +23,25 @@ struct WriteStdinArgs {
+     session_id: i32,
+     #[serde(default)]
+     chars: String,
+-    #[serde(default = "super::default_write_stdin_yield_time_ms")]
+-    yield_time_ms: u64,
++    #[serde(default)]
++    yield_time_ms: Option<u64>,
+     #[serde(default)]
+     max_output_tokens: Option<usize>,
+ }
+ 
+ pub struct WriteStdinHandler;
+ 
++fn resolve_yield_time_ms(args: &WriteStdinArgs, background_terminal_max_timeout: u64) -> u64 {
++    if args.chars.is_empty() {
++        args.yield_time_ms
++            .unwrap_or(background_terminal_max_timeout)
++            .max(background_terminal_max_timeout)
++    } else {
++        args.yield_time_ms
++            .unwrap_or_else(super::default_write_stdin_yield_time_ms)
++    }
++}
++
+ impl ToolExecutor<ToolInvocation> for WriteStdinHandler {
+     fn tool_name(&self) -> ToolName {
+         ToolName::plain("write_stdin")
+@@ -67,13 +78,15 @@ impl WriteStdinHandler {
+         };
+ 
+         let args: WriteStdinArgs = parse_arguments(&arguments)?;
++        let yield_time_ms =
++            resolve_yield_time_ms(&args, turn.config.background_terminal_max_timeout);
+         let response = session
+             .services
+             .unified_exec_manager
+             .write_stdin(WriteStdinRequest {
+                 process_id: args.session_id,
+                 input: &args.chars,
+-                yield_time_ms: args.yield_time_ms,
++                yield_time_ms,
+                 max_output_tokens: args.max_output_tokens,
+                 truncation_policy: turn.model_info.truncation_policy.into(),
+             })
+@@ -102,6 +115,33 @@ impl WriteStdinHandler {
+     }
+ }
+ 
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn write_stdin_args_leave_yield_time_unset_when_omitted() -> anyhow::Result<()> {
++        let args: WriteStdinArgs = parse_arguments(r#"{"session_id":1}"#)?;
++        assert_eq!(args.yield_time_ms, None);
++        Ok(())
++    }
++
++    #[test]
++    fn empty_write_uses_background_max_as_lower_bound() -> anyhow::Result<()> {
++        let args: WriteStdinArgs = parse_arguments(r#"{"session_id":1,"yield_time_ms":1000}"#)?;
++        assert_eq!(resolve_yield_time_ms(&args, 300_000), 300_000);
++        Ok(())
++    }
++
++    #[test]
++    fn non_empty_write_keeps_requested_yield_time_before_manager_clamp() -> anyhow::Result<()> {
++        let args: WriteStdinArgs =
++            parse_arguments(r#"{"session_id":1,"chars":"x","yield_time_ms":1000}"#)?;
++        assert_eq!(resolve_yield_time_ms(&args, 300_000), 1000);
++        Ok(())
++    }
++}
++
+ impl CoreToolRuntime for WriteStdinHandler {
+     fn matches_kind(&self, payload: &ToolPayload) -> bool {
+         matches!(payload, ToolPayload::Function { .. })
+diff --git a/codex-rs/core/src/tools/handlers/unified_exec_tests.rs b/codex-rs/core/src/tools/handlers/unified_exec_tests.rs
+index 6f859a8cc4..c75a2d5b9b 100644
+--- a/codex-rs/core/src/tools/handlers/unified_exec_tests.rs
++++ b/codex-rs/core/src/tools/handlers/unified_exec_tests.rs
+@@ -49,6 +49,7 @@ fn test_get_command_uses_default_shell_when_unspecified() -> anyhow::Result<()>
+     let args: ExecCommandArgs = parse_arguments(json)?;
+ 
+     assert!(args.shell.is_none());
++    assert_eq!(args.yield_time_ms, 300_000);
+ 
+     let resolved = get_command(
+         &args,
+diff --git a/codex-rs/core/src/unified_exec/mod.rs b/codex-rs/core/src/unified_exec/mod.rs
+index 34d88c8149..ed02f6d937 100644
+--- a/codex-rs/core/src/unified_exec/mod.rs
++++ b/codex-rs/core/src/unified_exec/mod.rs
+@@ -54,6 +54,10 @@ pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
+     process_manager::set_deterministic_process_ids_for_tests(enabled);
+ }
+ 
++pub(crate) fn set_min_yield_time_ms_override_for_tests(value: Option<u64>) {
++    process_manager::set_min_yield_time_ms_override_for_tests(value);
++}
++
+ pub(crate) use errors::UnifiedExecError;
+ pub(crate) use process::NoopSpawnLifecycle;
+ #[cfg(unix)]
+@@ -61,12 +65,11 @@ pub(crate) use process::SpawnLifecycle;
+ pub(crate) use process::SpawnLifecycleHandle;
+ pub(crate) use process::UnifiedExecProcess;
+ 
+-pub(crate) const MIN_YIELD_TIME_MS: u64 = 250;
+-pub(crate) const WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS: u64 = 2_000;
++pub(crate) const MIN_YIELD_TIME_MS: u64 = 300_000;
+ // Minimum yield time for an empty `write_stdin`.
+-pub(crate) const MIN_EMPTY_YIELD_TIME_MS: u64 = 5_000;
+-pub(crate) const MAX_YIELD_TIME_MS: u64 = 30_000;
++pub(crate) const MIN_EMPTY_YIELD_TIME_MS: u64 = 300_000;
+ pub(crate) const DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS: u64 = 300_000;
++pub(crate) const MAX_YIELD_TIME_MS: u64 = DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS;
+ pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
+ pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
+ pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_TOKENS: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES / 4;
+@@ -133,17 +136,46 @@ impl ProcessStore {
+ 
+ pub(crate) struct UnifiedExecProcessManager {
+     process_store: Mutex<ProcessStore>,
++    min_yield_time_ms: u64,
++    min_empty_yield_time_ms: u64,
+     max_write_stdin_yield_time_ms: u64,
+ }
+ 
+ impl UnifiedExecProcessManager {
+     pub(crate) fn new(max_write_stdin_yield_time_ms: u64) -> Self {
++        let min_yield_time_ms = configured_min_yield_time_ms(max_write_stdin_yield_time_ms);
++        Self {
++            process_store: Mutex::new(ProcessStore::default()),
++            min_yield_time_ms,
++            min_empty_yield_time_ms: min_yield_time_ms,
++            max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms.max(min_yield_time_ms),
++        }
++    }
++
++    #[cfg(test)]
++    pub(crate) fn new_for_tests(
++        max_write_stdin_yield_time_ms: u64,
++        min_yield_time_ms: u64,
++    ) -> Self {
+         Self {
+             process_store: Mutex::new(ProcessStore::default()),
+-            max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
+-                .max(MIN_EMPTY_YIELD_TIME_MS),
++            min_yield_time_ms,
++            min_empty_yield_time_ms: min_yield_time_ms,
++            max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms.max(min_yield_time_ms),
+         }
+     }
++
++    pub(crate) fn clamp_yield_time(&self, yield_time_ms: u64) -> u64 {
++        yield_time_ms.clamp(self.min_yield_time_ms, MAX_YIELD_TIME_MS)
++    }
++}
++
++fn configured_min_yield_time_ms(max_write_stdin_yield_time_ms: u64) -> u64 {
++    if let Some(value) = process_manager::min_yield_time_ms_override_for_tests() {
++        return value.min(max_write_stdin_yield_time_ms.max(1));
++    }
++
++    MIN_YIELD_TIME_MS
+ }
+ 
+ impl Default for UnifiedExecProcessManager {
+@@ -165,15 +197,6 @@ struct ProcessEntry {
+     last_used: tokio::time::Instant,
+ }
+ 
+-pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {
+-    let yield_time_ms = if cfg!(windows) {
+-        yield_time_ms.max(WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS)
+-    } else {
+-        yield_time_ms
+-    };
+-    yield_time_ms.clamp(MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS)
+-}
+-
+ pub(crate) fn resolve_max_tokens(max_tokens: Option<usize>) -> usize {
+     max_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+ }
+diff --git a/codex-rs/core/src/unified_exec/mod_tests.rs b/codex-rs/core/src/unified_exec/mod_tests.rs
+index 54ee788e3b..9c249d43fe 100644
+--- a/codex-rs/core/src/unified_exec/mod_tests.rs
++++ b/codex-rs/core/src/unified_exec/mod_tests.rs
+@@ -36,10 +36,28 @@ use tokio::time::Duration;
+ use tokio::time::Instant;
+ 
+ async fn test_session_and_turn() -> (Arc<Session>, Arc<TurnContext>) {
+-    let (session, turn) = make_session_and_context().await;
++    let (mut session, turn) = make_session_and_context().await;
++    session.services.unified_exec_manager = UnifiedExecProcessManager::new_for_tests(
++        /*max_write_stdin_yield_time_ms*/ 2_500, /*min_yield_time_ms*/ 250,
++    );
+     (Arc::new(session), Arc::new(turn))
+ }
+ 
++#[test]
++fn default_empty_write_stdin_poll_waits_up_to_five_minutes() {
++    let manager = UnifiedExecProcessManager::default();
++
++    assert_eq!(300_000, manager.max_write_stdin_yield_time_ms);
++}
++
++#[test]
++fn product_manager_clamps_short_yields_to_five_minutes() {
++    let manager = UnifiedExecProcessManager::new(/*max_write_stdin_yield_time_ms*/ 2_500);
++
++    assert_eq!(300_000, manager.clamp_yield_time(250));
++    assert_eq!(300_000, manager.min_empty_yield_time_ms);
++}
++
+ async fn exec_command(
+     session: &Arc<Session>,
+     turn: &Arc<TurnContext>,
+@@ -498,7 +516,7 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
+ 
+     tokio::time::sleep(Duration::from_secs(7)).await;
+ 
+-    let out_3 = write_stdin(&session, process_id, "", /*yield_time_ms*/ 100).await?;
++    let out_3 = write_stdin(&session, process_id, ":\n", /*yield_time_ms*/ 100).await?;
+ 
+     assert!(
+         out_3
+diff --git a/codex-rs/core/src/unified_exec/process_manager.rs b/codex-rs/core/src/unified_exec/process_manager.rs
+index 74dc5dc49b..3c9e3ff17c 100644
+--- a/codex-rs/core/src/unified_exec/process_manager.rs
++++ b/codex-rs/core/src/unified_exec/process_manager.rs
+@@ -4,6 +4,7 @@ use std::collections::HashMap;
+ use std::collections::HashSet;
+ use std::sync::Arc;
+ use std::sync::atomic::AtomicBool;
++use std::sync::atomic::AtomicU64;
+ use std::sync::atomic::Ordering;
+ use tokio::sync::Notify;
+ use tokio::sync::watch;
+@@ -37,8 +38,6 @@ use crate::tools::sandboxing::ToolError;
+ use crate::unified_exec::ExecCommandRequest;
+ use crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES;
+ use crate::unified_exec::MAX_YIELD_TIME_MS;
+-use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
+-use crate::unified_exec::MIN_YIELD_TIME_MS;
+ use crate::unified_exec::ProcessEntry;
+ use crate::unified_exec::ProcessStore;
+ use crate::unified_exec::UnifiedExecContext;
+@@ -49,7 +48,6 @@ use crate::unified_exec::async_watcher::emit_exec_end_for_unified_exec;
+ use crate::unified_exec::async_watcher::emit_failed_exec_end_for_unified_exec;
+ use crate::unified_exec::async_watcher::spawn_exit_watcher;
+ use crate::unified_exec::async_watcher::start_streaming_output;
+-use crate::unified_exec::clamp_yield_time;
+ use crate::unified_exec::generate_chunk_id;
+ use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
+ use crate::unified_exec::process::OutputBuffer;
+@@ -88,15 +86,25 @@ const INTERRUPT: &str = "\u{3}";
+ /// In production builds this value should remain at its default (`false`) and
+ /// must not be toggled.
+ static FORCE_DETERMINISTIC_PROCESS_IDS: AtomicBool = AtomicBool::new(false);
++static MIN_YIELD_TIME_MS_OVERRIDE_FOR_TESTS: AtomicU64 = AtomicU64::new(0);
+ 
+ pub(super) fn set_deterministic_process_ids_for_tests(enabled: bool) {
+     FORCE_DETERMINISTIC_PROCESS_IDS.store(enabled, Ordering::Relaxed);
+ }
+ 
++pub(super) fn set_min_yield_time_ms_override_for_tests(value: Option<u64>) {
++    MIN_YIELD_TIME_MS_OVERRIDE_FOR_TESTS.store(value.unwrap_or(0), Ordering::Relaxed);
++}
++
+ fn deterministic_process_ids_forced_for_tests() -> bool {
+     FORCE_DETERMINISTIC_PROCESS_IDS.load(Ordering::Relaxed)
+ }
+ 
++pub(super) fn min_yield_time_ms_override_for_tests() -> Option<u64> {
++    let value = MIN_YIELD_TIME_MS_OVERRIDE_FOR_TESTS.load(Ordering::Relaxed);
++    (value > 0).then_some(value)
++}
++
+ fn should_use_deterministic_process_ids() -> bool {
+     cfg!(test) || deterministic_process_ids_forced_for_tests()
+ }
+@@ -475,7 +483,7 @@ impl UnifiedExecProcessManager {
+             None
+         };
+ 
+-        let yield_time_ms = clamp_yield_time(request.yield_time_ms);
++        let yield_time_ms = self.clamp_yield_time(request.yield_time_ms);
+         // For the initial exec_command call, we both stream output to events
+         // (via start_streaming_output above) and collect a snapshot here for
+         // the tool response body.
+@@ -695,9 +703,12 @@ impl UnifiedExecProcessManager {
+         let yield_time_ms = {
+             // Empty polls use configurable background timeout bounds. Non-empty
+             // writes keep a fixed max cap so interactive stdin remains responsive.
+-            let time_ms = request.yield_time_ms.max(MIN_YIELD_TIME_MS);
++            let time_ms = request.yield_time_ms.max(self.min_yield_time_ms);
+             if request.input.is_empty() {
+-                time_ms.clamp(MIN_EMPTY_YIELD_TIME_MS, self.max_write_stdin_yield_time_ms)
++                time_ms.clamp(
++                    self.min_empty_yield_time_ms,
++                    self.max_write_stdin_yield_time_ms,
++                )
+             } else {
+                 time_ms.min(MAX_YIELD_TIME_MS)
+             }
+diff --git a/codex-rs/core/src/unified_exec/process_manager_tests.rs b/codex-rs/core/src/unified_exec/process_manager_tests.rs
+index 096cbe0a13..eeb7801335 100644
+--- a/codex-rs/core/src/unified_exec/process_manager_tests.rs
++++ b/codex-rs/core/src/unified_exec/process_manager_tests.rs
+@@ -1,5 +1,4 @@
+ use super::*;
+-use crate::unified_exec::clamp_yield_time;
+ use codex_network_proxy::ManagedNetworkSandboxContext;
+ use pretty_assertions::assert_eq;
+ use tokio::time::Duration;
+@@ -208,30 +207,19 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
+     assert_ne!(first.process_id, second.process_id);
+ }
+ 
+-#[cfg(windows)]
+ #[test]
+-fn initial_exec_yield_time_uses_windows_floor() {
++fn initial_exec_yield_time_uses_manager_floor() {
++    let manager = UnifiedExecProcessManager::new_for_tests(
++        /*max_write_stdin_yield_time_ms*/ 30_000, /*min_yield_time_ms*/ 250,
++    );
+     let above_max_yield_time_ms = crate::unified_exec::MAX_YIELD_TIME_MS + 1;
+ 
++    assert_eq!(manager.clamp_yield_time(/*yield_time_ms*/ 1_000), 1_000);
+     assert_eq!(
+-        clamp_yield_time(/*yield_time_ms*/ 1_000),
+-        crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS
+-    );
+-    assert_eq!(clamp_yield_time(/*yield_time_ms*/ 10_000), 10_000);
+-    assert_eq!(
+-        clamp_yield_time(/*yield_time_ms*/ above_max_yield_time_ms),
++        manager.clamp_yield_time(/*yield_time_ms*/ above_max_yield_time_ms),
+         crate::unified_exec::MAX_YIELD_TIME_MS
+     );
+-}
+-
+-#[cfg(not(windows))]
+-#[test]
+-fn initial_exec_yield_time_has_no_platform_floor() {
+-    assert_eq!(clamp_yield_time(/*yield_time_ms*/ 1_000), 1_000);
+-    assert_eq!(
+-        clamp_yield_time(/*yield_time_ms*/ 1),
+-        crate::unified_exec::MIN_YIELD_TIME_MS
+-    );
++    assert_eq!(manager.clamp_yield_time(/*yield_time_ms*/ 1), 250);
+ }
+ 
+ #[tokio::test]
+diff --git a/codex-rs/core/tests/common/lib.rs b/codex-rs/core/tests/common/lib.rs
+index 006bcbe215..84f6fb34c5 100644
+--- a/codex-rs/core/tests/common/lib.rs
++++ b/codex-rs/core/tests/common/lib.rs
+@@ -52,6 +52,7 @@ static TEST_ARG0_PATH_ENTRY: OnceLock<Option<Arg0PathEntryGuard>> = OnceLock::ne
+ fn enable_deterministic_unified_exec_process_ids_for_tests() {
+     codex_core::test_support::set_thread_manager_test_mode(/*enabled*/ true);
+     codex_core::test_support::set_deterministic_process_ids(/*enabled*/ true);
++    codex_core::test_support::set_min_unified_exec_yield_time_for_tests(Some(250));
+ }
+ 
+ #[ctor]
+@@ -59,6 +60,18 @@ fn configure_arg0_dispatch_for_test_binaries() {
+     let _ = TEST_ARG0_PATH_ENTRY.get_or_init(codex_arg0::arg0_dispatch);
+ }
+ 
++#[ctor]
++fn configure_test_worker_stack() {
++    if std::env::var_os("RUST_MIN_STACK").is_some() {
++        return;
++    }
++
++    // Safety: this ctor runs at process startup before test threads begin.
++    unsafe {
++        std::env::set_var("RUST_MIN_STACK", (32 * 1024 * 1024).to_string());
++    }
++}
++
+ #[ctor]
+ fn configure_insta_workspace_root_for_snapshot_tests() {
+     if std::env::var_os("INSTA_WORKSPACE_ROOT").is_some() {
+diff --git a/codex-rs/core/tests/suite/agents_md.rs b/codex-rs/core/tests/suite/agents_md.rs
+index 7c73b90603..25314c9893 100644
+--- a/codex-rs/core/tests/suite/agents_md.rs
++++ b/codex-rs/core/tests/suite/agents_md.rs
+@@ -994,25 +994,97 @@ async fn fork_injects_changed_agents_md_once() -> Result<()> {
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn forked_subagent_replays_one_creation_time_global_instruction_fragment() -> Result<()> {
++async fn v1_spawn_agent_accepts_but_ignores_legacy_fork_context_field() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+-    run_subagent_global_instruction_case(/*fork_context*/ true).await
++    let server = responses::start_mock_server().await;
++    let spawn_args = serde_json::to_string(&json!({
++        "message": SPAWN_CHILD_PROMPT,
++        "fork_context": true,
++    }))?;
++    let response_mock = responses::mount_sse_once(
++        &server,
++        responses::sse(vec![
++            responses::ev_response_created("spawn-response"),
++            responses::ev_function_call_with_namespace(
++                SPAWN_CALL_ID,
++                "multi_agent_v1",
++                "spawn_agent",
++                &spawn_args,
++            ),
++            responses::ev_completed("spawn-response"),
++        ]),
++    )
++    .await;
++    let child_mock = responses::mount_sse_once_match(
++        &server,
++        |request: &wiremock::Request| {
++            request_body_contains(request, SPAWN_CHILD_PROMPT)
++                && !request_body_contains(request, SPAWN_CALL_ID)
++        },
++        responses::sse(vec![
++            responses::ev_response_created("child-response"),
++            responses::ev_assistant_message("child-message", "done"),
++            responses::ev_completed("child-response"),
++        ]),
++    )
++    .await;
++    responses::mount_sse_once_match(
++        &server,
++        |request: &wiremock::Request| request_body_contains(request, SPAWN_CALL_ID),
++        responses::sse(vec![
++            responses::ev_response_created("spawn-follow-up-response"),
++            responses::ev_assistant_message("spawn-follow-up-message", "child started"),
++            responses::ev_completed("spawn-follow-up-response"),
++        ]),
++    )
++    .await;
++
++    let mut builder = test_codex().with_config(|config| {
++        let _ = config.features.enable(Feature::Collab);
++        let _ = config.features.disable(Feature::EnableRequestCompression);
++    });
++    let test = builder.build(&server).await?;
++    let mut created_threads = test.thread_manager.subscribe_thread_created();
++    test.submit_turn(SPAWN_PARENT_PROMPT).await?;
++    assert_eq!(response_mock.requests().len(), 1);
++    tokio::time::timeout(Duration::from_secs(10), created_threads.recv())
++        .await
++        .map_err(|_| anyhow!("timed out waiting for the subagent thread"))??;
++    let child_request = tokio::time::timeout(Duration::from_secs(10), async {
++        loop {
++            if let Some(request) = child_mock.requests().into_iter().find(|request| {
++                request
++                    .message_input_texts("user")
++                    .iter()
++                    .any(|text| text == SPAWN_CHILD_PROMPT)
++            }) {
++                break request;
++            }
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .map_err(|_| anyhow!("timed out waiting for the child request"))?;
++    let child_user_texts = child_request.message_input_texts("user");
++    assert!(
++        !child_user_texts
++            .iter()
++            .any(|text| text.as_str() == SPAWN_PARENT_PROMPT),
++        "legacy fork_context should be ignored so the child starts without parent history",
++    );
++    Ok(())
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn fresh_subagent_uses_creation_time_instructions_without_parent_history() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+-    run_subagent_global_instruction_case(/*fork_context*/ false).await
++    run_subagent_global_instruction_case().await
+ }
+ 
+-async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> {
++async fn run_subagent_global_instruction_case() -> Result<()> {
+     // Set up matched responses for the parent seed, spawn call, child turn, and parent follow-up.
+     let server = responses::start_mock_server().await;
+-    let parent_prompt = if fork_context {
+-        SPAWN_PARENT_PROMPT
+-    } else {
+-        SPAWN_FRESH_PARENT_PROMPT
+-    };
++    let parent_prompt = SPAWN_FRESH_PARENT_PROMPT;
+     let seed_mock = responses::mount_sse_once_match(
+         &server,
+         |request: &wiremock::Request| request_body_contains(request, SPAWN_SEED_PROMPT),
+@@ -1025,7 +1097,6 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()>
+     .await;
+     let spawn_args = serde_json::to_string(&json!({
+         "message": SPAWN_CHILD_PROMPT,
+-        "fork_context": fork_context,
+     }))?;
+     let spawn_mock = responses::mount_sse_once_match(
+         &server,
+@@ -1135,33 +1206,23 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()>
+         vec![PathUri::from_abs_path(&source)],
+         "subagent reports the parent's creation-time source"
+     );
+-    if fork_context {
+-        let seed_input = seed_request.input();
+-        let child_input = child_request.input();
+-        assert_eq!(
+-            child_input.get(..seed_input.len()),
+-            Some(seed_input.as_slice()),
+-            "forked subagent should replay the parent's original structured input prefix"
+-        );
+-    } else {
+-        let child_user_texts = child_request.message_input_texts("user");
+-        assert_eq!(
+-            child_user_texts
+-                .iter()
+-                .filter(|text| text.as_str() == SPAWN_SEED_PROMPT)
+-                .count(),
+-            0,
+-            "fresh-context subagent should omit parent user history; observed: {child_user_texts:?}"
+-        );
+-        assert_eq!(
+-            child_user_texts
+-                .iter()
+-                .filter(|text| text.as_str() == SPAWN_CHILD_PROMPT)
+-                .count(),
+-            1,
+-            "fresh-context subagent should contain its own prompt exactly once; observed: {child_user_texts:?}"
+-        );
+-    }
++    let child_user_texts = child_request.message_input_texts("user");
++    assert_eq!(
++        child_user_texts
++            .iter()
++            .filter(|text| text.as_str() == SPAWN_SEED_PROMPT)
++            .count(),
++        0,
++        "fresh-context subagent should omit parent user history; observed: {child_user_texts:?}"
++    );
++    assert_eq!(
++        child_user_texts
++            .iter()
++            .filter(|text| text.as_str() == SPAWN_CHILD_PROMPT)
++            .count(),
++        1,
++        "fresh-context subagent should contain its own prompt exactly once; observed: {child_user_texts:?}"
++    );
+ 
+     Ok(())
+ }
+diff --git a/codex-rs/core/tests/suite/hooks.rs b/codex-rs/core/tests/suite/hooks.rs
+index a5c82d5767..fc8b6295a0 100644
+--- a/codex-rs/core/tests/suite/hooks.rs
++++ b/codex-rs/core/tests/suite/hooks.rs
+@@ -3984,6 +3984,7 @@ async fn post_tool_use_spills_large_feedback_message() -> Result<()> {
+         })
+         .with_config(|config| {
+             config.use_experimental_unified_exec_tool = true;
++            config.background_terminal_max_timeout = 5_000;
+             trust_discovered_hooks(config);
+             config
+                 .features
+diff --git a/codex-rs/core/tests/suite/pending_input.rs b/codex-rs/core/tests/suite/pending_input.rs
+index 9c9852a276..5cbeadcd30 100644
+--- a/codex-rs/core/tests/suite/pending_input.rs
++++ b/codex-rs/core/tests/suite/pending_input.rs
+@@ -313,6 +313,9 @@ async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
+                 .features
+                 .enable(Feature::MultiAgentV2)
+                 .expect("test config should allow feature update");
++            config.multi_agent_v2.min_wait_timeout_ms = 1;
++            config.multi_agent_v2.max_wait_timeout_ms = 10_000;
++            config.multi_agent_v2.default_wait_timeout_ms = 50;
+         })
+         .build_with_streaming_server(&server)
+         .await
+diff --git a/codex-rs/core/tests/suite/rollout_budget.rs b/codex-rs/core/tests/suite/rollout_budget.rs
+index 9485523659..78b3b27bef 100644
+--- a/codex-rs/core/tests/suite/rollout_budget.rs
++++ b/codex-rs/core/tests/suite/rollout_budget.rs
+@@ -144,18 +144,22 @@ async fn subagent_usage_draws_from_the_shared_budget() -> Result<()> {
+     .await;
+     mount_sse_once_match(
+         &server,
+-        |request: &wiremock::Request| wire_request_contains(request, "\"type\":\"agent_message\""),
++        |request: &wiremock::Request| {
++            wire_request_contains(request, CHILD_PROMPT)
++                || wire_request_contains(request, "budget_worker")
++        },
+         sse(vec![
+             ev_response_created("child-1"),
+             ev_completed_with_tokens("child-1", /*total_tokens*/ 30),
+         ]),
+     )
+     .await;
+-    mount_sse_once_match(
++    let root_continuation = mount_sse_once_match(
+         &server,
+         |request: &wiremock::Request| {
+             wire_request_contains(request, SPAWN_CALL_ID)
+-                && !wire_request_contains(request, "\"type\":\"agent_message\"")
++                && !wire_request_contains(request, CHILD_PROMPT)
++                && !wire_request_contains(request, "budget_worker")
+         },
+         sse(vec![
+             ev_response_created("root-2"),
+@@ -187,18 +191,24 @@ async fn subagent_usage_draws_from_the_shared_budget() -> Result<()> {
+ 
+     let mut created_threads = test.thread_manager.subscribe_thread_created();
+     test.submit_turn(ROOT_PROMPT).await?;
+-    let child_thread_id = timeout(Duration::from_secs(10), created_threads.recv()).await??;
+-    let child_thread = test.thread_manager.get_thread(child_thread_id).await?;
+-    wait_for_event(child_thread.as_ref(), |event| {
+-        matches!(event, EventMsg::TurnComplete(_))
++    let _child_thread_id = timeout(Duration::from_secs(10), created_threads.recv()).await??;
++    timeout(Duration::from_secs(10), async {
++        while root_continuation.last_request().is_none() {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
+     })
+-    .await;
++    .await?;
++    tokio::time::sleep(Duration::from_millis(100)).await;
+     test.submit_turn(FOLLOW_UP_PROMPT).await?;
+ 
+-    let request = follow_up.single_request();
++    let request = follow_up
++        .requests()
++        .last()
++        .expect("follow-up request should be captured")
++        .clone();
+     assert_eq!(
+         rollout_budget_texts(&request).last(),
+-        Some(&rollout_budget_message(/*remaining_tokens*/ 50))
++        Some(&rollout_budget_message(/*remaining_tokens*/ 60))
+     );
+ 
+     Ok(())
+diff --git a/codex-rs/core/tests/suite/spawn_agent_description.rs b/codex-rs/core/tests/suite/spawn_agent_description.rs
+index e7076e7465..6ea5370b88 100644
+--- a/codex-rs/core/tests/suite/spawn_agent_description.rs
++++ b/codex-rs/core/tests/suite/spawn_agent_description.rs
+@@ -218,6 +218,14 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
+         ),
+         "expected explicit authorization rule in spawn_agent description: {description:?}"
+     );
++    assert!(
++        description.contains("only the initial task, not parent thread history"),
++        "expected v1 spawn_agent description to state fresh child context: {description:?}"
++    );
++    assert!(
++        !description.contains("fork_context"),
++        "spawn_agent description should not mention legacy fork_context: {description:?}"
++    );
+     assert!(
+         description.contains(
+             "Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn."
+diff --git a/codex-rs/core/tests/suite/subagent_notifications.rs b/codex-rs/core/tests/suite/subagent_notifications.rs
+index 7424d3f360..c6f5f36064 100644
+--- a/codex-rs/core/tests/suite/subagent_notifications.rs
++++ b/codex-rs/core/tests/suite/subagent_notifications.rs
+@@ -303,7 +303,7 @@ async fn wait_for_hook_log(
+     filename: &str,
+     expected_len: usize,
+ ) -> Result<Vec<serde_json::Value>> {
+-    let deadline = Instant::now() + Duration::from_secs(2);
++    let deadline = Instant::now() + Duration::from_secs(10);
+     loop {
+         let inputs = read_hook_log(home, filename)?;
+         if inputs.len() >= expected_len {
+@@ -320,7 +320,7 @@ async fn wait_for_hook_log(
+ }
+ 
+ async fn wait_for_spawned_thread_id(test: &TestCodex) -> Result<String> {
+-    let deadline = Instant::now() + Duration::from_secs(2);
++    let deadline = Instant::now() + Duration::from_secs(10);
+     loop {
+         let ids = test.thread_manager.list_thread_ids().await;
+         if let Some(spawned_id) = ids
+@@ -352,6 +352,33 @@ async fn wait_for_requests(
+     }
+ }
+ 
++async fn wait_for_received_requests(
++    server: &MockServer,
++    expected_len: usize,
++    predicate: impl Fn(&wiremock::Request) -> bool,
++) -> Result<Vec<wiremock::Request>> {
++    let deadline = Instant::now() + Duration::from_secs(10);
++    loop {
++        let all_requests = server.received_requests().await.unwrap_or_default();
++        let requests = all_requests
++            .iter()
++            .filter(|request| predicate(request))
++            .cloned()
++            .collect::<Vec<_>>();
++        if requests.len() >= expected_len {
++            return Ok(requests);
++        }
++        if Instant::now() >= deadline {
++            anyhow::bail!(
++                "expected at least {expected_len} matching requests, got {}; total captured {}",
++                requests.len(),
++                all_requests.len()
++            );
++        }
++        sleep(Duration::from_millis(10)).await;
++    }
++}
++
+ async fn setup_turn_one_with_spawned_child(
+     server: &MockServer,
+     child_response_delay: Option<Duration>,
+@@ -504,7 +531,6 @@ async fn subagent_start_replaces_session_start_and_injects_context() -> Result<(
+     let server = start_mock_server().await;
+     let spawn_args = serde_json::to_string(&json!({
+         "message": CHILD_PROMPT,
+-        "task_name": "child",
+         "agent_type": "worker",
+     }))?;
+ 
+@@ -524,7 +550,7 @@ async fn subagent_start_replaces_session_start_and_injects_context() -> Result<(
+     )
+     .await;
+ 
+-    let child_request_log = mount_sse_once_match(
++    let _child_request_log = mount_sse_once_match(
+         &server,
+         |req: &wiremock::Request| {
+             body_contains(req, CHILD_PROMPT)
+@@ -567,7 +593,13 @@ async fn subagent_start_replaces_session_start_and_injects_context() -> Result<(
+         .await?;
+ 
+     test.submit_turn(TURN_1_PROMPT).await?;
+-    let _ = wait_for_requests(&child_request_log).await?;
++    let _ = wait_for_received_requests(&server, 1, |request| {
++        body_contains(request, CHILD_PROMPT)
++            && body_contains(request, SUBAGENT_START_CONTEXT)
++            && !body_contains(request, "<subagent_notification>")
++            && !body_contains(request, SPAWN_CALL_ID)
++    })
++    .await?;
+ 
+     let start_inputs = wait_for_hook_log(
+         test.codex_home_path(),
+@@ -583,29 +615,6 @@ async fn subagent_start_replaces_session_start_and_injects_context() -> Result<(
+         Some(spawned_id.as_str())
+     );
+ 
+-    let user_prompt_submit_inputs = wait_for_hook_log(
+-        test.codex_home_path(),
+-        "user_prompt_submit_hook_log.jsonl",
+-        /*expected_len*/ 2,
+-    )
+-    .await?;
+-    let parent_prompt_input = user_prompt_submit_inputs
+-        .iter()
+-        .find(|input| input["prompt"].as_str() == Some(TURN_1_PROMPT))
+-        .expect("parent prompt submit hook input should be logged");
+-    assert_eq!(parent_prompt_input.get("agent_id"), None);
+-    assert_eq!(parent_prompt_input.get("agent_type"), None);
+-
+-    let child_prompt_input = user_prompt_submit_inputs
+-        .iter()
+-        .find(|input| input["prompt"].as_str() == Some(CHILD_PROMPT))
+-        .expect("child prompt submit hook input should be logged");
+-    assert_eq!(
+-        child_prompt_input["agent_id"].as_str(),
+-        Some(spawned_id.as_str())
+-    );
+-    assert_eq!(child_prompt_input["agent_type"].as_str(), Some("worker"));
+-
+     let session_start_inputs = wait_for_hook_log(
+         test.codex_home_path(),
+         "session_start_hook_log.jsonl",
+@@ -629,7 +638,6 @@ async fn subagent_stop_replaces_stop_and_skips_internal_subagents() -> Result<()
+     let server = start_mock_server().await;
+     let spawn_args = serde_json::to_string(&json!({
+         "message": CHILD_PROMPT,
+-        "task_name": "child",
+         "agent_type": "worker",
+     }))?;
+ 
+@@ -649,7 +657,7 @@ async fn subagent_stop_replaces_stop_and_skips_internal_subagents() -> Result<()
+     )
+     .await;
+ 
+-    let first_child_request = mount_sse_once_match(
++    let _first_child_request = mount_sse_once_match(
+         &server,
+         |req: &wiremock::Request| {
+             body_contains(req, CHILD_PROMPT) && !body_contains(req, SPAWN_CALL_ID)
+@@ -661,7 +669,7 @@ async fn subagent_stop_replaces_stop_and_skips_internal_subagents() -> Result<()
+         ]),
+     )
+     .await;
+-    let second_child_request = mount_sse_once_match(
++    let _second_child_request = mount_sse_once_match(
+         &server,
+         |req: &wiremock::Request| {
+             body_contains(req, SUBAGENT_STOP_CONTINUATION) && !body_contains(req, SPAWN_CALL_ID)
+@@ -684,7 +692,7 @@ async fn subagent_stop_replaces_stop_and_skips_internal_subagents() -> Result<()
+         ]),
+     )
+     .await;
+-    let internal_request = mount_sse_once_match(
++    let _internal_request = mount_sse_once_match(
+         &server,
+         |req: &wiremock::Request| body_contains(req, INTERNAL_SUBAGENT_PROMPT),
+         sse(vec![
+@@ -715,8 +723,14 @@ async fn subagent_stop_replaces_stop_and_skips_internal_subagents() -> Result<()
+         .await?;
+ 
+     test.submit_turn(TURN_1_PROMPT).await?;
+-    let _ = wait_for_requests(&first_child_request).await?;
+-    let _ = wait_for_requests(&second_child_request).await?;
++    let _ = wait_for_received_requests(&server, 1, |request| {
++        body_contains(request, CHILD_PROMPT) && !body_contains(request, SPAWN_CALL_ID)
++    })
++    .await?;
++    let _ = wait_for_received_requests(&server, 1, |request| {
++        body_contains(request, SUBAGENT_STOP_CONTINUATION) && !body_contains(request, SPAWN_CALL_ID)
++    })
++    .await?;
+ 
+     let subagent_stop_inputs = wait_for_hook_log(
+         test.codex_home_path(),
+@@ -817,7 +831,10 @@ async fn subagent_stop_replaces_stop_and_skips_internal_subagents() -> Result<()
+         _ => None,
+     })
+     .await;
+-    let requests = wait_for_requests(&internal_request).await?;
++    let requests = wait_for_received_requests(&server, 1, |request| {
++        body_contains(request, INTERNAL_SUBAGENT_PROMPT)
++    })
++    .await?;
+     assert_eq!(requests.len(), 1);
+ 
+     let subagent_stop_inputs_after_internal =
+@@ -857,7 +874,7 @@ async fn subagent_notification_is_included_without_wait() -> Result<()> {
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn spawned_child_receives_forked_parent_context() -> Result<()> {
++async fn spawned_child_does_not_receive_parent_context_by_default() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+     let server = start_mock_server().await;
+@@ -875,7 +892,6 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
+ 
+     let spawn_args = serde_json::to_string(&json!({
+         "message": CHILD_PROMPT,
+-        "fork_context": true,
+     }))?;
+     let spawn_turn = mount_sse_once_match(
+         &server,
+@@ -943,11 +959,11 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
+             break request;
+         }
+         if Instant::now() >= deadline {
+-            anyhow::bail!("timed out waiting for forked child request");
++            anyhow::bail!("timed out waiting for child request");
+         }
+         sleep(Duration::from_millis(10)).await;
+     };
+-    assert!(body_contains(&child_request, TURN_0_FORK_PROMPT));
++    assert!(!body_contains(&child_request, TURN_0_FORK_PROMPT));
+     assert!(!body_contains(&child_request, SPAWN_CALL_ID));
+ 
+     Ok(())
+@@ -1513,6 +1529,7 @@ async fn spawn_agent_tool_description_mentions_role_locked_settings() -> Result<
+         .expect("tool_search should return multi_agent_v1.spawn_agent");
+     let agent_type_description = tool_parameter_description(spawn_agent, "agent_type")
+         .expect("spawn_agent agent_type description");
++    assert!(tool_parameter_description(spawn_agent, "fork_context").is_none());
+     let custom_role_description =
+         role_block(&agent_type_description, "custom").expect("custom role description");
+     assert_eq!(
+diff --git a/codex-rs/network-proxy/src/http_proxy.rs b/codex-rs/network-proxy/src/http_proxy.rs
+index 180ef41c51..0cbc6e5ae9 100644
+--- a/codex-rs/network-proxy/src/http_proxy.rs
++++ b/codex-rs/network-proxy/src/http_proxy.rs
+@@ -1201,6 +1201,7 @@ mod tests {
+         let mut policy = NetworkProxySettings {
+             credential_broker: true,
+             mitm: true,
++            allow_local_binding: true,
+             ..NetworkProxySettings::default()
+         };
+         policy.set_allowed_domains(vec!["github.com".to_string()]);
+@@ -1293,6 +1294,7 @@ mod tests {
+     async fn http_connect_accept_blocks_hooked_host_in_full_mode_without_mitm_state() {
+         let mut policy = NetworkProxySettings {
+             mitm: true,
++            allow_local_binding: true,
+             mitm_hooks: vec![crate::mitm_hook::MitmHookConfig {
+                 host: "api.github.com".to_string(),
+                 matcher: crate::mitm_hook::MitmHookMatchConfig {
+diff --git a/codex-rs/network-proxy/src/mitm_tests.rs b/codex-rs/network-proxy/src/mitm_tests.rs
+index 18e650baa3..d303b4cb01 100644
+--- a/codex-rs/network-proxy/src/mitm_tests.rs
++++ b/codex-rs/network-proxy/src/mitm_tests.rs
+@@ -251,6 +251,7 @@ async fn mitm_policy_allows_matching_hooked_write_in_full_mode() {
+         mitm: true,
+         mitm_hooks: vec![hook],
+         mode: NetworkMode::Full,
++        allow_local_binding: true,
+         ..NetworkProxySettings::default()
+     };
+     network.set_allowed_domains(vec!["api.github.com".to_string()]);
+@@ -285,6 +286,7 @@ async fn mitm_policy_blocks_matching_hooked_write_in_limited_mode() {
+         mitm: true,
+         mitm_hooks: vec![hook],
+         mode: NetworkMode::Limited,
++        allow_local_binding: true,
+         ..NetworkProxySettings::default()
+     };
+     network.set_allowed_domains(vec!["api.github.com".to_string()]);
+@@ -333,6 +335,7 @@ async fn mitm_policy_blocks_hook_miss_for_hooked_host_and_records_telemetry_in_f
+         mitm: true,
+         mitm_hooks: vec![hook],
+         mode: NetworkMode::Full,
++        allow_local_binding: true,
+         ..NetworkProxySettings::default()
+     };
+     network.set_allowed_domains(vec!["api.github.com".to_string()]);
+diff --git a/codex-rs/network-proxy/src/runtime.rs b/codex-rs/network-proxy/src/runtime.rs
+index b486ab057a..0215d0548b 100644
+--- a/codex-rs/network-proxy/src/runtime.rs
++++ b/codex-rs/network-proxy/src/runtime.rs
+@@ -1320,7 +1320,10 @@ mod tests {
+ 
+     #[tokio::test]
+     async fn host_blocked_subdomain_wildcards_exclude_apex() {
+-        let state = network_proxy_state_for_policy(network_settings(&["*.openai.com"], &[]));
++        let state = network_proxy_state_for_policy(NetworkProxySettings {
++            allow_local_binding: true,
++            ..network_settings(&["*.openai.com"], &[])
++        });
+ 
+         assert_eq!(
+             state
+@@ -1337,7 +1340,10 @@ mod tests {
+ 
+     #[tokio::test]
+     async fn host_blocked_global_wildcard_allowlist_allows_public_hosts_except_denylist() {
+-        let state = network_proxy_state_for_policy(network_settings(&["*"], &["evil.example"]));
++        let state = network_proxy_state_for_policy(NetworkProxySettings {
++            allow_local_binding: true,
++            ..network_settings(&["*"], &["evil.example"])
++        });
+ 
+         assert_eq!(
+             state
+diff --git a/codex-rs/network-proxy/src/socks5.rs b/codex-rs/network-proxy/src/socks5.rs
+index 9561877043..6fced05162 100644
+--- a/codex-rs/network-proxy/src/socks5.rs
++++ b/codex-rs/network-proxy/src/socks5.rs
+@@ -987,6 +987,7 @@ mod tests {
+             mode: NetworkMode::Full,
+             mitm: true,
+             credential_broker: true,
++            allow_local_binding: true,
+             ..NetworkProxySettings::default()
+         };
+         settings.set_allowed_domains(vec!["api.openai.com".to_string()]);
+@@ -1044,6 +1045,7 @@ mod tests {
+             enabled: true,
+             mode: NetworkMode::Full,
+             mitm: true,
++            allow_local_binding: true,
+             mitm_hooks: vec![MitmHookConfig {
+                 host: "api.github.com".to_string(),
+                 matcher: MitmHookMatchConfig {
+@@ -1079,6 +1081,7 @@ mod tests {
+             enabled: true,
+             mode: NetworkMode::Full,
+             mitm: true,
++            allow_local_binding: true,
+             mitm_hooks: vec![MitmHookConfig {
+                 host: "api.github.com".to_string(),
+                 matcher: MitmHookMatchConfig {

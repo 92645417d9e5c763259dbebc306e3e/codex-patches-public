@@ -1,0 +1,417 @@
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 35875584e7..6d3bd3de26 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -609,7 +609,7 @@ impl MessageProcessor {
+     }
+ 
+     pub(crate) fn clear_runtime_references(&self) {
+-        self.account_processor.clear_external_auth();
++        self.account_processor.shutdown();
+         self.apps_processor.shutdown();
+         self.models_refresh_worker.shutdown();
+         self.skills_watcher.shutdown();
+@@ -808,6 +808,8 @@ impl MessageProcessor {
+         connection_id: ConnectionId,
+         request_attestation: bool,
+     ) {
++        self.account_processor
++            .maybe_start_account_rate_limits_poller();
+         self.thread_processor
+             .connection_initialized(
+                 connection_id,
+@@ -835,6 +837,7 @@ impl MessageProcessor {
+     }
+ 
+     pub(crate) async fn drain_background_tasks(&self) {
++        self.account_processor.drain_background_tasks().await;
+         self.models_refresh_worker.shutdown();
+         self.thread_processor.drain_background_tasks().await;
+     }
+@@ -944,13 +947,7 @@ impl MessageProcessor {
+                 )
+                 .await?;
+             if connection_initialized {
+-                self.thread_processor
+-                    .connection_initialized(
+-                        connection_id,
+-                        ConnectionCapabilities {
+-                            request_attestation: session.request_attestation(),
+-                        },
+-                    )
++                self.connection_initialized(connection_id, session.request_attestation())
+                     .await;
+             }
+             return Ok(());
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+index 3f2a2fb384..66158cfaa6 100644
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -22,6 +22,7 @@ use codex_analytics::InputError;
+ use codex_analytics::TurnSteerRequestError;
+ use codex_app_server_protocol::Account;
+ use codex_app_server_protocol::AccountLoginCompletedNotification;
++use codex_app_server_protocol::AccountRateLimitsUpdatedNotification;
+ use codex_app_server_protocol::AccountTokenUsageDailyBucket;
+ use codex_app_server_protocol::AccountTokenUsageSummary;
+ use codex_app_server_protocol::AccountUpdatedNotification;
+@@ -425,6 +426,7 @@ use codex_protocol::protocol::GitInfo as CoreGitInfo;
+ use codex_protocol::protocol::InitialHistory;
+ use codex_protocol::protocol::McpAuthStatus as CoreMcpAuthStatus;
+ use codex_protocol::protocol::Op;
++use codex_protocol::protocol::RateLimitSnapshot as CoreRateLimitSnapshot;
+ use codex_protocol::protocol::RealtimeVoicesList;
+ use codex_protocol::protocol::ResumedHistory;
+ use codex_protocol::protocol::ReviewDelivery as CoreReviewDelivery;
+diff --git a/codex-rs/app-server/src/request_processors/account_processor.rs b/codex-rs/app-server/src/request_processors/account_processor.rs
+index c16f1398f1..5c33adc81b 100644
+--- a/codex-rs/app-server/src/request_processors/account_processor.rs
++++ b/codex-rs/app-server/src/request_processors/account_processor.rs
+@@ -6,6 +6,7 @@ mod rate_limit_resets;
+ 
+ // Duration before a browser ChatGPT login attempt is abandoned.
+ const LOGIN_CHATGPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
++const ACCOUNT_RATE_LIMITS_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
+ const ACCOUNT_TOKEN_USAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 10);
+ const ACCOUNT_WORKSPACE_MESSAGES_FETCH_TIMEOUT: Duration =
+     Duration::from_millis(/*millis*/ 1000);
+@@ -54,6 +55,28 @@ enum RefreshTokenRequestOutcome {
+     FailedPermanently,
+ }
+ 
++#[derive(Clone)]
++struct CachedAccountRateLimits {
++    primary: CoreRateLimitSnapshot,
++    by_limit_id: HashMap<String, CoreRateLimitSnapshot>,
++    rate_limit_reset_credits: Option<RateLimitResetCreditsSummary>,
++}
++
++impl CachedAccountRateLimits {
++    fn into_response(self) -> GetAccountRateLimitsResponse {
++        GetAccountRateLimitsResponse {
++            rate_limits: self.primary.into(),
++            rate_limits_by_limit_id: Some(
++                self.by_limit_id
++                    .into_iter()
++                    .map(|(limit_id, snapshot)| (limit_id, snapshot.into()))
++                    .collect(),
++            ),
++            rate_limit_reset_credits: self.rate_limit_reset_credits,
++        }
++    }
++}
++
+ impl Drop for ActiveLogin {
+     fn drop(&mut self) {
+         self.cancel();
+@@ -68,6 +91,12 @@ pub(crate) struct AccountRequestProcessor {
+     config: Arc<Config>,
+     config_manager: ConfigManager,
+     active_login: Arc<Mutex<Option<ActiveLogin>>>,
++    rate_limits_poller_started: Arc<std::sync::atomic::AtomicBool>,
++    rate_limits_poller_shutdown: CancellationToken,
++    rate_limits_tasks: TaskTracker,
++    rate_limits_cache: Arc<Mutex<Option<CachedAccountRateLimits>>>,
++    rate_limits_fetch_lock: Arc<Mutex<()>>,
++    rate_limits_refresh_in_flight: Arc<std::sync::atomic::AtomicBool>,
+ }
+ 
+ impl AccountRequestProcessor {
+@@ -85,7 +114,41 @@ impl AccountRequestProcessor {
+             config,
+             config_manager,
+             active_login: Arc::new(Mutex::new(None)),
++            rate_limits_poller_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
++            rate_limits_poller_shutdown: CancellationToken::new(),
++            rate_limits_tasks: TaskTracker::new(),
++            rate_limits_cache: Arc::new(Mutex::new(None)),
++            rate_limits_fetch_lock: Arc::new(Mutex::new(())),
++            rate_limits_refresh_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
++        }
++    }
++
++    pub(crate) fn maybe_start_account_rate_limits_poller(&self) {
++        self.broadcast_cached_account_rate_limits();
++        if self
++            .rate_limits_poller_started
++            .swap(true, std::sync::atomic::Ordering::AcqRel)
++        {
++            return;
+         }
++
++        let processor = self.clone();
++        let shutdown = self.rate_limits_poller_shutdown.clone();
++        self.rate_limits_tasks.spawn(async move {
++            processor
++                .poll_account_rate_limits_until_shutdown(shutdown)
++                .await;
++        });
++    }
++
++    pub(crate) fn shutdown(&self) {
++        self.rate_limits_poller_shutdown.cancel();
++        self.rate_limits_tasks.close();
++        self.clear_external_auth();
++    }
++
++    pub(crate) async fn drain_background_tasks(&self) {
++        self.rate_limits_tasks.wait().await;
+     }
+ 
+     pub(crate) async fn login_account(
+@@ -876,6 +939,19 @@ impl AccountRequestProcessor {
+     async fn get_account_rate_limits_response(
+         &self,
+     ) -> Result<GetAccountRateLimitsResponse, JSONRPCErrorError> {
++        if let Some(cached) = self.rate_limits_cache.lock().await.clone() {
++            self.refresh_account_rate_limits_in_background();
++            return Ok(cached.into_response());
++        }
++
++        self.read_or_fetch_account_rate_limits()
++            .await
++            .map(CachedAccountRateLimits::into_response)
++    }
++
++    async fn fetch_account_rate_limits(
++        &self,
++    ) -> Result<CachedAccountRateLimits, JSONRPCErrorError> {
+         let Some(auth) = self.auth_manager.auth().await else {
+             return Err(invalid_request(
+                 "codex account authentication required to read rate limits",
+@@ -918,14 +994,9 @@ impl AccountRequestProcessor {
+             .cloned()
+             .unwrap_or_else(|| response.rate_limits[0].clone());
+ 
+-        Ok(GetAccountRateLimitsResponse {
+-            rate_limits: rate_limits.into(),
+-            rate_limits_by_limit_id: Some(
+-                rate_limits_by_limit_id
+-                    .into_iter()
+-                    .map(|(limit_id, snapshot)| (limit_id, snapshot.into()))
+-                    .collect(),
+-            ),
++        Ok(CachedAccountRateLimits {
++            primary: rate_limits,
++            by_limit_id: rate_limits_by_limit_id,
+             rate_limit_reset_credits: response.rate_limit_reset_credits.map(|summary| {
+                 RateLimitResetCreditsSummary {
+                     available_count: summary.available_count,
+@@ -934,6 +1005,115 @@ impl AccountRequestProcessor {
+         })
+     }
+ 
++    async fn poll_account_rate_limits_until_shutdown(&self, shutdown: CancellationToken) {
++        loop {
++            tokio::select! {
++                _ = shutdown.cancelled() => break,
++                _ = self.poll_account_rate_limits_once() => {}
++            }
++
++            tokio::select! {
++                _ = shutdown.cancelled() => break,
++                _ = tokio::time::sleep(ACCOUNT_RATE_LIMITS_POLL_INTERVAL) => {}
++            }
++        }
++    }
++
++    async fn poll_account_rate_limits_once(&self) {
++        if !self
++            .auth_manager
++            .auth_cached()
++            .as_ref()
++            .is_some_and(CodexAuth::uses_codex_backend)
++        {
++            self.rate_limits_cache.lock().await.take();
++            return;
++        }
++
++        if let Err(err) = self.fetch_and_cache_account_rate_limits().await {
++            tracing::debug!("failed to poll ChatGPT account rate limits: {err:?}");
++        }
++    }
++
++    fn refresh_account_rate_limits_in_background(&self) {
++        if self
++            .rate_limits_refresh_in_flight
++            .swap(true, std::sync::atomic::Ordering::AcqRel)
++        {
++            return;
++        }
++
++        let processor = self.clone();
++        let shutdown = self.rate_limits_poller_shutdown.clone();
++        self.rate_limits_tasks.spawn(async move {
++            tokio::select! {
++                _ = shutdown.cancelled() => {}
++                result = processor.fetch_and_cache_account_rate_limits() => {
++                    if let Err(err) = result {
++                        tracing::debug!("failed to refresh ChatGPT account rate limits: {err:?}");
++                    }
++                }
++            }
++            processor
++                .rate_limits_refresh_in_flight
++                .store(false, std::sync::atomic::Ordering::Release);
++        });
++    }
++
++    fn broadcast_cached_account_rate_limits(&self) {
++        let processor = self.clone();
++        self.rate_limits_tasks.spawn(async move {
++            if let Some(cached) = processor.rate_limits_cache.lock().await.clone() {
++                processor.send_rate_limits_notifications(&cached).await;
++            }
++        });
++    }
++
++    async fn fetch_and_cache_account_rate_limits(
++        &self,
++    ) -> Result<CachedAccountRateLimits, JSONRPCErrorError> {
++        let _guard = self.rate_limits_fetch_lock.lock().await;
++        self.fetch_and_cache_account_rate_limits_inner().await
++    }
++
++    async fn read_or_fetch_account_rate_limits(
++        &self,
++    ) -> Result<CachedAccountRateLimits, JSONRPCErrorError> {
++        let _guard = self.rate_limits_fetch_lock.lock().await;
++        if let Some(cached) = self.rate_limits_cache.lock().await.clone() {
++            return Ok(cached);
++        }
++        self.fetch_and_cache_account_rate_limits_inner().await
++    }
++
++    async fn fetch_and_cache_account_rate_limits_inner(
++        &self,
++    ) -> Result<CachedAccountRateLimits, JSONRPCErrorError> {
++        let cached = self.fetch_account_rate_limits().await?;
++        let previous = {
++            let mut cache = self.rate_limits_cache.lock().await;
++            let previous = cache.clone();
++            *cache = Some(cached.clone());
++            previous
++        };
++        if previous.as_ref().map(|snapshot| &snapshot.by_limit_id) != Some(&cached.by_limit_id) {
++            self.send_rate_limits_notifications(&cached).await;
++        }
++        Ok(cached)
++    }
++
++    async fn send_rate_limits_notifications(&self, cached: &CachedAccountRateLimits) {
++        for snapshot in cached.by_limit_id.values() {
++            self.outgoing
++                .send_server_notification(ServerNotification::AccountRateLimitsUpdated(
++                    AccountRateLimitsUpdatedNotification {
++                        rate_limits: snapshot.clone().into(),
++                    },
++                ))
++                .await;
++        }
++    }
++
+     async fn get_account_token_usage_response(
+         &self,
+     ) -> Result<GetAccountTokenUsageResponse, JSONRPCErrorError> {
+diff --git a/codex-rs/app-server/tests/suite/v2/rate_limits.rs b/codex-rs/app-server/tests/suite/v2/rate_limits.rs
+index 58c31c453b..8095f95af9 100644
+--- a/codex-rs/app-server/tests/suite/v2/rate_limits.rs
++++ b/codex-rs/app-server/tests/suite/v2/rate_limits.rs
+@@ -3,6 +3,7 @@ use app_test_support::ChatGptAuthFixture;
+ use app_test_support::TestAppServer;
+ use app_test_support::to_response;
+ use app_test_support::write_chatgpt_auth;
++use codex_app_server_protocol::AccountRateLimitsUpdatedNotification;
+ use codex_app_server_protocol::AddCreditsNudgeCreditType;
+ use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
+ use codex_app_server_protocol::GetAccountRateLimitsResponse;
+@@ -267,6 +268,70 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn initialized_chatgpt_account_polls_rate_limits() -> Result<()> {
++    let codex_home = TempDir::new()?;
++    write_chatgpt_auth(
++        codex_home.path(),
++        ChatGptAuthFixture::new("chatgpt-token")
++            .account_id("account-123")
++            .plan_type("pro"),
++        AuthCredentialsStoreMode::File,
++    )?;
++
++    let server = MockServer::start().await;
++    let server_url = server.uri();
++    write_chatgpt_base_url(codex_home.path(), &server_url)?;
++
++    let response_body = json!({
++        "plan_type": "pro",
++        "rate_limit": {
++            "allowed": true,
++            "limit_reached": false,
++            "primary_window": {
++                "used_percent": 37,
++                "limit_window_seconds": 3600,
++                "reset_after_seconds": 120,
++                "reset_at": 1735689720,
++            }
++        }
++    });
++
++    Mock::given(method("GET"))
++        .and(path("/api/codex/usage"))
++        .and(header("authorization", "Bearer chatgpt-token"))
++        .and(header("chatgpt-account-id", "account-123"))
++        .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
++        .mount(&server)
++        .await;
++
++    let mut mcp =
++        TestAppServer::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
++    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
++
++    let notification = timeout(
++        DEFAULT_READ_TIMEOUT,
++        mcp.read_stream_until_notification_message("account/rateLimits/updated"),
++    )
++    .await??;
++    let received: AccountRateLimitsUpdatedNotification = serde_json::from_value(
++        notification
++            .params
++            .expect("account/rateLimits/updated params must be present"),
++    )?;
++
++    assert_eq!(
++        received.rate_limits.primary,
++        Some(RateLimitWindow {
++            used_percent: 37,
++            window_duration_mins: Some(60),
++            resets_at: Some(1735689720),
++        })
++    );
++
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn send_add_credits_nudge_email_requires_auth() -> Result<()> {
+     let codex_home = TempDir::new()?;
+diff --git a/codex-rs/app-server/tests/suite/v2/remote_control.rs b/codex-rs/app-server/tests/suite/v2/remote_control.rs
+index 30f7f73beb..4417334361 100644
+--- a/codex-rs/app-server/tests/suite/v2/remote_control.rs
++++ b/codex-rs/app-server/tests/suite/v2/remote_control.rs
+@@ -1075,6 +1075,14 @@ async fn read_http_request(listener: &TcpListener) -> Result<HttpRequest> {
+             respond_with_json(reader.into_inner(), serde_json::json!({ "models": [] })).await?;
+             continue;
+         }
++        if request_line.starts_with("GET /backend-api/wham/usage ") {
++            respond_with_json(
++                reader.into_inner(),
++                serde_json::json!({ "plan_type": "pro" }),
++            )
++            .await?;
++            continue;
++        }
+ 
+         return Ok(HttpRequest {
+             request_line,
