@@ -2715,10 +2715,18 @@ index 0c0f88b759..0eb2493a45 100644
              Self::FastMode,
              Self::RawOutput,
 diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
-index 8c8598d780..f2596360f2 100644
+index 8c8598d780..c9f6b916e7 100644
 --- a/codex-rs/tui/src/chatwidget.rs
 +++ b/codex-rs/tui/src/chatwidget.rs
-@@ -107,9 +107,11 @@ use codex_app_server_protocol::SkillsListResponse;
+@@ -80,6 +80,7 @@ use crate::token_usage::TokenUsageInfo;
+ use crate::version::CODEX_CLI_VERSION;
+ use codex_app_server_protocol::AddCreditsNudgeCreditType;
+ use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
++use codex_app_server_protocol::AgentMessageDeltaNotification;
+ use codex_app_server_protocol::AppSummary;
+ use codex_app_server_protocol::CodexErrorInfo as AppServerCodexErrorInfo;
+ use codex_app_server_protocol::CollabAgentTool;
+@@ -107,9 +108,11 @@ use codex_app_server_protocol::SkillsListResponse;
  use codex_app_server_protocol::ThreadGoal as AppThreadGoal;
  use codex_app_server_protocol::ThreadGoalStatus as AppThreadGoalStatus;
  use codex_app_server_protocol::ThreadItem;
@@ -2730,7 +2738,7 @@ index 8c8598d780..f2596360f2 100644
  use codex_app_server_protocol::ToolRequestUserInputParams;
  use codex_app_server_protocol::Turn;
  use codex_app_server_protocol::TurnCompletedNotification;
-@@ -571,6 +573,12 @@ pub(crate) struct ChatWidget {
+@@ -571,6 +574,12 @@ pub(crate) struct ChatWidget {
      pending_rate_limit_reset_hint_request_id: Option<u64>,
      pending_usage_menu_rate_limit_request_id: Option<u64>,
      pending_rate_limit_reset_hint: Option<PlainHistoryCell>,
@@ -2743,7 +2751,7 @@ index 8c8598d780..f2596360f2 100644
      available_rate_limit_reset_credits: Option<i64>,
      next_rate_limit_reset_request_id: u64,
      plan_type: Option<PlanType>,
-@@ -634,7 +642,10 @@ pub(crate) struct ChatWidget {
+@@ -634,7 +643,10 @@ pub(crate) struct ChatWidget {
      reasoning_buffer: String,
      // Accumulates full reasoning content for transcript-only recording
      full_reasoning_buffer: String,
@@ -2754,11 +2762,12 @@ index 8c8598d780..f2596360f2 100644
      status_state: StatusState,
      review: ReviewState,
      // Active hook runs render in a dedicated live cell so they can run alongside tools.
-@@ -849,6 +860,11 @@ enum ThreadItemRenderSource {
+@@ -849,6 +861,12 @@ enum ThreadItemRenderSource {
      Replay(ReplayKind),
  }
  
 +enum DeferredLiveThreadNotification {
++    AgentMessageDelta(AgentMessageDeltaNotification),
 +    ItemStarted(ItemStartedNotification),
 +    ItemCompleted(ItemCompletedNotification),
 +}
@@ -2766,7 +2775,7 @@ index 8c8598d780..f2596360f2 100644
  impl ThreadItemRenderSource {
      fn is_replay(self) -> bool {
          matches!(self, Self::Replay(_))
-@@ -938,6 +954,16 @@ fn token_usage_info_from_app_server(token_usage: ThreadTokenUsage) -> TokenUsage
+@@ -938,6 +956,16 @@ fn token_usage_info_from_app_server(token_usage: ThreadTokenUsage) -> TokenUsage
      }
  }
  
@@ -2826,10 +2835,10 @@ index 4b36eca408..992893817f 100644
                      self.submit_user_message_with_user_prompt_submit_hook(
                          user_message,
 diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
-index 978308b196..cc0e303bc5 100644
+index 978308b196..b4bda5507f 100644
 --- a/codex-rs/tui/src/chatwidget/protocol.rs
 +++ b/codex-rs/tui/src/chatwidget/protocol.rs
-@@ -1,6 +1,47 @@
+@@ -1,6 +1,51 @@
  use super::*;
  
  impl ChatWidget {
@@ -2843,7 +2852,8 @@ index 978308b196..cc0e303bc5 100644
 +        self.live_reasoning_block_pending()
 +            && matches!(
 +                item,
-+                ThreadItem::CommandExecution { .. }
++                ThreadItem::AgentMessage { .. }
++                    | ThreadItem::CommandExecution { .. }
 +                    | ThreadItem::FileChange { .. }
 +                    | ThreadItem::McpToolCall { .. }
 +                    | ThreadItem::WebSearch { .. }
@@ -2858,6 +2868,9 @@ index 978308b196..cc0e303bc5 100644
 +        let deferred = std::mem::take(&mut self.deferred_live_thread_notifications);
 +        for notification in deferred {
 +            match notification {
++                DeferredLiveThreadNotification::AgentMessageDelta(notification) => {
++                    self.on_agent_message_delta(notification.delta);
++                }
 +                DeferredLiveThreadNotification::ItemStarted(notification) => {
 +                    self.dispatch_item_started_notification(
 +                        notification,
@@ -2877,7 +2890,7 @@ index 978308b196..cc0e303bc5 100644
      pub(crate) fn handle_server_notification(
          &mut self,
          notification: ServerNotification,
-@@ -34,6 +75,9 @@ impl ChatWidget {
+@@ -34,6 +79,9 @@ impl ChatWidget {
                      notification.token_usage,
                  )));
              }
@@ -2887,7 +2900,7 @@ index 978308b196..cc0e303bc5 100644
              ServerNotification::ThreadNameUpdated(notification) => {
                  match ThreadId::from_string(&notification.thread_id) {
                      Ok(thread_id) => {
-@@ -58,10 +102,27 @@ impl ChatWidget {
+@@ -58,10 +106,27 @@ impl ChatWidget {
                  self.on_thread_settings_updated(notification);
              }
              ServerNotification::TurnStarted(notification) => {
@@ -2918,7 +2931,20 @@ index 978308b196..cc0e303bc5 100644
                  }
              }
              ServerNotification::TurnCompleted(notification) => {
-@@ -84,9 +145,7 @@ impl ChatWidget {
+@@ -74,6 +139,12 @@ impl ChatWidget {
+                 self.handle_item_completed_notification(notification, replay_kind);
+             }
+             ServerNotification::AgentMessageDelta(notification) => {
++                if replay_kind.is_none() && self.live_reasoning_block_pending() {
++                    self.deferred_live_thread_notifications.push(
++                        DeferredLiveThreadNotification::AgentMessageDelta(notification),
++                    );
++                    return;
++                }
+                 self.on_agent_message_delta(notification.delta);
+             }
+             ServerNotification::PlanDelta(notification) => self.on_plan_delta(notification.delta),
+@@ -84,9 +155,7 @@ impl ChatWidget {
                  );
              }
              ServerNotification::ReasoningTextDelta(notification) => {
@@ -2929,7 +2955,7 @@ index 978308b196..cc0e303bc5 100644
              }
              ServerNotification::ReasoningSummaryPartAdded(notification) => {
                  self.on_reasoning_section_break(notification.summary_index);
-@@ -261,6 +320,7 @@ impl ChatWidget {
+@@ -261,6 +330,7 @@ impl ChatWidget {
                  self.on_task_complete(
                      /*last_agent_message*/ None,
                      notification.turn.duration_ms,
@@ -2937,7 +2963,7 @@ index 978308b196..cc0e303bc5 100644
                      replay_kind.is_some(),
                  )
              }
-@@ -300,6 +360,19 @@ impl ChatWidget {
+@@ -300,6 +370,19 @@ impl ChatWidget {
          &mut self,
          notification: ItemStartedNotification,
          from_replay: bool,
@@ -2957,7 +2983,7 @@ index 978308b196..cc0e303bc5 100644
      ) {
          match notification.item {
              item @ ThreadItem::CommandExecution { .. } => self.on_command_execution_started(item),
-@@ -313,6 +386,11 @@ impl ChatWidget {
+@@ -313,6 +396,11 @@ impl ChatWidget {
              ThreadItem::ImageGeneration { .. } => {
                  self.on_image_generation_begin();
              }
@@ -2969,7 +2995,7 @@ index 978308b196..cc0e303bc5 100644
              ThreadItem::CollabAgentToolCall {
                  id,
                  tool,
-@@ -347,10 +425,37 @@ impl ChatWidget {
+@@ -347,10 +435,37 @@ impl ChatWidget {
          notification: ItemCompletedNotification,
          replay_kind: Option<ReplayKind>,
      ) {
@@ -4493,7 +4519,7 @@ index e508c77735..e68d6f9774 100644
          }),
          /*replay_kind*/ None,
 diff --git a/codex-rs/tui/src/chatwidget/tests/history_replay.rs b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
-index 1eecbeb766..fcd727746b 100644
+index 1eecbeb766..a41ecad597 100644
 --- a/codex-rs/tui/src/chatwidget/tests/history_replay.rs
 +++ b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
 @@ -940,6 +940,7 @@ async fn replayed_reasoning_item_hides_raw_reasoning_when_disabled() {
@@ -4710,16 +4736,113 @@ index 1eecbeb766..fcd727746b 100644
  #[tokio::test]
  async fn replayed_in_progress_mcp_tool_call_stays_active() {
      let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-@@ -1192,7 +1385,7 @@ async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
+@@ -1192,7 +1385,104 @@ async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
  }
  
  #[tokio::test]
 -async fn live_reasoning_summary_shows_round_token_suffix() {
++async fn live_agent_output_waits_for_pending_reasoning_final() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.show_welcome_banner = false;
++
++    chat.handle_server_notification(
++        ServerNotification::TurnStarted(TurnStartedNotification {
++            thread_id: "thread-1".to_string(),
++            turn: AppServerTurn {
++                id: "turn-1".to_string(),
++                items_view: codex_app_server_protocol::TurnItemsView::Full,
++                items: Vec::new(),
++                status: AppServerTurnStatus::InProgress,
++                error: None,
++                started_at: Some(0),
++                completed_at: None,
++                duration_ms: None,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++    let _ = drain_insert_history(&mut rx);
++
++    chat.handle_server_notification(
++        ServerNotification::ReasoningSummaryTextDelta(ReasoningSummaryTextDeltaNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            item_id: "reasoning-1".to_string(),
++            delta: "**Reasoning first**\n\nSummary".to_string(),
++            summary_index: 0,
++        }),
++        /*replay_kind*/ None,
++    );
++
++    chat.handle_server_notification(
++        ServerNotification::AgentMessageDelta(
++            codex_app_server_protocol::AgentMessageDeltaNotification {
++                thread_id: "thread-1".to_string(),
++                turn_id: "turn-1".to_string(),
++                item_id: "agent-1".to_string(),
++                delta: "Visible answer".to_string(),
++            },
++        ),
++        /*replay_kind*/ None,
++    );
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            completed_at_ms: 0,
++            item: AppServerThreadItem::AgentMessage {
++                id: "agent-1".to_string(),
++                text: "Visible answer".to_string(),
++                phase: Some(MessagePhase::FinalAnswer),
++                memory_citation: None,
++                continuation_notice: None,
++                continuation_hidden: false,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++    assert!(
++        drain_insert_history(&mut rx).is_empty(),
++        "agent output must wait until the pending reasoning block is finalized"
++    );
++
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            completed_at_ms: 0,
++            item: AppServerThreadItem::Reasoning {
++                id: "reasoning-1".to_string(),
++                summary: vec!["**Reasoning first**\n\nSummary".to_string()],
++                content: Vec::new(),
++                continued: false,
++                reasoning_output_tokens: Some(292),
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++
++    let rendered = drain_insert_history(&mut rx)
++        .into_iter()
++        .map(|lines| lines_to_single_string(&lines))
++        .collect::<Vec<_>>()
++        .join("\n");
++    let reasoning_pos = rendered
++        .find("Reasoning first")
++        .expect("expected reasoning summary");
++    let answer_pos = rendered.find("Visible answer").expect("expected answer");
++    assert!(
++        reasoning_pos < answer_pos,
++        "reasoning summary must render before ordinary assistant output"
++    );
++}
++
++#[tokio::test]
 +async fn live_reasoning_summary_shows_red_round_token_suffix_for_truncation_fingerprint() {
      let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
      chat.show_welcome_banner = false;
  
-@@ -1251,7 +1444,170 @@ async fn live_reasoning_summary_shows_round_token_suffix() {
+@@ -1251,7 +1541,170 @@ async fn live_reasoning_summary_shows_round_token_suffix() {
          .last()
          .expect("expected reasoning token suffix");
      assert_eq!(suffix.content.as_ref(), " ■ 516 tokens");
