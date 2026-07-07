@@ -1652,11 +1652,45 @@ index 578e3fafef..297e053401 100644
                  reasoning_output_tokens: None,
              },
              thread_id: "thread-child".to_string(),
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index c9f6b916e7..159666eaa3 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -591,6 +591,7 @@ pub(crate) struct ChatWidget {
+     adaptive_chunking: AdaptiveChunkingPolicy,
+     // Stream lifecycle controller
+     stream_controller: Option<StreamController>,
++    continuation_turn_ids_rendered: HashSet<String>,
+     // Stream lifecycle controller for proposed plan output.
+     plan_stream_controller: Option<PlanStreamController>,
+     pending_stream_consolidations: usize,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 7dcc6b7cad..196286a7bb 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -152,6 +152,7 @@ impl ChatWidget {
+             add_credits_nudge_email_in_flight: None,
+             adaptive_chunking: AdaptiveChunkingPolicy::default(),
+             stream_controller: None,
++            continuation_turn_ids_rendered: HashSet::new(),
+             plan_stream_controller: None,
+             pending_stream_consolidations: 0,
+             clipboard_lease: None,
 diff --git a/codex-rs/tui/src/chatwidget/replay.rs b/codex-rs/tui/src/chatwidget/replay.rs
-index eaeb86ec8b..8eccbf5438 100644
+index eaeb86ec8b..290a732f5e 100644
 --- a/codex-rs/tui/src/chatwidget/replay.rs
 +++ b/codex-rs/tui/src/chatwidget/replay.rs
-@@ -121,6 +121,7 @@ impl ChatWidget {
+@@ -73,6 +73,9 @@ impl ChatWidget {
+     ) {
+         let from_replay = render_source.is_replay();
+         let replay_kind = render_source.replay_kind();
++        if item_should_show_turn_id(&item) {
++            self.add_turn_id_once(Some(&turn_id));
++        }
+         match item {
+             ThreadItem::UserMessage { content, .. } => {
+                 self.on_committed_user_message(&content, from_replay);
+@@ -121,6 +124,7 @@ impl ChatWidget {
                          continuation_hidden,
                      },
                      from_replay,
@@ -1664,7 +1698,7 @@ index eaeb86ec8b..8eccbf5438 100644
                  );
              }
              ThreadItem::Plan { text, .. } => self.on_plan_item_completed(text),
-@@ -128,13 +129,16 @@ impl ChatWidget {
+@@ -128,13 +132,16 @@ impl ChatWidget {
                  summary,
                  content,
                  continued,
@@ -1681,17 +1715,52 @@ index eaeb86ec8b..8eccbf5438 100644
              ),
              item @ ThreadItem::CommandExecution {
                  status: codex_app_server_protocol::CommandExecutionStatus::InProgress,
+@@ -214,3 +221,19 @@ impl ChatWidget {
+         }
+     }
+ }
++
++fn item_should_show_turn_id(item: &ThreadItem) -> bool {
++    match item {
++        ThreadItem::UserMessage { .. } => false,
++        ThreadItem::AgentMessage {
++            continuation_hidden: true,
++            continuation_notice: None,
++            ..
++        } => false,
++        ThreadItem::FileChange {
++            status: codex_app_server_protocol::PatchApplyStatus::InProgress,
++            ..
++        } => false,
++        _ => true,
++    }
++}
+diff --git a/codex-rs/tui/src/chatwidget/session_flow.rs b/codex-rs/tui/src/chatwidget/session_flow.rs
+index 6d913a21a5..802c1a2528 100644
+--- a/codex-rs/tui/src/chatwidget/session_flow.rs
++++ b/codex-rs/tui/src/chatwidget/session_flow.rs
+@@ -25,6 +25,7 @@ impl ChatWidget {
+         if previous_thread_id != self.thread_id {
+             self.review.recent_auto_review_denials = RecentAutoReviewDenials::default();
+         }
++        self.continuation_turn_ids_rendered.clear();
+         self.refresh_plan_mode_nudge();
+         self.turn_lifecycle.reset_thread();
+         self.clear_safety_buffering();
 diff --git a/codex-rs/tui/src/chatwidget/streaming.rs b/codex-rs/tui/src/chatwidget/streaming.rs
-index 5d5c89693b..b773b7f237 100644
+index 5273afcfe7..651333a7f9 100644
 --- a/codex-rs/tui/src/chatwidget/streaming.rs
 +++ b/codex-rs/tui/src/chatwidget/streaming.rs
-@@ -321,20 +321,32 @@ impl ChatWidget {
+@@ -329,20 +329,33 @@ impl ChatWidget {
          self.on_agent_reasoning_delta(delta);
      }
  
-+    fn add_continuation_turn_id(&mut self, turn_id: Option<&str>) {
++    pub(super) fn add_turn_id_once(&mut self, turn_id: Option<&str>) {
 +        if let Some(turn_id) = turn_id.filter(|turn_id| !turn_id.is_empty()) {
-+            self.add_to_history(history_cell::new_continuation_turn_id(turn_id));
++            let turn_id = turn_id.to_string();
++            if self.continuation_turn_ids_rendered.insert(turn_id.clone()) {
++                self.add_to_history(history_cell::new_continuation_turn_id(&turn_id));
++            }
 +        }
 +    }
 +
@@ -1707,9 +1776,7 @@ index 5d5c89693b..b773b7f237 100644
          if let Some(reasoning_markdown) =
              self.reasoning_markdown_for_completed_item(summary, content, reasoning_output_tokens)
          {
-+            if continued || continuation_limit_hit {
-+                self.add_continuation_turn_id(turn_id);
-+            }
++            self.add_turn_id_once(turn_id);
              let cell = history_cell::new_reasoning_summary_block(
                  reasoning_markdown,
                  &self.config.cwd,
@@ -1718,7 +1785,7 @@ index 5d5c89693b..b773b7f237 100644
                  reasoning_output_tokens,
              );
              self.add_boxed_history(cell);
-@@ -367,6 +379,7 @@ impl ChatWidget {
+@@ -375,6 +388,7 @@ impl ChatWidget {
                  reasoning_markdown,
                  &self.config.cwd,
                  /*continued*/ false,
@@ -1726,7 +1793,7 @@ index 5d5c89693b..b773b7f237 100644
                  /*reasoning_output_tokens*/ None,
              );
              self.add_boxed_history(cell);
-@@ -400,6 +413,7 @@ impl ChatWidget {
+@@ -408,6 +422,7 @@ impl ChatWidget {
                  reasoning_markdown,
                  &self.config.cwd,
                  /*continued*/ false,
@@ -1734,7 +1801,7 @@ index 5d5c89693b..b773b7f237 100644
                  /*reasoning_output_tokens*/ None,
              );
              self.add_boxed_history(cell);
-@@ -482,9 +496,11 @@ impl ChatWidget {
+@@ -490,9 +505,11 @@ impl ChatWidget {
          &mut self,
          item: AgentMessageItem,
          from_replay: bool,
@@ -1742,10 +1809,18 @@ index 5d5c89693b..b773b7f237 100644
      ) {
          if let Some(notice) = item.continuation_notice {
              self.finalize_completed_assistant_message(/*content*/ None);
-+            self.add_continuation_turn_id(turn_id);
++            self.add_turn_id_once(turn_id);
              self.add_to_history(history_cell::new_continuation_notice(notice));
              self.status_state.pending_status_indicator_restore = true;
              self.maybe_restore_status_indicator_after_stream_idle();
+@@ -506,6 +523,7 @@ impl ChatWidget {
+             }
+         }
+         let parsed = parse_assistant_markdown(&message, self.config.cwd.as_path());
++        self.add_turn_id_once(turn_id);
+         self.finalize_completed_assistant_message(
+             (!parsed.visible_markdown.is_empty()).then_some(parsed.visible_markdown.as_str()),
+         );
 diff --git a/codex-rs/tui/src/chatwidget/tests/helpers.rs b/codex-rs/tui/src/chatwidget/tests/helpers.rs
 index e68d6f9774..793697360b 100644
 --- a/codex-rs/tui/src/chatwidget/tests/helpers.rs
@@ -1759,7 +1834,7 @@ index e68d6f9774..793697360b 100644
              },
          }),
 diff --git a/codex-rs/tui/src/chatwidget/tests/history_replay.rs b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
-index a41ecad597..90cd1a165b 100644
+index 489f5e44ee..adf0bcc7a0 100644
 --- a/codex-rs/tui/src/chatwidget/tests/history_replay.rs
 +++ b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
 @@ -10,6 +10,18 @@ use codex_protocol::permissions::FileSystemSpecialPath;
@@ -1862,7 +1937,7 @@ index a41ecad597..90cd1a165b 100644
          .expect("expected reasoning token suffix");
      assert_eq!(suffix.content.as_ref(), " ■ 516 tokens");
      assert_eq!(suffix.style.fg, Some(ratatui::style::Color::Red));
-+    assert_eq!(
++    assert_ne!(
 +        suffix.style.bg,
 +        Some(ratatui::style::Color::Rgb(255, 128, 0))
 +    );
@@ -1895,7 +1970,7 @@ index a41ecad597..90cd1a165b 100644
      assert!(rendered.contains("[Hidden assistant output]"));
      assert!(!rendered.contains("hidden"));
  }
-@@ -1287,12 +1310,11 @@ async fn hidden_tool_notice_renders_placeholder_live() {
+@@ -1287,12 +1310,62 @@ async fn hidden_tool_notice_renders_placeholder_live() {
          /*replay_kind*/ None,
      );
  
@@ -1910,10 +1985,61 @@ index a41ecad597..90cd1a165b 100644
 +        .map(|lines| lines_to_single_string(&lines))
 +        .collect::<Vec<_>>()
 +        .join("\n");
++    assert!(rendered.contains("[Skipped tool execution]"));
++}
++
++#[tokio::test]
++async fn live_turn_id_renders_once_for_visible_and_continuation_items() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.show_welcome_banner = false;
++    let turn_id = "turn-visible";
++
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: turn_id.to_string(),
++            completed_at_ms: 0,
++            item: AppServerThreadItem::AgentMessage {
++                id: "agent-visible".to_string(),
++                text: "visible answer".to_string(),
++                phase: Some(MessagePhase::FinalAnswer),
++                memory_citation: None,
++                continuation_notice: None,
++                continuation_hidden: false,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: turn_id.to_string(),
++            completed_at_ms: 1,
++            item: AppServerThreadItem::AgentMessage {
++                id: "agent-hidden-tool".to_string(),
++                text: "[Skipped tool execution]".to_string(),
++                phase: Some(MessagePhase::Commentary),
++                memory_citation: None,
++                continuation_notice: Some(
++                    codex_app_server_protocol::ContinuationNoticeKind::SkippedToolExecution,
++                ),
++                continuation_hidden: true,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++
++    let rendered = drain_insert_history_transcript(&mut rx)
++        .into_iter()
++        .map(|lines| lines_to_single_string(&lines))
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert_eq!(rendered.matches(turn_id).count(), 1, "{rendered}");
++    assert!(rendered.contains("visible answer"));
      assert!(rendered.contains("[Skipped tool execution]"));
  }
  
-@@ -1369,6 +1391,7 @@ async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
+@@ -1369,6 +1442,7 @@ async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
                  summary: vec!["Summary only".to_string()],
                  content: Vec::new(),
                  continued: false,
@@ -1921,7 +2047,7 @@ index a41ecad597..90cd1a165b 100644
                  reasoning_output_tokens: None,
              },
          }),
-@@ -1460,6 +1483,7 @@ async fn live_agent_output_waits_for_pending_reasoning_final() {
+@@ -1524,6 +1598,7 @@ async fn live_agent_output_waits_for_pending_reasoning_final() {
                  summary: vec!["**Reasoning first**\n\nSummary".to_string()],
                  content: Vec::new(),
                  continued: false,
@@ -1929,7 +2055,7 @@ index a41ecad597..90cd1a165b 100644
                  reasoning_output_tokens: Some(292),
              },
          }),
-@@ -1525,17 +1549,17 @@ async fn live_reasoning_summary_shows_red_round_token_suffix_for_truncation_fing
+@@ -1589,17 +1664,17 @@ async fn live_reasoning_summary_shows_red_round_token_suffix_for_truncation_fing
                  summary: vec!["**Considering installation updates**\n\nSummary only".to_string()],
                  content: Vec::new(),
                  continued: true,
@@ -1952,7 +2078,7 @@ index a41ecad597..90cd1a165b 100644
      let suffix = lines[0]
          .spans
          .last()
-@@ -1591,18 +1615,18 @@ async fn live_raw_reasoning_without_summary_uses_fallback_title() {
+@@ -1655,18 +1730,18 @@ async fn live_raw_reasoning_without_summary_uses_fallback_title() {
                  summary: Vec::new(),
                  content: vec!["raw reasoning".to_string()],
                  continued: true,
@@ -1977,7 +2103,7 @@ index a41ecad597..90cd1a165b 100644
      assert!(rendered.contains("[No reasoning summary]"));
      assert!(rendered.contains("raw reasoning"));
  }
-@@ -1641,18 +1665,18 @@ async fn live_completed_raw_reasoning_without_deltas_uses_fallback_title() {
+@@ -1705,18 +1780,18 @@ async fn live_completed_raw_reasoning_without_deltas_uses_fallback_title() {
                  summary: Vec::new(),
                  content: vec!["raw reasoning".to_string()],
                  continued: true,
@@ -2002,7 +2128,7 @@ index a41ecad597..90cd1a165b 100644
      assert!(rendered.contains("[No reasoning summary]"));
      assert!(rendered.contains("raw reasoning"));
  }
-@@ -1691,18 +1715,18 @@ async fn live_completed_encrypted_only_reasoning_uses_fallback_title() {
+@@ -1755,18 +1830,18 @@ async fn live_completed_encrypted_only_reasoning_uses_fallback_title() {
                  summary: Vec::new(),
                  content: Vec::new(),
                  continued: true,
@@ -2027,7 +2153,7 @@ index a41ecad597..90cd1a165b 100644
      assert!(rendered.contains("[No reasoning summary]"));
      assert!(rendered.contains("123 tokens"));
  }
-@@ -1765,6 +1789,7 @@ async fn live_reasoning_summary_sections_render_titles_on_separate_lines() {
+@@ -1829,6 +1904,7 @@ async fn live_reasoning_summary_sections_render_titles_on_separate_lines() {
                  ],
                  content: Vec::new(),
                  continued: false,
@@ -2036,7 +2162,7 @@ index a41ecad597..90cd1a165b 100644
              },
          }),
 diff --git a/codex-rs/tui/src/history_cell/messages.rs b/codex-rs/tui/src/history_cell/messages.rs
-index 8d24aaedcf..876040655d 100644
+index 8d24aaedcf..c3702b1e94 100644
 --- a/codex-rs/tui/src/history_cell/messages.rs
 +++ b/codex-rs/tui/src/history_cell/messages.rs
 @@ -209,6 +209,7 @@ pub(crate) struct ReasoningSummaryCell {
@@ -2093,19 +2219,17 @@ index 8d24aaedcf..876040655d 100644
                          Span::styled(span.content, style)
                      })
                      .collect();
-@@ -270,8 +285,10 @@ impl ReasoningSummaryCell {
+@@ -270,7 +285,9 @@ impl ReasoningSummaryCell {
              && let Some(tokens) = self.reasoning_output_tokens.filter(|tokens| *tokens > 0)
              && let Some(first_line) = summary_lines.first_mut()
          {
 -            let usage_style = if is_reasoning_truncation_fingerprint(tokens) {
--                Style::default().fg(Color::Red)
 +            let usage_style = if self.continuation_limit_hit {
-+                Style::default().fg(Color::Black).bg(Color::Red)
++                Style::default().fg(Color::Red)
 +            } else if is_reasoning_truncation_fingerprint(tokens) {
-+                Style::default().fg(Color::Red).bg(Color::Rgb(255, 128, 0))
+                 Style::default().fg(Color::Red)
              } else {
                  Style::default().fg(Color::Rgb(192, 160, 0))
-             };
 @@ -525,6 +542,7 @@ pub(crate) fn new_reasoning_summary_block(
      full_reasoning_buffer: String,
      cwd: &Path,
@@ -2150,7 +2274,7 @@ index 7c01b19c50..2c1a345b29 100644
  struct ContextCompactedHistoryCell {
      duration_ms: Option<i64>,
 diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
-index da9243eabe..d5b4dc3acc 100644
+index da9243eabe..8a463bf68d 100644
 --- a/codex-rs/tui/src/history_cell/tests.rs
 +++ b/codex-rs/tui/src/history_cell/tests.rs
 @@ -239,6 +239,7 @@ fn source_backed_cells_render_raw_source_without_prefix_or_style() {
@@ -2269,11 +2393,12 @@ index da9243eabe..d5b4dc3acc 100644
          /*reasoning_output_tokens*/ Some(516),
      );
  
-@@ -2539,6 +2555,38 @@ fn reasoning_summary_usage_suffix_is_red_for_truncation_fingerprint_rounds() {
+@@ -2539,6 +2555,41 @@ fn reasoning_summary_usage_suffix_is_red_for_truncation_fingerprint_rounds() {
          .expect("expected usage suffix on first reasoning line");
      assert_eq!(suffix.content.as_ref(), " ■ 516 tokens");
      assert_eq!(suffix.style.fg, Some(Color::Red));
-+    assert_eq!(suffix.style.bg, Some(Color::Rgb(255, 128, 0)));
++    assert_ne!(suffix.style.bg, Some(Color::Rgb(255, 128, 0)));
++    assert_eq!(lines[0].spans[1].style.fg, Some(Color::Black));
 +    assert_eq!(lines[0].spans[1].style.bg, Some(Color::Rgb(255, 128, 0)));
 +}
 +
@@ -2292,8 +2417,10 @@ index da9243eabe..d5b4dc3acc 100644
 +        .spans
 +        .last()
 +        .expect("expected usage suffix on first reasoning line");
++    assert_eq!(lines[0].spans[1].style.fg, Some(Color::Black));
 +    assert_eq!(lines[0].spans[1].style.bg, Some(Color::Red));
-+    assert_eq!(suffix.style.bg, Some(Color::Red));
++    assert_eq!(suffix.style.fg, Some(Color::Red));
++    assert_ne!(suffix.style.bg, Some(Color::Red));
 +}
 +
 +#[test]
@@ -2308,7 +2435,7 @@ index da9243eabe..d5b4dc3acc 100644
  }
  
  #[test]
-@@ -2645,6 +2693,7 @@ fn wrapped_and_prefixed_cells_handle_tiny_widths() {
+@@ -2645,6 +2696,7 @@ fn wrapped_and_prefixed_cells_handle_tiny_widths() {
          &test_cwd(),
          /*transcript_only*/ false,
          /*continued*/ false,
