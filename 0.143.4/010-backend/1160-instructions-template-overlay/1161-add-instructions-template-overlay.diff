@@ -1,0 +1,698 @@
+diff --git a/codex-rs/app-server/tests/suite/v2/remote_thread_store.rs b/codex-rs/app-server/tests/suite/v2/remote_thread_store.rs
+index 2002b08a88..e228ae5789 100644
+--- a/codex-rs/app-server/tests/suite/v2/remote_thread_store.rs
++++ b/codex-rs/app-server/tests/suite/v2/remote_thread_store.rs
+@@ -380,9 +380,11 @@ fn assert_no_local_persistence_artifacts(codex_home: &Path) -> Result<()> {
+     );
+     let mut entries = codex_home_entries(codex_home)?;
+     // Bazel test runs may initialize shell snapshot storage under codex_home.
++    // Chat Completions provider setup may create model-provider config/cache.
+     // That is not thread persistence; keep the assertion focused on rollout,
+     // session, sqlite, and other unexpected thread-store artifacts.
+     entries.remove("shell_snapshots");
++    entries.remove("chat-completions");
+     assert_eq!(
+         entries,
+         BTreeSet::from([
+diff --git a/codex-rs/models-manager/src/cache_overlay.rs b/codex-rs/models-manager/src/cache_overlay.rs
+new file mode 100644
+index 0000000000..2d664ea123
+--- /dev/null
++++ b/codex-rs/models-manager/src/cache_overlay.rs
+@@ -0,0 +1,203 @@
++use codex_protocol::openai_models::ModelInfo;
++use serde_json::Map;
++use serde_json::Value;
++use std::fs;
++use std::io;
++use std::io::ErrorKind;
++use std::path::Path;
++use std::path::PathBuf;
++use tracing::warn;
++
++pub(crate) const INSTRUCTIONS_OVERLAY_FILE: &str = "instructions.json";
++pub(crate) const INSTRUCTIONS_OVERLAY_DIR: &str = "instructions";
++
++#[derive(Debug, Clone)]
++pub(crate) struct ModelsCacheOverlay {
++    json_path: PathBuf,
++    dir_path: PathBuf,
++}
++
++impl ModelsCacheOverlay {
++    pub(crate) fn new(codex_home: PathBuf) -> Self {
++        Self {
++            json_path: codex_home.join(INSTRUCTIONS_OVERLAY_FILE),
++            dir_path: codex_home.join(INSTRUCTIONS_OVERLAY_DIR),
++        }
++    }
++
++    pub(crate) fn apply(&self, mut models: Vec<ModelInfo>) -> Vec<ModelInfo> {
++        self.apply_json_overlay(&mut models);
++        seed_overlay_dir(&models, &self.dir_path);
++        apply_overlay_dir(&mut models, &self.dir_path);
++        models
++    }
++
++    pub(crate) fn seed_dir(&self, mut models: Vec<ModelInfo>) {
++        self.apply_json_overlay(&mut models);
++        seed_overlay_dir(&models, &self.dir_path);
++    }
++
++    fn apply_json_overlay(&self, models: &mut [ModelInfo]) {
++        if let Some(overlay) = match load_overlay(&self.json_path) {
++            Ok(overlay) => overlay,
++            Err(err) => {
++                warn!(
++                    path = %self.json_path.display(),
++                    "failed to load instructions overlay: {err}"
++                );
++                return;
++            }
++        } {
++            for model in models {
++                let Some(overlay_model) = overlay_model(&overlay, &model.slug) else {
++                    continue;
++                };
++                apply_overlay_model(model, overlay_model, &self.json_path);
++            }
++        }
++    }
++}
++
++fn load_overlay(path: &Path) -> io::Result<Option<Value>> {
++    match fs::read(path) {
++        Ok(contents) => serde_json::from_slice::<Value>(&contents)
++            .map(Some)
++            .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string())),
++        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
++        Err(err) => Err(err),
++    }
++}
++
++fn overlay_model<'a>(overlay: &'a Value, slug: &str) -> Option<&'a Map<String, Value>> {
++    overlay
++        .get("models")
++        .and_then(Value::as_object)
++        .and_then(|models| models.get(slug))
++        .and_then(Value::as_object)
++}
++
++fn template_value(model: &Map<String, Value>) -> Option<&Value> {
++    model
++        .get("model_messages")
++        .and_then(Value::as_object)
++        .and_then(|messages| messages.get("instructions_template"))
++}
++
++fn apply_overlay_model(model: &mut ModelInfo, overlay_model: &Map<String, Value>, path: &Path) {
++    let Some(messages) = model.model_messages.as_mut() else {
++        return;
++    };
++    let Some(template) = template_value(overlay_model) else {
++        return;
++    };
++    let Some(template) = template.as_str() else {
++        warn!(
++            model = %model.slug,
++            path = %path.display(),
++            "instructions overlay instructions_template must be a string"
++        );
++        return;
++    };
++    if template.is_empty() {
++        warn!(
++            model = %model.slug,
++            path = %path.display(),
++            "instructions overlay instructions_template must not be empty"
++        );
++        return;
++    }
++    messages.instructions_template = Some(template.to_string());
++}
++
++fn apply_overlay_dir(models: &mut [ModelInfo], dir_path: &Path) {
++    for model in models {
++        let Some(path) = overlay_dir_model_path(dir_path, &model.slug) else {
++            continue;
++        };
++        let template = match fs::read_to_string(&path) {
++            Ok(template) => template,
++            Err(err) if err.kind() == ErrorKind::NotFound => continue,
++            Err(err) => {
++                warn!(
++                    model = %model.slug,
++                    path = %path.display(),
++                    "failed to load instructions overlay file: {err}"
++                );
++                continue;
++            }
++        };
++        apply_template_string(model, &template, &path);
++    }
++}
++
++fn seed_overlay_dir(models: &[ModelInfo], dir_path: &Path) {
++    match fs::metadata(dir_path) {
++        Ok(metadata) if metadata.is_dir() => return,
++        Ok(_) => {
++            warn!(
++                path = %dir_path.display(),
++                "instructions overlay path is not a directory"
++            );
++            return;
++        }
++        Err(err) if err.kind() == ErrorKind::NotFound => {}
++        Err(err) => {
++            warn!(
++                path = %dir_path.display(),
++                "failed to inspect instructions overlay directory: {err}"
++            );
++            return;
++        }
++    }
++    if let Err(err) = fs::create_dir_all(dir_path) {
++        warn!(
++            path = %dir_path.display(),
++            "failed to create instructions overlay directory: {err}"
++        );
++        return;
++    }
++    for model in models {
++        let Some(path) = overlay_dir_model_path(dir_path, &model.slug) else {
++            continue;
++        };
++        let Some(template) = model
++            .model_messages
++            .as_ref()
++            .and_then(|messages| messages.instructions_template.as_deref())
++        else {
++            continue;
++        };
++        if template.trim().is_empty() {
++            continue;
++        }
++        if let Err(err) = fs::write(&path, template) {
++            warn!(
++                model = %model.slug,
++                path = %path.display(),
++                "failed to seed instructions overlay file: {err}"
++            );
++        }
++    }
++}
++
++fn overlay_dir_model_path(dir_path: &Path, slug: &str) -> Option<PathBuf> {
++    if slug.is_empty() || slug.contains(std::path::MAIN_SEPARATOR) {
++        return None;
++    }
++    Some(dir_path.join(format!("{slug}.md")))
++}
++
++fn apply_template_string(model: &mut ModelInfo, template: &str, path: &Path) {
++    let Some(messages) = model.model_messages.as_mut() else {
++        return;
++    };
++    if template.trim().is_empty() {
++        warn!(
++            model = %model.slug,
++            path = %path.display(),
++            "instructions overlay file must not be empty"
++        );
++        return;
++    }
++    messages.instructions_template = Some(template.to_string());
++}
+diff --git a/codex-rs/models-manager/src/lib.rs b/codex-rs/models-manager/src/lib.rs
+index 4a4c590afe..c1d22101a6 100644
+--- a/codex-rs/models-manager/src/lib.rs
++++ b/codex-rs/models-manager/src/lib.rs
+@@ -1,4 +1,5 @@
+ pub(crate) mod cache;
++pub(crate) mod cache_overlay;
+ pub mod collaboration_mode_presets;
+ pub(crate) mod config;
+ pub mod manager;
+diff --git a/codex-rs/models-manager/src/manager.rs b/codex-rs/models-manager/src/manager.rs
+index 96a7cc5345..05d69ab5ac 100644
+--- a/codex-rs/models-manager/src/manager.rs
++++ b/codex-rs/models-manager/src/manager.rs
+@@ -1,4 +1,5 @@
+ use super::cache::ModelsCacheManager;
++use crate::cache_overlay::ModelsCacheOverlay;
+ use crate::collaboration_mode_presets::builtin_collaboration_mode_presets;
+ use crate::config::ModelsManagerConfig;
+ use crate::model_info;
+@@ -219,6 +220,7 @@ pub struct OpenAiModelsManager {
+     remote_models: Arc<RwLock<Vec<ModelInfo>>>,
+     etag: Arc<RwLock<Option<String>>>,
+     cache_manager: ModelsCacheManager,
++    cache_overlay: ModelsCacheOverlay,
+     endpoint_client: SharedModelsEndpointClient,
+     auth_manager: Option<Arc<AuthManager>>,
+     refresh_in_progress: Arc<AtomicBool>,
+@@ -239,12 +241,14 @@ impl OpenAiModelsManager {
+         auth_manager: Option<Arc<AuthManager>>,
+     ) -> Self {
+         let cache_path = codex_home.join(MODEL_CACHE_FILE);
++        let cache_overlay = ModelsCacheOverlay::new(codex_home.clone());
+         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
+         let remote_models = load_remote_models_from_file().unwrap_or_default();
+         Self {
+             remote_models: Arc::new(RwLock::new(remote_models)),
+             etag: Arc::new(RwLock::new(None)),
+             cache_manager,
++            cache_overlay,
+             endpoint_client,
+             auth_manager,
+             refresh_in_progress: Arc::new(AtomicBool::new(false)),
+@@ -276,11 +280,15 @@ impl ModelsManager for OpenAiModelsManager {
+     }
+ 
+     fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {
+-        Box::pin(async move { self.remote_models.read().await.clone() })
++        Box::pin(async move {
++            let models = self.remote_models.read().await.clone();
++            self.cache_overlay.apply(models)
++        })
+     }
+ 
+     fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, TryLockError> {
+-        Ok(self.remote_models.try_read()?.clone())
++        let models = self.remote_models.try_read()?.clone();
++        Ok(self.cache_overlay.apply(models))
+     }
+ 
+     fn auth_manager(&self) -> Option<&AuthManager> {
+@@ -380,7 +388,7 @@ impl OpenAiModelsManager {
+         &self,
+         http_client_factory: &HttpClientFactory,
+     ) -> CoreResult<()> {
+-        fetch_and_update_models_inner(
++        let result = fetch_and_update_models_inner(
+             Arc::clone(&self.endpoint_client),
+             self.cache_manager.clone(),
+             Arc::clone(&self.remote_models),
+@@ -388,7 +396,16 @@ impl OpenAiModelsManager {
+             self.auth_manager.clone(),
+             http_client_factory.clone(),
+         )
+-        .await
++        .await;
++        if result.is_ok() {
++            self.seed_current_overlay_dir().await;
++        }
++        result
++    }
++
++    async fn seed_current_overlay_dir(&self) {
++        let models = self.remote_models.read().await.clone();
++        self.cache_overlay.seed_dir(models);
+     }
+ 
+     fn start_background_model_refresh(&self, http_client_factory: HttpClientFactory) {
+@@ -402,20 +419,24 @@ impl OpenAiModelsManager {
+         let remote_models = Arc::clone(&self.remote_models);
+         let etag = Arc::clone(&self.etag);
+         let auth_manager = self.auth_manager.clone();
++        let cache_overlay = self.cache_overlay.clone();
+         let refresh_in_progress = Arc::clone(&self.refresh_in_progress);
+         tokio::spawn(async move {
+             debug!("models refresh: background refresh started");
+             match fetch_and_update_models_inner(
+                 endpoint_client,
+                 cache_manager,
+-                remote_models,
++                Arc::clone(&remote_models),
+                 etag,
+                 auth_manager,
+                 http_client_factory,
+             )
+             .await
+             {
+-                Ok(()) => debug!("models refresh: background refresh completed"),
++                Ok(()) => {
++                    cache_overlay.seed_dir(remote_models.read().await.clone());
++                    debug!("models refresh: background refresh completed");
++                }
+                 Err(err) => debug!("models refresh: background refresh failed: {err}"),
+             }
+             refresh_in_progress.store(false, Ordering::Release);
+@@ -453,6 +474,7 @@ impl OpenAiModelsManager {
+         let models = cache.models.clone();
+         *self.etag.write().await = cache.etag.clone();
+         self.apply_remote_models(models.clone()).await;
++        self.seed_current_overlay_dir().await;
+         info!(
+             models_count = models.len(),
+             etag = ?cache.etag,
+@@ -486,6 +508,7 @@ impl OpenAiModelsManager {
+         let models = loaded.cache.models.clone();
+         *self.etag.write().await = loaded.cache.etag.clone();
+         self.apply_remote_models(models.clone()).await;
++        self.seed_current_overlay_dir().await;
+         info!(
+             models_count = models.len(),
+             etag = ?loaded.cache.etag,
+diff --git a/codex-rs/models-manager/src/manager_tests.rs b/codex-rs/models-manager/src/manager_tests.rs
+index 4396e0e4f5..f40d3f8b81 100644
+--- a/codex-rs/models-manager/src/manager_tests.rs
++++ b/codex-rs/models-manager/src/manager_tests.rs
+@@ -11,6 +11,7 @@ use codex_login::ExternalAuth;
+ use codex_login::ExternalAuthRefreshContext;
+ use codex_login::TokenData;
+ use codex_protocol::auth::AuthMode;
++use codex_protocol::openai_models::ModelMessages;
+ use codex_protocol::openai_models::ModelsResponse;
+ use pretty_assertions::assert_eq;
+ use serde_json::json;
+@@ -35,6 +36,16 @@ fn remote_model(slug: &str, display: &str, priority: i32) -> ModelInfo {
+     remote_model_with_visibility(slug, display, priority, "list")
+ }
+ 
++fn remote_model_with_prompt(slug: &str, display: &str, priority: i32, prompt: &str) -> ModelInfo {
++    let mut model = remote_model(slug, display, priority);
++    model.model_messages = Some(ModelMessages {
++        instructions_template: Some(prompt.to_string()),
++        instructions_variables: None,
++        approvals: None,
++    });
++    model
++}
++
+ fn remote_model_with_visibility(
+     slug: &str,
+     display: &str,
+@@ -279,6 +290,7 @@ impl ModelsEndpointClient for BlockingSecondFetchModelsEndpoint {
+     fn list_models<'a>(
+         &'a self,
+         _client_version: &'a str,
++        _http_client_factory: HttpClientFactory,
+     ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
+         Box::pin(async move {
+             let fetch_number = self.fetch_count.fetch_add(1, Ordering::SeqCst) + 1;
+@@ -310,6 +322,7 @@ impl ModelsEndpointClient for FailingModelsEndpoint {
+     fn list_models<'a>(
+         &'a self,
+         _client_version: &'a str,
++        _http_client_factory: HttpClientFactory,
+     ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
+         Box::pin(async move {
+             self.fetch_count.fetch_add(1, Ordering::SeqCst);
+@@ -343,6 +356,22 @@ fn static_manager_for_tests(model_catalog: ModelsResponse) -> StaticModelsManage
+     StaticModelsManager::new(/*auth_manager*/ None, model_catalog)
+ }
+ 
++fn instructions_overlay_path(codex_home: &Path) -> std::path::PathBuf {
++    codex_home.join(crate::cache_overlay::INSTRUCTIONS_OVERLAY_FILE)
++}
++
++fn instructions_overlay_dir_path(codex_home: &Path) -> std::path::PathBuf {
++    codex_home.join(crate::cache_overlay::INSTRUCTIONS_OVERLAY_DIR)
++}
++
++fn write_instructions_overlay(codex_home: &Path, value: serde_json::Value) {
++    std::fs::write(
++        instructions_overlay_path(codex_home),
++        serde_json::to_vec_pretty(&value).expect("overlay should serialize"),
++    )
++    .expect("overlay should be written");
++}
++
+ async fn chatgpt_auth_tokens_for_tests(codex_home: &Path) -> CodexAuth {
+     let auth_dot_json = codex_login::AuthDotJson {
+         auth_mode: Some(AuthMode::ChatgptAuthTokens),
+@@ -834,6 +863,223 @@ async fn refresh_available_models_uses_cache_when_fresh() {
+     );
+ }
+ 
++#[tokio::test]
++async fn instructions_overlay_missing_file_does_not_write() {
++    let prompted = remote_model_with_prompt(
++        "prompted-cache-model",
++        "Prompted Cache Model",
++        /*priority*/ 1,
++        "upstream prompt\nwith newline",
++    );
++    let codex_home = tempdir().expect("temp dir");
++    let endpoint = TestModelsEndpoint::new(vec![vec![prompted.clone()]]);
++    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
++
++    manager
++        .refresh_available_models(
++            RefreshStrategy::OnlineIfUncached,
++            &DEFAULT_HTTP_CLIENT_FACTORY,
++        )
++        .await
++        .expect("refresh succeeds");
++    assert_models_contain(&manager.get_remote_models().await, &[prompted]);
++    assert!(!instructions_overlay_path(codex_home.path()).exists());
++}
++
++#[tokio::test]
++async fn instructions_overlay_overrides_prompt_and_reloads_file() {
++    let remote = remote_model_with_prompt(
++        "overlay-cache-model",
++        "Overlay Cache Model",
++        /*priority*/ 1,
++        "upstream prompt",
++    );
++    let codex_home = tempdir().expect("temp dir");
++    write_instructions_overlay(
++        codex_home.path(),
++        json!({
++            "models": {
++                "overlay-cache-model": {
++                    "model_messages": {
++                        "instructions_template": "local prompt one"
++                    }
++                }
++            }
++        }),
++    );
++    let endpoint = TestModelsEndpoint::new(vec![vec![remote]]);
++    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
++
++    manager
++        .refresh_available_models(
++            RefreshStrategy::OnlineIfUncached,
++            &DEFAULT_HTTP_CLIENT_FACTORY,
++        )
++        .await
++        .expect("refresh succeeds");
++    let config = ModelsManagerConfig {
++        personality_enabled: true,
++        ..Default::default()
++    };
++    let model_info = manager.get_model_info("overlay-cache-model", &config).await;
++    assert_eq!(
++        model_info
++            .model_messages
++            .as_ref()
++            .and_then(|messages| messages.instructions_template.as_deref()),
++        Some("local prompt one")
++    );
++    assert_eq!(model_info.display_name, "Overlay Cache Model");
++    assert_eq!(model_info.base_instructions, "base instructions");
++
++    write_instructions_overlay(
++        codex_home.path(),
++        json!({
++            "models": {
++                "overlay-cache-model": {
++                    "model_messages": {
++                        "instructions_template": "local prompt two"
++                    }
++                }
++            }
++        }),
++    );
++    let updated = manager.get_model_info("overlay-cache-model", &config).await;
++    assert_eq!(
++        updated
++            .model_messages
++            .as_ref()
++            .and_then(|messages| messages.instructions_template.as_deref()),
++        Some("local prompt two")
++    );
++}
++
++#[tokio::test]
++async fn instructions_overlay_dir_overrides_prompt_and_reloads_file() {
++    let remote = remote_model_with_prompt(
++        "overlay-dir-model",
++        "Overlay Dir Model",
++        /*priority*/ 1,
++        "upstream prompt",
++    );
++    let codex_home = tempdir().expect("temp dir");
++    let overlay_dir = instructions_overlay_dir_path(codex_home.path());
++    std::fs::create_dir_all(&overlay_dir).expect("create instructions overlay dir");
++    std::fs::write(overlay_dir.join("overlay-dir-model.md"), "local prompt one")
++        .expect("write instructions overlay file");
++    let endpoint = TestModelsEndpoint::new(vec![vec![remote]]);
++    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
++
++    manager
++        .refresh_available_models(
++            RefreshStrategy::OnlineIfUncached,
++            &DEFAULT_HTTP_CLIENT_FACTORY,
++        )
++        .await
++        .expect("refresh succeeds");
++    let config = ModelsManagerConfig {
++        personality_enabled: true,
++        ..Default::default()
++    };
++    let model_info = manager.get_model_info("overlay-dir-model", &config).await;
++    assert_eq!(
++        model_info
++            .model_messages
++            .as_ref()
++            .and_then(|messages| messages.instructions_template.as_deref()),
++        Some("local prompt one")
++    );
++
++    std::fs::write(overlay_dir.join("overlay-dir-model.md"), "local prompt two")
++        .expect("rewrite instructions overlay file");
++    let updated = manager.get_model_info("overlay-dir-model", &config).await;
++    assert_eq!(
++        updated
++            .model_messages
++            .as_ref()
++            .and_then(|messages| messages.instructions_template.as_deref()),
++        Some("local prompt two")
++    );
++}
++
++#[tokio::test]
++async fn missing_instructions_overlay_dir_is_seeded_from_model_prompts() {
++    let remote = remote_model_with_prompt(
++        "seeded-overlay-model",
++        "Seeded Overlay Model",
++        /*priority*/ 1,
++        "upstream prompt",
++    );
++    let codex_home = tempdir().expect("temp dir");
++    let overlay_dir = instructions_overlay_dir_path(codex_home.path());
++    let endpoint = TestModelsEndpoint::new(vec![vec![remote]]);
++    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
++
++    manager
++        .refresh_available_models(
++            RefreshStrategy::OnlineIfUncached,
++            &DEFAULT_HTTP_CLIENT_FACTORY,
++        )
++        .await
++        .expect("refresh succeeds");
++    assert_eq!(
++        std::fs::read_to_string(overlay_dir.join("seeded-overlay-model.md"))
++            .expect("read seeded instructions overlay file"),
++        "upstream prompt"
++    );
++}
++
++#[tokio::test]
++async fn instructions_overlay_dir_takes_precedence_over_json_overlay() {
++    let remote = remote_model_with_prompt(
++        "overlay-dir-json-model",
++        "Overlay Dir Json Model",
++        /*priority*/ 1,
++        "upstream prompt",
++    );
++    let codex_home = tempdir().expect("temp dir");
++    write_instructions_overlay(
++        codex_home.path(),
++        json!({
++            "models": {
++                "overlay-dir-json-model": {
++                    "model_messages": {
++                        "instructions_template": "json prompt"
++                    }
++                }
++            }
++        }),
++    );
++    let overlay_dir = instructions_overlay_dir_path(codex_home.path());
++    std::fs::create_dir_all(&overlay_dir).expect("create instructions overlay dir");
++    std::fs::write(overlay_dir.join("overlay-dir-json-model.md"), "file prompt")
++        .expect("write instructions overlay file");
++    let endpoint = TestModelsEndpoint::new(vec![vec![remote]]);
++    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
++
++    manager
++        .refresh_available_models(
++            RefreshStrategy::OnlineIfUncached,
++            &DEFAULT_HTTP_CLIENT_FACTORY,
++        )
++        .await
++        .expect("refresh succeeds");
++    let config = ModelsManagerConfig {
++        personality_enabled: true,
++        ..Default::default()
++    };
++    let model_info = manager
++        .get_model_info("overlay-dir-json-model", &config)
++        .await;
++    assert_eq!(
++        model_info
++            .model_messages
++            .as_ref()
++            .and_then(|messages| messages.instructions_template.as_deref()),
++        Some("file prompt")
++    );
++}
++
+ #[tokio::test]
+ async fn refresh_available_models_uses_stale_cache_without_refetching() {
+     let initial_models = vec![remote_model("stale", "Stale", /*priority*/ 1)];
+@@ -864,7 +1110,10 @@ async fn refresh_available_models_uses_stale_cache_without_refetching() {
+ 
+     tokio::time::timeout(
+         Duration::from_millis(100),
+-        manager.refresh_available_models(RefreshStrategy::OnlineIfUncached),
++        manager.refresh_available_models(
++            RefreshStrategy::OnlineIfUncached,
++            &DEFAULT_HTTP_CLIENT_FACTORY,
++        ),
+     )
+     .await
+     .expect("stale cache should return before background fetch completes")
+@@ -884,7 +1133,12 @@ async fn foreground_model_refresh_failure_uses_debug_noise() {
+     let endpoint = FailingModelsEndpoint::new();
+     let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+ 
+-    let catalog = manager.raw_model_catalog(RefreshStrategy::Online).await;
++    let catalog = manager
++        .raw_model_catalog(
++            RefreshStrategy::Online,
++            DEFAULT_HTTP_CLIENT_FACTORY.clone(),
++        )
++        .await;
+ 
+     assert_eq!(endpoint.fetch_count(), 1);
+     assert!(
+@@ -934,7 +1188,10 @@ async fn refresh_available_models_uses_version_mismatched_cache_without_blocking
+ 
+     tokio::time::timeout(
+         Duration::from_millis(100),
+-        manager.refresh_available_models(RefreshStrategy::OnlineIfUncached),
++        manager.refresh_available_models(
++            RefreshStrategy::OnlineIfUncached,
++            &DEFAULT_HTTP_CLIENT_FACTORY,
++        ),
+     )
+     .await
+     .expect("version-mismatched cache should return before background fetch completes")
+@@ -980,7 +1237,10 @@ async fn background_refresh_failure_uses_debug_noise_after_cache_hit() {
+ 
+     tokio::time::timeout(
+         Duration::from_millis(100),
+-        manager.refresh_available_models(RefreshStrategy::OnlineIfUncached),
++        manager.refresh_available_models(
++            RefreshStrategy::OnlineIfUncached,
++            &DEFAULT_HTTP_CLIENT_FACTORY,
++        ),
+     )
+     .await
+     .expect("cache hit should return before background refresh completes")

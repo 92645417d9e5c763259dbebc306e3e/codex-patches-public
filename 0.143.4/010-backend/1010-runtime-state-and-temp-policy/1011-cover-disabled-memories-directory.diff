@@ -1,0 +1,409 @@
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index 0c8d0899a4..8a16c3ee9a 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -5265,6 +5265,46 @@ async fn memory_tool_makes_memories_root_readable_without_creating_or_widening_w
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn workspace_write_skips_memories_root_when_memory_feature_disabled() -> std::io::Result<()> {
++    let codex_home = TempDir::new()?;
++    let memories_root = codex_home.path().join("memories");
++    let config = Config::load_from_base_config_with_overrides(
++        ConfigToml {
++            features: Some(FeaturesToml::from(BTreeMap::from([(
++                "memories".to_string(),
++                false,
++            )]))),
++            sandbox_workspace_write: Some(SandboxWorkspaceWrite {
++                writable_roots: vec![codex_home.path().join("workspace").abs()],
++                ..Default::default()
++            }),
++            ..Default::default()
++        },
++        ConfigOverrides {
++            sandbox_mode: Some(SandboxMode::WorkspaceWrite),
++            ..Default::default()
++        },
++        codex_home.abs(),
++    )
++    .await?;
++
++    assert!(
++        !memories_root.exists(),
++        "expected disabled memories feature not to create {}",
++        memories_root.display()
++    );
++    let expected_memories_root = memories_root.abs();
++    if let SandboxPolicy::WorkspaceWrite { writable_roots, .. } = &config.legacy_sandbox_policy() {
++        assert!(
++            !writable_roots.contains(&expected_memories_root),
++            "expected disabled memories root not to be writable"
++        );
++    }
++
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn config_defaults_to_file_cli_auth_store_mode() -> std::io::Result<()> {
+     let codex_home = TempDir::new()?;
+diff --git a/codex-rs/rollout/src/state_db.rs b/codex-rs/rollout/src/state_db.rs
+index f22019af84..2a383d752c 100644
+--- a/codex-rs/rollout/src/state_db.rs
++++ b/codex-rs/rollout/src/state_db.rs
+@@ -46,6 +46,8 @@ pub async fn init(config: &impl RolloutConfigView) -> Option<StateDbHandle> {
+         config.codex_home,
+         config.sqlite_home,
+         config.model_provider_id,
++        /*create_goals_db*/ true,
++        config.generate_memories,
+     )
+     .await
+     {
+@@ -67,6 +69,8 @@ pub async fn try_init(config: &impl RolloutConfigView) -> anyhow::Result<StateDb
+         config.codex_home,
+         config.sqlite_home,
+         config.model_provider_id,
++        /*create_goals_db*/ true,
++        config.generate_memories,
+     )
+     .await
+ }
+@@ -75,11 +79,15 @@ async fn try_init_with_roots(
+     codex_home: PathBuf,
+     sqlite_home: PathBuf,
+     default_model_provider_id: String,
++    create_goals_db: bool,
++    create_memories_db: bool,
+ ) -> anyhow::Result<StateDbHandle> {
+     try_init_with_roots_inner(
+         codex_home,
+         sqlite_home,
+         default_model_provider_id,
++        create_goals_db,
++        create_memories_db,
+         /*backfill_lease_seconds*/ None,
+     )
+     .await
+@@ -96,6 +104,8 @@ async fn try_init_with_roots_and_backfill_lease(
+         codex_home,
+         sqlite_home,
+         default_model_provider_id,
++        /*create_goals_db*/ true,
++        /*create_memories_db*/ true,
+         Some(backfill_lease_seconds),
+     )
+     .await
+@@ -105,17 +115,23 @@ async fn try_init_with_roots_inner(
+     codex_home: PathBuf,
+     sqlite_home: PathBuf,
+     default_model_provider_id: String,
++    create_goals_db: bool,
++    create_memories_db: bool,
+     backfill_lease_seconds: Option<i64>,
+ ) -> anyhow::Result<StateDbHandle> {
+-    let runtime =
+-        codex_state::StateRuntime::init(sqlite_home.clone(), default_model_provider_id.clone())
+-            .await
+-            .with_context(|| {
+-                format!(
+-                    "failed to initialize state runtime at {}",
+-                    sqlite_home.display()
+-                )
+-            })?;
++    let runtime = codex_state::StateRuntime::init_with_optional_db_creation(
++        sqlite_home.clone(),
++        default_model_provider_id.clone(),
++        create_goals_db,
++        create_memories_db,
++    )
++    .await
++    .with_context(|| {
++        format!(
++            "failed to initialize state runtime at {}",
++            sqlite_home.display()
++        )
++    })?;
+     let backfill_gate_started = Instant::now();
+     let backfill_gate_result = wait_for_backfill_gate(
+         runtime.as_ref(),
+diff --git a/codex-rs/rollout/src/state_db_tests.rs b/codex-rs/rollout/src/state_db_tests.rs
+index 18566d887e..3d1c801227 100644
+--- a/codex-rs/rollout/src/state_db_tests.rs
++++ b/codex-rs/rollout/src/state_db_tests.rs
+@@ -107,6 +107,86 @@ async fn try_init_times_out_waiting_for_stuck_startup_backfill() -> anyhow::Resu
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn disabled_memories_state_db_does_not_create_placeholder_file() -> anyhow::Result<()> {
++    let home = TempDir::new().expect("temp dir");
++    let config = RolloutConfig {
++        codex_home: home.path().to_path_buf(),
++        sqlite_home: home.path().to_path_buf(),
++        cwd: home.path().to_path_buf(),
++        model_provider_id: "test-provider".to_string(),
++        generate_memories: false,
++    };
++
++    let _runtime = try_init(&config).await?;
++
++    assert!(codex_state::state_db_path(home.path()).is_file());
++    assert!(codex_state::logs_db_path(home.path()).is_file());
++    assert!(codex_state::goals_db_path(home.path()).is_file());
++    assert!(!codex_state::memories_db_path(home.path()).exists());
++
++    Ok(())
++}
++
++#[tokio::test]
++async fn disabled_memories_state_db_ignores_existing_file() -> anyhow::Result<()> {
++    let home = TempDir::new().expect("temp dir");
++    let memories_path = codex_state::memories_db_path(home.path());
++    std::fs::write(&memories_path, b"not a sqlite database")?;
++    let config = RolloutConfig {
++        codex_home: home.path().to_path_buf(),
++        sqlite_home: home.path().to_path_buf(),
++        cwd: home.path().to_path_buf(),
++        model_provider_id: "test-provider".to_string(),
++        generate_memories: false,
++    };
++
++    let _runtime = try_init(&config).await?;
++
++    assert_eq!(std::fs::read(&memories_path)?, b"not a sqlite database");
++
++    Ok(())
++}
++
++#[tokio::test]
++async fn disabled_goals_state_db_does_not_create_placeholder_file() -> anyhow::Result<()> {
++    let home = TempDir::new().expect("temp dir");
++
++    let _runtime = codex_state::StateRuntime::init_with_optional_db_creation(
++        home.path().to_path_buf(),
++        "test-provider".to_string(),
++        /*create_goals_db*/ false,
++        /*create_memories_db*/ true,
++    )
++    .await?;
++
++    assert!(codex_state::state_db_path(home.path()).is_file());
++    assert!(codex_state::logs_db_path(home.path()).is_file());
++    assert!(!codex_state::goals_db_path(home.path()).exists());
++    assert!(codex_state::memories_db_path(home.path()).is_file());
++
++    Ok(())
++}
++
++#[tokio::test]
++async fn disabled_goals_state_db_ignores_existing_file() -> anyhow::Result<()> {
++    let home = TempDir::new().expect("temp dir");
++    let goals_path = codex_state::goals_db_path(home.path());
++    std::fs::write(&goals_path, b"not a sqlite database")?;
++
++    let _runtime = codex_state::StateRuntime::init_with_optional_db_creation(
++        home.path().to_path_buf(),
++        "test-provider".to_string(),
++        /*create_goals_db*/ false,
++        /*create_memories_db*/ true,
++    )
++    .await?;
++
++    assert_eq!(std::fs::read(&goals_path)?, b"not a sqlite database");
++
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn reconcile_rollout_preserves_existing_explicit_title() -> anyhow::Result<()> {
+     let home = TempDir::new().expect("temp dir");
+diff --git a/codex-rs/state/src/runtime.rs b/codex-rs/state/src/runtime.rs
+index 4b1d264d0b..505f3b26e7 100644
+--- a/codex-rs/state/src/runtime.rs
++++ b/codex-rs/state/src/runtime.rs
+@@ -171,9 +171,40 @@ impl StateRuntime {
+     /// keeping logs in a dedicated file to reduce lock contention with the
+     /// rest of the state store.
+     pub async fn init(codex_home: PathBuf, default_provider: String) -> anyhow::Result<Arc<Self>> {
++        Self::init_with_optional_db_creation(
++            codex_home,
++            default_provider,
++            /*create_goals_db*/ true,
++            /*create_memories_db*/ true,
++        )
++        .await
++    }
++
++    pub async fn init_with_optional_memories_db_creation(
++        codex_home: PathBuf,
++        default_provider: String,
++        create_memories_db: bool,
++    ) -> anyhow::Result<Arc<Self>> {
++        Self::init_with_optional_db_creation(
++            codex_home,
++            default_provider,
++            /*create_goals_db*/ true,
++            create_memories_db,
++        )
++        .await
++    }
++
++    pub async fn init_with_optional_db_creation(
++        codex_home: PathBuf,
++        default_provider: String,
++        create_goals_db: bool,
++        create_memories_db: bool,
++    ) -> anyhow::Result<Arc<Self>> {
+         Self::init_inner(
+             codex_home,
+             default_provider,
++            create_goals_db,
++            create_memories_db,
+             /*telemetry_override*/ None,
+         )
+         .await
+@@ -185,12 +216,21 @@ impl StateRuntime {
+         default_provider: String,
+         telemetry_override: &dyn DbTelemetry,
+     ) -> anyhow::Result<Arc<Self>> {
+-        Self::init_inner(codex_home, default_provider, Some(telemetry_override)).await
++        Self::init_inner(
++            codex_home,
++            default_provider,
++            /*create_goals_db*/ true,
++            /*create_memories_db*/ true,
++            Some(telemetry_override),
++        )
++        .await
+     }
+ 
+     async fn init_inner(
+         codex_home: PathBuf,
+         default_provider: String,
++        create_goals_db: bool,
++        create_memories_db: bool,
+         telemetry_override: Option<&dyn DbTelemetry>,
+     ) -> anyhow::Result<Arc<Self>> {
+         tokio::fs::create_dir_all(&codex_home).await?;
+@@ -218,18 +258,27 @@ impl StateRuntime {
+                 return Err(err);
+             }
+         };
+-        let goals_pool =
+-            match open_goals_sqlite(&goals_path, &goals_migrator, telemetry_override).await {
+-                Ok(db) => Arc::new(db),
+-                Err(err) => {
+-                    warn!("failed to open goals db at {}: {err}", goals_path.display());
+-                    close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref()]).await;
+-                    return Err(err);
+-                }
+-            };
+-        let memories_pool = match open_memories_sqlite(
++        let goals_pool = match open_optional_sqlite(
++            &goals_path,
++            &goals_migrator,
++            GOALS_DB,
++            create_goals_db,
++            telemetry_override,
++        )
++        .await
++        {
++            Ok(db) => Arc::new(db),
++            Err(err) => {
++                warn!("failed to open goals db at {}: {err}", goals_path.display());
++                close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref()]).await;
++                return Err(err);
++            }
++        };
++        let memories_pool = match open_optional_sqlite(
+             &memories_path,
+             &memories_migrator,
++            MEMORIES_DB,
++            create_memories_db,
+             telemetry_override,
+         )
+         .await
+@@ -388,20 +437,46 @@ async fn open_logs_sqlite(
+     open_sqlite(path, migrator, LOGS_DB, telemetry_override).await
+ }
+ 
+-async fn open_goals_sqlite(
++async fn open_memories_sqlite(
+     path: &Path,
+     migrator: &Migrator,
+     telemetry_override: Option<&dyn DbTelemetry>,
+ ) -> anyhow::Result<SqlitePool> {
+-    open_sqlite(path, migrator, GOALS_DB, telemetry_override).await
++    open_sqlite(path, migrator, MEMORIES_DB, telemetry_override).await
+ }
+ 
+-async fn open_memories_sqlite(
++async fn open_optional_sqlite(
+     path: &Path,
+     migrator: &Migrator,
++    spec: RuntimeDbSpec,
++    create_if_missing: bool,
+     telemetry_override: Option<&dyn DbTelemetry>,
+ ) -> anyhow::Result<SqlitePool> {
+-    open_sqlite(path, migrator, MEMORIES_DB, telemetry_override).await
++    if create_if_missing {
++        return open_sqlite(path, migrator, spec, telemetry_override).await;
++    }
++
++    open_in_memory_sqlite(migrator, spec, telemetry_override).await
++}
++
++async fn open_in_memory_sqlite(
++    migrator: &Migrator,
++    spec: RuntimeDbSpec,
++    telemetry_override: Option<&dyn DbTelemetry>,
++) -> anyhow::Result<SqlitePool> {
++    let options = SqliteConnectOptions::new()
++        .in_memory(true)
++        .create_if_missing(true)
++        .log_statements(LevelFilter::Off);
++    open_sqlite_with_options(
++        Path::new(":memory:"),
++        options,
++        /*max_connections*/ 1,
++        migrator,
++        spec,
++        telemetry_override,
++    )
++    .await
+ }
+ 
+ async fn open_sqlite(
+@@ -411,9 +486,28 @@ async fn open_sqlite(
+     telemetry_override: Option<&dyn DbTelemetry>,
+ ) -> anyhow::Result<SqlitePool> {
+     let options = base_sqlite_options(path).auto_vacuum(SqliteAutoVacuum::Incremental);
++    open_sqlite_with_options(
++        path,
++        options,
++        /*max_connections*/ 5,
++        migrator,
++        spec,
++        telemetry_override,
++    )
++    .await
++}
++
++async fn open_sqlite_with_options(
++    path: &Path,
++    options: SqliteConnectOptions,
++    max_connections: u32,
++    migrator: &Migrator,
++    spec: RuntimeDbSpec,
++    telemetry_override: Option<&dyn DbTelemetry>,
++) -> anyhow::Result<SqlitePool> {
+     let started = Instant::now();
+     let pool_result = SqlitePoolOptions::new()
+-        .max_connections(5)
++        .max_connections(max_connections)
+         .connect_with(options)
+         .await
+         .map_err(anyhow::Error::from);

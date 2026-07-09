@@ -1,0 +1,70 @@
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index 45d3df04d9..b1c03ad9b7 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -1,5 +1,6 @@
+ use crate::config::edit::ConfigEdit;
+ use crate::config::edit::ConfigEditsBuilder;
++use crate::non_openai::NonOpenAiConfig;
+ use crate::path_utils::normalize_for_native_workdir;
+ use crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS;
+ use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
+@@ -652,6 +653,9 @@ pub struct Config {
+     /// Info needed to make an API request to the model.
+     pub model_provider: ModelProviderInfo,
+ 
++    /// Non-OpenAI Responses-compatible side providers loaded from `non-openai.json`.
++    pub(crate) non_openai: NonOpenAiConfig,
++
+     /// Optionally specify the personality of the model
+     pub personality: Option<Personality>,
+ 
+@@ -1487,6 +1491,13 @@ impl Config {
+         }
+     }
+ 
++    pub(crate) fn provider_for_model(&self, model: &str) -> ModelProviderInfo {
++        self.non_openai
++            .route_for_model(model, None)
++            .map(|route| route.provider)
++            .unwrap_or_else(|| self.model_provider.clone())
++    }
++
+     pub fn auth_route_config(&self) -> Option<AuthRouteConfig> {
+         self.respect_system_proxy
+             .then(AuthRouteConfig::respect_system_proxy)
+@@ -3435,6 +3446,8 @@ impl Config {
+             .clone()
+             .filter(|value| !value.is_empty());
+ 
++        let non_openai = NonOpenAiConfig::load_and_heal(codex_home.as_path())?;
++
+         let model_providers =
+             merge_configured_model_providers(built_in_model_providers(openai_base_url), cfg.model_providers)
+                 .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?;
+@@ -3803,6 +3816,7 @@ impl Config {
+                 .unwrap_or_default(),
+             model_provider_id,
+             model_provider,
++            non_openai,
+             cwd: resolved_cwd,
+             workspace_roots: workspace_roots.clone(),
+             workspace_roots_explicit,
+diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
+index 2ed02f7087..2faeafa05d 100644
+--- a/codex-rs/core/src/thread_manager.rs
++++ b/codex-rs/core/src/thread_manager.rs
+@@ -264,10 +264,11 @@ pub fn build_models_manager(
+     auth_manager: Arc<AuthManager>,
+ ) -> SharedModelsManager {
+     let provider = create_model_provider(config.model_provider.clone(), Some(auth_manager));
+-    provider.models_manager(
++    let manager = provider.models_manager(
+         config.codex_home.to_path_buf(),
+         config.model_catalog.clone(),
+-    )
++    );
++    config.non_openai.wrap_models_manager(manager)
+ }
+ 
+ pub fn thread_store_from_config(

@@ -1,0 +1,432 @@
+diff --git a/codex-rs/core/Cargo.toml b/codex-rs/core/Cargo.toml
+index a575f32df5..1deeb37941 100644
+--- a/codex-rs/core/Cargo.toml
++++ b/codex-rs/core/Cargo.toml
+@@ -48,6 +48,7 @@ codex-models-manager = { workspace = true }
+ codex-shell-command = { workspace = true }
+ codex-execpolicy = { workspace = true }
+ codex-git-utils = { workspace = true }
++codex-home = { workspace = true }
+ codex-hooks = { workspace = true }
+ codex-http-client = { workspace = true }
+ codex-install-context = { workspace = true }
+@@ -138,7 +139,6 @@ codex-extension-items = { workspace = true }
+ assert_cmd = { workspace = true }
+ assert_matches = { workspace = true }
+ codex-image-generation-extension = { workspace = true }
+-codex-home = { workspace = true }
+ codex-otel = { workspace = true }
+ codex-test-binary-support = { workspace = true }
+ codex-utils-cargo-bin = { workspace = true }
+diff --git a/codex-rs/core/src/agents_md_manager.rs b/codex-rs/core/src/agents_md_manager.rs
+index 1e3a3f291d..6d2413d830 100644
+--- a/codex-rs/core/src/agents_md_manager.rs
++++ b/codex-rs/core/src/agents_md_manager.rs
+@@ -2,14 +2,17 @@ use crate::agents_md::LoadedAgentsMd;
+ use crate::agents_md::load_project_instructions;
+ use crate::config::Config;
+ use crate::environment_selection::TurnEnvironmentSnapshot;
++use codex_extension_api::LoadedUserInstructions;
+ use codex_extension_api::UserInstructions;
++use codex_extension_api::UserInstructionsProvider;
++use codex_home::CodexHomeUserInstructionsProvider;
+ use codex_protocol::protocol::TurnEnvironmentSelection;
+ use std::sync::Arc;
+ use tokio::sync::Mutex;
+ 
+ /// Owns the inputs and cached result of AGENTS.md discovery for a session.
+ pub(crate) struct AgentsMdManager {
+-    user_instructions: Option<UserInstructions>,
++    user_instructions: Mutex<Option<UserInstructions>>,
+     cache: Mutex<AgentsMdCache>,
+ }
+ 
+@@ -22,22 +25,50 @@ struct AgentsMdCache {
+ impl AgentsMdManager {
+     pub(crate) fn new(user_instructions: Option<UserInstructions>) -> Self {
+         Self {
+-            user_instructions: user_instructions
+-                .filter(|instructions| !instructions.text.trim().is_empty()),
++            user_instructions: Mutex::new(
++                user_instructions.filter(|instructions| !instructions.text.trim().is_empty()),
++            ),
+             cache: Mutex::new(AgentsMdCache::default()),
+         }
+     }
+ 
+     pub(crate) async fn refresh(&self, config: &Config, environments: &TurnEnvironmentSnapshot) {
++        self.refresh_inner(config, environments, false).await;
++    }
++
++    pub(crate) async fn refresh_from_codex_home(
++        &self,
++        config: &Config,
++        environments: &TurnEnvironmentSnapshot,
++    ) -> LoadedUserInstructions {
++        let provider = CodexHomeUserInstructionsProvider::new(config.codex_home.clone());
++        let loaded = provider.load_user_instructions().await;
++        {
++            let mut user_instructions = self.user_instructions.lock().await;
++            *user_instructions = loaded
++                .instructions
++                .clone()
++                .filter(|instructions| !instructions.text.trim().is_empty());
++        }
++        self.refresh_inner(config, environments, true).await;
++        loaded
++    }
++
++    async fn refresh_inner(
++        &self,
++        config: &Config,
++        environments: &TurnEnvironmentSnapshot,
++        force: bool,
++    ) {
+         let selections = environments.to_selections();
+-        if self.cache.lock().await.selections.as_ref() == Some(&selections) {
++        if !force && self.cache.lock().await.selections.as_ref() == Some(&selections) {
+             return;
+         }
+ 
+-        let loaded =
+-            load_project_instructions(config, self.user_instructions.clone(), environments)
+-                .await
+-                .map(Arc::new);
++        let user_instructions = self.user_instructions.lock().await.clone();
++        let loaded = load_project_instructions(config, user_instructions, environments)
++            .await
++            .map(Arc::new);
+         let mut cache = self.cache.lock().await;
+         cache.selections = Some(selections);
+         cache.loaded = loaded;
+@@ -47,7 +78,7 @@ impl AgentsMdManager {
+         self.cache.lock().await.loaded.clone()
+     }
+ 
+-    pub(crate) fn user_instructions(&self) -> Option<UserInstructions> {
+-        self.user_instructions.clone()
++    pub(crate) async fn user_instructions(&self) -> Option<UserInstructions> {
++        self.user_instructions.lock().await.clone()
+     }
+ }
+diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
+index d2a9fd5222..58bd86c219 100644
+--- a/codex-rs/core/src/compact.rs
++++ b/codex-rs/core/src/compact.rs
+@@ -68,17 +68,20 @@ pub(crate) enum InitialContextInjection {
+ }
+ 
+ pub(crate) async fn build_compaction_initial_context(
+-    sess: &Session,
+-    turn_context: &TurnContext,
++    sess: &Arc<Session>,
++    turn_context: &Arc<TurnContext>,
+     initial_context_injection: &InitialContextInjection,
+ ) -> (Vec<ResponseItem>, Option<Arc<WorldState>>) {
+     // Return the rendered state with its items so history and its baseline stay identical.
+     match initial_context_injection {
+-        InitialContextInjection::BeforeLastUserMessage(world_state) => {
++        InitialContextInjection::BeforeLastUserMessage(_) => {
++            let world_state = sess
++                .refresh_context_boundary_inputs(Arc::clone(turn_context))
++                .await;
+             let items = sess
+-                .build_initial_context_with_world_state(turn_context, world_state.as_ref())
++                .build_initial_context_with_world_state(turn_context.as_ref(), world_state.as_ref())
+                 .await;
+-            (items, Some(Arc::clone(world_state)))
++            (items, Some(world_state))
+         }
+         InitialContextInjection::DoNotInject => (Vec::new(), None),
+     }
+@@ -224,6 +227,8 @@ async fn run_compact_task_inner_impl(
+     initial_context_injection: InitialContextInjection,
+     compaction_metadata: CompactionTurnMetadata,
+ ) -> CodexResult<String> {
++    sess.refresh_base_instructions_for_context_boundary(turn_context.as_ref())
++        .await;
+     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+     sess.emit_turn_item_started(&turn_context, &compaction_item)
+         .await;
+@@ -333,12 +338,8 @@ async fn run_compact_task_inner_impl(
+     }
+     let (window_number, window_ids) = sess.advance_auto_compact_window().await;
+ 
+-    let (initial_context, world_state_baseline) = build_compaction_initial_context(
+-        sess.as_ref(),
+-        turn_context.as_ref(),
+-        &initial_context_injection,
+-    )
+-    .await;
++    let (initial_context, world_state_baseline) =
++        build_compaction_initial_context(&sess, &turn_context, &initial_context_injection).await;
+     if !initial_context.is_empty() {
+         new_history =
+             insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
+diff --git a/codex-rs/core/src/compact_remote.rs b/codex-rs/core/src/compact_remote.rs
+index 4b1db93555..ad9ea627c7 100644
+--- a/codex-rs/core/src/compact_remote.rs
++++ b/codex-rs/core/src/compact_remote.rs
+@@ -190,6 +190,8 @@ async fn run_remote_compact_task_inner_impl(
+     analytics_details: &mut CompactionAnalyticsDetails,
+ ) -> CodexResult<()> {
+     let turn_context = &step_context.turn;
++    sess.refresh_base_instructions_for_context_boundary(turn_context.as_ref())
++        .await;
+     let context_compaction_item = ContextCompactionItem::new();
+     let compaction_id = context_compaction_item.id.clone();
+     // Use the UI compaction item ID as the trace compaction ID so protocol lifecycle events,
+@@ -258,8 +260,8 @@ async fn run_remote_compact_task_inner_impl(
+     } = attempt;
+     let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
+     let (new_history, world_state_baseline) = process_compacted_history(
+-        sess.as_ref(),
+-        compaction_turn_context.as_ref(),
++        sess,
++        compaction_turn_context,
+         new_history,
+         &initial_context_injection,
+     )
+@@ -302,8 +304,8 @@ async fn run_remote_compact_task_inner_impl(
+ }
+ 
+ pub(crate) async fn process_compacted_history(
+-    sess: &Session,
+-    turn_context: &TurnContext,
++    sess: &Arc<Session>,
++    turn_context: &Arc<TurnContext>,
+     mut compacted_history: Vec<ResponseItem>,
+     initial_context_injection: &InitialContextInjection,
+ ) -> (Vec<ResponseItem>, Option<Arc<WorldState>>) {
+diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_remote_v2.rs
+index 5fa6de13dc..173a71a31e 100644
+--- a/codex-rs/core/src/compact_remote_v2.rs
++++ b/codex-rs/core/src/compact_remote_v2.rs
+@@ -202,6 +202,8 @@ async fn run_remote_compact_task_inner_impl(
+     analytics_details: &mut CompactionAnalyticsDetails,
+ ) -> CodexResult<()> {
+     let turn_context = &step_context.turn;
++    sess.refresh_base_instructions_for_context_boundary(turn_context.as_ref())
++        .await;
+     let context_compaction_item = ContextCompactionItem::new();
+     let compaction_id = context_compaction_item.id.clone();
+     let compaction_trace = sess.services.rollout_thread_trace.compaction_trace_context(
+@@ -281,8 +283,8 @@ async fn run_remote_compact_task_inner_impl(
+     analytics_details.retained_image_count = Some(retained_images);
+     let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
+     let (new_history, world_state_baseline) = process_compacted_history(
+-        sess.as_ref(),
+-        compaction_turn_context.as_ref(),
++        sess,
++        compaction_turn_context,
+         compacted_history,
+         &initial_context_injection,
+     )
+diff --git a/codex-rs/core/src/compact_tests.rs b/codex-rs/core/src/compact_tests.rs
+index 16b9ae16f6..3d7036876c 100644
+--- a/codex-rs/core/src/compact_tests.rs
++++ b/codex-rs/core/src/compact_tests.rs
+@@ -12,6 +12,7 @@ async fn process_compacted_history_with_test_session(
+     previous_turn_settings: Option<&PreviousTurnSettings>,
+ ) -> (Vec<ResponseItem>, Vec<ResponseItem>) {
+     let (session, turn_context) = crate::session::tests::make_session_and_context().await;
++    let session = Arc::new(session);
+     let turn_context = Arc::new(turn_context);
+     session
+         .set_previous_turn_settings(previous_turn_settings.cloned())
+diff --git a/codex-rs/core/src/compact_token_budget.rs b/codex-rs/core/src/compact_token_budget.rs
+index 710e7cefe5..354f99d35e 100644
+--- a/codex-rs/core/src/compact_token_budget.rs
++++ b/codex-rs/core/src/compact_token_budget.rs
+@@ -76,7 +76,7 @@ async fn run_compact_task_inner(
+     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+     sess.emit_turn_item_started(turn_context, &compaction_item)
+         .await;
+-    sess.start_new_context_window(turn_context.as_ref(), world_state)
++    sess.start_new_context_window(Arc::clone(turn_context), world_state)
+         .await;
+     sess.emit_turn_item_completed(turn_context, compaction_item)
+         .await;
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index a4fbddd79e..d4f898333b 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -1292,6 +1292,46 @@ impl Session {
+         }
+     }
+ 
++    pub(crate) async fn refresh_base_instructions_for_context_boundary(
++        &self,
++        turn_context: &TurnContext,
++    ) {
++        let base_instructions =
++            if let Some(base_instructions) = turn_context.config.base_instructions.clone() {
++                base_instructions
++            } else {
++                let model_info = self
++                    .services
++                    .models_manager
++                    .get_model_info(
++                        turn_context.collaboration_mode.model(),
++                        &turn_context.config.to_models_manager_config(),
++                    )
++                    .await;
++                model_info.get_model_instructions(turn_context.personality)
++            };
++        let mut state = self.state.lock().await;
++        state.session_configuration.base_instructions = base_instructions;
++    }
++
++    pub(crate) async fn refresh_context_boundary_inputs(
++        self: &Arc<Self>,
++        turn_context: Arc<TurnContext>,
++    ) -> Arc<WorldState> {
++        self.refresh_base_instructions_for_context_boundary(turn_context.as_ref())
++            .await;
++        let loaded_user_instructions = self
++            .services
++            .agents_md_manager
++            .refresh_from_codex_home(&turn_context.config, &turn_context.environments)
++            .await;
++        for warning in loaded_user_instructions.warnings {
++            warn!("failed to refresh global AGENTS.md instructions: {warning}");
++        }
++        let step_context = self.capture_step_context(Arc::clone(&turn_context)).await;
++        Arc::new(self.build_world_state_for_step(step_context.as_ref()).await)
++    }
++
+     // Merges connector IDs into the session-level explicit connector selection.
+     #[tracing::instrument(
+         level = "trace",
+@@ -1588,7 +1628,7 @@ impl Session {
+     }
+ 
+     pub(crate) async fn user_instructions(&self) -> Option<codex_extension_api::UserInstructions> {
+-        self.services.agents_md_manager.user_instructions()
++        self.services.agents_md_manager.user_instructions().await
+     }
+ 
+     pub(crate) async fn provider(&self) -> ModelProviderInfo {
+@@ -3538,21 +3578,24 @@ impl Session {
+     }
+ 
+     pub(crate) async fn start_new_context_window(
+-        &self,
+-        turn_context: &TurnContext,
+-        world_state: Arc<WorldState>,
++        self: &Arc<Self>,
++        turn_context: Arc<TurnContext>,
++        _world_state: Arc<WorldState>,
+     ) -> u64 {
+         let window = {
+             let mut state = self.state.lock().await;
+             state.start_new_context_window()
+         };
+         let (window_number, window_ids) = window;
++        let world_state = self
++            .refresh_context_boundary_inputs(Arc::clone(&turn_context))
++            .await;
+         let context_items = self
+-            .build_initial_context_with_world_state(turn_context, world_state.as_ref())
++            .build_initial_context_with_world_state(turn_context.as_ref(), world_state.as_ref())
+             .await;
+         let turn_context_item = turn_context.to_turn_context_item();
+         self.replace_compacted_history(
+-            turn_context,
++            turn_context.as_ref(),
+             context_items,
+             Some(turn_context_item),
+             Some(world_state),
+@@ -3566,7 +3609,7 @@ impl Session {
+             },
+         )
+         .await;
+-        self.recompute_token_usage(turn_context).await;
++        self.recompute_token_usage(turn_context.as_ref()).await;
+         window_number
+     }
+ 
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index 97d7f50507..678a4f2f90 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -2321,6 +2321,58 @@ async fn recompute_token_usage_uses_session_base_instructions() {
+     assert_eq!(actual_tokens, expected_tokens.max(0));
+ }
+ 
++#[tokio::test]
++async fn context_boundary_refresh_uses_latest_instruction_overlay() {
++    let (session, turn_context) = make_session_and_context().await;
++    let overlay_dir = turn_context.config.codex_home.join("instructions");
++    std::fs::create_dir_all(&overlay_dir).expect("create instructions overlay dir");
++    std::fs::write(
++        overlay_dir.join(format!("{}.md", turn_context.collaboration_mode.model())),
++        "fresh model instructions",
++    )
++    .expect("write instructions overlay file");
++
++    session
++        .refresh_base_instructions_for_context_boundary(&turn_context)
++        .await;
++
++    assert_eq!(
++        session.get_base_instructions().await.text,
++        "fresh model instructions"
++    );
++}
++
++#[tokio::test]
++async fn context_boundary_refresh_uses_latest_global_agents_md() {
++    let (session, turn_context) = make_session_and_context().await;
++    let session = Arc::new(session);
++    let turn_context = Arc::new(turn_context);
++    let global_agents = turn_context.config.codex_home.join("AGENTS.md");
++    std::fs::create_dir_all(turn_context.config.codex_home.as_path()).expect("create codex home");
++    std::fs::write(&global_agents, "first global instructions")
++        .expect("write first global AGENTS.md");
++    let first_world_state = session
++        .refresh_context_boundary_inputs(Arc::clone(&turn_context))
++        .await;
++    let first_items = session
++        .build_initial_context_with_world_state(turn_context.as_ref(), first_world_state.as_ref())
++        .await;
++    let first_text = user_input_texts(&first_items).join("\n");
++    assert!(first_text.contains("first global instructions"));
++
++    std::fs::write(&global_agents, "second global instructions")
++        .expect("write second global AGENTS.md");
++    let second_world_state = session
++        .refresh_context_boundary_inputs(Arc::clone(&turn_context))
++        .await;
++    let second_items = session
++        .build_initial_context_with_world_state(turn_context.as_ref(), second_world_state.as_ref())
++        .await;
++    let second_text = user_input_texts(&second_items).join("\n");
++    assert!(second_text.contains("second global instructions"));
++    assert!(!second_text.contains("first global instructions"));
++}
++
+ #[tokio::test]
+ async fn recompute_token_usage_updates_model_context_window() {
+     let (session, mut turn_context) = make_session_and_context().await;
+@@ -2810,7 +2862,7 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
+         Arc::new(build_world_state_from_turn_context(session.as_ref(), &turn_context).await);
+ 
+     session
+-        .start_new_context_window(turn_context.as_ref(), world_state)
++        .start_new_context_window(Arc::clone(&turn_context), world_state)
+         .await;
+ 
+     let live_history = session.clone_history().await;
+diff --git a/codex-rs/core/src/session/tests/guardian_tests.rs b/codex-rs/core/src/session/tests/guardian_tests.rs
+index b960611ebf..34e68fe8c4 100644
+--- a/codex-rs/core/src/session/tests/guardian_tests.rs
++++ b/codex-rs/core/src/session/tests/guardian_tests.rs
+@@ -524,6 +524,7 @@ async fn guardian_allows_unified_exec_additional_permissions_requests_past_polic
+ #[tokio::test]
+ async fn process_compacted_history_preserves_separate_guardian_developer_message() {
+     let (session, mut turn_context) = make_session_and_context().await;
++    let session = Arc::new(session);
+     let guardian_policy = crate::guardian::guardian_policy_prompt();
+     let guardian_source =
+         SessionSource::SubAgent(SubAgentSource::Other(GUARDIAN_REVIEWER_NAME.to_string()));

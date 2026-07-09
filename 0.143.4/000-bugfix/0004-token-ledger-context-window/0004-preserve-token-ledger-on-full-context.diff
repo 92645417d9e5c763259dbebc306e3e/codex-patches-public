@@ -1,0 +1,102 @@
+diff --git a/codex-rs/core/tests/suite/client.rs b/codex-rs/core/tests/suite/client.rs
+index 4d298998af..f3555bac79 100644
+--- a/codex-rs/core/tests/suite/client.rs
++++ b/codex-rs/core/tests/suite/client.rs
+@@ -3356,7 +3356,7 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Result<()> {
++async fn context_window_error_records_model_window_without_synthetic_usage() -> anyhow::Result<()> {
+     skip_if_no_network!(Ok(()));
+     let server = MockServer::start().await;
+ 
+@@ -3424,8 +3424,7 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
+             event,
+             EventMsg::TokenCount(payload)
+                 if payload.info.as_ref().is_some_and(|info| {
+-                    info.model_context_window == Some(info.total_token_usage.total_tokens)
+-                        && info.total_token_usage.total_tokens > 0
++                    info.model_context_window == Some(EFFECTIVE_CONTEXT_WINDOW)
+                 })
+         )
+     })
+@@ -3440,10 +3439,8 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
+         .expect("token usage info present when context window is exceeded");
+ 
+     assert_eq!(info.model_context_window, Some(EFFECTIVE_CONTEXT_WINDOW));
+-    assert_eq!(
+-        info.total_token_usage.total_tokens,
+-        EFFECTIVE_CONTEXT_WINDOW
+-    );
++    assert_eq!(info.total_token_usage.total_tokens, 0);
++    assert_eq!(info.last_token_usage.total_tokens, 0);
+ 
+     let error_event = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Error(_))).await;
+     let expected_context_window_message = CodexErr::ContextWindowExceeded.to_string();
+diff --git a/codex-rs/protocol/src/protocol.rs b/codex-rs/protocol/src/protocol.rs
+index 57a36c3312..fde41963ee 100644
+--- a/codex-rs/protocol/src/protocol.rs
++++ b/codex-rs/protocol/src/protocol.rs
+@@ -2069,18 +2069,7 @@ impl TokenUsageInfo {
+     }
+ 
+     pub fn fill_to_context_window(&mut self, context_window: i64) {
+-        let previous_total = self.total_token_usage.total_tokens;
+-        let delta = (context_window - previous_total).max(0);
+-
+         self.model_context_window = Some(context_window);
+-        self.total_token_usage = TokenUsage {
+-            total_tokens: context_window,
+-            ..TokenUsage::default()
+-        };
+-        self.last_token_usage = TokenUsage {
+-            total_tokens: delta,
+-            ..TokenUsage::default()
+-        };
+     }
+ 
+     pub fn full_context_window(context_window: i64) -> Self {
+@@ -6198,4 +6187,42 @@ mod tests {
+ 
+         assert_eq!(info.model_context_window, Some(258_400));
+     }
++
++    #[test]
++    fn token_usage_info_fill_to_context_window_preserves_cumulative_usage() {
++        let total = TokenUsage {
++            input_tokens: 1_000,
++            cached_input_tokens: 900,
++            output_tokens: 50,
++            reasoning_output_tokens: 25,
++            total_tokens: 2_314_304_474,
++        };
++        let last = TokenUsage {
++            input_tokens: 10,
++            cached_input_tokens: 9,
++            output_tokens: 1,
++            reasoning_output_tokens: 0,
++            total_tokens: 11,
++        };
++        let mut info = TokenUsageInfo {
++            total_token_usage: total.clone(),
++            last_token_usage: last.clone(),
++            model_context_window: None,
++        };
++
++        info.fill_to_context_window(258_400);
++
++        assert_eq!(info.total_token_usage, total);
++        assert_eq!(info.last_token_usage, last);
++        assert_eq!(info.model_context_window, Some(258_400));
++    }
++
++    #[test]
++    fn token_usage_info_full_context_window_does_not_create_synthetic_usage() {
++        let info = TokenUsageInfo::full_context_window(258_400);
++
++        assert_eq!(info.total_token_usage, TokenUsage::default());
++        assert_eq!(info.last_token_usage, TokenUsage::default());
++        assert_eq!(info.model_context_window, Some(258_400));
++    }
+ }

@@ -1,0 +1,765 @@
+diff --git a/codex-rs/codex-api/src/common.rs b/codex-rs/codex-api/src/common.rs
+index e4600e26aa..a6cb12d4e2 100644
+--- a/codex-rs/codex-api/src/common.rs
++++ b/codex-rs/codex-api/src/common.rs
+@@ -217,6 +217,8 @@ pub struct ResponsesApiRequest {
+     pub model: String,
+     #[serde(skip_serializing_if = "String::is_empty")]
+     pub instructions: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub previous_response_id: Option<String>,
+     pub input: Vec<ResponseItem>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub tools: Option<Vec<serde_json::Value>>,
+@@ -243,7 +245,7 @@ impl From<&ResponsesApiRequest> for ResponseCreateWsRequest {
+         Self {
+             model: request.model.clone(),
+             instructions: request.instructions.clone(),
+-            previous_response_id: None,
++            previous_response_id: request.previous_response_id.clone(),
+             input: request.input.clone(),
+             tools: request.tools.clone(),
+             tool_choice: request.tool_choice.clone(),
+diff --git a/codex-rs/codex-api/tests/clients.rs b/codex-rs/codex-api/tests/clients.rs
+index ab4ab1d08f..0141fb678a 100644
+--- a/codex-rs/codex-api/tests/clients.rs
++++ b/codex-rs/codex-api/tests/clients.rs
+@@ -308,6 +308,7 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
+     let request = ResponsesApiRequest {
+         model: "gpt-test".into(),
+         instructions: "Say hi".into(),
++        previous_response_id: None,
+         input: vec![ResponseItem::Message {
+             id: Some("msg_1".into()),
+             role: "user".into(),
+@@ -401,6 +402,7 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
+     let request = ResponsesApiRequest {
+         model: "gpt-test".into(),
+         instructions: "Say hi".into(),
++        previous_response_id: None,
+         input: Vec::new(),
+         tools: Some(Vec::new()),
+         tool_choice: "auto".into(),
+@@ -515,6 +517,7 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
+     let request = ResponsesApiRequest {
+         model: "gpt-test".into(),
+         instructions: "Say hi".into(),
++        previous_response_id: None,
+         input: vec![ResponseItem::Message {
+             id: Some("msg_1".into()),
+             role: "user".into(),
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index 4b1ee60329..da83f76dce 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -27,6 +27,7 @@ use std::collections::HashMap;
+ use std::sync::Arc;
+ use std::sync::Mutex as StdMutex;
+ use std::sync::OnceLock;
++use std::sync::RwLock as StdRwLock;
+ 
+ use codex_api::AgentIdentityTelemetry;
+ use codex_api::ApiError;
+@@ -117,6 +118,9 @@ use crate::client_common::Prompt;
+ use crate::client_common::ResponseEvent;
+ use crate::client_common::ResponseStream;
+ use crate::feedback_tags;
++use crate::non_openai;
++use crate::non_openai::NonOpenAiConfig;
++use crate::non_openai::NonOpenAiRequestRoute;
+ use crate::responses_metadata::CodexResponsesMetadata;
+ use crate::responses_metadata::subagent_header_value;
+ use crate::util::emit_feedback_auth_recovery_tags;
+@@ -202,6 +206,7 @@ fn session_telemetry_for_request(
+ struct ModelClientState {
+     thread_id: ThreadId,
+     provider: SharedModelProvider,
++    non_openai: StdRwLock<NonOpenAiConfig>,
+     auth_env_telemetry: AuthEnvTelemetry,
+     session_source: SessionSource,
+     originator: String,
+@@ -224,6 +229,7 @@ struct ModelClientState {
+ /// share the same auth/provider setup flow.
+ struct CurrentClientSetup {
+     auth: Option<CodexAuth>,
++    provider_info: ModelProviderInfo,
+     api_provider: ApiProvider,
+     api_auth: SharedAuthProvider,
+     agent_identity_telemetry: Option<AgentIdentityTelemetry>,
+@@ -310,6 +316,7 @@ fn responses_request_properties_match(
+     let ResponsesApiRequest {
+         model: previous_model,
+         instructions: previous_instructions,
++        previous_response_id: previous_previous_response_id,
+         input: _,
+         tools: previous_tools,
+         tool_choice: previous_tool_choice,
+@@ -327,6 +334,7 @@ fn responses_request_properties_match(
+     let ResponsesApiRequest {
+         model: current_model,
+         instructions: current_instructions,
++        previous_response_id: current_previous_response_id,
+         input: _,
+         tools: current_tools,
+         tool_choice: current_tool_choice,
+@@ -344,6 +352,7 @@ fn responses_request_properties_match(
+ 
+     previous_model == current_model
+         && previous_instructions == current_instructions
++        && previous_previous_response_id == current_previous_response_id
+         && previous_tools == current_tools
+         && previous_tool_choice == current_tool_choice
+         && previous_parallel_tool_calls == current_parallel_tool_calls
+@@ -425,6 +434,45 @@ impl ModelClient {
+         attestation_provider: Option<Arc<dyn AttestationProvider>>,
+         tx_event: Option<async_channel::Sender<CodexEvent>>,
+         http_client_factory: HttpClientFactory,
++    ) -> Self {
++        Self::new_with_non_openai(
++            auth_manager,
++            agent_identity_policy,
++            thread_id,
++            provider_info,
++            session_source,
++            originator,
++            model_verbosity,
++            enable_request_compression,
++            include_timing_metrics,
++            beta_features_header,
++            item_ids_enabled,
++            concurrent_reasoning_summaries_enabled,
++            NonOpenAiConfig::default(),
++            attestation_provider,
++            tx_event,
++            http_client_factory,
++        )
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    pub(crate) fn new_with_non_openai(
++        auth_manager: Option<Arc<AuthManager>>,
++        agent_identity_policy: AgentIdentityAuthPolicy,
++        thread_id: ThreadId,
++        provider_info: ModelProviderInfo,
++        session_source: SessionSource,
++        originator: String,
++        model_verbosity: Option<VerbosityConfig>,
++        enable_request_compression: bool,
++        include_timing_metrics: bool,
++        beta_features_header: Option<String>,
++        item_ids_enabled: bool,
++        concurrent_reasoning_summaries_enabled: bool,
++        non_openai: NonOpenAiConfig,
++        attestation_provider: Option<Arc<dyn AttestationProvider>>,
++        tx_event: Option<async_channel::Sender<CodexEvent>>,
++        http_client_factory: HttpClientFactory,
+     ) -> Self {
+         let model_provider = create_model_provider(provider_info, auth_manager);
+         let codex_api_key_env_enabled = model_provider
+@@ -438,6 +486,7 @@ impl ModelClient {
+             state: Arc::new(ModelClientState {
+                 thread_id,
+                 provider: model_provider,
++                non_openai: StdRwLock::new(non_openai),
+                 auth_env_telemetry,
+                 session_source,
+                 originator,
+@@ -485,6 +534,30 @@ impl ModelClient {
+         }
+     }
+ 
++    pub(crate) fn refresh_non_openai_config(&self, non_openai: NonOpenAiConfig) {
++        *self
++            .state
++            .non_openai
++            .write()
++            .expect("non-openai route state poisoned") = non_openai;
++    }
++
++    fn non_openai_config(&self) -> NonOpenAiConfig {
++        self.state
++            .non_openai
++            .read()
++            .expect("non-openai route state poisoned")
++            .clone()
++    }
++
++    fn non_openai_route_for_model(
++        &self,
++        model: &str,
++        effort: Option<&ReasoningEffortConfig>,
++    ) -> Option<NonOpenAiRequestRoute> {
++        self.non_openai_config().route_for_model(model, effort)
++    }
++
+     pub(crate) fn auth_manager(&self) -> Option<Arc<AuthManager>> {
+         self.state.provider.auth_manager()
+     }
+@@ -527,7 +600,7 @@ impl ModelClient {
+         if prompt.input.is_empty() {
+             return Ok(Vec::new());
+         }
+-        let client_setup = self.current_client_setup().await?;
++        let client_setup = self.current_client_setup_for_model(model_info).await?;
+         let transport =
+             self.build_responses_transport(&client_setup.api_provider, RESPONSES_COMPACT_ENDPOINT)?;
+         let request_telemetry = Self::build_request_telemetry(
+@@ -807,6 +880,17 @@ impl ModelClient {
+         }
+     }
+ 
++    fn build_non_openai_reasoning(route: &NonOpenAiRequestRoute) -> Option<Reasoning> {
++        route
++            .upstream_reasoning_effort
++            .as_ref()
++            .map(|effort| Reasoning {
++                effort: Some(effort.clone()),
++                summary: None,
++                context: None,
++            })
++    }
++
+     #[allow(clippy::too_many_arguments)]
+     fn build_responses_request(
+         &self,
+@@ -819,7 +903,9 @@ impl ModelClient {
+         responses_metadata: &CodexResponsesMetadata,
+     ) -> Result<ResponsesApiRequest> {
+         let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
+-        let is_openai = self.state.provider.info().is_openai();
++        let non_openai_route =
++            self.non_openai_route_for_model(model_info.slug.as_str(), effort.as_ref());
++        let is_openai = non_openai_route.is_none() && self.state.provider.info().is_openai();
+         if is_openai {
+             input
+                 .iter_mut()
+@@ -856,8 +942,11 @@ impl ModelClient {
+             .then_some(StreamOptions {
+                 reasoning_summary_delivery: codex_api::ReasoningSummaryDelivery::SequentialCutoff,
+             });
+-        let reasoning = Self::build_reasoning(model_info, effort, summary);
+-        let include = if reasoning.is_some() {
++        let reasoning = non_openai_route
++            .as_ref()
++            .and_then(Self::build_non_openai_reasoning)
++            .or_else(|| Self::build_reasoning(model_info, effort, summary));
++        let include = if reasoning.is_some() && non_openai_route.is_none() {
+             vec!["reasoning.encrypted_content".to_string()]
+         } else {
+             Vec::new()
+@@ -873,16 +962,25 @@ impl ModelClient {
+             }
+             None
+         };
+-        let text = create_text_param_for_request(
+-            verbosity,
+-            &prompt.output_schema,
+-            prompt.output_schema_strict,
+-        );
++        let output_schema = if non_openai_route
++            .as_ref()
++            .is_some_and(|route| !route.supports_json_schema_output)
++        {
++            None
++        } else {
++            prompt.output_schema.clone()
++        };
++        let text =
++            create_text_param_for_request(verbosity, &output_schema, prompt.output_schema_strict);
+         let prompt_cache_key = Some(self.prompt_cache_key());
+         let service_tier = model_info.service_tier_for_request(service_tier);
+         let request = ResponsesApiRequest {
+-            model: model_info.slug.clone(),
++            model: non_openai_route
++                .as_ref()
++                .map(|route| route.upstream_model.clone())
++                .unwrap_or_else(|| model_info.slug.clone()),
+             instructions,
++            previous_response_id: None,
+             input,
+             tools,
+             tool_choice: "auto".to_string(),
+@@ -917,6 +1015,18 @@ impl ModelClient {
+         self.state.provider.info().supports_websockets
+     }
+ 
++    pub fn responses_websocket_enabled_for_model(&self, model_info: &ModelInfo) -> bool {
++        self.non_openai_route_for_model(model_info.slug.as_str(), None)
++            .map(|route| route.provider.supports_websockets)
++            .unwrap_or_else(|| self.responses_websocket_enabled())
++    }
++
++    fn wire_api_for_model(&self, model_info: &ModelInfo) -> WireApi {
++        self.non_openai_route_for_model(model_info.slug.as_str(), None)
++            .map(|route| route.provider.wire_api)
++            .unwrap_or(self.state.provider.info().wire_api)
++    }
++
+     /// Returns auth + provider configuration resolved from the current session auth state.
+     ///
+     /// This centralizes setup used by both prewarm and normal request paths so they stay in
+@@ -935,12 +1045,31 @@ impl ModelClient {
+             .await?;
+         Ok(CurrentClientSetup {
+             auth,
++            provider_info: self.state.provider.info().clone(),
+             api_provider,
+             api_auth: resolved_auth.auth,
+             agent_identity_telemetry: resolved_auth.agent_identity_telemetry,
+         })
+     }
+ 
++    async fn current_client_setup_for_model(
++        &self,
++        model_info: &ModelInfo,
++    ) -> Result<CurrentClientSetup> {
++        let non_openai = self.non_openai_config();
++        let Some(route) = non_openai.route_for_model(model_info.slug.as_str(), None) else {
++            return self.current_client_setup().await;
++        };
++        let api_key = non_openai.read_api_key(&route.provider_id).await?;
++        Ok(CurrentClientSetup {
++            auth: None,
++            provider_info: route.provider.clone(),
++            api_provider: non_openai::api_provider_for_route(&route)?,
++            api_auth: non_openai::api_auth_for_key(api_key),
++            agent_identity_telemetry: None,
++        })
++    }
++
+     fn build_responses_transport(
+         &self,
+         api_provider: &ApiProvider,
+@@ -1351,10 +1480,14 @@ impl ModelClientSession {
+             ))
+     }
+ 
+-    fn responses_request_compression(&self, auth: Option<&CodexAuth>) -> Compression {
++    fn responses_request_compression(
++        &self,
++        provider_info: &ModelProviderInfo,
++        auth: Option<&CodexAuth>,
++    ) -> Compression {
+         if self.client.state.enable_request_compression
+             && auth.is_some_and(CodexAuth::uses_codex_backend)
+-            && self.client.state.provider.info().is_openai()
++            && provider_info.is_openai()
+         {
+             Compression::Zstd
+         } else {
+@@ -1380,7 +1513,7 @@ impl ModelClientSession {
+         )
+     )]
+     async fn stream_responses_api(
+-        &self,
++        &mut self,
+         prompt: &Prompt,
+         model_info: &ModelInfo,
+         session_telemetry: &SessionTelemetry,
+@@ -1396,7 +1529,10 @@ impl ModelClientSession {
+             .map(AuthManager::unauthorized_recovery);
+         let mut pending_retry = PendingUnauthorizedRetry::default();
+         loop {
+-            let client_setup = self.client.current_client_setup().await?;
++            let client_setup = self
++                .client
++                .current_client_setup_for_model(model_info)
++                .await?;
+             let transport = self
+                 .client
+                 .build_responses_transport(&client_setup.api_provider, RESPONSES_ENDPOINT)?;
+@@ -1412,7 +1548,10 @@ impl ModelClientSession {
+                 RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
+                 self.client.state.auth_env_telemetry.clone(),
+             );
+-            let compression = self.responses_request_compression(client_setup.auth.as_ref());
++            let compression = self.responses_request_compression(
++                &client_setup.provider_info,
++                client_setup.auth.as_ref(),
++            );
+             let mut options = self
+                 .build_responses_options(
+                     responses_metadata,
+@@ -1430,6 +1569,23 @@ impl ModelClientSession {
+                 service_tier.clone(),
+                 responses_metadata,
+             )?;
++            let logical_request = request.clone();
++            let use_previous_response_id = self
++                .client
++                .non_openai_route_for_model(model_info.slug.as_str(), effort.as_ref())
++                .is_some_and(|route| route.supports_previous_response_id);
++            if use_previous_response_id
++                && let Some(last_response) = self.get_last_response()
++                && !last_response.response_id.is_empty()
++                && let Some(incremental_items) = self.get_incremental_items(
++                    &request,
++                    Some(&last_response),
++                    /*allow_empty_delta*/ false,
++                )
++            {
++                request.previous_response_id = Some(last_response.response_id);
++                request.input = incremental_items;
++            }
+             let store = request.store;
+             self.client
+                 .prepare_response_items_for_request(&mut request.input, store);
+@@ -1448,12 +1604,16 @@ impl ModelClientSession {
+ 
+             match stream_result {
+                 Ok(stream) => {
+-                    let (stream, _) = map_response_stream(
++                    let (stream, last_request_rx) = map_response_stream(
+                         stream,
+                         request_session_telemetry,
+                         inference_trace_attempt,
+                         Arc::clone(&self.client.state.provider),
+                     );
++                    if use_previous_response_id {
++                        self.websocket_session.last_request = Some(logical_request);
++                        self.websocket_session.last_response_rx = Some(last_request_rx);
++                    }
+                     return Ok(stream);
+                 }
+                 Err(ApiError::Transport(
+@@ -1527,7 +1687,10 @@ impl ModelClientSession {
+             .map(AuthManager::unauthorized_recovery);
+         let mut pending_retry = PendingUnauthorizedRetry::default();
+         loop {
+-            let client_setup = self.client.current_client_setup().await?;
++            let client_setup = self
++                .client
++                .current_client_setup_for_model(model_info)
++                .await?;
+             let request_auth_context = AuthRequestTelemetryContext::new(
+                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                 client_setup.api_auth.as_ref(),
+@@ -1712,7 +1875,10 @@ impl ModelClientSession {
+         service_tier: Option<String>,
+         responses_metadata: &CodexResponsesMetadata,
+     ) -> Result<()> {
+-        if !self.client.responses_websocket_enabled() {
++        if !self
++            .client
++            .responses_websocket_enabled_for_model(model_info)
++        {
+             return Ok(());
+         }
+         if self.websocket_session.last_request.is_some() {
+@@ -1777,10 +1943,13 @@ impl ModelClientSession {
+         responses_metadata: &CodexResponsesMetadata,
+         inference_trace: &InferenceTraceContext,
+     ) -> Result<ResponseStream> {
+-        let wire_api = self.client.state.provider.info().wire_api;
++        let wire_api = self.client.wire_api_for_model(model_info);
+         match wire_api {
+             WireApi::Responses => {
+-                if self.client.responses_websocket_enabled() {
++                if self
++                    .client
++                    .responses_websocket_enabled_for_model(model_info)
++                {
+                     let request_trace = current_span_w3c_trace_context();
+                     match self
+                         .stream_responses_websocket(
+diff --git a/codex-rs/core/src/client_common_tests.rs b/codex-rs/core/src/client_common_tests.rs
+index b8d0a364a3..f2c0d053aa 100644
+--- a/codex-rs/core/src/client_common_tests.rs
++++ b/codex-rs/core/src/client_common_tests.rs
+@@ -109,6 +109,7 @@ fn serializes_text_verbosity_when_set() {
+     let req = ResponsesApiRequest {
+         model: "gpt-5.4".to_string(),
+         instructions: "i".to_string(),
++        previous_response_id: None,
+         input,
+         tools: Some(tools),
+         tool_choice: "auto".to_string(),
+@@ -157,6 +158,7 @@ fn serializes_text_schema_with_strict_format() {
+     let req = ResponsesApiRequest {
+         model: "gpt-5.4".to_string(),
+         instructions: "i".to_string(),
++        previous_response_id: None,
+         input,
+         tools: Some(tools),
+         tool_choice: "auto".to_string(),
+@@ -219,6 +221,7 @@ fn omits_text_when_not_set() {
+     let req = ResponsesApiRequest {
+         model: "gpt-5.4".to_string(),
+         instructions: "i".to_string(),
++        previous_response_id: None,
+         input,
+         tools: Some(tools),
+         tool_choice: "auto".to_string(),
+@@ -243,6 +246,7 @@ fn serializes_flex_service_tier_when_set() {
+     let req = ResponsesApiRequest {
+         model: "gpt-5.4".to_string(),
+         instructions: "i".to_string(),
++        previous_response_id: None,
+         input: vec![],
+         tools: Some(vec![]),
+         tool_choice: "auto".to_string(),
+@@ -264,3 +268,35 @@ fn serializes_flex_service_tier_when_set() {
+         Some("flex")
+     );
+ }
++
++#[test]
++fn serializes_previous_response_id_only_when_set() {
++    let mut req = ResponsesApiRequest {
++        model: "gpt-5.4".to_string(),
++        instructions: "i".to_string(),
++        previous_response_id: None,
++        input: vec![],
++        tools: Some(vec![]),
++        tool_choice: "auto".to_string(),
++        parallel_tool_calls: true,
++        reasoning: None,
++        store: false,
++        stream: true,
++        stream_options: None,
++        include: vec![],
++        prompt_cache_key: None,
++        service_tier: None,
++        text: None,
++        client_metadata: None,
++    };
++
++    let v = serde_json::to_value(&req).expect("json");
++    assert!(v.get("previous_response_id").is_none());
++
++    req.previous_response_id = Some("resp_123".to_string());
++    let v = serde_json::to_value(&req).expect("json");
++    assert_eq!(
++        v.get("previous_response_id").and_then(|id| id.as_str()),
++        Some("resp_123")
++    );
++}
+diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.rs
+index 981f51f9df..f8f28c7a75 100644
+--- a/codex-rs/core/src/client_tests.rs
++++ b/codex-rs/core/src/client_tests.rs
+@@ -12,6 +12,7 @@ use super::X_OPENAI_SUBAGENT_HEADER;
+ use crate::AttestationContext;
+ use crate::AttestationProvider;
+ use crate::GenerateAttestationFuture;
++use crate::non_openai::NonOpenAiConfig;
+ use crate::responses_metadata::CodexResponsesMetadata;
+ use crate::test_support::TestCodexResponsesRequestKind;
+ use crate::test_support::responses_metadata as test_responses_metadata;
+@@ -278,6 +279,117 @@ fn test_model_info() -> ModelInfo {
+     .expect("deserialize test model info")
+ }
+ 
++fn test_model_info_with_slug(slug: &str) -> ModelInfo {
++    let mut model_info = test_model_info();
++    model_info.slug = slug.to_string();
++    model_info.display_name = slug.to_string();
++    model_info
++}
++
++fn test_non_openai_config(base_url: &str, api_key: &str) -> (TempDir, NonOpenAiConfig) {
++    let codex_home = TempDir::new().expect("create codex home");
++    std::fs::write(
++        codex_home.path().join("non-openai.json"),
++        json!({
++            "mimo": {
++                "enabled": true,
++                "api_key": api_key,
++                "base_url": base_url,
++                "models": {
++                    "mimo-v2.5": {
++                        "display_name": "mimo-v2.5",
++                        "reasoning": {}
++                    }
++                }
++            }
++        })
++        .to_string(),
++    )
++    .expect("write non-openai config");
++    let config = NonOpenAiConfig::load_and_heal(codex_home.path()).expect("load non-openai config");
++    (codex_home, config)
++}
++
++#[tokio::test]
++async fn current_client_setup_routes_by_model_not_previous_non_openai_selection() {
++    let (_codex_home, non_openai) = test_non_openai_config("https://mimo.example/v1", "sk-test");
++    let openai_provider = create_oss_provider_with_base_url(
++        "https://openai-compatible.example/v1",
++        WireApi::Responses,
++    );
++    let client = ModelClient::new_with_non_openai(
++        /*auth_manager*/ None,
++        AgentIdentityAuthPolicy::JwtOnly,
++        ThreadId::new(),
++        openai_provider,
++        SessionSource::Exec,
++        "test_originator".to_string(),
++        /*model_verbosity*/ None,
++        /*enable_request_compression*/ false,
++        /*include_timing_metrics*/ false,
++        /*beta_features_header*/ None,
++        /*item_ids_enabled*/ false,
++        /*concurrent_reasoning_summaries_enabled*/ false,
++        non_openai,
++        /*attestation_provider*/ None,
++        /*tx_event*/ None,
++        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
++    );
++
++    let mimo_setup = client
++        .current_client_setup_for_model(&test_model_info_with_slug("mimo-v2.5"))
++        .await
++        .expect("mimo setup");
++    assert_eq!(mimo_setup.api_provider.base_url, "https://mimo.example/v1");
++
++    let openai_setup = client
++        .current_client_setup_for_model(&test_model_info_with_slug("gpt-5.4"))
++        .await
++        .expect("openai setup");
++    assert_eq!(
++        openai_setup.api_provider.base_url,
++        "https://openai-compatible.example/v1"
++    );
++}
++
++#[tokio::test]
++async fn current_client_setup_uses_refreshed_non_openai_route_table() {
++    let (_old_home, old_non_openai) =
++        test_non_openai_config("https://old-mimo.example/v1", "sk-old");
++    let openai_provider = create_oss_provider_with_base_url(
++        "https://openai-compatible.example/v1",
++        WireApi::Responses,
++    );
++    let client = ModelClient::new_with_non_openai(
++        /*auth_manager*/ None,
++        AgentIdentityAuthPolicy::JwtOnly,
++        ThreadId::new(),
++        openai_provider,
++        SessionSource::Exec,
++        "test_originator".to_string(),
++        /*model_verbosity*/ None,
++        /*enable_request_compression*/ false,
++        /*include_timing_metrics*/ false,
++        /*beta_features_header*/ None,
++        /*item_ids_enabled*/ false,
++        /*concurrent_reasoning_summaries_enabled*/ false,
++        old_non_openai,
++        /*attestation_provider*/ None,
++        /*tx_event*/ None,
++        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
++    );
++    let (_new_home, new_non_openai) =
++        test_non_openai_config("https://new-mimo.example/v1", "sk-new");
++
++    client.refresh_non_openai_config(new_non_openai);
++
++    let setup = client
++        .current_client_setup_for_model(&test_model_info_with_slug("mimo-v2.5"))
++        .await
++        .expect("mimo setup");
++    assert_eq!(setup.api_provider.base_url, "https://new-mimo.example/v1");
++}
++
+ #[test]
+ fn build_reasoning_omits_spark_summary_even_when_configured() {
+     let mut model_info = test_model_info();
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index c6bc4f5091..9fcac1c662 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -1704,12 +1704,16 @@ impl Session {
+                 .with_user_layer_from(&next_config.config_layer_stack);
+             config.tool_suggest =
+                 resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
++            config.non_openai = next_config.non_openai.clone();
+             let config = Arc::new(config);
+             state.session_configuration.original_config_do_not_use = Arc::clone(&config);
+             let new_config = notify_config_contributors
+                 .then(|| Self::build_effective_session_config(&state.session_configuration));
+             (previous_config, new_config, config)
+         };
++        self.services
++            .model_client
++            .refresh_non_openai_config(config.non_openai.clone());
+         self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
+         self.services.skills_service.clear_cache();
+         self.services.plugins_manager.clear_cache();
+diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
+index cab7383e3d..42a52ab058 100644
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -1104,7 +1104,7 @@ impl Session {
+                 thread_store: Arc::clone(&thread_store),
+                 attestation_provider: attestation_provider.clone(),
+                 time_provider,
+-                model_client: ModelClient::new(
++                model_client: ModelClient::new_with_non_openai(
+                     Some(Arc::clone(&auth_manager)),
+                     if config.features.enabled(Feature::UseAgentIdentity) {
+                         AgentIdentityAuthPolicy::ChatGptAuth
+@@ -1112,7 +1112,7 @@ impl Session {
+                         AgentIdentityAuthPolicy::JwtOnly
+                     },
+                     thread_id,
+-                    session_configuration.provider.clone(),
++                    config.model_provider.clone(),
+                     session_configuration.session_source.clone(),
+                     session_configuration.originator.clone(),
+                     config.model_verbosity,
+@@ -1127,6 +1127,7 @@ impl Session {
+                     /*concurrent_reasoning_summaries_enabled*/ config
+                         .features
+                         .enabled(Feature::ConcurrentReasoningSummaries),
++                    config.non_openai.clone(),
+                     attestation_provider,
+                     Some(tx_event.clone()),
+                     config.http_client_factory(),
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index b51d172e23..47211926e0 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -5704,11 +5704,11 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+         )),
+         attestation_provider: None,
+         time_provider: Arc::new(crate::current_time::SystemTimeProvider),
+-        model_client: ModelClient::new(
++        model_client: ModelClient::new_with_non_openai(
+             Some(auth_manager.clone()),
+             AgentIdentityAuthPolicy::JwtOnly,
+             thread_id,
+-            session_configuration.provider.clone(),
++            config.model_provider.clone(),
+             session_configuration.session_source.clone(),
+             session_configuration.originator.clone(),
+             config.model_verbosity,
+@@ -5720,6 +5720,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+             config
+                 .features
+                 .enabled(Feature::ConcurrentReasoningSummaries),
++            config.non_openai.clone(),
+             /*attestation_provider*/ None,
+             /*tx_event*/ None,
+             config.http_client_factory(),
+@@ -7842,11 +7843,11 @@ where
+         )),
+         attestation_provider: None,
+         time_provider: Arc::new(crate::current_time::SystemTimeProvider),
+-        model_client: ModelClient::new(
++        model_client: ModelClient::new_with_non_openai(
+             Some(Arc::clone(&auth_manager)),
+             AgentIdentityAuthPolicy::JwtOnly,
+             thread_id,
+-            session_configuration.provider.clone(),
++            config.model_provider.clone(),
+             session_configuration.session_source.clone(),
+             session_configuration.originator.clone(),
+             config.model_verbosity,
+@@ -7858,6 +7859,7 @@ where
+             config
+                 .features
+                 .enabled(Feature::ConcurrentReasoningSummaries),
++            config.non_openai.clone(),
+             /*attestation_provider*/ None,
+             /*tx_event*/ None,
+             config.http_client_factory(),

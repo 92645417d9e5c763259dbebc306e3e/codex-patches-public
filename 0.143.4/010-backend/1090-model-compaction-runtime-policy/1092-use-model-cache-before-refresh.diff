@@ -1,0 +1,821 @@
+diff --git a/codex-rs/app-server/tests/suite/v2/model_list.rs b/codex-rs/app-server/tests/suite/v2/model_list.rs
+index 92706a817f..04b127365f 100644
+--- a/codex-rs/app-server/tests/suite/v2/model_list.rs
++++ b/codex-rs/app-server/tests/suite/v2/model_list.rs
+@@ -7,6 +7,7 @@ use app_test_support::TestAppServer;
+ use app_test_support::to_response;
+ use app_test_support::write_chatgpt_auth;
+ use app_test_support::write_models_cache;
++use app_test_support::write_models_cache_with_models;
+ use codex_app_server_protocol::JSONRPCError;
+ use codex_app_server_protocol::JSONRPCResponse;
+ use codex_app_server_protocol::Model;
+@@ -21,7 +22,9 @@ use codex_protocol::openai_models::ModelInfo;
+ use codex_protocol::openai_models::ModelPreset;
+ use codex_protocol::openai_models::ModelsResponse;
+ use core_test_support::responses::mount_models_once;
++use core_test_support::responses::mount_models_once_with_delay;
+ use pretty_assertions::assert_eq;
++use serde_json::Value;
+ use serde_json::json;
+ use tempfile::TempDir;
+ use tokio::time::timeout;
+@@ -166,6 +169,116 @@ async fn list_models_includes_hidden_models() -> Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn list_models_returns_cached_models_before_background_refresh() -> Result<()> {
++    let server = MockServer::start().await;
++    let remote_model: ModelInfo = serde_json::from_value(json!({
++        "slug": "remote-delayed-model",
++        "display_name": "Remote Delayed Model",
++        "description": "Delayed model should not block app-server model/list",
++        "default_reasoning_level": "medium",
++        "supported_reasoning_levels": [{"effort": "medium", "description": "Medium"}],
++        "shell_type": "shell_command",
++        "visibility": "list",
++        "minimal_client_version": [0, 1, 0],
++        "supported_in_api": true,
++        "priority": 0,
++        "upgrade": null,
++        "base_instructions": "base instructions",
++        "supports_reasoning_summaries": false,
++        "support_verbosity": false,
++        "default_verbosity": null,
++        "apply_patch_tool_type": null,
++        "truncation_policy": {"mode": "bytes", "limit": 10_000},
++        "supports_parallel_tool_calls": false,
++        "supports_image_detail_original": false,
++        "context_window": 272_000,
++        "max_context_window": 272_000,
++        "experimental_supported_tools": [],
++    }))?;
++    let cached_model: ModelInfo = serde_json::from_value(json!({
++        "slug": "cached-startup-model",
++        "display_name": "Cached Startup Model",
++        "description": "Cached model should be returned immediately",
++        "default_reasoning_level": "medium",
++        "supported_reasoning_levels": [{"effort": "medium", "description": "Medium"}],
++        "shell_type": "shell_command",
++        "visibility": "list",
++        "minimal_client_version": [0, 1, 0],
++        "supported_in_api": true,
++        "priority": 0,
++        "upgrade": null,
++        "base_instructions": "base instructions",
++        "supports_reasoning_summaries": false,
++        "support_verbosity": false,
++        "default_verbosity": null,
++        "apply_patch_tool_type": null,
++        "truncation_policy": {"mode": "bytes", "limit": 10_000},
++        "supports_parallel_tool_calls": false,
++        "supports_image_detail_original": false,
++        "context_window": 272_000,
++        "max_context_window": 272_000,
++        "experimental_supported_tools": [],
++    }))?;
++    let _models_mock = mount_models_once_with_delay(
++        &server,
++        ModelsResponse {
++            models: vec![remote_model],
++        },
++        Duration::from_secs(2),
++    )
++    .await;
++
++    let codex_home = TempDir::new()?;
++    write_models_cache_with_models(codex_home.path(), vec![cached_model])?;
++    let cache_path = codex_home.path().join("models_cache.json");
++    let mut cache: Value = serde_json::from_slice(&std::fs::read(&cache_path)?)?;
++    cache["client_version"] = Value::String("older-client-version".to_string());
++    std::fs::write(&cache_path, serde_json::to_vec_pretty(&cache)?)?;
++
++    let server_uri = server.uri();
++    std::fs::write(
++        codex_home.path().join("config.toml"),
++        format!(
++            r#"
++model = "mock-model"
++approval_policy = "never"
++sandbox_mode = "read-only"
++openai_base_url = "{server_uri}/v1"
++"#
++        ),
++    )?;
++    write_chatgpt_auth(
++        codex_home.path(),
++        ChatGptAuthFixture::new("chatgpt-access-token").plan_type("pro"),
++        AuthCredentialsStoreMode::File,
++    )?;
++
++    let mut mcp =
++        TestAppServer::new_with_env(codex_home.path(), &[("OPENAI_API_KEY", None)]).await?;
++    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
++    let request_id = mcp
++        .send_list_models_request(ModelListParams {
++            limit: Some(100),
++            cursor: None,
++            include_hidden: None,
++        })
++        .await?;
++
++    let response: JSONRPCResponse = timeout(
++        Duration::from_millis(750),
++        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
++    )
++    .await??;
++    let ModelListResponse { data, .. } = to_response::<ModelListResponse>(response)?;
++    assert!(
++        data.iter().any(|model| model.id == "cached-startup-model"),
++        "model/list should return cached models without waiting for /models"
++    );
++
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn list_models_uses_chatgpt_remote_catalog_as_source_of_truth() -> Result<()> {
+     let server = MockServer::start().await;
+@@ -297,7 +410,9 @@ async fn list_models_pagination_works() -> Result<()> {
+     let mut cursor = None;
+     let mut items = Vec::new();
+ 
+-    for _ in 0..expected_models.len() {
++    const MAX_PAGES: usize = 100;
++
++    for _ in 0..MAX_PAGES {
+         let request_id = mcp
+             .send_list_models_request(ModelListParams {
+                 limit: Some(1),
+@@ -323,14 +438,17 @@ async fn list_models_pagination_works() -> Result<()> {
+         if let Some(next_cursor) = next_cursor {
+             cursor = Some(next_cursor);
+         } else {
+-            assert_eq!(items, expected_models);
++            assert!(
++                items.starts_with(&expected_models),
++                "paginated model list should start with the cached startup catalog"
++            );
+             return Ok(());
+         }
+     }
+ 
+     panic!(
+         "model pagination did not terminate after {} pages",
+-        expected_models.len()
++        MAX_PAGES
+     );
+ }
+ 
+diff --git a/codex-rs/core/tests/suite/models_cache_ttl.rs b/codex-rs/core/tests/suite/models_cache_ttl.rs
+index 161a415008..2245daa97b 100644
+--- a/codex-rs/core/tests/suite/models_cache_ttl.rs
++++ b/codex-rs/core/tests/suite/models_cache_ttl.rs
+@@ -157,7 +157,7 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
+ async fn uses_cache_when_version_matches() -> Result<()> {
+     let server = MockServer::start().await;
+     let cached_model = test_remote_model(VERSIONED_MODEL, /*priority*/ 1);
+-    let models_mock = responses::mount_models_once(
++    let _models_mock = responses::mount_models_once(
+         &server,
+         ModelsResponse {
+             models: vec![test_remote_model("remote", /*priority*/ 2)],
+@@ -194,20 +194,14 @@ async fn uses_cache_when_version_matches() -> Result<()> {
+         models.iter().any(|preset| preset.model == VERSIONED_MODEL),
+         "expected cached model"
+     );
+-    assert_eq!(
+-        models_mock.requests().len(),
+-        0,
+-        "/models should not be called when cache version matches"
+-    );
+-
+     Ok(())
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn refreshes_when_cache_version_missing() -> Result<()> {
++async fn uses_cache_when_cache_version_missing() -> Result<()> {
+     let server = MockServer::start().await;
+     let cached_model = test_remote_model(MISSING_VERSION_MODEL, /*priority*/ 1);
+-    let models_mock = responses::mount_models_once(
++    let _models_mock = responses::mount_models_once(
+         &server,
+         ModelsResponse {
+             models: vec![test_remote_model("remote-missing", /*priority*/ 2)],
+@@ -241,28 +235,25 @@ async fn refreshes_when_cache_version_missing() -> Result<()> {
+         .await;
+ 
+     assert!(
+-        models.iter().any(|preset| preset.model == "remote-missing"),
+-        "expected refreshed models"
+-    );
+-    assert_eq!(
+-        models_mock.requests().len(),
+-        1,
+-        "/models should be called when cache version is missing"
++        models
++            .iter()
++            .any(|preset| preset.model == MISSING_VERSION_MODEL),
++        "expected cached model"
+     );
+ 
+     Ok(())
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn refreshes_when_cache_version_differs() -> Result<()> {
++async fn uses_cache_when_cache_version_differs() -> Result<()> {
+     let server = MockServer::start().await;
+     let cached_model = test_remote_model(DIFFERENT_VERSION_MODEL, /*priority*/ 1);
+     let models_response = ModelsResponse {
+         models: vec![test_remote_model("remote-different", /*priority*/ 2)],
+     };
+-    let mut models_mocks = Vec::new();
++    let mut _models_mocks = Vec::new();
+     for _ in 0..3 {
+-        models_mocks.push(responses::mount_models_once(&server, models_response.clone()).await);
++        _models_mocks.push(responses::mount_models_once(&server, models_response.clone()).await);
+     }
+ 
+     let mut builder = test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+@@ -294,13 +285,8 @@ async fn refreshes_when_cache_version_differs() -> Result<()> {
+     assert!(
+         models
+             .iter()
+-            .any(|preset| preset.model == "remote-different"),
+-        "expected refreshed models"
+-    );
+-    let models_request_count: usize = models_mocks.iter().map(|mock| mock.requests().len()).sum();
+-    assert!(
+-        models_request_count >= 1,
+-        "/models should be called when cache version differs"
++            .any(|preset| preset.model == DIFFERENT_VERSION_MODEL),
++        "expected cached model"
+     );
+ 
+     Ok(())
+diff --git a/codex-rs/models-manager/src/cache.rs b/codex-rs/models-manager/src/cache.rs
+index 812716d29c..05fbdf5c87 100644
+--- a/codex-rs/models-manager/src/cache.rs
++++ b/codex-rs/models-manager/src/cache.rs
+@@ -12,12 +12,19 @@ use tracing::error;
+ use tracing::info;
+ 
+ /// Manages loading and saving of models cache to disk.
+-#[derive(Debug)]
++#[derive(Debug, Clone)]
+ pub(crate) struct ModelsCacheManager {
+     cache_path: PathBuf,
+     cache_ttl: Duration,
+ }
+ 
++#[derive(Debug)]
++pub(crate) struct ModelsCacheLoad {
++    pub(crate) cache: ModelsCache,
++    pub(crate) client_version_matches: bool,
++    pub(crate) is_fresh: bool,
++}
++
+ impl ModelsCacheManager {
+     /// Create a new cache manager with the given path and TTL.
+     pub(crate) fn new(cache_path: PathBuf, cache_ttl: Duration) -> Self {
+@@ -73,6 +80,37 @@ impl ModelsCacheManager {
+         Some(cache)
+     }
+ 
++    /// Attempt to load any cache entry, regardless of TTL.
++    pub(crate) async fn load_any(&self, expected_version: &str) -> Option<ModelsCacheLoad> {
++        info!(
++            cache_path = %self.cache_path.display(),
++            expected_version,
++            "models cache: attempting load_any"
++        );
++        let cache = match self.load().await {
++            Ok(cache) => cache?,
++            Err(err) => {
++                error!("failed to load models cache: {err}");
++                return None;
++            }
++        };
++        let client_version_matches = cache.client_version.as_deref() == Some(expected_version);
++        let is_fresh = cache.is_fresh(self.cache_ttl);
++        info!(
++            cache_path = %self.cache_path.display(),
++            cached_version = ?cache.client_version,
++            fetched_at = %cache.fetched_at,
++            client_version_matches,
++            is_fresh,
++            "models cache: loaded cache file"
++        );
++        Some(ModelsCacheLoad {
++            cache,
++            client_version_matches,
++            is_fresh,
++        })
++    }
++
+     /// Persist the cache to disk, creating parent directories as needed.
+     pub(crate) async fn persist_cache(
+         &self,
+diff --git a/codex-rs/models-manager/src/manager.rs b/codex-rs/models-manager/src/manager.rs
+index 3439ceafc5..2a48f98d18 100644
+--- a/codex-rs/models-manager/src/manager.rs
++++ b/codex-rs/models-manager/src/manager.rs
+@@ -16,10 +16,13 @@ use std::future::Future;
+ use std::path::PathBuf;
+ use std::pin::Pin;
+ use std::sync::Arc;
++use std::sync::atomic::AtomicBool;
++use std::sync::atomic::Ordering;
+ use std::time::Duration;
+ use tokio::sync::RwLock;
+ use tokio::sync::TryLockError;
+ use tracing::Instrument as _;
++use tracing::debug;
+ use tracing::error;
+ use tracing::info;
+ 
+@@ -213,11 +216,12 @@ pub type SharedModelsManager = Arc<dyn ModelsManager>;
+ /// OpenAI-compatible model manager backed by bundled models, cache, and `/models`.
+ #[derive(Debug)]
+ pub struct OpenAiModelsManager {
+-    remote_models: RwLock<Vec<ModelInfo>>,
+-    etag: RwLock<Option<String>>,
++    remote_models: Arc<RwLock<Vec<ModelInfo>>>,
++    etag: Arc<RwLock<Option<String>>>,
+     cache_manager: ModelsCacheManager,
+     endpoint_client: SharedModelsEndpointClient,
+     auth_manager: Option<Arc<AuthManager>>,
++    refresh_in_progress: Arc<AtomicBool>,
+ }
+ 
+ /// Static model manager backed by an authoritative in-process catalog.
+@@ -238,11 +242,12 @@ impl OpenAiModelsManager {
+         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
+         let remote_models = load_remote_models_from_file().unwrap_or_default();
+         Self {
+-            remote_models: RwLock::new(remote_models),
+-            etag: RwLock::new(None),
++            remote_models: Arc::new(RwLock::new(remote_models)),
++            etag: Arc::new(RwLock::new(None)),
+             cache_manager,
+             endpoint_client,
+             auth_manager,
++            refresh_in_progress: Arc::new(AtomicBool::new(false)),
+         }
+     }
+ }
+@@ -355,9 +360,9 @@ impl OpenAiModelsManager {
+                 Ok(())
+             }
+             RefreshStrategy::OnlineIfUncached => {
+-                // Try cache first, fall back to online if unavailable
+-                if self.try_load_cache().await {
+-                    info!("models cache: using cached models for OnlineIfUncached");
++                if self.try_load_any_cache().await {
++                    self.start_background_model_refresh(http_client_factory.clone());
++                    info!("models cache: using local models for OnlineIfUncached");
+                     return Ok(());
+                 }
+                 info!("models cache: cache miss, fetching remote models");
+@@ -374,17 +379,43 @@ impl OpenAiModelsManager {
+         &self,
+         http_client_factory: &HttpClientFactory,
+     ) -> CoreResult<()> {
+-        let client_version = crate::client_version_to_whole();
+-        let (models, etag) = self
+-            .endpoint_client
+-            .list_models(&client_version, http_client_factory.clone())
+-            .await?;
+-        self.apply_remote_models(models.clone()).await;
+-        *self.etag.write().await = etag.clone();
+-        self.cache_manager
+-            .persist_cache(&models, etag, client_version)
+-            .await;
+-        Ok(())
++        fetch_and_update_models_inner(
++            Arc::clone(&self.endpoint_client),
++            self.cache_manager.clone(),
++            Arc::clone(&self.remote_models),
++            Arc::clone(&self.etag),
++            self.auth_manager.clone(),
++            http_client_factory.clone(),
++        )
++        .await
++    }
++
++    fn start_background_model_refresh(&self, http_client_factory: HttpClientFactory) {
++        if self.refresh_in_progress.swap(true, Ordering::AcqRel) {
++            return;
++        }
++
++        let endpoint_client = Arc::clone(&self.endpoint_client);
++        let cache_manager = self.cache_manager.clone();
++        let remote_models = Arc::clone(&self.remote_models);
++        let etag = Arc::clone(&self.etag);
++        let auth_manager = self.auth_manager.clone();
++        let refresh_in_progress = Arc::clone(&self.refresh_in_progress);
++        tokio::spawn(async move {
++            if let Err(err) = fetch_and_update_models_inner(
++                endpoint_client,
++                cache_manager,
++                remote_models,
++                etag,
++                auth_manager,
++                http_client_factory,
++            )
++            .await
++            {
++                debug!("failed to refresh models in background: {err}");
++            }
++            refresh_in_progress.store(false, Ordering::Release);
++        });
+     }
+ 
+     async fn should_refresh_models(&self) -> bool {
+@@ -397,34 +428,7 @@ impl OpenAiModelsManager {
+ 
+     /// Replace the cached remote models and rebuild the derived presets list.
+     async fn apply_remote_models(&self, models: Vec<ModelInfo>) {
+-        // Use the remote models list as the source of truth if it contains at least one
+-        // non-hidden model and the user is using ChatGPT auth.
+-        let should_use_remote_models_only = !models.is_empty()
+-            && models
+-                .iter()
+-                .any(|model| model.visibility == ModelVisibility::List)
+-            && self.auth_manager.as_ref().is_some_and(|auth_manager| {
+-                auth_manager
+-                    .auth_mode()
+-                    .is_some_and(AuthMode::has_chatgpt_account)
+-            });
+-        if should_use_remote_models_only {
+-            *self.remote_models.write().await = models;
+-            return;
+-        }
+-
+-        let mut existing_models = load_remote_models_from_file().unwrap_or_default();
+-        for model in models {
+-            if let Some(existing_index) = existing_models
+-                .iter()
+-                .position(|existing| existing.slug == model.slug)
+-            {
+-                existing_models[existing_index] = model;
+-            } else {
+-                existing_models.push(model);
+-            }
+-        }
+-        *self.remote_models.write().await = existing_models;
++        apply_remote_models_to(&self.remote_models, self.auth_manager.as_ref(), models).await;
+     }
+ 
+     /// Attempt to satisfy the refresh from the cache when it matches the provider and TTL.
+@@ -452,6 +456,95 @@ impl OpenAiModelsManager {
+         );
+         true
+     }
++
++    /// Attempt to satisfy `OnlineIfUncached` from any cache entry.
++    async fn try_load_any_cache(&self) -> bool {
++        let _timer =
++            codex_otel::start_global_timer("codex.remote_models.load_cache.duration_ms", &[]);
++        let client_version = crate::client_version_to_whole();
++        info!(client_version, "models cache: evaluating cache eligibility");
++        // TODO(celia-oai): Include provider identity in cache eligibility so switching
++        // providers does not reuse a models_cache.json entry from another provider.
++        let loaded = match self.cache_manager.load_any(&client_version).await {
++            Some(loaded) => loaded,
++            None => {
++                info!("models cache: no usable cache entry");
++                return false;
++            }
++        };
++        if !loaded.client_version_matches {
++            info!(
++                cached_version = ?loaded.cache.client_version,
++                expected_version = client_version,
++                "models cache: using cache despite version mismatch"
++            );
++        }
++        let models = loaded.cache.models.clone();
++        *self.etag.write().await = loaded.cache.etag.clone();
++        self.apply_remote_models(models.clone()).await;
++        info!(
++            models_count = models.len(),
++            etag = ?loaded.cache.etag,
++            is_fresh = loaded.is_fresh,
++            "models cache: cache entry applied"
++        );
++        true
++    }
++}
++
++async fn fetch_and_update_models_inner(
++    endpoint_client: SharedModelsEndpointClient,
++    cache_manager: ModelsCacheManager,
++    remote_models: Arc<RwLock<Vec<ModelInfo>>>,
++    etag_store: Arc<RwLock<Option<String>>>,
++    auth_manager: Option<Arc<AuthManager>>,
++    http_client_factory: HttpClientFactory,
++) -> CoreResult<()> {
++    let client_version = crate::client_version_to_whole();
++    let (models, etag) = endpoint_client
++        .list_models(&client_version, http_client_factory)
++        .await?;
++    apply_remote_models_to(&remote_models, auth_manager.as_ref(), models.clone()).await;
++    *etag_store.write().await = etag.clone();
++    cache_manager
++        .persist_cache(&models, etag, client_version)
++        .await;
++    Ok(())
++}
++
++async fn apply_remote_models_to(
++    remote_models: &RwLock<Vec<ModelInfo>>,
++    auth_manager: Option<&Arc<AuthManager>>,
++    models: Vec<ModelInfo>,
++) {
++    // Use the remote models list as the source of truth if it contains at least one
++    // non-hidden model and the user is using ChatGPT auth.
++    let should_use_remote_models_only = !models.is_empty()
++        && models
++            .iter()
++            .any(|model| model.visibility == ModelVisibility::List)
++        && auth_manager.is_some_and(|auth_manager| {
++            auth_manager
++                .auth_mode()
++                .is_some_and(AuthMode::has_chatgpt_account)
++        });
++    if should_use_remote_models_only {
++        *remote_models.write().await = models;
++        return;
++    }
++
++    let mut existing_models = load_remote_models_from_file().unwrap_or_default();
++    for model in models {
++        if let Some(existing_index) = existing_models
++            .iter()
++            .position(|existing| existing.slug == model.slug)
++        {
++            existing_models[existing_index] = model;
++        } else {
++            existing_models.push(model);
++        }
++    }
++    *remote_models.write().await = existing_models;
+ }
+ 
+ impl ModelsManager for StaticModelsManager {
+diff --git a/codex-rs/models-manager/src/manager_tests.rs b/codex-rs/models-manager/src/manager_tests.rs
+index e74c7cac4c..ca63c4fa8e 100644
+--- a/codex-rs/models-manager/src/manager_tests.rs
++++ b/codex-rs/models-manager/src/manager_tests.rs
+@@ -20,7 +20,9 @@ use std::sync::Arc;
+ use std::sync::Mutex;
+ use std::sync::atomic::AtomicUsize;
+ use std::sync::atomic::Ordering;
++use std::time::Duration;
+ use tempfile::tempdir;
++use tokio::sync::oneshot;
+ 
+ #[path = "model_info_overrides_tests.rs"]
+ mod model_info_overrides_tests;
+@@ -75,6 +77,36 @@ fn assert_models_contain(actual: &[ModelInfo], expected: &[ModelInfo]) {
+     }
+ }
+ 
++async fn wait_for_fetch_count(endpoint: &BlockingSecondFetchModelsEndpoint, expected: usize) {
++    tokio::time::timeout(Duration::from_secs(1), async {
++        loop {
++            if endpoint.fetch_count() >= expected {
++                break;
++            }
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .expect("timed out waiting for model fetch");
++}
++
++async fn wait_for_models_to_contain(manager: &OpenAiModelsManager, expected: &[ModelInfo]) {
++    tokio::time::timeout(Duration::from_secs(1), async {
++        loop {
++            let models = manager.get_remote_models().await;
++            if expected
++                .iter()
++                .all(|model| models.iter().any(|candidate| candidate.slug == model.slug))
++            {
++                break;
++            }
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .expect("timed out waiting for background model refresh");
++}
++
+ #[derive(Debug)]
+ struct TestModelsEndpoint {
+     has_command_auth: bool,
+@@ -84,6 +116,38 @@ struct TestModelsEndpoint {
+     observed_proxy_policy: Mutex<Option<OutboundProxyPolicy>>,
+ }
+ 
++struct BlockingSecondFetchModelsEndpoint {
++    responses: Mutex<VecDeque<Vec<ModelInfo>>>,
++    fetch_count: AtomicUsize,
++    second_fetch_gate: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
++}
++
++impl std::fmt::Debug for BlockingSecondFetchModelsEndpoint {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("BlockingSecondFetchModelsEndpoint")
++            .field("fetch_count", &self.fetch_count())
++            .finish_non_exhaustive()
++    }
++}
++
++impl BlockingSecondFetchModelsEndpoint {
++    fn new(responses: Vec<Vec<ModelInfo>>) -> (Arc<Self>, oneshot::Sender<()>) {
++        let (tx, rx) = oneshot::channel();
++        (
++            Arc::new(Self {
++                responses: Mutex::new(responses.into()),
++                fetch_count: AtomicUsize::new(0),
++                second_fetch_gate: tokio::sync::Mutex::new(Some(rx)),
++            }),
++            tx,
++        )
++    }
++
++    fn fetch_count(&self) -> usize {
++        self.fetch_count.load(Ordering::SeqCst)
++    }
++}
++
+ impl TestModelsEndpoint {
+     fn new(responses: Vec<Vec<ModelInfo>>) -> Arc<Self> {
+         Arc::new(Self {
+@@ -185,6 +249,37 @@ impl ModelsEndpointClient for TestModelsEndpoint {
+     }
+ }
+ 
++impl ModelsEndpointClient for BlockingSecondFetchModelsEndpoint {
++    fn has_command_auth(&self) -> bool {
++        false
++    }
++
++    fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool> {
++        Box::pin(async { true })
++    }
++
++    fn list_models<'a>(
++        &'a self,
++        _client_version: &'a str,
++    ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
++        Box::pin(async move {
++            let fetch_number = self.fetch_count.fetch_add(1, Ordering::SeqCst) + 1;
++            if fetch_number == 2
++                && let Some(rx) = self.second_fetch_gate.lock().await.take()
++            {
++                let _ = rx.await;
++            }
++            let models = self
++                .responses
++                .lock()
++                .expect("responses lock should not be poisoned")
++                .pop_front()
++                .unwrap_or_default();
++            Ok((models, None))
++        })
++    }
++}
++
+ fn openai_manager_for_tests(
+     codex_home: std::path::PathBuf,
+     endpoint_client: Arc<dyn ModelsEndpointClient>,
+@@ -702,11 +797,14 @@ async fn refresh_available_models_uses_cache_when_fresh() {
+ }
+ 
+ #[tokio::test]
+-async fn refresh_available_models_refetches_when_cache_stale() {
++async fn refresh_available_models_uses_stale_cache_without_refetching() {
+     let initial_models = vec![remote_model("stale", "Stale", /*priority*/ 1)];
+     let codex_home = tempdir().expect("temp dir");
+     let updated_models = vec![remote_model("fresh", "Fresh", /*priority*/ 9)];
+-    let endpoint = TestModelsEndpoint::new(vec![initial_models.clone(), updated_models.clone()]);
++    let (endpoint, unblock_second_fetch) = BlockingSecondFetchModelsEndpoint::new(vec![
++        initial_models.clone(),
++        updated_models.clone(),
++    ]);
+     let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
+ 
+     manager
+@@ -726,19 +824,62 @@ async fn refresh_available_models_refetches_when_cache_stale() {
+         .await
+         .expect("cache manipulation succeeds");
+ 
++    tokio::time::timeout(
++        Duration::from_millis(100),
++        manager.refresh_available_models(RefreshStrategy::OnlineIfUncached),
++    )
++    .await
++    .expect("stale cache should return before background fetch completes")
++    .expect("second refresh succeeds");
++    assert_models_contain(&manager.get_remote_models().await, &initial_models);
++    wait_for_fetch_count(endpoint.as_ref(), 2).await;
++    unblock_second_fetch
++        .send(())
++        .expect("background fetch should still be waiting");
++    wait_for_models_to_contain(&manager, &updated_models).await;
++}
++
++#[tokio::test]
++async fn refresh_available_models_uses_version_mismatched_cache_without_blocking() {
++    let initial_models = vec![remote_model("old", "Old", /*priority*/ 1)];
++    let codex_home = tempdir().expect("temp dir");
++    let updated_models = vec![remote_model("new", "New", /*priority*/ 2)];
++    let (endpoint, unblock_second_fetch) = BlockingSecondFetchModelsEndpoint::new(vec![
++        initial_models.clone(),
++        updated_models.clone(),
++    ]);
++    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
++
+     manager
+         .refresh_available_models(
+             RefreshStrategy::OnlineIfUncached,
+             &DEFAULT_HTTP_CLIENT_FACTORY,
+         )
+         .await
+-        .expect("second refresh succeeds");
+-    assert_models_contain(&manager.get_remote_models().await, &updated_models);
+-    assert_eq!(
+-        endpoint.fetch_count(),
+-        2,
+-        "stale cache refresh should fetch models again"
+-    );
++        .expect("initial refresh succeeds");
++
++    manager
++        .cache_manager
++        .mutate_cache_for_test(|cache| {
++            let client_version = crate::client_version_to_whole();
++            cache.client_version = Some(format!("{client_version}-mismatch"));
++        })
++        .await
++        .expect("cache mutation succeeds");
++
++    tokio::time::timeout(
++        Duration::from_millis(100),
++        manager.refresh_available_models(RefreshStrategy::OnlineIfUncached),
++    )
++    .await
++    .expect("version-mismatched cache should return before background fetch completes")
++    .expect("second refresh succeeds");
++    assert_models_contain(&manager.get_remote_models().await, &initial_models);
++    wait_for_fetch_count(endpoint.as_ref(), 2).await;
++    unblock_second_fetch
++        .send(())
++        .expect("background fetch should still be waiting");
++    wait_for_models_to_contain(&manager, &updated_models).await;
+ }
+ 
+ #[tokio::test]
+@@ -768,11 +909,11 @@ async fn refresh_available_models_refetches_when_version_mismatch() {
+ 
+     manager
+         .refresh_available_models(
+-            RefreshStrategy::OnlineIfUncached,
++            RefreshStrategy::Online,
+             &DEFAULT_HTTP_CLIENT_FACTORY,
+         )
+         .await
+-        .expect("second refresh succeeds");
++        .expect("online refresh succeeds");
+     assert_models_contain(&manager.get_remote_models().await, &updated_models);
+     assert_eq!(
+         endpoint.fetch_count(),
+@@ -808,11 +949,11 @@ async fn refresh_available_models_drops_removed_remote_models() {
+ 
+     manager
+         .refresh_available_models(
+-            RefreshStrategy::OnlineIfUncached,
++            RefreshStrategy::Online,
+             &DEFAULT_HTTP_CLIENT_FACTORY,
+         )
+         .await
+-        .expect("second refresh succeeds");
++        .expect("online refresh succeeds");
+ 
+     let available = manager
+         .try_list_models()
+@@ -828,7 +969,7 @@ async fn refresh_available_models_drops_removed_remote_models() {
+     assert_eq!(
+         endpoint.fetch_count(),
+         2,
+-        "second refresh should fetch models again"
++        "online refresh should fetch models again"
+     );
+ }
+ 

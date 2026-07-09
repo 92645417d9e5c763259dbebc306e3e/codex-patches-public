@@ -1,0 +1,331 @@
+diff --git a/codex-rs/app-server/tests/common/models_cache.rs b/codex-rs/app-server/tests/common/models_cache.rs
+index b34515302e..4ea97c056f 100644
+--- a/codex-rs/app-server/tests/common/models_cache.rs
++++ b/codex-rs/app-server/tests/common/models_cache.rs
+@@ -36,6 +36,7 @@ fn preset_to_info(preset: &ModelPreset, priority: i32) -> ModelInfo {
+         model_messages: None,
+         include_skills_usage_instructions: false,
+         supports_reasoning_summaries: false,
++            supports_plaintext_reasoning: false,
+         default_reasoning_summary: ReasoningSummary::Auto,
+         support_verbosity: false,
+         default_verbosity: None,
+diff --git a/codex-rs/codex-api/tests/models_integration.rs b/codex-rs/codex-api/tests/models_integration.rs
+index 8eddf01906..1f25e78886 100644
+--- a/codex-rs/codex-api/tests/models_integration.rs
++++ b/codex-rs/codex-api/tests/models_integration.rs
+@@ -82,6 +82,7 @@ async fn models_client_hits_models_endpoint() {
+             model_messages: None,
+             include_skills_usage_instructions: false,
+             supports_reasoning_summaries: false,
++            supports_plaintext_reasoning: false,
+             default_reasoning_summary: ReasoningSummary::Auto,
+             support_verbosity: false,
+             default_verbosity: None,
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index cfc26c5711..b7a8386fd4 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -65,6 +65,7 @@ pub use network_proxy_loader::MtimeConfigReloader;
+ pub use network_proxy_loader::build_network_proxy_state;
+ pub use network_proxy_loader::build_network_proxy_state_and_reloader;
+ mod original_image_detail;
++mod plaintext_reasoning;
+ pub use codex_mcp::SandboxState;
+ mod mcp_openai_file;
+ mod mcp_tool_call;
+diff --git a/codex-rs/core/src/plaintext_reasoning.rs b/codex-rs/core/src/plaintext_reasoning.rs
+new file mode 100644
+index 0000000000..648c712a74
+--- /dev/null
++++ b/codex-rs/core/src/plaintext_reasoning.rs
+@@ -0,0 +1,57 @@
++use codex_protocol::models::ReasoningItemContent;
++use codex_protocol::models::ReasoningItemReasoningSummary;
++use codex_protocol::models::ResponseItem;
++
++pub(crate) fn normalize_plaintext_reasoning_item(item: &mut ResponseItem) {
++    let ResponseItem::Reasoning {
++        summary, content, ..
++    } = item
++    else {
++        return;
++    };
++    let Some(raw_content) = content.take() else {
++        return;
++    };
++    summary.extend(raw_content.into_iter().filter_map(|entry| {
++        let text = match entry {
++            ReasoningItemContent::ReasoningText { text } | ReasoningItemContent::Text { text } => {
++                text
++            }
++        };
++        (!text.trim().is_empty()).then_some(ReasoningItemReasoningSummary::SummaryText { text })
++    }));
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn plaintext_reasoning_is_projected_as_reasoning_summary() {
++        let mut item = ResponseItem::Reasoning {
++            id: Some("rs_test".to_string()),
++            summary: Vec::new(),
++            content: Some(vec![ReasoningItemContent::ReasoningText {
++                text: "visible chain".to_string(),
++            }]),
++            encrypted_content: None,
++            internal_chat_message_metadata_passthrough: None,
++        };
++
++        normalize_plaintext_reasoning_item(&mut item);
++
++        let ResponseItem::Reasoning {
++            summary, content, ..
++        } = item
++        else {
++            panic!("expected reasoning item");
++        };
++        assert_eq!(content, None);
++        assert_eq!(
++            summary,
++            vec![ReasoningItemReasoningSummary::SummaryText {
++                text: "visible chain".to_string()
++            }]
++        );
++    }
++}
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index d11ad3ecda..b599549631 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -36,6 +36,7 @@ use crate::mentions::build_skill_name_counts;
+ use crate::mentions::collect_explicit_app_ids;
+ use crate::mentions::collect_explicit_plugin_mentions;
+ use crate::mentions::collect_tool_mentions_from_messages;
++use crate::plaintext_reasoning::normalize_plaintext_reasoning_item;
+ use crate::plugins::build_plugin_injections;
+ use crate::responses_metadata::CodexResponsesMetadata;
+ use crate::responses_metadata::CodexResponsesRequestKind;
+@@ -2313,6 +2314,9 @@ async fn try_run_sampling_request(
+                 if turn_context.item_ids_enabled() {
+                     assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
+                 }
++                if turn_context.model_info.supports_plaintext_reasoning {
++                    normalize_plaintext_reasoning_item(&mut item);
++                }
+                 saw_encrypted_reasoning |= reasoning_item_has_encrypted_content(&item);
+                 round_has_reasoning_activity |= response_item_starts_reasoning_round(&item);
+                 round_response_items.push(item.clone());
+@@ -2888,15 +2892,27 @@ async fn try_run_sampling_request(
+                     if !active_item_is_streaming_to_client {
+                         continue;
+                     }
+-                    let event = ReasoningRawContentDeltaEvent {
+-                        thread_id: sess.thread_id.to_string(),
+-                        turn_id: turn_context.sub_id.clone(),
+-                        item_id: active.id(),
+-                        delta,
+-                        content_index,
+-                    };
+-                    sess.send_event(&turn_context, EventMsg::ReasoningRawContentDelta(event))
+-                        .await;
++                    if turn_context.model_info.supports_plaintext_reasoning {
++                        let event = ReasoningContentDeltaEvent {
++                            thread_id: sess.thread_id.to_string(),
++                            turn_id: turn_context.sub_id.clone(),
++                            item_id: active.id(),
++                            delta,
++                            summary_index: 0,
++                        };
++                        sess.send_event(&turn_context, EventMsg::ReasoningContentDelta(event))
++                            .await;
++                    } else {
++                        let event = ReasoningRawContentDeltaEvent {
++                            thread_id: sess.thread_id.to_string(),
++                            turn_id: turn_context.sub_id.clone(),
++                            item_id: active.id(),
++                            delta,
++                            content_index,
++                        };
++                        sess.send_event(&turn_context, EventMsg::ReasoningRawContentDelta(event))
++                            .await;
++                    }
+                 } else {
+                     error_or_panic("ReasoningRawContentDelta without active item".to_string());
+                 }
+diff --git a/codex-rs/core/tests/suite/auto_review.rs b/codex-rs/core/tests/suite/auto_review.rs
+index 30c4d4a595..8693537a58 100644
+--- a/codex-rs/core/tests/suite/auto_review.rs
++++ b/codex-rs/core/tests/suite/auto_review.rs
+@@ -246,6 +246,7 @@ fn remote_model_with_auto_review_override(slug: &str, review_model: &str) -> Mod
+         model_messages: None,
+         include_skills_usage_instructions: false,
+         supports_reasoning_summaries: false,
++            supports_plaintext_reasoning: false,
+         default_reasoning_summary: ReasoningSummary::Auto,
+         support_verbosity: false,
+         default_verbosity: None,
+diff --git a/codex-rs/core/tests/suite/model_switching.rs b/codex-rs/core/tests/suite/model_switching.rs
+index 2450bad601..841e8ebd7f 100644
+--- a/codex-rs/core/tests/suite/model_switching.rs
++++ b/codex-rs/core/tests/suite/model_switching.rs
+@@ -99,6 +99,7 @@ fn test_model_info(
+         model_messages: None,
+         include_skills_usage_instructions: false,
+         supports_reasoning_summaries: false,
++            supports_plaintext_reasoning: false,
+         default_reasoning_summary: ReasoningSummary::Auto,
+         support_verbosity: false,
+         default_verbosity: None,
+@@ -927,6 +928,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
+         model_messages: None,
+         include_skills_usage_instructions: false,
+         supports_reasoning_summaries: false,
++            supports_plaintext_reasoning: false,
+         default_reasoning_summary: ReasoningSummary::Auto,
+         support_verbosity: false,
+         default_verbosity: None,
+diff --git a/codex-rs/core/tests/suite/models_cache_ttl.rs b/codex-rs/core/tests/suite/models_cache_ttl.rs
+index 2245daa97b..a7734e272c 100644
+--- a/codex-rs/core/tests/suite/models_cache_ttl.rs
++++ b/codex-rs/core/tests/suite/models_cache_ttl.rs
+@@ -355,6 +355,7 @@ fn test_remote_model(slug: &str, priority: i32) -> ModelInfo {
+         model_messages: None,
+         include_skills_usage_instructions: false,
+         supports_reasoning_summaries: false,
++            supports_plaintext_reasoning: false,
+         default_reasoning_summary: ReasoningSummary::Auto,
+         support_verbosity: false,
+         default_verbosity: None,
+diff --git a/codex-rs/core/tests/suite/personality.rs b/codex-rs/core/tests/suite/personality.rs
+index a493a8be07..bc16c15452 100644
+--- a/codex-rs/core/tests/suite/personality.rs
++++ b/codex-rs/core/tests/suite/personality.rs
+@@ -567,6 +567,7 @@ async fn remote_model_friendly_personality_instructions_with_feature() -> anyhow
+         }),
+         include_skills_usage_instructions: false,
+         supports_reasoning_summaries: false,
++            supports_plaintext_reasoning: false,
+         default_reasoning_summary: ReasoningSummary::Auto,
+         support_verbosity: false,
+         default_verbosity: None,
+@@ -684,6 +685,7 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
+         }),
+         include_skills_usage_instructions: false,
+         supports_reasoning_summaries: false,
++            supports_plaintext_reasoning: false,
+         default_reasoning_summary: ReasoningSummary::Auto,
+         support_verbosity: false,
+         default_verbosity: None,
+diff --git a/codex-rs/core/tests/suite/remote_models.rs b/codex-rs/core/tests/suite/remote_models.rs
+index 895af1a64b..7379a50541 100644
+--- a/codex-rs/core/tests/suite/remote_models.rs
++++ b/codex-rs/core/tests/suite/remote_models.rs
+@@ -492,6 +492,7 @@ async fn remote_models_remote_model_uses_unified_exec() -> Result<()> {
+         model_messages: None,
+         include_skills_usage_instructions: false,
+         supports_reasoning_summaries: false,
++            supports_plaintext_reasoning: false,
+         default_reasoning_summary: ReasoningSummary::Auto,
+         support_verbosity: false,
+         default_verbosity: None,
+@@ -746,6 +747,7 @@ async fn remote_models_apply_remote_base_instructions() -> Result<()> {
+         model_messages: None,
+         include_skills_usage_instructions: false,
+         supports_reasoning_summaries: false,
++            supports_plaintext_reasoning: false,
+         default_reasoning_summary: ReasoningSummary::Auto,
+         support_verbosity: false,
+         default_verbosity: None,
+@@ -1273,6 +1275,7 @@ fn test_remote_model_with_policy(
+         model_messages: None,
+         include_skills_usage_instructions: false,
+         supports_reasoning_summaries: false,
++            supports_plaintext_reasoning: false,
+         default_reasoning_summary: ReasoningSummary::Auto,
+         support_verbosity: false,
+         default_verbosity: None,
+diff --git a/codex-rs/core/tests/suite/rmcp_client.rs b/codex-rs/core/tests/suite/rmcp_client.rs
+index cc16f3ead7..3c83262bb2 100644
+--- a/codex-rs/core/tests/suite/rmcp_client.rs
++++ b/codex-rs/core/tests/suite/rmcp_client.rs
+@@ -1654,6 +1654,7 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
+                 model_messages: None,
+                 include_skills_usage_instructions: false,
+                 supports_reasoning_summaries: false,
++            supports_plaintext_reasoning: false,
+                 default_reasoning_summary: ReasoningSummary::Auto,
+                 support_verbosity: false,
+                 default_verbosity: None,
+diff --git a/codex-rs/core/tests/suite/spawn_agent_description.rs b/codex-rs/core/tests/suite/spawn_agent_description.rs
+index c66ada313c..5934c74209 100644
+--- a/codex-rs/core/tests/suite/spawn_agent_description.rs
++++ b/codex-rs/core/tests/suite/spawn_agent_description.rs
+@@ -73,6 +73,7 @@ fn test_model_info(
+         model_messages: None,
+         include_skills_usage_instructions: false,
+         supports_reasoning_summaries: false,
++            supports_plaintext_reasoning: false,
+         default_reasoning_summary: ReasoningSummary::Auto,
+         support_verbosity: false,
+         default_verbosity: None,
+diff --git a/codex-rs/core/tests/suite/view_image.rs b/codex-rs/core/tests/suite/view_image.rs
+index 38c2a7d771..f741129ad9 100644
+--- a/codex-rs/core/tests/suite/view_image.rs
++++ b/codex-rs/core/tests/suite/view_image.rs
+@@ -1376,6 +1376,7 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
+         model_messages: None,
+         include_skills_usage_instructions: false,
+         supports_reasoning_summaries: false,
++            supports_plaintext_reasoning: false,
+         default_reasoning_summary: ReasoningSummary::Auto,
+         support_verbosity: false,
+         default_verbosity: None,
+diff --git a/codex-rs/models-manager/src/model_info.rs b/codex-rs/models-manager/src/model_info.rs
+index 75d333efe3..be7d104675 100644
+--- a/codex-rs/models-manager/src/model_info.rs
++++ b/codex-rs/models-manager/src/model_info.rs
+@@ -94,6 +94,7 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
+         model_messages: local_personality_messages_for_slug(slug),
+         include_skills_usage_instructions: false,
+         supports_reasoning_summaries: false,
++            supports_plaintext_reasoning: false,
+         default_reasoning_summary: ReasoningSummary::Auto,
+         support_verbosity: false,
+         default_verbosity: None,
+diff --git a/codex-rs/protocol/src/openai_models.rs b/codex-rs/protocol/src/openai_models.rs
+index 7e7c637aa0..8d549be212 100644
+--- a/codex-rs/protocol/src/openai_models.rs
++++ b/codex-rs/protocol/src/openai_models.rs
+@@ -376,6 +376,8 @@ pub struct ModelInfo {
+     #[serde(default)]
+     pub include_skills_usage_instructions: bool,
+     pub supports_reasoning_summaries: bool,
++    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
++    pub supports_plaintext_reasoning: bool,
+     #[serde(default)]
+     pub default_reasoning_summary: ReasoningSummary,
+     pub support_verbosity: bool,
+@@ -679,6 +681,7 @@ mod tests {
+             model_messages: spec,
+             include_skills_usage_instructions: false,
+             supports_reasoning_summaries: false,
++            supports_plaintext_reasoning: false,
+             default_reasoning_summary: ReasoningSummary::Auto,
+             support_verbosity: false,
+             default_verbosity: None,
+diff --git a/codex-rs/tools/src/tool_config_tests.rs b/codex-rs/tools/src/tool_config_tests.rs
+index af340af6d2..dfaa8319d1 100644
+--- a/codex-rs/tools/src/tool_config_tests.rs
++++ b/codex-rs/tools/src/tool_config_tests.rs
+@@ -29,6 +29,7 @@ fn model_with_shell_type(shell_type: ConfigShellToolType) -> ModelInfo {
+         model_messages: None,
+         include_skills_usage_instructions: false,
+         supports_reasoning_summaries: false,
++            supports_plaintext_reasoning: false,
+         default_reasoning_summary: Default::default(),
+         support_verbosity: false,
+         default_verbosity: None,

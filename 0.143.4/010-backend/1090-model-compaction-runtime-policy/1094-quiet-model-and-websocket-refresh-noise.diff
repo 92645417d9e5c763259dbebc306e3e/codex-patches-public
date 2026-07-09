@@ -1,0 +1,354 @@
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index ac393d3929..9f2359d1d2 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -1959,6 +1959,7 @@ dependencies = [
+  "tokio-tungstenite",
+  "tokio-util",
+  "tracing",
++ "tracing-test",
+  "tungstenite",
+  "url",
+  "wiremock",
+@@ -3608,6 +3609,7 @@ dependencies = [
+  "tempfile",
+  "tokio",
+  "tracing",
++ "tracing-test",
+ ]
+ 
+ [[package]]
+diff --git a/codex-rs/codex-api/Cargo.toml b/codex-rs/codex-api/Cargo.toml
+index 21f6b67425..77c101b0e7 100644
+--- a/codex-rs/codex-api/Cargo.toml
++++ b/codex-rs/codex-api/Cargo.toml
+@@ -37,6 +37,7 @@ pretty_assertions = { workspace = true }
+ tokio-test = { workspace = true }
+ wiremock = { workspace = true }
+ reqwest = { workspace = true }
++tracing-test = { workspace = true, features = ["no-env-filter"] }
+ 
+ [lints]
+ workspace = true
+diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+index 92541c6cd9..21aba29da8 100644
+--- a/codex-rs/codex-api/src/endpoint/responses_websocket.rs
++++ b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+@@ -38,7 +38,6 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+ use tracing::Instrument;
+ use tracing::Span;
+ use tracing::debug;
+-use tracing::error;
+ use tracing::info;
+ use tracing::instrument;
+ use tungstenite::extensions::ExtensionsConfig;
+@@ -469,11 +468,7 @@ async fn connect_websocket(
+         Err(err) => {
+             let err_text = err.to_string();
+             let api_error = map_ws_error(err, &url);
+-            if matches!(api_error, ApiError::ResponseStreamDisconnected { .. }) {
+-                debug!("failed to connect to websocket: {err_text}, url: {url}");
+-            } else {
+-                error!("failed to connect to websocket: {err_text}, url: {url}");
+-            }
++            log_websocket_connect_failure(&err_text, &url);
+             return Err(api_error);
+         }
+     };
+@@ -515,6 +510,10 @@ fn websocket_config() -> WebSocketConfig {
+     config
+ }
+ 
++fn log_websocket_connect_failure(err_text: &str, url: &Url) {
++    debug!("failed to connect to websocket: {err_text}, url: {url}");
++}
++
+ fn map_ws_error(err: WsError, url: &Url) -> ApiError {
+     match err {
+         WsError::Http(response) => {
+@@ -826,6 +825,7 @@ mod tests {
+     use pretty_assertions::assert_eq;
+     use serde_json::json;
+     use std::collections::HashMap;
++    use tracing_test::traced_test;
+ 
+     #[test]
+     fn direct_serialization_preserves_websocket_request_payload() {
+@@ -895,6 +895,25 @@ mod tests {
+         assert_eq!(delay, None);
+     }
+ 
++    #[test]
++    #[traced_test]
++    fn websocket_connect_failure_uses_debug_noise() {
++        let url = Url::parse("wss://chatgpt.com/backend-api/codex/responses").expect("valid URL");
++
++        log_websocket_connect_failure("connection refused", &url);
++
++        logs_assert(|lines: &[&str]| {
++            let logs = lines.join("\n");
++            if !logs.contains("failed to connect to websocket: connection refused") {
++                return Err("missing websocket connection failure debug log".to_string());
++            }
++            if logs.contains("ERROR") && logs.contains("failed to connect to websocket") {
++                return Err("websocket connection failure was logged as error".to_string());
++            }
++            Ok(())
++        });
++    }
++
+     #[test]
+     fn parse_wrapped_websocket_error_event_maps_to_transport_http() {
+         let payload = json!({
+diff --git a/codex-rs/models-manager/Cargo.toml b/codex-rs/models-manager/Cargo.toml
+index 2655bb2e7f..e1241bec76 100644
+--- a/codex-rs/models-manager/Cargo.toml
++++ b/codex-rs/models-manager/Cargo.toml
+@@ -30,3 +30,4 @@ tracing = { workspace = true, features = ["log"] }
+ pretty_assertions = { workspace = true }
+ serde_json = { workspace = true }
+ tempfile = { workspace = true }
++tracing-test = { workspace = true, features = ["no-env-filter"] }
+diff --git a/codex-rs/models-manager/src/manager.rs b/codex-rs/models-manager/src/manager.rs
+index 2a48f98d18..96a7cc5345 100644
+--- a/codex-rs/models-manager/src/manager.rs
++++ b/codex-rs/models-manager/src/manager.rs
+@@ -314,7 +314,7 @@ impl OpenAiModelsManager {
+             .refresh_available_models(refresh_strategy, &http_client_factory)
+             .await
+         {
+-            error!("failed to refresh available models: {err}");
++            debug!("failed to refresh available models: {err}");
+         }
+         ModelsResponse {
+             models: self.get_remote_models().await,
+@@ -333,7 +333,7 @@ impl OpenAiModelsManager {
+             .refresh_available_models(RefreshStrategy::Online, &http_client_factory)
+             .await
+         {
+-            error!("failed to refresh available models: {err}");
++            debug!("failed to refresh available models: {err}");
+         }
+     }
+ 
+@@ -362,6 +362,7 @@ impl OpenAiModelsManager {
+             RefreshStrategy::OnlineIfUncached => {
+                 if self.try_load_any_cache().await {
+                     self.start_background_model_refresh(http_client_factory.clone());
++                    debug!("models refresh: serving cached models before background refresh");
+                     info!("models cache: using local models for OnlineIfUncached");
+                     return Ok(());
+                 }
+@@ -392,6 +393,7 @@ impl OpenAiModelsManager {
+ 
+     fn start_background_model_refresh(&self, http_client_factory: HttpClientFactory) {
+         if self.refresh_in_progress.swap(true, Ordering::AcqRel) {
++            debug!("models refresh: background refresh already running");
+             return;
+         }
+ 
+@@ -402,7 +404,8 @@ impl OpenAiModelsManager {
+         let auth_manager = self.auth_manager.clone();
+         let refresh_in_progress = Arc::clone(&self.refresh_in_progress);
+         tokio::spawn(async move {
+-            if let Err(err) = fetch_and_update_models_inner(
++            debug!("models refresh: background refresh started");
++            match fetch_and_update_models_inner(
+                 endpoint_client,
+                 cache_manager,
+                 remote_models,
+@@ -412,7 +415,8 @@ impl OpenAiModelsManager {
+             )
+             .await
+             {
+-                debug!("failed to refresh models in background: {err}");
++                Ok(()) => debug!("models refresh: background refresh completed"),
++                Err(err) => debug!("models refresh: background refresh failed: {err}"),
+             }
+             refresh_in_progress.store(false, Ordering::Release);
+         });
+@@ -504,6 +508,11 @@ async fn fetch_and_update_models_inner(
+     let (models, etag) = endpoint_client
+         .list_models(&client_version, http_client_factory)
+         .await?;
++    debug!(
++        models_count = models.len(),
++        etag = ?etag,
++        "models refresh: fetched remote models"
++    );
+     apply_remote_models_to(&remote_models, auth_manager.as_ref(), models.clone()).await;
+     *etag_store.write().await = etag.clone();
+     cache_manager
+diff --git a/codex-rs/models-manager/src/manager_tests.rs b/codex-rs/models-manager/src/manager_tests.rs
+index ca63c4fa8e..4396e0e4f5 100644
+--- a/codex-rs/models-manager/src/manager_tests.rs
++++ b/codex-rs/models-manager/src/manager_tests.rs
+@@ -23,6 +23,7 @@ use std::sync::atomic::Ordering;
+ use std::time::Duration;
+ use tempfile::tempdir;
+ use tokio::sync::oneshot;
++use tracing_test::traced_test;
+ 
+ #[path = "model_info_overrides_tests.rs"]
+ mod model_info_overrides_tests;
+@@ -122,6 +123,11 @@ struct BlockingSecondFetchModelsEndpoint {
+     second_fetch_gate: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+ }
+ 
++#[derive(Debug)]
++struct FailingModelsEndpoint {
++    fetch_count: AtomicUsize,
++}
++
+ impl std::fmt::Debug for BlockingSecondFetchModelsEndpoint {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         f.debug_struct("BlockingSecondFetchModelsEndpoint")
+@@ -192,6 +198,18 @@ impl TestModelsEndpoint {
+     }
+ }
+ 
++impl FailingModelsEndpoint {
++    fn new() -> Arc<Self> {
++        Arc::new(Self {
++            fetch_count: AtomicUsize::new(0),
++        })
++    }
++
++    fn fetch_count(&self) -> usize {
++        self.fetch_count.load(Ordering::SeqCst)
++    }
++}
++
+ #[derive(Debug)]
+ struct TestExternalApiKeyAuth;
+ 
+@@ -280,6 +298,26 @@ impl ModelsEndpointClient for BlockingSecondFetchModelsEndpoint {
+     }
+ }
+ 
++impl ModelsEndpointClient for FailingModelsEndpoint {
++    fn has_command_auth(&self) -> bool {
++        false
++    }
++
++    fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool> {
++        Box::pin(async { true })
++    }
++
++    fn list_models<'a>(
++        &'a self,
++        _client_version: &'a str,
++    ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
++        Box::pin(async move {
++            self.fetch_count.fetch_add(1, Ordering::SeqCst);
++            Err(codex_protocol::error::CodexErr::Timeout)
++        })
++    }
++}
++
+ fn openai_manager_for_tests(
+     codex_home: std::path::PathBuf,
+     endpoint_client: Arc<dyn ModelsEndpointClient>,
+@@ -840,6 +878,33 @@ async fn refresh_available_models_uses_stale_cache_without_refetching() {
+ }
+ 
+ #[tokio::test]
++#[traced_test]
++async fn foreground_model_refresh_failure_uses_debug_noise() {
++    let codex_home = tempdir().expect("temp dir");
++    let endpoint = FailingModelsEndpoint::new();
++    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
++
++    let catalog = manager.raw_model_catalog(RefreshStrategy::Online).await;
++
++    assert_eq!(endpoint.fetch_count(), 1);
++    assert!(
++        !catalog.models.is_empty(),
++        "foreground refresh failure should preserve existing bundled models"
++    );
++    logs_assert(|lines: &[&str]| {
++        let logs = lines.join("\n");
++        if !logs.contains("failed to refresh available models") {
++            return Err("missing foreground refresh failure debug log".to_string());
++        }
++        if logs.contains("ERROR") && logs.contains("failed to refresh available models") {
++            return Err("foreground refresh failure was logged as error".to_string());
++        }
++        Ok(())
++    });
++}
++
++#[tokio::test]
++#[traced_test]
+ async fn refresh_available_models_uses_version_mismatched_cache_without_blocking() {
+     let initial_models = vec![remote_model("old", "Old", /*priority*/ 1)];
+     let codex_home = tempdir().expect("temp dir");
+@@ -880,6 +945,68 @@ async fn refresh_available_models_uses_version_mismatched_cache_without_blocking
+         .send(())
+         .expect("background fetch should still be waiting");
+     wait_for_models_to_contain(&manager, &updated_models).await;
++
++    logs_assert(|lines: &[&str]| {
++        let logs = lines.join("\n");
++        if !logs.contains("models refresh: serving cached models before background refresh") {
++            return Err("missing cached-startup debug log".to_string());
++        }
++        if !logs.contains("models refresh: background refresh completed") {
++            return Err("missing background refresh completion debug log".to_string());
++        }
++        Ok(())
++    });
++}
++
++#[tokio::test]
++#[traced_test]
++async fn background_refresh_failure_uses_debug_noise_after_cache_hit() {
++    let cached_models = vec![remote_model(
++        "cached-timeout",
++        "Cached Timeout",
++        /*priority*/ 1,
++    )];
++    let codex_home = tempdir().expect("temp dir");
++    let endpoint = FailingModelsEndpoint::new();
++    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
++    manager
++        .cache_manager
++        .persist_cache(
++            &cached_models,
++            None,
++            format!("{}-mismatch", crate::client_version_to_whole()),
++        )
++        .await;
++
++    tokio::time::timeout(
++        Duration::from_millis(100),
++        manager.refresh_available_models(RefreshStrategy::OnlineIfUncached),
++    )
++    .await
++    .expect("cache hit should return before background refresh completes")
++    .expect("cached refresh succeeds");
++    assert_models_contain(&manager.get_remote_models().await, &cached_models);
++    tokio::time::timeout(Duration::from_secs(1), async {
++        loop {
++            if endpoint.fetch_count() >= 1 && !manager.refresh_in_progress.load(Ordering::Acquire) {
++                break;
++            }
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .expect("timed out waiting for background refresh failure");
++
++    logs_assert(|lines: &[&str]| {
++        let logs = lines.join("\n");
++        if !logs.contains("models refresh: background refresh failed") {
++            return Err("missing background refresh failure debug log".to_string());
++        }
++        if logs.contains("ERROR") && logs.contains("models refresh: background refresh failed") {
++            return Err("background refresh failure was logged as error".to_string());
++        }
++        Ok(())
++    });
+ }
+ 
+ #[tokio::test]

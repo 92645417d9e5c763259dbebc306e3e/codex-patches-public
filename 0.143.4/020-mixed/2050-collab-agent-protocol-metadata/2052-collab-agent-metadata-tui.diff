@@ -1,0 +1,345 @@
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index b6d8e7cfd3..e664816b0a 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -1073,6 +1073,8 @@ See the Codex keymap documentation for supported actions and examples."
+         let initial_session_started_at = Instant::now();
+         if let Some(started) = initial_started_thread {
+             let thread_id = started.session.thread_id;
++            app.primary_thread_id = Some(thread_id);
++            app.backfill_loaded_subagent_threads(&mut app_server).await;
+             app.enqueue_primary_thread_session(started.session, started.turns)
+                 .await?;
+             if should_prompt_for_paused_goal_after_startup_resume {
+diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
+index 4fdd6fa0cf..127ba8da8c 100644
+--- a/codex-rs/tui/src/app/session_lifecycle.rs
++++ b/codex-rs/tui/src/app/session_lifecycle.rs
+@@ -618,9 +618,10 @@ impl App {
+             initial_user_message,
+         );
+         self.replace_chat_widget(ChatWidget::new_with_app_event(init));
++        self.primary_thread_id = Some(started.session.thread_id);
++        self.backfill_loaded_subagent_threads(app_server).await;
+         self.enqueue_primary_thread_session(started.session, started.turns)
+             .await?;
+-        self.backfill_loaded_subagent_threads(app_server).await;
+         Ok(())
+     }
+ 
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index 72cfd5145d..78e36bec74 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -1180,6 +1180,65 @@ async fn collab_receiver_notification_caches_thread_without_app_server_read() {
+     );
+ }
+ 
++#[tokio::test]
++async fn collab_receiver_notification_renders_metadata_without_app_server_read() {
++    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
++    let receiver_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000126").expect("valid thread id");
++
++    app.handle_thread_event_now(ThreadBufferedEvent::Notification(
++        ServerNotification::ItemStarted(ItemStartedNotification {
++            thread_id: ThreadId::new().to_string(),
++            turn_id: "turn-1".to_string(),
++            started_at_ms: 0,
++            item: ThreadItem::CollabAgentToolCall {
++                id: "wait-1".to_string(),
++                tool: codex_app_server_protocol::CollabAgentTool::Wait,
++                status: codex_app_server_protocol::CollabAgentToolCallStatus::InProgress,
++                sender_thread_id: ThreadId::new().to_string(),
++                receiver_thread_ids: vec![receiver_thread_id.to_string()],
++                prompt: None,
++                model: None,
++                reasoning_effort: None,
++                agents_states: HashMap::from([(
++                    receiver_thread_id.to_string(),
++                    codex_app_server_protocol::CollabAgentState {
++                        status: codex_app_server_protocol::CollabAgentStatus::Running,
++                        message: None,
++                        agent_nickname: Some("Scout".to_string()),
++                        agent_role: Some("explorer".to_string()),
++                    },
++                )]),
++            },
++        }),
++    ));
++
++    assert_eq!(
++        app.agent_navigation.get(&receiver_thread_id),
++        Some(&AgentPickerThreadEntry {
++            agent_nickname: Some("Scout".to_string()),
++            agent_role: Some("explorer".to_string()),
++            agent_path: None,
++            is_running: false,
++            is_closed: false,
++        })
++    );
++
++    let mut rendered_cells = Vec::new();
++    while let Ok(event) = app_event_rx.try_recv() {
++        if let AppEvent::InsertHistoryCell(cell) = event {
++            rendered_cells.push(lines_to_single_string(&cell.transcript_lines(/*width*/ 80)));
++        }
++    }
++
++    assert!(
++        rendered_cells
++            .iter()
++            .any(|cell| cell.contains("Waiting for Scout [explorer]")),
++        "expected cached metadata in rendered collab row, got {rendered_cells:?}"
++    );
++}
++
+ #[tokio::test]
+ async fn collab_receiver_notification_does_not_cache_not_found_thread() {
+     let mut app = make_test_app().await;
+@@ -1205,6 +1264,8 @@ async fn collab_receiver_notification_does_not_cache_not_found_thread() {
+                     codex_app_server_protocol::CollabAgentState {
+                         status: codex_app_server_protocol::CollabAgentStatus::NotFound,
+                         message: None,
++                        agent_nickname: None,
++                        agent_role: None,
+                     },
+                 )]),
+             },
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+index bb317d3fc9..d04e82e388 100644
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -13,6 +13,31 @@ pub(super) enum ThreadRollbackOrigin {
+     SafetyBufferingRetry,
+ }
+ 
++fn collab_receiver_metadata(
++    notification: &ServerNotification,
++    receiver_thread_id: &str,
++) -> (Option<String>, Option<String>) {
++    let state = match notification {
++        ServerNotification::ItemStarted(notification) => match &notification.item {
++            ThreadItem::CollabAgentToolCall { agents_states, .. } => {
++                agents_states.get(receiver_thread_id)
++            }
++            _ => None,
++        },
++        ServerNotification::ItemCompleted(notification) => match &notification.item {
++            ThreadItem::CollabAgentToolCall { agents_states, .. } => {
++                agents_states.get(receiver_thread_id)
++            }
++            _ => None,
++        },
++        _ => None,
++    };
++
++    state
++        .map(|state| (state.agent_nickname.clone(), state.agent_role.clone()))
++        .unwrap_or_default()
++}
++
+ impl App {
+     pub(super) async fn shutdown_current_thread(&mut self, app_server: &mut AppServerSession) {
+         if let Some(thread_id) = self.chat_widget.thread_id() {
+@@ -979,14 +1004,15 @@ impl App {
+                 continue;
+             };
+ 
+-            if self.agent_navigation.get(&thread_id).is_some() {
+-                continue;
+-            }
++            let existing_entry = self.agent_navigation.get(&thread_id).cloned();
++            let (agent_nickname, agent_role) =
++                collab_receiver_metadata(notification, receiver_thread_id);
++            let agent_nickname =
++                agent_nickname.or_else(|| existing_entry.as_ref()?.agent_nickname.clone());
++            let agent_role = agent_role.or_else(|| existing_entry.as_ref()?.agent_role.clone());
++            let is_closed = existing_entry.is_some_and(|entry| entry.is_closed);
+ 
+-            self.upsert_agent_picker_thread(
+-                thread_id, /*agent_nickname*/ None, /*agent_role*/ None,
+-                /*is_closed*/ false,
+-            );
++            self.upsert_agent_picker_thread(thread_id, agent_nickname, agent_role, is_closed);
+         }
+     }
+ 
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index 1650461774..eae9ef008f 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -450,6 +450,8 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
+                     AppServerCollabAgentState {
+                         status: AppServerCollabAgentStatus::PendingInit,
+                         message: None,
++                        agent_nickname: None,
++                        agent_role: None,
+                     },
+                 )]),
+             },
+@@ -849,6 +851,8 @@ async fn live_app_server_collab_wait_items_render_history() {
+                         AppServerCollabAgentState {
+                             status: AppServerCollabAgentStatus::Completed,
+                             message: Some("Done".to_string()),
++                            agent_nickname: None,
++                            agent_role: None,
+                         },
+                     ),
+                     (
+@@ -856,6 +860,8 @@ async fn live_app_server_collab_wait_items_render_history() {
+                         AppServerCollabAgentState {
+                             status: AppServerCollabAgentStatus::Running,
+                             message: None,
++                            agent_nickname: None,
++                            agent_role: None,
+                         },
+                     ),
+                 ]),
+@@ -919,6 +925,8 @@ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effo
+                     AppServerCollabAgentState {
+                         status: AppServerCollabAgentStatus::PendingInit,
+                         message: None,
++                        agent_nickname: None,
++                        agent_role: None,
+                     },
+                 )]),
+             },
+diff --git a/codex-rs/tui/src/multi_agents.rs b/codex-rs/tui/src/multi_agents.rs
+index da776fc9eb..2ba6589088 100644
+--- a/codex-rs/tui/src/multi_agents.rs
++++ b/codex-rs/tui/src/multi_agents.rs
+@@ -443,10 +443,14 @@ fn resume_end(
+     fallback_error: &str,
+     agent_metadata: &mut impl FnMut(ThreadId) -> AgentMetadata,
+ ) -> PlainHistoryCell {
++    let metadata = match status {
++        Some(status) => metadata_with_state(agent_metadata(receiver_thread_id), status),
++        None => agent_metadata(receiver_thread_id),
++    };
+     collab_event(
+         title_with_agent(
+             "Resumed",
+-            agent_label(receiver_thread_id, &agent_metadata(receiver_thread_id)),
++            agent_label(receiver_thread_id, &metadata),
+             /*spawn_request*/ None,
+         ),
+         vec![status_summary_line(status, fallback_error)],
+@@ -566,7 +570,11 @@ fn wait_complete_lines(
+             let parsed_thread_id = parse_thread_id(thread_id)?;
+             let status = agents_states.get(thread_id)?;
+             seen.insert(parsed_thread_id);
+-            Some((parsed_thread_id, agent_metadata(parsed_thread_id), status))
++            Some((
++                parsed_thread_id,
++                metadata_with_state(agent_metadata(parsed_thread_id), status),
++                status,
++            ))
+         })
+         .collect::<Vec<_>>();
+ 
+@@ -574,8 +582,13 @@ fn wait_complete_lines(
+         .iter()
+         .filter_map(|(thread_id, status)| {
+             let parsed_thread_id = parse_thread_id(thread_id)?;
+-            (!seen.contains(&parsed_thread_id))
+-                .then(|| (parsed_thread_id, agent_metadata(parsed_thread_id), status))
++            (!seen.contains(&parsed_thread_id)).then(|| {
++                (
++                    parsed_thread_id,
++                    metadata_with_state(agent_metadata(parsed_thread_id), status),
++                    status,
++                )
++            })
+         })
+         .collect::<Vec<_>>();
+     extras.sort_by_key(|entry| entry.0.to_string());
+@@ -596,6 +609,16 @@ fn wait_complete_lines(
+     }
+ }
+ 
++fn metadata_with_state(mut metadata: AgentMetadata, status: &CollabAgentState) -> AgentMetadata {
++    if metadata.agent_nickname.is_none() {
++        metadata.agent_nickname = status.agent_nickname.clone();
++    }
++    if metadata.agent_role.is_none() {
++        metadata.agent_role = status.agent_role.clone();
++    }
++    metadata
++}
++
+ fn first_agent_state<'a>(
+     receiver_thread_ids: &[String],
+     agents_states: &'a std::collections::HashMap<String, CollabAgentState>,
+@@ -882,6 +905,40 @@ mod tests {
+         assert_eq!(title.spans[6].style.fg, Some(Color::Magenta));
+     }
+ 
++    #[test]
++    fn wait_complete_uses_agent_state_metadata_when_cache_is_empty() {
++        let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
++            .expect("valid sender thread id");
++        let robie_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
++            .expect("valid robie thread id");
++        let cell = tool_call_history_cell(
++            &ThreadItem::CollabAgentToolCall {
++                id: "call-wait".to_string(),
++                tool: CollabAgentTool::Wait,
++                status: CollabAgentToolCallStatus::Completed,
++                sender_thread_id: sender_thread_id.to_string(),
++                receiver_thread_ids: vec![robie_id.to_string()],
++                prompt: None,
++                model: None,
++                reasoning_effort: None,
++                agents_states: HashMap::from([(
++                    robie_id.to_string(),
++                    CollabAgentState {
++                        status: CollabAgentStatus::Running,
++                        message: None,
++                        agent_nickname: Some("Ohm".to_string()),
++                        agent_role: Some("hephaestus".to_string()),
++                    },
++                )]),
++            },
++            /*cached_spawn_request*/ None,
++            |_thread_id| AgentMetadata::default(),
++        )
++        .expect("wait item renders");
++
++        assert!(cell_to_text(&cell).contains("Ohm [hephaestus]: Running"));
++    }
++
+     #[test]
+     fn collab_resume_interrupted_snapshot() {
+         let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
+@@ -916,6 +973,8 @@ mod tests {
+         CollabAgentState {
+             status,
+             message: message.map(str::to_string),
++            agent_nickname: None,
++            agent_role: None,
+         }
+     }
+ 
+diff --git a/codex-rs/tui/src/snapshots/codex_tui__app__tests__clear_ui_after_long_transcript_fresh_header_only.snap b/codex-rs/tui/src/snapshots/codex_tui__app__tests__clear_ui_after_long_transcript_fresh_header_only.snap
+index 1363059f6f..47daa4136a 100644
+--- a/codex-rs/tui/src/snapshots/codex_tui__app__tests__clear_ui_after_long_transcript_fresh_header_only.snap
++++ b/codex-rs/tui/src/snapshots/codex_tui__app__tests__clear_ui_after_long_transcript_fresh_header_only.snap
+@@ -1,5 +1,5 @@
+ ---
+-source: tui/src/app.rs
++source: tui/src/app/tests.rs
+ expression: rendered
+ ---
+ ┌─────────────────────────────────────────────┐
+diff --git a/codex-rs/tui/src/snapshots/codex_tui__app__tests__clear_ui_header_fast_status_fast_capable_models.snap b/codex-rs/tui/src/snapshots/codex_tui__app__tests__clear_ui_header_fast_status_fast_capable_models.snap
+index 0f3edbe381..841376c94f 100644
+--- a/codex-rs/tui/src/snapshots/codex_tui__app__tests__clear_ui_header_fast_status_fast_capable_models.snap
++++ b/codex-rs/tui/src/snapshots/codex_tui__app__tests__clear_ui_header_fast_status_fast_capable_models.snap
+@@ -1,5 +1,5 @@
+ ---
+-source: tui/src/app.rs
++source: tui/src/app/tests.rs
+ expression: rendered
+ ---
+ ┌────────────────────────────────────────────────────┐

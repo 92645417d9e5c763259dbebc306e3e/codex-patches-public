@@ -1,0 +1,414 @@
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index d280790bdc..707ffe1a02 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -635,6 +635,7 @@ pub(crate) struct ChatWidget {
+     reasoning_buffer: String,
+     // Accumulates full reasoning content for transcript-only recording
+     full_reasoning_buffer: String,
++    reasoning_summary_index: Option<i64>,
+     status_state: StatusState,
+     review: ReviewState,
+     // Active hook runs render in a dedicated live cell so they can run alongside tools.
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 56ba30b68a..f443db91e1 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -180,6 +180,7 @@ impl ChatWidget {
+             interrupts: InterruptManager::new(),
+             reasoning_buffer: String::new(),
+             full_reasoning_buffer: String::new(),
++            reasoning_summary_index: None,
+             status_state: StatusState::default(),
+             review: ReviewState::default(),
+             active_hook_cell: None,
+diff --git a/codex-rs/tui/src/chatwidget/input_flow.rs b/codex-rs/tui/src/chatwidget/input_flow.rs
+index e100f69282..4b36eca408 100644
+--- a/codex-rs/tui/src/chatwidget/input_flow.rs
++++ b/codex-rs/tui/src/chatwidget/input_flow.rs
+@@ -39,6 +39,7 @@ impl ChatWidget {
+                     // Reset any reasoning header only when we are actually submitting a turn.
+                     self.reasoning_buffer.clear();
+                     self.full_reasoning_buffer.clear();
++                    self.reasoning_summary_index = None;
+                     self.set_status_header(String::from("Working"));
+                     self.submit_user_message_with_user_prompt_submit_hook(
+                         user_message,
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index 498a016414..d14f3897c6 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -78,14 +78,19 @@ impl ChatWidget {
+             }
+             ServerNotification::PlanDelta(notification) => self.on_plan_delta(notification.delta),
+             ServerNotification::ReasoningSummaryTextDelta(notification) => {
+-                self.on_agent_reasoning_delta(notification.delta);
++                self.on_agent_reasoning_summary_delta(
++                    notification.delta,
++                    notification.summary_index,
++                );
+             }
+             ServerNotification::ReasoningTextDelta(notification) => {
+                 if self.config.show_raw_agent_reasoning {
+                     self.on_agent_reasoning_delta(notification.delta);
+                 }
+             }
+-            ServerNotification::ReasoningSummaryPartAdded(_) => self.on_reasoning_section_break(),
++            ServerNotification::ReasoningSummaryPartAdded(notification) => {
++                self.on_reasoning_section_break(notification.summary_index);
++            }
+             ServerNotification::TerminalInteraction(notification) => {
+                 self.on_terminal_interaction(notification.process_id, notification.stdin)
+             }
+diff --git a/codex-rs/tui/src/chatwidget/replay.rs b/codex-rs/tui/src/chatwidget/replay.rs
+index 45a882a81b..d725be05b2 100644
+--- a/codex-rs/tui/src/chatwidget/replay.rs
++++ b/codex-rs/tui/src/chatwidget/replay.rs
+@@ -113,8 +113,8 @@ impl ChatWidget {
+                 summary, content, ..
+             } => {
+                 if from_replay {
+-                    for delta in summary {
+-                        self.on_agent_reasoning_delta(delta);
++                    for (summary_index, delta) in summary.into_iter().enumerate() {
++                        self.on_agent_reasoning_summary_delta(delta, summary_index as i64);
+                     }
+                     if self.config.show_raw_agent_reasoning {
+                         for delta in content {
+diff --git a/codex-rs/tui/src/chatwidget/slash_dispatch.rs b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+index 2d4afd2b39..81920b7276 100644
+--- a/codex-rs/tui/src/chatwidget/slash_dispatch.rs
++++ b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+@@ -742,6 +742,7 @@ impl ChatWidget {
+                 if self.is_session_configured() {
+                     self.reasoning_buffer.clear();
+                     self.full_reasoning_buffer.clear();
++                    self.reasoning_summary_index = None;
+                     self.set_status_header(String::from("Working"));
+                     self.submit_user_message(user_message);
+                 } else {
+diff --git a/codex-rs/tui/src/chatwidget/streaming.rs b/codex-rs/tui/src/chatwidget/streaming.rs
+index c83d212bca..5951b2f051 100644
+--- a/codex-rs/tui/src/chatwidget/streaming.rs
++++ b/codex-rs/tui/src/chatwidget/streaming.rs
+@@ -236,6 +236,17 @@ impl ChatWidget {
+         self.request_redraw();
+     }
+ 
++    pub(super) fn on_agent_reasoning_summary_delta(&mut self, delta: String, summary_index: i64) {
++        if self.reasoning_summary_index != Some(summary_index) {
++            if self.reasoning_summary_index.is_some() {
++                self.on_reasoning_section_break(summary_index);
++            } else {
++                self.reasoning_summary_index = Some(summary_index);
++            }
++        }
++        self.on_agent_reasoning_delta(delta);
++    }
++
+     pub(super) fn on_agent_reasoning_final(&mut self) {
+         // At the end of a reasoning block, record transcript-only content.
+         self.full_reasoning_buffer.push_str(&self.reasoning_buffer);
+@@ -248,14 +259,21 @@ impl ChatWidget {
+         }
+         self.reasoning_buffer.clear();
+         self.full_reasoning_buffer.clear();
++        self.reasoning_summary_index = None;
+         self.request_redraw();
+     }
+ 
+-    pub(super) fn on_reasoning_section_break(&mut self) {
++    pub(super) fn on_reasoning_section_break(&mut self, summary_index: i64) {
++        if self.reasoning_summary_index == Some(summary_index) && self.reasoning_buffer.is_empty() {
++            return;
++        }
+         // Start a new reasoning block for header extraction and accumulate transcript.
+-        self.full_reasoning_buffer.push_str(&self.reasoning_buffer);
+-        self.full_reasoning_buffer.push_str("\n\n");
++        if !self.reasoning_buffer.is_empty() {
++            self.full_reasoning_buffer.push_str(&self.reasoning_buffer);
++            self.full_reasoning_buffer.push_str("\n\n");
++        }
+         self.reasoning_buffer.clear();
++        self.reasoning_summary_index = Some(summary_index);
+     }
+ 
+     fn mark_interrupted_streams_for_retry(&mut self) {
+diff --git a/codex-rs/tui/src/chatwidget/tests/history_replay.rs b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
+index 9306553441..faf9ddf520 100644
+--- a/codex-rs/tui/src/chatwidget/tests/history_replay.rs
++++ b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
+@@ -941,6 +941,60 @@ async fn replayed_reasoning_item_hides_raw_reasoning_when_disabled() {
+     assert!(!rendered.contains("Raw reasoning"));
+ }
+ 
++#[tokio::test]
++async fn replayed_reasoning_summary_parts_render_as_separate_sections() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.config.show_raw_agent_reasoning = false;
++    chat.handle_thread_session(crate::session_state::ThreadSessionState {
++        thread_id: ThreadId::new(),
++        forked_from_id: None,
++        fork_parent_title: None,
++        thread_name: None,
++        model: "test-model".to_string(),
++        model_provider_id: "test-provider".to_string(),
++        service_tier: None,
++        approval_policy: AskForApproval::Never,
++        approvals_reviewer: ApprovalsReviewer::User,
++        permission_profile: PermissionProfile::read_only(),
++        active_permission_profile: None,
++        cwd: test_project_path().abs(),
++        runtime_workspace_roots: Vec::new(),
++        instruction_source_paths: Vec::new(),
++        reasoning_effort: None,
++        collaboration_mode: None,
++        personality: None,
++        message_history: None,
++        network_proxy: None,
++        rollout_path: None,
++    });
++    let _ = drain_insert_history(&mut rx);
++
++    chat.replay_thread_item(
++        AppServerThreadItem::Reasoning {
++            id: "reasoning-1".to_string(),
++            summary: vec![
++                "**Planning resolution execution**\n\nRecord the baseline.".to_string(),
++                "**Continuing workflow steps**\n\nClose the loop.".to_string(),
++            ],
++            content: Vec::new(),
++        },
++        "turn-1".to_string(),
++        ReplayKind::ThreadSnapshot,
++    );
++
++    let rendered = match rx.try_recv() {
++        Ok(AppEvent::InsertHistoryCell(cell)) => {
++            lines_to_single_string(&cell.transcript_lines(/*width*/ 80))
++        }
++        other => panic!("expected InsertHistoryCell, got {other:?}"),
++    };
++    assert!(rendered.contains("Planning resolution execution"));
++    assert!(rendered.contains("Continuing workflow steps"));
++    assert!(rendered.contains("Record the baseline."));
++    assert!(rendered.contains("Close the loop."));
++    assert!(!rendered.contains("baseline.Close"));
++}
++
+ #[tokio::test]
+ async fn replayed_reasoning_item_shows_raw_reasoning_when_enabled() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+@@ -1074,6 +1128,80 @@ async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
+     assert_eq!(rendered.matches("Summary only").count(), 1);
+ }
+ 
++#[tokio::test]
++async fn live_reasoning_summary_sections_render_titles_on_separate_lines() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.show_welcome_banner = false;
++
++    chat.handle_server_notification(
++        ServerNotification::TurnStarted(TurnStartedNotification {
++            thread_id: "thread-1".to_string(),
++            turn: AppServerTurn {
++                id: "turn-1".to_string(),
++                items_view: codex_app_server_protocol::TurnItemsView::Full,
++                items: Vec::new(),
++                status: AppServerTurnStatus::InProgress,
++                error: None,
++                started_at: Some(0),
++                completed_at: None,
++                duration_ms: None,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++    let _ = drain_insert_history(&mut rx);
++
++    for (summary_index, delta) in [
++        (
++            0,
++            "**Planning resolution execution**\n\nRecord the baseline.".to_string(),
++        ),
++        (
++            1,
++            "**Continuing workflow steps**\n\nClose the loop.".to_string(),
++        ),
++    ] {
++        chat.handle_server_notification(
++            ServerNotification::ReasoningSummaryTextDelta(ReasoningSummaryTextDeltaNotification {
++                thread_id: "thread-1".to_string(),
++                turn_id: "turn-1".to_string(),
++                item_id: "reasoning-1".to_string(),
++                delta,
++                summary_index,
++            }),
++            /*replay_kind*/ None,
++        );
++    }
++
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            completed_at_ms: 0,
++            item: AppServerThreadItem::Reasoning {
++                id: "reasoning-1".to_string(),
++                summary: vec![
++                    "**Planning resolution execution**\n\nRecord the baseline.".to_string(),
++                    "**Continuing workflow steps**\n\nClose the loop.".to_string(),
++                ],
++                content: Vec::new(),
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++
++    let rendered = match rx.try_recv() {
++        Ok(AppEvent::InsertHistoryCell(cell)) => {
++            lines_to_single_string(&cell.transcript_lines(/*width*/ 80))
++        }
++        other => panic!("expected InsertHistoryCell, got {other:?}"),
++    };
++    assert!(rendered.contains("Continuing workflow steps"));
++    assert!(rendered.contains("Record the baseline."));
++    assert!(rendered.contains("Close the loop."));
++    assert!(!rendered.contains("baseline.Close"));
++}
++
+ #[tokio::test]
+ async fn thread_snapshot_replayed_turn_started_marks_task_running() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+index e6a34ee2b4..c534a8202a 100644
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -82,6 +82,7 @@ impl ChatWidget {
+         }
+         self.full_reasoning_buffer.clear();
+         self.reasoning_buffer.clear();
++        self.reasoning_summary_index = None;
+         self.set_ambient_pet_notification(
+             crate::pets::PetNotificationKind::Running,
+             /*body*/ None,
+diff --git a/codex-rs/tui/src/history_cell/messages.rs b/codex-rs/tui/src/history_cell/messages.rs
+index d81c38c235..a2755ac1d8 100644
+--- a/codex-rs/tui/src/history_cell/messages.rs
++++ b/codex-rs/tui/src/history_cell/messages.rs
+@@ -506,16 +506,10 @@ pub(crate) fn new_reasoning_summary_block(
+         let after_open = &full_reasoning_buffer[(open + 2)..];
+         if let Some(close) = after_open.find("**") {
+             let after_close_idx = open + 2 + close + 2;
+-            // if we don't have anything beyond `after_close_idx`
+-            // then we don't have a summary to inject into history
+             if after_close_idx < full_reasoning_buffer.len() {
+-                let header_buffer = full_reasoning_buffer[..after_close_idx].to_string();
+-                let summary_buffer = full_reasoning_buffer[after_close_idx..].to_string();
+-                // Preserve the session cwd so local file links render the same way in the
+-                // collapsed reasoning block as they did while streaming live content.
+                 return Box::new(ReasoningSummaryCell::new(
+-                    header_buffer,
+-                    summary_buffer,
++                    String::new(),
++                    full_reasoning_buffer.to_string(),
+                     &cwd,
+                     /*transcript_only*/ false,
+                 ));
+@@ -523,7 +517,7 @@ pub(crate) fn new_reasoning_summary_block(
+         }
+     }
+     Box::new(ReasoningSummaryCell::new(
+-        "".to_string(),
++        String::new(),
+         full_reasoning_buffer.to_string(),
+         &cwd,
+         /*transcript_only*/ true,
+diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
+index 58c8d057bc..efd599a6c5 100644
+--- a/codex-rs/tui/src/history_cell/tests.rs
++++ b/codex-rs/tui/src/history_cell/tests.rs
+@@ -2297,10 +2297,24 @@ fn reasoning_summary_block() {
+     );
+ 
+     let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
+-    assert_eq!(rendered_display, vec!["■ Detailed reasoning goes here."]);
++    assert_eq!(
++        rendered_display,
++        vec![
++            "■ High level reasoning",
++            "  ",
++            "  Detailed reasoning goes here."
++        ]
++    );
+ 
+     let rendered_transcript = render_transcript(cell.as_ref());
+-    assert_eq!(rendered_transcript, vec!["■ Detailed reasoning goes here."]);
++    assert_eq!(
++        rendered_transcript,
++        vec![
++            "■ High level reasoning",
++            "  ",
++            "  Detailed reasoning goes here."
++        ]
++    );
+ }
+ 
+ #[test]
+@@ -2368,7 +2382,14 @@ async fn reasoning_summary_block_respects_config_overrides() {
+     );
+ 
+     let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
+-    assert_eq!(rendered_display, vec!["■ Detailed reasoning goes here."]);
++    assert_eq!(
++        rendered_display,
++        vec![
++            "■ High level reasoning",
++            "  ",
++            "  Detailed reasoning goes here."
++        ]
++    );
+ }
+ 
+ #[test]
+@@ -2409,10 +2430,38 @@ fn reasoning_summary_block_splits_header_and_summary_when_present() {
+     );
+ 
+     let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
+-    assert_eq!(rendered_display, vec!["■ We should fix the bug next."]);
++    assert_eq!(
++        rendered_display,
++        vec!["■ High level plan", "  ", "  We should fix the bug next."]
++    );
+ 
+     let rendered_transcript = render_transcript(cell.as_ref());
+-    assert_eq!(rendered_transcript, vec!["■ We should fix the bug next."]);
++    assert_eq!(
++        rendered_transcript,
++        vec!["■ High level plan", "  ", "  We should fix the bug next."]
++    );
++}
++
++#[test]
++fn reasoning_summary_block_keeps_each_section_header_on_its_own_line() {
++    let cell = new_reasoning_summary_block(
++        "**First title**\n\nFirst summary.\n\n**Second title**\n\nSecond summary.".to_string(),
++        &test_cwd(),
++    );
++
++    let rendered_transcript = render_transcript(cell.as_ref());
++    assert_eq!(
++        rendered_transcript,
++        vec![
++            "■ First title",
++            "  ",
++            "  First summary.",
++            "  ",
++            "  Second title",
++            "  ",
++            "  Second summary.",
++        ]
++    );
+ }
+ 
+ #[test]

@@ -1,0 +1,285 @@
+diff --git a/codex-rs/app-server/tests/common/test_app_server.rs b/codex-rs/app-server/tests/common/test_app_server.rs
+index 825ea46ab8..5257280807 100644
+--- a/codex-rs/app-server/tests/common/test_app_server.rs
++++ b/codex-rs/app-server/tests/common/test_app_server.rs
+@@ -235,6 +235,7 @@ impl TestAppServer {
+         cmd.stderr(Stdio::piped());
+         cmd.current_dir(codex_home);
+         cmd.env("CODEX_HOME", codex_home);
++        cmd.env("CODEX_SQLITE_HOME", codex_home);
+         cmd.env("RUST_LOG", "warn");
+         // Keep integration tests isolated from host managed configuration.
+         cmd.env(
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+index 04d59c24ab..a062c1b884 100644
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -2027,8 +2027,12 @@ async fn run_debug_clear_memories_command(
+         .await?;
+ 
+     let memories_path = memories_db_path(config.sqlite_home.as_path());
+-    let cleared_memories_db =
++    let mut cleared_memories_db =
+         StateRuntime::clear_memory_data_in_sqlite_home(config.sqlite_home.as_path()).await?;
++    if config.sqlite_home.as_path() != config.codex_home.as_path() {
++        cleared_memories_db |=
++            StateRuntime::clear_memory_data_in_sqlite_home(config.codex_home.as_path()).await?;
++    }
+ 
+     clear_memory_roots_contents(&config.codex_home).await?;
+ 
+diff --git a/codex-rs/config/src/config_toml.rs b/codex-rs/config/src/config_toml.rs
+index 823d59c0bc..0b4d63f317 100644
+--- a/codex-rs/config/src/config_toml.rs
++++ b/codex-rs/config/src/config_toml.rs
+@@ -322,7 +322,7 @@ pub struct ConfigToml {
+     pub history: Option<History>,
+ 
+     /// Directory where Codex stores the SQLite state DB.
+-    /// Defaults to `$CODEX_SQLITE_HOME` when set. Otherwise uses `$CODEX_HOME`.
++    /// Defaults to `$CODEX_SQLITE_HOME` when set. Otherwise uses the Codex system temp root.
+     pub sqlite_home: Option<AbsolutePathBuf>,
+ 
+     /// Directory where Codex writes log files. Setting this value explicitly
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+index fb4d8740ba..0d22f347fb 100644
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -5479,7 +5479,7 @@
+           "$ref": "#/definitions/AbsolutePathBuf"
+         }
+       ],
+-      "description": "Directory where Codex stores the SQLite state DB. Defaults to `$CODEX_SQLITE_HOME` when set. Otherwise uses `$CODEX_HOME`."
++      "description": "Directory where Codex stores the SQLite state DB. Defaults to `$CODEX_SQLITE_HOME` when set. Otherwise uses the Codex system temp root."
+     },
+     "suppress_unstable_features_warning": {
+       "description": "Suppress warnings about unstable (under development) features.",
+@@ -5535,4 +5535,4 @@
+   },
+   "title": "ConfigToml",
+   "type": "object"
+-}
+\ No newline at end of file
++}
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index 8a16c3ee9a..9928d88873 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -108,6 +108,7 @@ use pretty_assertions::assert_eq;
+ use rmcp::model::ElicitationCapability;
+ use rmcp::model::FormElicitationCapability;
+ use rmcp::model::UrlElicitationCapability;
++use serial_test::serial;
+ 
+ use codex_config::test_support::CloudConfigBundleFixture;
+ use std::collections::BTreeMap;
+@@ -147,6 +148,32 @@ fn stdio_mcp_with_args(command: &str, args: &[&str]) -> McpServerConfig {
+     }
+ }
+ 
++struct EnvVarGuard {
++    key: &'static str,
++    old: Option<std::ffi::OsString>,
++}
++
++impl EnvVarGuard {
++    fn remove(key: &'static str) -> Self {
++        let old = std::env::var_os(key);
++        unsafe {
++            std::env::remove_var(key);
++        }
++        Self { key, old }
++    }
++}
++
++impl Drop for EnvVarGuard {
++    fn drop(&mut self) {
++        unsafe {
++            match self.old.as_ref() {
++                Some(value) => std::env::set_var(self.key, value),
++                None => std::env::remove_var(self.key),
++            }
++        }
++    }
++}
++
+ fn http_mcp(url: &str) -> McpServerConfig {
+     McpServerConfig {
+         auth: Default::default(),
+@@ -5138,7 +5165,9 @@ async fn default_zsh_path_sets_runtime_zsh_path() -> std::io::Result<()> {
+ }
+ 
+ #[tokio::test]
+-async fn sqlite_home_defaults_to_codex_home_for_workspace_write() -> std::io::Result<()> {
++#[serial(sqlite_home_env)]
++async fn sqlite_home_defaults_to_codex_tmp_root_for_workspace_write() -> std::io::Result<()> {
++    let _sqlite_home_guard = EnvVarGuard::remove(codex_state::SQLITE_HOME_ENV);
+     let codex_home = TempDir::new()?;
+     let config = Config::load_from_base_config_with_overrides(
+         ConfigToml::default(),
+@@ -5150,7 +5179,33 @@ async fn sqlite_home_defaults_to_codex_home_for_workspace_write() -> std::io::Re
+     )
+     .await?;
+ 
+-    assert_eq!(config.sqlite_home, codex_home.path().to_path_buf());
++    assert_eq!(
++        config.sqlite_home,
++        codex_utils_home_dir::find_codex_tmp_root()?.into_path_buf()
++    );
++
++    Ok(())
++}
++
++#[tokio::test]
++#[serial(sqlite_home_env)]
++async fn sqlite_home_defaults_to_codex_tmp_root_outside_workspace_write() -> std::io::Result<()> {
++    let _sqlite_home_guard = EnvVarGuard::remove(codex_state::SQLITE_HOME_ENV);
++    let codex_home = TempDir::new()?;
++    let config = Config::load_from_base_config_with_overrides(
++        ConfigToml::default(),
++        ConfigOverrides {
++            sandbox_mode: Some(SandboxMode::ReadOnly),
++            ..Default::default()
++        },
++        codex_home.abs(),
++    )
++    .await?;
++
++    assert_eq!(
++        config.sqlite_home,
++        codex_utils_home_dir::find_codex_tmp_root()?.into_path_buf()
++    );
+ 
+     Ok(())
+ }
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index 6348f14c04..bd0ee010c3 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -286,6 +286,12 @@ fn resolve_sqlite_home_env(resolved_cwd: &Path) -> Option<PathBuf> {
+     }
+ }
+ 
++fn default_sqlite_home(codex_home: &Path) -> PathBuf {
++    codex_utils_home_dir::find_codex_tmp_root()
++        .map(AbsolutePathBuf::into_path_buf)
++        .unwrap_or_else(|_| codex_home.to_path_buf())
++}
++
+ fn resolve_cli_auth_credentials_store_mode(
+     configured: AuthCredentialsStoreMode,
+     package_version: &str,
+@@ -3666,12 +3672,6 @@ impl Config {
+             .as_ref()
+             .map(AbsolutePathBuf::to_path_buf)
+             .unwrap_or_else(|| codex_home.join("log").to_path_buf());
+-        let sqlite_home = cfg
+-            .sqlite_home
+-            .as_ref()
+-            .map(AbsolutePathBuf::to_path_buf)
+-            .or_else(|| resolve_sqlite_home_env(&resolved_cwd))
+-            .unwrap_or_else(|| codex_home.to_path_buf());
+         let original_permission_profile = permission_profile.clone();
+         apply_requirement_constrained_value(
+             "approval_policy",
+@@ -3777,6 +3777,12 @@ impl Config {
+             .value
+             .set(effective_permission_profile)
+             .map_err(std::io::Error::from)?;
++        let sqlite_home = cfg
++            .sqlite_home
++            .as_ref()
++            .map(AbsolutePathBuf::to_path_buf)
++            .or_else(|| resolve_sqlite_home_env(&resolved_cwd))
++            .unwrap_or_else(|| default_sqlite_home(&codex_home));
+         let permission_profile_state = PermissionProfileState::from_constrained_active_profile(
+             constrained_permission_profile.value,
+             active_permission_profile,
+diff --git a/codex-rs/core/tests/common/lib.rs b/codex-rs/core/tests/common/lib.rs
+index 29ed4875e0..006bcbe215 100644
+--- a/codex-rs/core/tests/common/lib.rs
++++ b/codex-rs/core/tests/common/lib.rs
+@@ -207,14 +207,16 @@ pub async fn load_default_config_for_test_with_cloud_config_bundle(
+     codex_home: &TempDir,
+     cloud_config_bundle: CloudConfigBundleLoader,
+ ) -> Config {
+-    ConfigBuilder::default()
++    let mut config = ConfigBuilder::default()
+         .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+         .codex_home(codex_home.path().to_path_buf())
+         .harness_overrides(default_test_overrides())
+         .cloud_config_bundle(cloud_config_bundle)
+         .build()
+         .await
+-        .expect("defaults for test should always succeed")
++        .expect("defaults for test should always succeed");
++    config.sqlite_home = codex_home.path().to_path_buf();
++    config
+ }
+ 
+ pub fn managed_network_requirements_loader() -> CloudConfigBundleLoader {
+diff --git a/codex-rs/memories/write/src/startup_tests.rs b/codex-rs/memories/write/src/startup_tests.rs
+index fad1ce14a4..b5d74b6705 100644
+--- a/codex-rs/memories/write/src/startup_tests.rs
++++ b/codex-rs/memories/write/src/startup_tests.rs
+@@ -429,6 +429,7 @@ async fn run_memory_phase_one_model_request_test(
+         .codex
+         .state_db()
+         .ok_or_else(|| anyhow::anyhow!("state db should be enabled for memory startup test"))?;
++    db.mark_backfill_complete(/*last_watermark*/ None).await?;
+     seed_stage1_candidate(
+         db.as_ref(),
+         home.path(),
+@@ -470,6 +471,7 @@ async fn run_memory_phase_two_model_request_test(
+         .codex
+         .state_db()
+         .ok_or_else(|| anyhow::anyhow!("state db should be enabled for memory startup test"))?;
++    db.mark_backfill_complete(/*last_watermark*/ None).await?;
+     seed_stage1_output(
+         db.as_ref(),
+         home.path(),
+@@ -528,6 +530,7 @@ async fn build_test_codex_with_memories_config(
+                 .features
+                 .enable(Feature::Sqlite)
+                 .expect("test config should allow feature update");
++            config.sqlite_home = config.codex_home.to_path_buf();
+             config.memories = memories;
+         })
+         .build(server)
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index dc8262f7db..7e2a5e6f92 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -2011,10 +2011,12 @@ mod tests {
+     use tempfile::TempDir;
+ 
+     async fn build_config(temp_dir: &TempDir) -> std::io::Result<Config> {
+-        ConfigBuilder::default()
++        let mut config = ConfigBuilder::default()
+             .codex_home(temp_dir.path().to_path_buf())
+             .build()
+-            .await
++            .await?;
++        config.sqlite_home = temp_dir.path().to_path_buf();
++        Ok(config)
+     }
+ 
+     fn write_session_rollout(
+@@ -2548,6 +2550,8 @@ mod tests {
+             })
+             .build()
+             .await?;
++        let mut config = config;
++        config.sqlite_home = temp_dir.path().to_path_buf();
+         let model_provider = config.model_provider_id.as_str();
+         let project_thread_id = write_session_rollout(
+             temp_dir.path(),
+@@ -2617,6 +2621,8 @@ mod tests {
+             })
+             .build()
+             .await?;
++        let mut config = config;
++        config.sqlite_home = temp_dir.path().to_path_buf();
+         let mut app_server = AppServerSession::new(
+             codex_app_server_client::AppServerClient::InProcess(
+                 start_test_embedded_app_server(config.clone()).await?,
