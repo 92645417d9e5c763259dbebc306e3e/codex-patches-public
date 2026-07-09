@@ -1,0 +1,259 @@
+diff --git a/codex-rs/core/src/non_openai.rs b/codex-rs/core/src/non_openai.rs
+index 74bd2336e3..e7e0cb84be 100644
+--- a/codex-rs/core/src/non_openai.rs
++++ b/codex-rs/core/src/non_openai.rs
+@@ -660,7 +660,57 @@ pub(crate) fn api_provider_for_route(route: &NonOpenAiRequestRoute) -> CodexResu
+ }
+ 
+ fn default_config() -> BTreeMap<String, ProviderConfig> {
+-    BTreeMap::new()
++    let mut providers = BTreeMap::new();
++    providers.insert("mimo".to_string(), default_mimo_provider());
++    providers
++}
++
++fn default_mimo_provider() -> ProviderConfig {
++    let mut provider = ProviderConfig {
++        enabled: false,
++        api_key: DEFAULT_API_KEY.to_string(),
++        base_url: "https://api.xiaomimimo.com/v1".to_string(),
++        display_name: "MiMo".to_string(),
++        transport: TransportConfig {
++            http_sse: true,
++            websocket: false,
++        },
++        capabilities: CapabilityConfig {
++            json_schema_output: false,
++            plaintext_reasoning: true,
++            previous_response_id: false,
++        },
++        models: BTreeMap::new(),
++    };
++    let mut reasoning = BTreeMap::new();
++    reasoning.insert(
++        "low".to_string(),
++        ReasoningRouteConfig {
++            upstream_model: "mimo-v2.5".to_string(),
++            upstream_reasoning_effort: Some(ReasoningEffort::High),
++        },
++    );
++    reasoning.insert(
++        "high".to_string(),
++        ReasoningRouteConfig {
++            upstream_model: "mimo-v2.5-pro".to_string(),
++            upstream_reasoning_effort: Some(ReasoningEffort::High),
++        },
++    );
++    provider.models.insert(
++        "mimo-v2.5".to_string(),
++        ModelConfig {
++            display_name: "mimo-v2.5".to_string(),
++            description: Some("Cost-efficient model developed by Xiaomi.".to_string()),
++            text: true,
++            image: false,
++            web_search: false,
++            context_window: 512_000,
++            effective_context_window_percent: 95,
++            reasoning,
++        },
++    );
++    provider
+ }
+ 
+ #[cfg(test)]
+@@ -669,46 +719,53 @@ mod tests {
+     use tempfile::TempDir;
+ 
+     #[test]
+-    fn self_heal_creates_empty_config() {
++    fn self_heal_creates_mimo_defaults_and_instruction_file() {
+         let codex_home = TempDir::new().unwrap();
+ 
+         let config = NonOpenAiConfig::load_and_heal(codex_home.path()).unwrap();
+ 
+         assert!(config.models().is_empty());
+         assert!(codex_home.path().join(CONFIG_FILE).exists());
++        assert!(
++            codex_home
++                .path()
++                .join(INSTRUCTIONS_DIR)
++                .join("mimo-v2.5.md")
++                .exists()
++        );
+     }
+ 
+     #[test]
+-    fn enabled_provider_injects_model_and_instruction_overlay() {
++    fn mimo_self_heal_fills_provider_defaults_without_replacing_api_key() {
+         let codex_home = TempDir::new().unwrap();
+         fs::write(
+             codex_home.path().join(CONFIG_FILE),
+-            r#"{
+-  "local": {
+-    "enabled": true,
+-    "api_key": "sk-live",
+-    "base_url": "https://example.invalid/v1",
+-    "models": {
+-      "local-model": {
+-        "display_name": "local-model",
+-        "reasoning": {
+-          "high": {
+-            "upstream_model": "upstream-model",
+-            "upstream_reasoning_effort": "high"
+-          }
+-        }
+-      }
+-    }
+-  }
+-}"#,
++            r#"{"mimo":{"enabled":true,"api_key":"sk-live"}}"#,
+         )
+         .unwrap();
++
++        let loaded = NonOpenAiConfig::load_and_heal(codex_home.path()).unwrap();
++        let healed = fs::read_to_string(codex_home.path().join(CONFIG_FILE)).unwrap();
++        let healed: Value = serde_json::from_str(&healed).unwrap();
++
++        assert_eq!(healed["mimo"]["api_key"], "sk-live");
++        assert_eq!(healed["mimo"]["base_url"], "https://api.xiaomimimo.com/v1");
++        assert!(healed["mimo"]["models"]["mimo-v2.5"].is_object());
++        assert_eq!(loaded.models().len(), 1);
++    }
++
++    #[test]
++    fn enabled_provider_injects_model_and_instruction_overlay() {
++        let codex_home = TempDir::new().unwrap();
++        let mut config = default_config();
++        config.get_mut("mimo").unwrap().enabled = true;
++        write_if_changed(&codex_home.path().join(CONFIG_FILE), &config).unwrap();
+         fs::create_dir_all(codex_home.path().join(INSTRUCTIONS_DIR)).unwrap();
+         fs::write(
+             codex_home
+                 .path()
+                 .join(INSTRUCTIONS_DIR)
+-                .join("local-model.md"),
++                .join("mimo-v2.5.md"),
+             "custom instructions",
+         )
+         .unwrap();
+@@ -717,7 +774,7 @@ mod tests {
+         let models = config.models();
+ 
+         assert_eq!(models.len(), 1);
+-        assert_eq!(models[0].slug, "local-model");
++        assert_eq!(models[0].slug, "mimo-v2.5");
+         assert_eq!(
+             models[0]
+                 .model_messages
+@@ -730,43 +787,21 @@ mod tests {
+     #[test]
+     fn route_maps_local_reasoning_to_upstream_model_and_effort() {
+         let codex_home = TempDir::new().unwrap();
+-        fs::write(
+-            codex_home.path().join(CONFIG_FILE),
+-            r#"{
+-  "local": {
+-    "enabled": true,
+-    "api_key": "sk-live",
+-    "base_url": "https://example.invalid/v1",
+-    "models": {
+-      "local-model": {
+-        "reasoning": {
+-          "low": {
+-            "upstream_model": "small-model",
+-            "upstream_reasoning_effort": "high"
+-          },
+-          "high": {
+-            "upstream_model": "large-model",
+-            "upstream_reasoning_effort": "high"
+-          }
+-        }
+-      }
+-    }
+-  }
+-}"#,
+-        )
+-        .unwrap();
++        let mut config = default_config();
++        config.get_mut("mimo").unwrap().enabled = true;
++        write_if_changed(&codex_home.path().join(CONFIG_FILE), &config).unwrap();
+         let loaded = NonOpenAiConfig::load_and_heal(codex_home.path()).unwrap();
+ 
+         let low = loaded
+-            .route_for_model("local-model", Some(&ReasoningEffort::Low))
++            .route_for_model("mimo-v2.5", Some(&ReasoningEffort::Low))
+             .unwrap();
+         let high = loaded
+-            .route_for_model("local-model", Some(&ReasoningEffort::High))
++            .route_for_model("mimo-v2.5", Some(&ReasoningEffort::High))
+             .unwrap();
+ 
+-        assert_eq!(low.upstream_model, "small-model");
++        assert_eq!(low.upstream_model, "mimo-v2.5");
+         assert_eq!(low.upstream_reasoning_effort, Some(ReasoningEffort::High));
+-        assert_eq!(high.upstream_model, "large-model");
++        assert_eq!(high.upstream_model, "mimo-v2.5-pro");
+         assert_eq!(high.upstream_reasoning_effort, Some(ReasoningEffort::High));
+         assert!(!low.supports_previous_response_id);
+         assert!(!high.supports_previous_response_id);
+@@ -775,19 +810,16 @@ mod tests {
+     #[tokio::test]
+     async fn api_key_reload_reads_only_current_file_value() {
+         let codex_home = TempDir::new().unwrap();
+-        fs::write(
+-            codex_home.path().join(CONFIG_FILE),
+-            r#"{"local":{"enabled":true,"api_key":"sk-old","base_url":"https://example.invalid/v1","models":{"local-model":{}}}}"#,
+-        )
+-        .unwrap();
++        let mut config = default_config();
++        let mimo = config.get_mut("mimo").unwrap();
++        mimo.enabled = true;
++        mimo.api_key = "sk-old".to_string();
++        write_if_changed(&codex_home.path().join(CONFIG_FILE), &config).unwrap();
+         let loaded = NonOpenAiConfig::load_and_heal(codex_home.path()).unwrap();
+-        fs::write(
+-            codex_home.path().join(CONFIG_FILE),
+-            r#"{"local":{"enabled":true,"api_key":"sk-new","base_url":"https://example.invalid/v1","models":{"local-model":{}}}}"#,
+-        )
+-        .unwrap();
++        config.get_mut("mimo").unwrap().api_key = "sk-new".to_string();
++        write_if_changed(&codex_home.path().join(CONFIG_FILE), &config).unwrap();
+ 
+-        assert_eq!(loaded.read_api_key("local").await.unwrap(), "sk-new");
++        assert_eq!(loaded.read_api_key("mimo").await.unwrap(), "sk-new");
+     }
+ 
+     #[test]
+@@ -820,26 +852,24 @@ mod tests {
+     #[test]
+     fn family_guard_blocks_openai_non_openai_takeover() {
+         let codex_home = TempDir::new().unwrap();
+-        fs::write(
+-            codex_home.path().join(CONFIG_FILE),
+-            r#"{"local":{"enabled":true,"api_key":"sk-live","base_url":"https://example.invalid/v1","models":{"local-model":{}}}}"#,
+-        )
+-        .unwrap();
++        let mut config = default_config();
++        config.get_mut("mimo").unwrap().enabled = true;
++        write_if_changed(&codex_home.path().join(CONFIG_FILE), &config).unwrap();
+         let loaded = NonOpenAiConfig::load_and_heal(codex_home.path()).unwrap();
+ 
+         assert!(
+             loaded
+-                .family_takeover_message("gpt-5.4", "local-model")
++                .family_takeover_message("gpt-5.4", "mimo-v2.5")
+                 .is_some()
+         );
+         assert!(
+             loaded
+-                .family_takeover_message("local-model", "gpt-5.4")
++                .family_takeover_message("mimo-v2.5", "gpt-5.4")
+                 .is_some()
+         );
+         assert!(
+             loaded
+-                .family_takeover_message("local-model", "local-model")
++                .family_takeover_message("mimo-v2.5", "mimo-v2.5")
+                 .is_none()
+         );
+     }
