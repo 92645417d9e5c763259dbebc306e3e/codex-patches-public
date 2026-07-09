@@ -16,10 +16,10 @@ index 2002b08a88..e228ae5789 100644
          BTreeSet::from([
 diff --git a/codex-rs/models-manager/src/cache_overlay.rs b/codex-rs/models-manager/src/cache_overlay.rs
 new file mode 100644
-index 0000000000..2d664ea123
+index 0000000000..8a34f5baa7
 --- /dev/null
 +++ b/codex-rs/models-manager/src/cache_overlay.rs
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,206 @@
 +use codex_protocol::openai_models::ModelInfo;
 +use serde_json::Map;
 +use serde_json::Value;
@@ -154,7 +154,7 @@ index 0000000000..2d664ea123
 +
 +fn seed_overlay_dir(models: &[ModelInfo], dir_path: &Path) {
 +    match fs::metadata(dir_path) {
-+        Ok(metadata) if metadata.is_dir() => return,
++        Ok(metadata) if metadata.is_dir() => {}
 +        Ok(_) => {
 +            warn!(
 +                path = %dir_path.display(),
@@ -182,6 +182,9 @@ index 0000000000..2d664ea123
 +        let Some(path) = overlay_dir_model_path(dir_path, &model.slug) else {
 +            continue;
 +        };
++        if path.exists() {
++            continue;
++        }
 +        let Some(template) = model
 +            .model_messages
 +            .as_ref()
@@ -355,7 +358,7 @@ index 96a7cc5345..05d69ab5ac 100644
              models_count = models.len(),
              etag = ?loaded.cache.etag,
 diff --git a/codex-rs/models-manager/src/manager_tests.rs b/codex-rs/models-manager/src/manager_tests.rs
-index 4396e0e4f5..f40d3f8b81 100644
+index 4396e0e4f5..091e29cc69 100644
 --- a/codex-rs/models-manager/src/manager_tests.rs
 +++ b/codex-rs/models-manager/src/manager_tests.rs
 @@ -11,6 +11,7 @@ use codex_login::ExternalAuth;
@@ -422,7 +425,7 @@ index 4396e0e4f5..f40d3f8b81 100644
  async fn chatgpt_auth_tokens_for_tests(codex_home: &Path) -> CodexAuth {
      let auth_dot_json = codex_login::AuthDotJson {
          auth_mode: Some(AuthMode::ChatgptAuthTokens),
-@@ -834,6 +863,223 @@ async fn refresh_available_models_uses_cache_when_fresh() {
+@@ -834,6 +863,275 @@ async fn refresh_available_models_uses_cache_when_fresh() {
      );
  }
  
@@ -450,7 +453,7 @@ index 4396e0e4f5..f40d3f8b81 100644
 +}
 +
 +#[tokio::test]
-+async fn instructions_overlay_overrides_prompt_and_reloads_file() {
++async fn instructions_json_overlay_is_transcribed_to_overlay_dir() {
 +    let remote = remote_model_with_prompt(
 +        "overlay-cache-model",
 +        "Overlay Cache Model",
@@ -494,6 +497,13 @@ index 4396e0e4f5..f40d3f8b81 100644
 +    );
 +    assert_eq!(model_info.display_name, "Overlay Cache Model");
 +    assert_eq!(model_info.base_instructions, "base instructions");
++    assert_eq!(
++        std::fs::read_to_string(
++            instructions_overlay_dir_path(codex_home.path()).join("overlay-cache-model.md")
++        )
++        .expect("read transcribed instructions overlay file"),
++        "local prompt one"
++    );
 +
 +    write_instructions_overlay(
 +        codex_home.path(),
@@ -513,7 +523,7 @@ index 4396e0e4f5..f40d3f8b81 100644
 +            .model_messages
 +            .as_ref()
 +            .and_then(|messages| messages.instructions_template.as_deref()),
-+        Some("local prompt two")
++        Some("local prompt one")
 +    );
 +}
 +
@@ -593,6 +603,51 @@ index 4396e0e4f5..f40d3f8b81 100644
 +}
 +
 +#[tokio::test]
++async fn existing_instructions_overlay_dir_seeds_missing_model_files() {
++    let existing = remote_model_with_prompt(
++        "existing-overlay-model",
++        "Existing Overlay Model",
++        /*priority*/ 1,
++        "existing upstream prompt",
++    );
++    let missing = remote_model_with_prompt(
++        "missing-overlay-model",
++        "Missing Overlay Model",
++        /*priority*/ 1,
++        "missing upstream prompt",
++    );
++    let codex_home = tempdir().expect("temp dir");
++    let overlay_dir = instructions_overlay_dir_path(codex_home.path());
++    std::fs::create_dir_all(&overlay_dir).expect("create instructions overlay dir");
++    std::fs::write(
++        overlay_dir.join("existing-overlay-model.md"),
++        "existing local prompt",
++    )
++    .expect("write existing overlay file");
++    let endpoint = TestModelsEndpoint::new(vec![vec![existing, missing]]);
++    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
++
++    manager
++        .refresh_available_models(
++            RefreshStrategy::OnlineIfUncached,
++            &DEFAULT_HTTP_CLIENT_FACTORY,
++        )
++        .await
++        .expect("refresh succeeds");
++
++    assert_eq!(
++        std::fs::read_to_string(overlay_dir.join("existing-overlay-model.md"))
++            .expect("read existing instructions overlay file"),
++        "existing local prompt"
++    );
++    assert_eq!(
++        std::fs::read_to_string(overlay_dir.join("missing-overlay-model.md"))
++            .expect("read seeded instructions overlay file"),
++        "missing upstream prompt"
++    );
++}
++
++#[tokio::test]
 +async fn instructions_overlay_dir_takes_precedence_over_json_overlay() {
 +    let remote = remote_model_with_prompt(
 +        "overlay-dir-json-model",
@@ -646,7 +701,7 @@ index 4396e0e4f5..f40d3f8b81 100644
  #[tokio::test]
  async fn refresh_available_models_uses_stale_cache_without_refetching() {
      let initial_models = vec![remote_model("stale", "Stale", /*priority*/ 1)];
-@@ -864,7 +1110,10 @@ async fn refresh_available_models_uses_stale_cache_without_refetching() {
+@@ -864,7 +1162,10 @@ async fn refresh_available_models_uses_stale_cache_without_refetching() {
  
      tokio::time::timeout(
          Duration::from_millis(100),
@@ -658,7 +713,7 @@ index 4396e0e4f5..f40d3f8b81 100644
      )
      .await
      .expect("stale cache should return before background fetch completes")
-@@ -884,7 +1133,12 @@ async fn foreground_model_refresh_failure_uses_debug_noise() {
+@@ -884,7 +1185,12 @@ async fn foreground_model_refresh_failure_uses_debug_noise() {
      let endpoint = FailingModelsEndpoint::new();
      let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
  
@@ -672,7 +727,7 @@ index 4396e0e4f5..f40d3f8b81 100644
  
      assert_eq!(endpoint.fetch_count(), 1);
      assert!(
-@@ -934,7 +1188,10 @@ async fn refresh_available_models_uses_version_mismatched_cache_without_blocking
+@@ -934,7 +1240,10 @@ async fn refresh_available_models_uses_version_mismatched_cache_without_blocking
  
      tokio::time::timeout(
          Duration::from_millis(100),
@@ -684,7 +739,7 @@ index 4396e0e4f5..f40d3f8b81 100644
      )
      .await
      .expect("version-mismatched cache should return before background fetch completes")
-@@ -980,7 +1237,10 @@ async fn background_refresh_failure_uses_debug_noise_after_cache_hit() {
+@@ -980,7 +1289,10 @@ async fn background_refresh_failure_uses_debug_noise_after_cache_hit() {
  
      tokio::time::timeout(
          Duration::from_millis(100),
