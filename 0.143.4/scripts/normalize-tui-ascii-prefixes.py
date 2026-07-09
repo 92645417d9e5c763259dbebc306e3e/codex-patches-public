@@ -1,5 +1,5 @@
 diff --git a/codex-rs/tui/src/app/agent_status_feed.rs b/codex-rs/tui/src/app/agent_status_feed.rs
-index eb14551d5a..eff1ab43e5 100644
+index 96f2c67bcd..4fd7fe49e3 100644
 --- a/codex-rs/tui/src/app/agent_status_feed.rs
 +++ b/codex-rs/tui/src/app/agent_status_feed.rs
 @@ -38,7 +38,7 @@ impl HistoryCell for AgentStatusHistoryCell {
@@ -43,10 +43,10 @@ index d7583d2b44..b62aafac51 100644
      "###);
      assert!(!rendered.contains("hidden raw reasoning"));
 diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
-index afe269195a..153dd059e8 100644
+index 8713537fbc..8b448f4a5f 100644
 --- a/codex-rs/tui/src/app/event_dispatch.rs
 +++ b/codex-rs/tui/src/app/event_dispatch.rs
-@@ -1473,7 +1473,7 @@ impl App {
+@@ -1480,7 +1480,7 @@ impl App {
                                      self.chat_widget.submit_initial_user_message_if_pending();
                                  }
                                  self.chat_widget.add_plain_history_lines(vec![
@@ -55,7 +55,7 @@ index afe269195a..153dd059e8 100644
                                      Line::from(vec![
                                          "  ".into(),
                                          "Codex can now safely edit files and execute commands in your computer"
-@@ -1506,7 +1506,7 @@ impl App {
+@@ -1513,7 +1513,7 @@ impl App {
                                          preset.active_permission_profile.clone(),
                                      ));
                                  self.chat_widget.add_plain_history_lines(vec![
@@ -892,10 +892,10 @@ index f727ca3480..3a1f7af7f8 100644
  
      #[test]
 diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
-index 42903d2e7f..509d7a844e 100644
+index fa745c652e..1ba82cc4f0 100644
 --- a/codex-rs/tui/src/chatwidget.rs
 +++ b/codex-rs/tui/src/chatwidget.rs
-@@ -1413,7 +1413,7 @@ impl ChatWidget {
+@@ -1414,7 +1414,7 @@ impl ChatWidget {
          self.transcript.bump_active_cell_revision();
      }
  
@@ -904,7 +904,7 @@ index 42903d2e7f..509d7a844e 100644
      fn finalize_active_cell_as_failed(&mut self) {
          if let Some(mut cell) = self.transcript.active_cell.take() {
              // Insert finalized cell into history and keep grouping consistent.
-@@ -1566,7 +1566,7 @@ impl ChatWidget {
+@@ -1567,7 +1567,7 @@ impl ChatWidget {
  
      fn rename_confirmation_cell(name: &str, thread_id: Option<ThreadId>) -> PlainHistoryCell {
          let mut line = vec![
@@ -914,10 +914,10 @@ index 42903d2e7f..509d7a844e 100644
              name.to_string().cyan(),
          ];
 diff --git a/codex-rs/tui/src/chatwidget/model_popups.rs b/codex-rs/tui/src/chatwidget/model_popups.rs
-index 1194fc15c6..2816dd6aa3 100644
+index b7d218c5bc..8c0a1f5e99 100644
 --- a/codex-rs/tui/src/chatwidget/model_popups.rs
 +++ b/codex-rs/tui/src/chatwidget/model_popups.rs
-@@ -369,7 +369,7 @@ impl ChatWidget {
+@@ -394,7 +394,7 @@ impl ChatWidget {
          };
          let warning_text = warn_effort.as_ref().map(|effort| {
              let effort_label = Self::reasoning_effort_label(effort);
@@ -998,7 +998,7 @@ index cd092d4760..23f4a3f7cc 100644
 -• Thread forked from 019c2d47-4935-7423-a190-05691f566092
 +■ Thread forked from 019c2d47-4935-7423-a190-05691f566092
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_guardian_review_denied_renders_denied_request.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_guardian_review_denied_renders_denied_request.snap
-index 70af203e46..bc3aeca694 100644
+index 6bbd8a657c..33e1fce0f1 100644
 --- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_guardian_review_denied_renders_denied_request.snap
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_guardian_review_denied_renders_denied_request.snap
 @@ -9,10 +9,10 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
@@ -1015,7 +1015,7 @@ index 70af203e46..bc3aeca694 100644
  
  › Ask Codex to do anything
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_guardian_review_timed_out_renders_timed_out_request.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_guardian_review_timed_out_renders_timed_out_request.snap
-index 3dfe36e763..120bdfc18b 100644
+index 72c6586ad9..7a18269501 100644
 --- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_guardian_review_timed_out_renders_timed_out_request.snap
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_guardian_review_timed_out_renders_timed_out_request.snap
 @@ -9,10 +9,10 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
@@ -1032,7 +1032,7 @@ index 3dfe36e763..120bdfc18b 100644
  
  › Ask Codex to do anything
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_mcp_startup_failure_renders_warning_history.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_mcp_startup_failure_renders_warning_history.snap
-index efc431bbe8..49a6db4e9d 100644
+index 7a74c0a052..b365b38121 100644
 --- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_mcp_startup_failure_renders_warning_history.snap
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__app_server_mcp_startup_failure_renders_warning_history.snap
 @@ -5,8 +5,8 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
@@ -1155,10 +1155,10 @@ index 8017384f55..75ac9fcde4 100644
        FROM "users"
        WHERE "email" LIKE '%@example.com';
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chatwidget_tall.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chatwidget_tall.snap
-index a21401ff95..d84b93b3e0 100644
+index 603033a275..b172ed6c0a 100644
 --- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chatwidget_tall.snap
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__chatwidget_tall.snap
-@@ -4,25 +4,25 @@ assertion_line: 2288
+@@ -3,25 +3,25 @@ source: tui/src/chatwidget/tests/status_and_layout.rs
  expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
  ---
  
@@ -1203,7 +1203,7 @@ index a21401ff95..d84b93b3e0 100644
  › Ask Codex to do anything
  
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__compact_queues_user_messages_snapshot.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__compact_queues_user_messages_snapshot.snap
-index 777439a1cd..15cc3b0488 100644
+index 0ff879f3a5..c905c4f2cb 100644
 --- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__compact_queues_user_messages_snapshot.snap
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__compact_queues_user_messages_snapshot.snap
 @@ -12,10 +12,10 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
@@ -1291,7 +1291,7 @@ index 4d916a33cc..cfb101f114 100644
 -• Here is the result.
 +■ Here is the result.
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__esc_interrupt_goal_paused_footer.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__esc_interrupt_goal_paused_footer.snap
-index bebbb3ffd5..7baf379ca9 100644
+index fd9d023c36..51e9bd7eac 100644
 --- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__esc_interrupt_goal_paused_footer.snap
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__esc_interrupt_goal_paused_footer.snap
 @@ -3,7 +3,7 @@ source: tui/src/chatwidget/tests/status_and_layout.rs
@@ -1304,7 +1304,7 @@ index bebbb3ffd5..7baf379ca9 100644
  "                                                                                "
  "› Ask Codex to do anything                                                      "
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__esc_interrupt_goal_paused_footer@windows.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__esc_interrupt_goal_paused_footer@windows.snap
-index 1025ae3862..af1378aecc 100644
+index 80910bd6d3..3acc04a462 100644
 --- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__esc_interrupt_goal_paused_footer@windows.snap
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__esc_interrupt_goal_paused_footer@windows.snap
 @@ -3,7 +3,7 @@ source: tui/src/chatwidget/tests/status_and_layout.rs
@@ -1528,7 +1528,7 @@ index f25eb53645..9bcafa0c0e 100644
 -• Thread forked from 019c2d47-4935-7423-a190-05691f566092
 +■ Thread forked from 019c2d47-4935-7423-a190-05691f566092
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_approved_exec_renders_approved_request.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_approved_exec_renders_approved_request.snap
-index 59c2814688..c00ba4a716 100644
+index bd272de13b..b43fed27a7 100644
 --- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_approved_exec_renders_approved_request.snap
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_approved_exec_renders_approved_request.snap
 @@ -7,7 +7,7 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
@@ -1541,7 +1541,7 @@ index 59c2814688..c00ba4a716 100644
  
  
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_approved_request_permissions_renders_request_summary.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_approved_request_permissions_renders_request_summary.snap
-index 74376286ff..4d589d52e8 100644
+index 4a05153625..c549cb68e4 100644
 --- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_approved_request_permissions_renders_request_summary.snap
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_approved_request_permissions_renders_request_summary.snap
 @@ -5,10 +5,10 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
@@ -1558,7 +1558,7 @@ index 74376286ff..4d589d52e8 100644
  
  › Ask Codex to do anything
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_denied_exec_renders_warning_and_denied_request.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_denied_exec_renders_warning_and_denied_request.snap
-index c9194b60b8..516aeb4b05 100644
+index b77d2ca174..ed1872c4c0 100644
 --- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_denied_exec_renders_warning_and_denied_request.snap
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_denied_exec_renders_warning_and_denied_request.snap
 @@ -9,14 +9,14 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
@@ -1580,7 +1580,7 @@ index c9194b60b8..516aeb4b05 100644
  
  › Ask Codex to do anything
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_parallel_reviews_render_aggregate_status.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_parallel_reviews_render_aggregate_status.snap
-index 653a48e949..183c987008 100644
+index 71c92e26b1..e6d0e58bed 100644
 --- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_parallel_reviews_render_aggregate_status.snap
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_parallel_reviews_render_aggregate_status.snap
 @@ -2,9 +2,9 @@
@@ -1597,7 +1597,7 @@ index 653a48e949..183c987008 100644
  
  › Ask Codex to do anything
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_timed_out_exec_renders_warning_and_timed_out_request.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_timed_out_exec_renders_warning_and_timed_out_request.snap
-index 8f6436bf66..2db1d8b001 100644
+index 748a3f85ff..65766885f7 100644
 --- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_timed_out_exec_renders_warning_and_timed_out_request.snap
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__guardian_timed_out_exec_renders_warning_and_timed_out_request.snap
 @@ -11,12 +11,12 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
@@ -1790,7 +1790,7 @@ index cf4c6943fd..8e6f2b58db 100644
 +■ Viewed Image
    └ example.png
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__mcp_startup_header_booting.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__mcp_startup_header_booting.snap
-index 68b689885c..9c44c08ab2 100644
+index 014c13cd11..21f395644d 100644
 --- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__mcp_startup_header_booting.snap
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__mcp_startup_header_booting.snap
 @@ -3,7 +3,7 @@ source: tui/src/chatwidget/tests/mcp_startup.rs
@@ -1917,7 +1917,7 @@ index 311be2edf5..5a7bc73345 100644
    warning: Heads up from the hook
    hook context: Remember the startup checklist.
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__preamble_keeps_working_status.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__preamble_keeps_working_status.snap
-index 4748d8f678..61752e8df7 100644
+index 65070af637..a9af6a29c6 100644
 --- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__preamble_keeps_working_status.snap
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__preamble_keeps_working_status.snap
 @@ -3,7 +3,7 @@ source: tui/src/chatwidget/tests/exec_flow.rs
@@ -1950,7 +1950,7 @@ index e18178d460..6c049fdd29 100644
 -• You have 2 usage limit resets available. Run /usage to use one.
 +■ You have 2 usage limit resets available. Run /usage to use one.
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__review_queues_user_messages_snapshot.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__review_queues_user_messages_snapshot.snap
-index d90ccd9c5f..cb344f8a9e 100644
+index 691523b8d0..c19b17e5df 100644
 --- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__review_queues_user_messages_snapshot.snap
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__review_queues_user_messages_snapshot.snap
 @@ -12,10 +12,10 @@ expression: normalize_snapshot_paths(term.backend().vt100().screen().contents())
@@ -1991,7 +1991,7 @@ index 3d08e82937..253bec63f7 100644
    warning: Heads up from the hook
    hook context: Remember the startup checklist.
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__slash_side_requests_forked_side_question_while_task_running.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__slash_side_requests_forked_side_question_while_task_running.snap
-index 47acb50d1f..0f8902888a 100644
+index 507e8bf10f..28a8bae31a 100644
 --- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__slash_side_requests_forked_side_question_while_task_running.snap
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__slash_side_requests_forked_side_question_while_task_running.snap
 @@ -3,7 +3,7 @@ source: tui/src/chatwidget/tests/side.rs
@@ -2004,7 +2004,7 @@ index 47acb50d1f..0f8902888a 100644
  "                                                                                "
  "› Ask Codex to do anything                                                      "
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_widget_active.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_widget_active.snap
-index c7bfc01487..83b2280533 100644
+index d87052b5e0..9ac72acbc5 100644
 --- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_widget_active.snap
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_widget_active.snap
 @@ -3,7 +3,7 @@ source: tui/src/chatwidget/tests/status_and_layout.rs
@@ -2027,7 +2027,7 @@ index f6f827fe53..ebd9673849 100644
 -• Session renamed to review-fix. To resume this session run codex resume, then select review-fix (123e4567-e89b-12d3-a456-426614174000)
 +■ Session renamed to review-fix. To resume this session run codex resume, then select review-fix (123e4567-e89b-12d3-a456-426614174000)
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__unified_exec_begin_restores_working_status.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__unified_exec_begin_restores_working_status.snap
-index b589d02e3f..37e9fe93f6 100644
+index d21f0481f4..1b7989cf5a 100644
 --- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__unified_exec_begin_restores_working_status.snap
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__unified_exec_begin_restores_working_status.snap
 @@ -3,7 +3,7 @@ source: tui/src/chatwidget/tests/exec_flow.rs
@@ -2121,7 +2121,7 @@ index f91637e2db..46c48016ae 100644
 -• Streaming response.
 +■ Streaming response.
 diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__unified_exec_wait_status_renders_command_in_single_details_row.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__unified_exec_wait_status_renders_command_in_single_details_row.snap
-index 67574c3729..7e082e875a 100644
+index e76f552444..f6d335673c 100644
 --- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__unified_exec_wait_status_renders_command_in_single_details_row.snap
 +++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__unified_exec_wait_status_renders_command_in_single_details_row.snap
 @@ -2,7 +2,7 @@
@@ -2239,7 +2239,7 @@ index 682e6adb95..7e09948471 100644
              })
          );
 diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
-index 952aff9f95..cc82923ba4 100644
+index f8d6f463e5..9574e0b59e 100644
 --- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
 +++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
 @@ -1131,7 +1131,7 @@ async fn live_app_server_server_overloaded_error_renders_warning() {
@@ -2405,7 +2405,7 @@ index e8fe8ed300..e40016b65e 100644
  #[tokio::test]
  async fn interrupt_exec_marks_failed_snapshot() {
 diff --git a/codex-rs/tui/src/chatwidget/tests/slash_commands.rs b/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
-index d8b3f8a0cd..f2038566f7 100644
+index d683aa3fbf..5259a9fba3 100644
 --- a/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
 +++ b/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
 @@ -825,7 +825,7 @@ async fn goal_control_slash_command_without_thread_shows_full_usage() {
@@ -2494,10 +2494,10 @@ index 96deb66773..f52454ec92 100644
    `features.code_mode` and `features.code_mode_only`, or select a model whose
    metadata enables Code Mode.
 diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
-index fdfad7f6d8..07e8c3b4d1 100644
+index d71a60820e..e6a34ee2b4 100644
 --- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
 +++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
-@@ -38,7 +38,7 @@ impl ChatWidget {
+@@ -45,7 +45,7 @@ impl ChatWidget {
      pub(super) fn log_websocket_timing_totals(&mut self, delta: RuntimeMetricsSummary) {
          if let Some(label) = history_cell::runtime_metrics_label(delta.responses_api_summary()) {
              self.add_plain_history_lines(vec![
@@ -2506,7 +2506,7 @@ index fdfad7f6d8..07e8c3b4d1 100644
              ]);
          }
      }
-@@ -306,7 +306,7 @@ impl ChatWidget {
+@@ -313,7 +313,7 @@ impl ChatWidget {
          // Drop preview-only stream tail content on any termination path before
          // failed-cell finalization, so transient tail cells are never persisted.
          self.clear_active_stream_tail();
@@ -3110,10 +3110,10 @@ index b71af3d251..b991e31a03 100644
                  "Loading MCP inventory".bold(),
                  "…".dim(),
 diff --git a/codex-rs/tui/src/history_cell/messages.rs b/codex-rs/tui/src/history_cell/messages.rs
-index 787f999cf1..999064b652 100644
+index 350ae81db1..d81c38c235 100644
 --- a/codex-rs/tui/src/history_cell/messages.rs
 +++ b/codex-rs/tui/src/history_cell/messages.rs
-@@ -238,7 +238,7 @@ impl ReasoningSummaryCell {
+@@ -259,7 +259,7 @@ impl ReasoningSummaryCell {
          adaptive_wrap_lines(
              &summary_lines,
              RtOptions::new(width as usize)
@@ -3122,7 +3122,7 @@ index 787f999cf1..999064b652 100644
                  .subsequent_indent("  ".into()),
          )
      }
-@@ -298,7 +298,7 @@ impl HistoryCell for AgentMessageCell {
+@@ -319,7 +319,7 @@ impl HistoryCell for AgentMessageCell {
          let mut wrapped = Vec::new();
          for (index, line) in self.lines.iter().enumerate() {
              let initial_indent = if index == 0 && self.is_first_line {
@@ -3131,7 +3131,7 @@ index 787f999cf1..999064b652 100644
              } else {
                  "  ".into()
              };
-@@ -371,19 +371,19 @@ impl HistoryCell for AgentMarkdownCell {
+@@ -392,19 +392,19 @@ impl HistoryCell for AgentMarkdownCell {
          else {
              return prefix_hyperlink_lines(
                  vec![HyperlinkLine::new(Line::default())],
@@ -3154,7 +3154,7 @@ index 787f999cf1..999064b652 100644
      }
  
      fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
-@@ -426,7 +426,7 @@ impl HistoryCell for StreamingAgentTailCell {
+@@ -447,7 +447,7 @@ impl HistoryCell for StreamingAgentTailCell {
          let mut lines = prefix_hyperlink_lines(
              self.lines.clone(),
              if self.is_first_line {
@@ -3978,7 +3978,7 @@ index ffda6cb13f..49d89bffc3 100644
 -• Searched the web
 +■ Searched the web
 diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
-index 42dadb8535..971204c124 100644
+index b5c9739239..1050b38c4a 100644
 --- a/codex-rs/tui/src/history_cell/tests.rs
 +++ b/codex-rs/tui/src/history_cell/tests.rs
 @@ -484,7 +484,7 @@ fn image_generation_call_renders_saved_path() {
@@ -4050,7 +4050,7 @@ index 42dadb8535..971204c124 100644
          "expected first rendered row to keep the prefix visible, got: {first_row:?}"
      );
  }
-@@ -1161,7 +1161,7 @@ fn web_search_history_cell_wraps_with_indented_continuation() {
+@@ -1170,7 +1170,7 @@ fn web_search_history_cell_wraps_with_indented_continuation() {
      assert_eq!(
          rendered,
          vec![
@@ -4059,7 +4059,7 @@ index 42dadb8535..971204c124 100644
              "  words to exercise wrapping".to_string(),
          ]
      );
-@@ -1182,7 +1182,7 @@ fn web_search_history_cell_short_query_does_not_wrap() {
+@@ -1191,7 +1191,7 @@ fn web_search_history_cell_short_query_does_not_wrap() {
  
      assert_eq!(
          rendered,
@@ -4068,7 +4068,7 @@ index 42dadb8535..971204c124 100644
      );
  }
  
-@@ -1238,7 +1238,7 @@ fn mcp_inventory_loading_without_animations_is_stable() {
+@@ -1247,7 +1247,7 @@ fn mcp_inventory_loading_without_animations_is_stable() {
      let second = render_lines(&cell.display_lines(/*width*/ 80));
  
      assert_eq!(first, second);
@@ -4077,7 +4077,7 @@ index 42dadb8535..971204c124 100644
  }
  
  #[test]
-@@ -2244,10 +2244,10 @@ fn reasoning_summary_block() {
+@@ -2254,10 +2254,10 @@ fn reasoning_summary_block() {
      );
  
      let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
@@ -4090,7 +4090,7 @@ index 42dadb8535..971204c124 100644
  }
  
  #[test]
-@@ -2290,7 +2290,7 @@ fn reasoning_summary_height_matches_wrapped_rendering_for_url_like_content() {
+@@ -2300,7 +2300,7 @@ fn reasoning_summary_height_matches_wrapped_rendering_for_url_like_content() {
          })
          .collect::<String>();
      assert!(
@@ -4099,7 +4099,7 @@ index 42dadb8535..971204c124 100644
          "expected first rendered row to keep summary bullet visible, got: {first_row:?}"
      );
  }
-@@ -2301,7 +2301,7 @@ fn reasoning_summary_block_returns_reasoning_cell_when_feature_disabled() {
+@@ -2311,7 +2311,7 @@ fn reasoning_summary_block_returns_reasoning_cell_when_feature_disabled() {
          new_reasoning_summary_block("Detailed reasoning goes here.".to_string(), &test_cwd());
  
      let rendered = render_transcript(cell.as_ref());
@@ -4108,7 +4108,7 @@ index 42dadb8535..971204c124 100644
  }
  
  #[tokio::test]
-@@ -2315,7 +2315,7 @@ async fn reasoning_summary_block_respects_config_overrides() {
+@@ -2325,7 +2325,7 @@ async fn reasoning_summary_block_respects_config_overrides() {
      );
  
      let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
@@ -4117,7 +4117,7 @@ index 42dadb8535..971204c124 100644
  }
  
  #[test]
-@@ -2326,7 +2326,7 @@ fn reasoning_summary_block_falls_back_when_header_is_missing() {
+@@ -2336,7 +2336,7 @@ fn reasoning_summary_block_falls_back_when_header_is_missing() {
      );
  
      let rendered = render_transcript(cell.as_ref());
@@ -4126,7 +4126,7 @@ index 42dadb8535..971204c124 100644
  }
  
  #[test]
-@@ -2337,7 +2337,7 @@ fn reasoning_summary_block_falls_back_when_summary_is_missing() {
+@@ -2347,7 +2347,7 @@ fn reasoning_summary_block_falls_back_when_summary_is_missing() {
      );
  
      let rendered = render_transcript(cell.as_ref());
@@ -4135,7 +4135,7 @@ index 42dadb8535..971204c124 100644
  
      let cell = new_reasoning_summary_block(
          "**High level reasoning without closing**\n\n  ".to_string(),
-@@ -2345,7 +2345,7 @@ fn reasoning_summary_block_falls_back_when_summary_is_missing() {
+@@ -2355,7 +2355,7 @@ fn reasoning_summary_block_falls_back_when_summary_is_missing() {
      );
  
      let rendered = render_transcript(cell.as_ref());
@@ -4144,7 +4144,7 @@ index 42dadb8535..971204c124 100644
  }
  
  #[test]
-@@ -2356,10 +2356,10 @@ fn reasoning_summary_block_splits_header_and_summary_when_present() {
+@@ -2366,10 +2366,10 @@ fn reasoning_summary_block_splits_header_and_summary_when_present() {
      );
  
      let rendered_display = render_lines(&cell.display_lines(/*width*/ 80));
@@ -4157,7 +4157,7 @@ index 42dadb8535..971204c124 100644
  }
  
  #[test]
-@@ -2373,7 +2373,7 @@ fn deprecation_notice_renders_summary_with_details() {
+@@ -2383,7 +2383,7 @@ fn deprecation_notice_renders_summary_with_details() {
      assert_eq!(
          rendered,
          vec![
@@ -4166,7 +4166,7 @@ index 42dadb8535..971204c124 100644
              "Use flag `bar` instead.".to_string(),
          ]
      );
-@@ -2387,7 +2387,7 @@ fn agent_markdown_cell_renders_source_at_different_widths() {
+@@ -2397,7 +2397,7 @@ fn agent_markdown_cell_renders_source_at_different_widths() {
  
      let lines_80 = render_lines(&cell.display_lines(/*width*/ 80));
      assert!(
@@ -4175,7 +4175,7 @@ index 42dadb8535..971204c124 100644
          "first line should start with bullet prefix: {:?}",
          lines_80[0]
      );
-@@ -2445,7 +2445,7 @@ fn agent_markdown_cell_narrow_width_shows_prefix_only() {
+@@ -2455,7 +2455,7 @@ fn agent_markdown_cell_narrow_width_shows_prefix_only() {
      let cell = AgentMarkdownCell::new(source.to_string(), &test_cwd());
  
      let lines = render_lines(&cell.display_lines(/*width*/ 2));

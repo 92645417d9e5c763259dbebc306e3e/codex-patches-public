@@ -107,7 +107,7 @@ index 760b516421..e79d5f0b99 100644
              queue!(writer, SetScrollRegion(1..area.top()))?;
  
 diff --git a/codex-rs/tui/src/onboarding/auth.rs b/codex-rs/tui/src/onboarding/auth.rs
-index f9392eb2e8..699a2b23c5 100644
+index 619163bc66..95cd5000cc 100644
 --- a/codex-rs/tui/src/onboarding/auth.rs
 +++ b/codex-rs/tui/src/onboarding/auth.rs
 @@ -655,7 +655,7 @@ impl AuthModeWidget {
