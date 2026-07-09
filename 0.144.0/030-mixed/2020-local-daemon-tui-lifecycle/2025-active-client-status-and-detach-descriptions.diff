@@ -1,0 +1,794 @@
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+index baaf15597d..c8b63a39e7 100644
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -1667,6 +1667,7 @@ server_notification_definitions! {
+     AccountRateLimitsUpdated => "account/rateLimits/updated" (v2::AccountRateLimitsUpdatedNotification),
+     AppListUpdated => "app/list/updated" (v2::AppListUpdatedNotification),
+     RemoteControlStatusChanged => "remoteControl/status/changed" (v2::RemoteControlStatusChangedNotification),
++    ActiveClientCountChanged => "appServer/activeClientCount/changed" (v2::ActiveClientCountChangedNotification),
+     ExternalAgentConfigImportProgress => "externalAgentConfig/import/progress" (v2::ExternalAgentConfigImportProgressNotification),
+     ExternalAgentConfigImportCompleted => "externalAgentConfig/import/completed" (v2::ExternalAgentConfigImportCompletedNotification),
+     FsChanged => "fs/changed" (v2::FsChangedNotification),
+@@ -1716,6 +1717,7 @@ server_notification_definitions! {
+ 
+ client_notification_definitions! {
+     Initialized,
++    ShutdownWhenNoActiveClients,
+ }
+ 
+ #[cfg(test)]
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/notification.rs b/codex-rs/app-server-protocol/src/protocol/v2/notification.rs
+index 8289cf5683..5d9cd2ffef 100644
+--- a/codex-rs/app-server-protocol/src/protocol/v2/notification.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/notification.rs
+@@ -25,6 +25,13 @@ pub struct WarningNotification {
+     pub message: String,
+ }
+ 
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ActiveClientCountChangedNotification {
++    pub active_client_count: usize,
++}
++
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+ #[serde(rename_all = "camelCase")]
+ #[ts(export_to = "v2/")]
+diff --git a/codex-rs/app-server/src/in_process.rs b/codex-rs/app-server/src/in_process.rs
+index e3fdfdde3e..d8f40ec7d3 100644
+--- a/codex-rs/app-server/src/in_process.rs
++++ b/codex-rs/app-server/src/in_process.rs
+@@ -436,6 +436,9 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
+             let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+                 outgoing: Arc::clone(&processor_outgoing),
+                 active_client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
++                shutdown_when_no_active_clients_requested: Arc::new(
++                    std::sync::atomic::AtomicBool::new(false),
++                ),
+                 analytics_events_client,
+                 arg0_paths: args.arg0_paths,
+                 config: args.config,
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+index ad6aa6ea3e..59a59e9bb2 100644
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -48,6 +48,7 @@ use crate::transport::start_remote_control;
+ use crate::transport::start_stdio_connection;
+ use crate::transport::start_websocket_acceptor;
+ use codex_analytics::AppServerRpcTransport;
++use codex_app_server_protocol::ActiveClientCountChangedNotification;
+ use codex_app_server_protocol::ConfigWarningNotification;
+ use codex_app_server_protocol::JSONRPCMessage;
+ use codex_app_server_protocol::ServerNotification;
+@@ -281,6 +282,24 @@ fn should_shutdown_when_no_connections(
+     enabled && had_connection && connection_count == 0 && running_turn_count == 0
+ }
+ 
++fn should_shutdown_when_no_active_clients(
++    requested: bool,
++    had_connection: bool,
++    active_client_count: usize,
++    running_turn_count: usize,
++) -> bool {
++    requested && had_connection && active_client_count == 0 && running_turn_count == 0
++}
++
++fn active_client_count_from_connections(
++    connections: &HashMap<ConnectionId, ConnectionState>,
++) -> usize {
++    connections
++        .values()
++        .filter(|connection_state| connection_state.session.counts_as_active_client())
++        .count()
++}
++
+ fn config_warning_from_error(
+     summary: impl Into<String>,
+     err: &std::io::Error,
+@@ -899,9 +918,13 @@ pub async fn run_main_with_transport_options(
+         let initialize_notification_sender = outgoing_message_sender.clone();
+         let outbound_control_tx = outbound_control_tx;
+         let active_client_count = Arc::new(AtomicUsize::new(0));
++        let shutdown_when_no_active_clients_requested = Arc::new(AtomicBool::new(false));
+         let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+             outgoing: outgoing_message_sender,
+             active_client_count,
++            shutdown_when_no_active_clients_requested: Arc::clone(
++                &shutdown_when_no_active_clients_requested,
++            ),
+             analytics_events_client,
+             arg0_paths,
+             config: Arc::new(config),
+@@ -942,6 +965,15 @@ pub async fn run_main_with_transport_options(
+                 ) {
+                     break "last_connection_closed";
+                 }
++                if should_shutdown_when_no_active_clients(
++                    shutdown_when_no_active_clients_requested
++                        .load(std::sync::atomic::Ordering::Acquire),
++                    had_connection,
++                    active_client_count_from_connections(&connections),
++                    running_turn_count,
++                ) {
++                    break "no_active_clients";
++                }
+                 if matches!(
+                     shutdown_state.update(running_turn_count, connections.len()),
+                     ShutdownAction::Finish
+@@ -1045,72 +1077,109 @@ pub async fn run_main_with_transport_options(
+                                 ) {
+                                     break "last_connection_closed";
+                                 }
++                                let active_client_count =
++                                    active_client_count_from_connections(&connections);
++                                initialize_notification_sender
++                                    .send_server_notification(ServerNotification::ActiveClientCountChanged(
++                                        ActiveClientCountChangedNotification {
++                                            active_client_count,
++                                        },
++                                    ))
++                                    .await;
++                                if should_shutdown_when_no_active_clients(
++                                    shutdown_when_no_active_clients_requested
++                                        .load(std::sync::atomic::Ordering::Acquire),
++                                    had_connection,
++                                    active_client_count,
++                                    running_turn_count,
++                                ) {
++                                    break "no_active_clients";
++                                }
+                             }
+                             TransportEvent::IncomingMessage { connection_id, message } => {
+                                 match message {
+                                     JSONRPCMessage::Request(request) => {
+-                                        let Some(connection_state) = connections.get_mut(&connection_id) else {
+-                                            warn!("dropping request from unknown connection: {connection_id:?}");
+-                                            continue;
+-                                        };
+-                                        let was_initialized =
+-                                            connection_state.session.initialized();
+-                                        processor
+-                                            .process_request(
+-                                                connection_id,
+-                                                request,
+-                                                &transport,
+-                                                Arc::clone(&connection_state.session),
+-                                            )
+-                                            .await;
+-                                        let opted_out_notification_methods_snapshot = connection_state
+-                                            .session
+-                                            .opted_out_notification_methods();
+-                                        let experimental_api_enabled =
+-                                            connection_state.session.experimental_api_enabled();
+-                                        let is_initialized = connection_state.session.initialized();
+-                                        if let Ok(mut opted_out_notification_methods) = connection_state
+-                                            .outbound_opted_out_notification_methods
+-                                            .write()
+-                                        {
+-                                            *opted_out_notification_methods =
+-                                                opted_out_notification_methods_snapshot;
+-                                        } else {
+-                                            warn!(
+-                                                "failed to update outbound opted-out notifications"
+-                                            );
+-                                        }
+-                                        connection_state
+-                                            .outbound_experimental_api_enabled
+-                                            .store(
+-                                                experimental_api_enabled,
+-                                                std::sync::atomic::Ordering::Release,
+-                                            );
+-                                        if !was_initialized && is_initialized {
++                                        let became_initialized = {
++                                            let Some(connection_state) = connections.get_mut(&connection_id) else {
++                                                warn!("dropping request from unknown connection: {connection_id:?}");
++                                                continue;
++                                            };
++                                            let was_initialized =
++                                                connection_state.session.initialized();
+                                             processor
+-                                                .send_initialize_notifications_to_connection(
++                                                .process_request(
+                                                     connection_id,
++                                                    request,
++                                                    &transport,
++                                                    Arc::clone(&connection_state.session),
+                                                 )
+                                                 .await;
++                                            let opted_out_notification_methods_snapshot = connection_state
++                                                .session
++                                                .opted_out_notification_methods();
++                                            let experimental_api_enabled =
++                                                connection_state.session.experimental_api_enabled();
++                                            let is_initialized = connection_state.session.initialized();
++                                            if let Ok(mut opted_out_notification_methods) = connection_state
++                                                .outbound_opted_out_notification_methods
++                                                .write()
++                                            {
++                                                *opted_out_notification_methods =
++                                                    opted_out_notification_methods_snapshot;
++                                            } else {
++                                                warn!(
++                                                    "failed to update outbound opted-out notifications"
++                                                );
++                                            }
++                                            connection_state
++                                                .outbound_experimental_api_enabled
++                                                .store(
++                                                    experimental_api_enabled,
++                                                    std::sync::atomic::Ordering::Release,
++                                                );
++                                            if !was_initialized && is_initialized {
++                                                processor
++                                                    .send_initialize_notifications_to_connection(
++                                                        connection_id,
++                                                    )
++                                                    .await;
++                                                initialize_notification_sender
++                                                    .send_server_notification_to_connections(
++                                                        &[connection_id],
++                                                        ServerNotification::RemoteControlStatusChanged(
++                                                            remote_control_status.clone(),
++                                                        ),
++                                                    )
++                                                    .await;
++                                                processor
++                                                    .connection_initialized(
++                                                        connection_id,
++                                                        connection_state
++                                                            .session
++                                                            .request_attestation(),
++                                                    )
++                                                    .await;
++                                                connection_state
++                                                    .outbound_initialized
++                                                    .store(true, std::sync::atomic::Ordering::Release);
++                                                true
++                                            } else {
++                                                false
++                                            }
++                                        };
++                                        if became_initialized {
+                                             initialize_notification_sender
+-                                                .send_server_notification_to_connections(
+-                                                    &[connection_id],
+-                                                    ServerNotification::RemoteControlStatusChanged(
+-                                                        remote_control_status.clone(),
++                                                .send_server_notification(
++                                                    ServerNotification::ActiveClientCountChanged(
++                                                        ActiveClientCountChangedNotification {
++                                                            active_client_count:
++                                                                active_client_count_from_connections(
++                                                                    &connections,
++                                                                ),
++                                                        },
+                                                     ),
+                                                 )
+                                                 .await;
+-                                            processor
+-                                                .connection_initialized(
+-                                                    connection_id,
+-                                                    connection_state
+-                                                        .session
+-                                                        .request_attestation(),
+-                                                )
+-                                                .await;
+-                                            connection_state
+-                                                .outbound_initialized
+-                                                .store(true, std::sync::atomic::Ordering::Release);
+                                         }
+                                     }
+                                     JSONRPCMessage::Response(response) => {
+@@ -1398,6 +1467,7 @@ mod tests {
+     use super::LogFormat;
+     #[cfg(debug_assertions)]
+     use super::loader_overrides_with_test_user_config_file;
++    use super::should_shutdown_when_no_active_clients;
+     use super::should_shutdown_when_no_connections;
+     #[cfg(debug_assertions)]
+     use codex_config::LoaderOverrides;
+@@ -1431,6 +1501,22 @@ mod tests {
+         ));
+     }
+ 
++    #[test]
++    fn idle_shutdown_waits_for_no_active_clients_and_no_running_turns() {
++        assert!(!should_shutdown_when_no_active_clients(
++            /*requested*/ true, /*had_connection*/ true, /*active_client_count*/ 1,
++            /*running_turn_count*/ 0,
++        ));
++        assert!(!should_shutdown_when_no_active_clients(
++            /*requested*/ true, /*had_connection*/ true, /*active_client_count*/ 0,
++            /*running_turn_count*/ 1,
++        ));
++        assert!(should_shutdown_when_no_active_clients(
++            /*requested*/ true, /*had_connection*/ true, /*active_client_count*/ 0,
++            /*running_turn_count*/ 0,
++        ));
++    }
++
+     #[test]
+     fn no_connection_shutdown_runs_only_after_clients_and_turns_are_gone() {
+         assert!(!should_shutdown_when_no_connections(
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 044b2839b7..6f1d95da4b 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -136,6 +136,7 @@ pub(crate) struct MessageProcessor {
+     windows_sandbox_processor: WindowsSandboxRequestProcessor,
+     request_serialization_queues: RequestSerializationQueues,
+     active_client_count: Arc<AtomicUsize>,
++    shutdown_when_no_active_clients_requested: Arc<AtomicBool>,
+ }
+ 
+ #[derive(Debug)]
+@@ -224,6 +225,7 @@ impl ConnectionSessionState {
+ pub(crate) struct MessageProcessorArgs {
+     pub(crate) outgoing: Arc<OutgoingMessageSender>,
+     pub(crate) active_client_count: Arc<AtomicUsize>,
++    pub(crate) shutdown_when_no_active_clients_requested: Arc<AtomicBool>,
+     pub(crate) analytics_events_client: AnalyticsEventsClient,
+     pub(crate) arg0_paths: Arg0DispatchPaths,
+     pub(crate) config: Arc<Config>,
+@@ -248,6 +250,7 @@ impl MessageProcessor {
+         let MessageProcessorArgs {
+             outgoing,
+             active_client_count,
++            shutdown_when_no_active_clients_requested,
+             analytics_events_client,
+             arg0_paths,
+             config,
+@@ -516,6 +519,7 @@ impl MessageProcessor {
+             windows_sandbox_processor,
+             request_serialization_queues: RequestSerializationQueues::default(),
+             active_client_count,
++            shutdown_when_no_active_clients_requested,
+         }
+     }
+ 
+@@ -639,16 +643,25 @@ impl MessageProcessor {
+     }
+ 
+     pub(crate) async fn process_notification(&self, notification: JSONRPCNotification) {
+-        // Currently, we do not expect to receive any notifications from the
+-        // client, so we just log them.
+-        tracing::info!("<- notification: {:?}", notification);
++        let notification = serde_json::to_value(notification)
++            .and_then(serde_json::from_value::<ClientNotification>);
++        match notification {
++            Ok(notification) => self.process_client_notification(notification).await,
++            Err(err) => tracing::info!("ignored untyped client notification: {err}"),
++        }
+     }
+ 
+     /// Handles typed notifications from in-process clients.
+     pub(crate) async fn process_client_notification(&self, notification: ClientNotification) {
+-        // Currently, we do not expect to receive any typed notifications from
+-        // in-process clients, so we just log them.
+-        tracing::info!("<- typed notification: {:?}", notification);
++        match notification {
++            ClientNotification::Initialized => {
++                tracing::info!("<- typed notification: initialized");
++            }
++            ClientNotification::ShutdownWhenNoActiveClients => {
++                self.shutdown_when_no_active_clients_requested
++                    .store(true, Ordering::Release);
++            }
++        }
+     }
+ 
+     async fn run_request_with_context<F>(
+diff --git a/codex-rs/app-server/src/message_processor_tracing_tests.rs b/codex-rs/app-server/src/message_processor_tracing_tests.rs
+index 1447a71d54..4a913f9074 100644
+--- a/codex-rs/app-server/src/message_processor_tracing_tests.rs
++++ b/codex-rs/app-server/src/message_processor_tracing_tests.rs
+@@ -253,6 +253,9 @@ async fn build_test_processor(
+     let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+         outgoing,
+         active_client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
++        shutdown_when_no_active_clients_requested: Arc::new(std::sync::atomic::AtomicBool::new(
++            false,
++        )),
+         analytics_events_client,
+         arg0_paths: Arg0DispatchPaths::default(),
+         config,
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index ccc330f358..b6d8e7cfd3 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -1000,6 +1000,7 @@ impl App {
+             }
+         };
+         chat_widget.remote_connection = remote_connection;
++        chat_widget.set_app_server_supports_detach(app_server_target.supports_detach());
+         let thread_and_widget_ms = thread_and_widget_started_at.elapsed().as_millis();
+         chat_widget
+             .maybe_prompt_windows_sandbox_enable(should_prompt_windows_sandbox_nux_at_startup);
+diff --git a/codex-rs/tui/src/app/app_server_event_targets.rs b/codex-rs/tui/src/app/app_server_event_targets.rs
+index 6c55850e4d..4aa10b6298 100644
+--- a/codex-rs/tui/src/app/app_server_event_targets.rs
++++ b/codex-rs/tui/src/app/app_server_event_targets.rs
+@@ -167,6 +167,7 @@ pub(super) fn server_notification_thread_target(
+         | ServerNotification::AccountRateLimitsUpdated(_)
+         | ServerNotification::AppListUpdated(_)
+         | ServerNotification::RemoteControlStatusChanged(_)
++        | ServerNotification::ActiveClientCountChanged(_)
+         | ServerNotification::ExternalAgentConfigImportProgress(_)
+         | ServerNotification::ExternalAgentConfigImportCompleted(_)
+         | ServerNotification::DeprecationNotice(_)
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index b32235d65a..1e76704c25 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -2379,6 +2379,11 @@ impl App {
+     ) -> AppRunControl {
+         match mode {
+             ExitMode::ShutdownFirst => {
++                if self.app_server_target.supports_detach()
++                    && let Err(err) = app_server.shutdown_when_no_active_clients().await
++                {
++                    tracing::warn!(error = %err, "failed to request app-server idle shutdown");
++                }
+                 // Mark the thread we are explicitly shutting down for exit so
+                 // its shutdown completion does not trigger agent failover.
+                 self.pending_shutdown_exit_thread_id =
+diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
+index b4bbbd231a..4fdd6fa0cf 100644
+--- a/codex-rs/tui/src/app/session_lifecycle.rs
++++ b/codex-rs/tui/src/app/session_lifecycle.rs
+@@ -325,6 +325,7 @@ impl App {
+     /// This helper copies every known nickname/role from `AgentNavigationState` into the
+     /// replacement widget so that replayed collab items render agent names immediately.
+     pub(super) fn replace_chat_widget(&mut self, mut chat_widget: ChatWidget) {
++        chat_widget.set_app_server_supports_detach(self.app_server_target.supports_detach());
+         // Transfer the last-written terminal title to the replacement widget
+         // so it knows what OSC title is currently displayed. Without this, the
+         // new widget would redundantly clear and rewrite the same title, causing
+diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+index c335ac7d13..a10c1cff86 100644
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -22,6 +22,7 @@ use codex_app_server_client::TypedRequestError;
+ use codex_app_server_protocol::Account;
+ use codex_app_server_protocol::AskForApproval;
+ use codex_app_server_protocol::AuthMode;
++use codex_app_server_protocol::ClientNotification;
+ use codex_app_server_protocol::ClientRequest;
+ use codex_app_server_protocol::ConfigBatchWriteParams;
+ use codex_app_server_protocol::ConfigRequirementsReadResponse;
+@@ -451,6 +452,13 @@ impl AppServerSession {
+         self.client.next_event().await
+     }
+ 
++    pub(crate) async fn shutdown_when_no_active_clients(&mut self) -> Result<()> {
++        self.client
++            .notify(ClientNotification::ShutdownWhenNoActiveClients)
++            .await
++            .wrap_err("app-server idle shutdown request failed")
++    }
++
+     #[cfg(test)]
+     pub(crate) async fn start_thread(&mut self, config: &Config) -> Result<AppServerStartedThread> {
+         self.start_thread_with_session_start_source(config, /*session_start_source*/ None)
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+index b07e839453..7d3db437cf 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+@@ -398,6 +398,7 @@ pub(crate) struct ChatComposer {
+     personality_command_enabled: bool,
+     windows_degraded_sandbox_active: bool,
+     side_conversation_active: bool,
++    app_server_supports_detach: bool,
+     history_search: Option<HistorySearchSession>,
+     submit_keys: Vec<KeyBinding>,
+     queue_keys: Vec<KeyBinding>,
+@@ -465,6 +466,7 @@ impl ChatComposer {
+             personality_command_enabled: self.personality_command_enabled,
+             allow_elevate_sandbox: self.windows_degraded_sandbox_active,
+             side_conversation_active: self.side_conversation_active,
++            app_server_supports_detach: self.app_server_supports_detach,
+         }
+     }
+ 
+@@ -562,6 +564,7 @@ impl ChatComposer {
+             personality_command_enabled: false,
+             windows_degraded_sandbox_active: false,
+             side_conversation_active: false,
++            app_server_supports_detach: false,
+             history_search: None,
+             submit_keys: vec![key_hint::plain(KeyCode::Enter)],
+             queue_keys: vec![key_hint::plain(KeyCode::Tab)],
+@@ -711,6 +714,10 @@ impl ChatComposer {
+         self.side_conversation_active = active;
+     }
+ 
++    pub fn set_app_server_supports_detach(&mut self, supports_detach: bool) {
++        self.app_server_supports_detach = supports_detach;
++    }
++
+     /// Compatibility shim for tests that still toggle the removed steer mode flag.
+     #[cfg(test)]
+     pub fn set_steer_enabled(&mut self, _enabled: bool) {}
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer/slash_input.rs b/codex-rs/tui/src/bottom_pane/chat_composer/slash_input.rs
+index 721b92acc8..59e93fd718 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer/slash_input.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/slash_input.rs
+@@ -180,6 +180,7 @@ impl<'a> SlashInput<'a> {
+                 personality_command_enabled: self.command_flags.personality_command_enabled,
+                 windows_degraded_sandbox_active: self.command_flags.allow_elevate_sandbox,
+                 side_conversation_active: self.command_flags.side_conversation_active,
++                app_server_supports_detach: self.command_flags.app_server_supports_detach,
+             },
+             self.service_tier_commands.to_vec(),
+         );
+diff --git a/codex-rs/tui/src/bottom_pane/command_popup.rs b/codex-rs/tui/src/bottom_pane/command_popup.rs
+index f613e5ee3f..268f69dcf2 100644
+--- a/codex-rs/tui/src/bottom_pane/command_popup.rs
++++ b/codex-rs/tui/src/bottom_pane/command_popup.rs
+@@ -37,6 +37,7 @@ pub(crate) struct CommandPopup {
+     command_filter: String,
+     commands: Vec<CommandItem>,
+     state: ScrollState,
++    app_server_supports_detach: bool,
+ }
+ 
+ #[derive(Clone, Copy, Debug, Default)]
+@@ -50,6 +51,7 @@ pub(crate) struct CommandPopupFlags {
+     pub(crate) personality_command_enabled: bool,
+     pub(crate) windows_degraded_sandbox_active: bool,
+     pub(crate) side_conversation_active: bool,
++    pub(crate) app_server_supports_detach: bool,
+ }
+ 
+ impl From<CommandPopupFlags> for BuiltinCommandFlags {
+@@ -64,6 +66,7 @@ impl From<CommandPopupFlags> for BuiltinCommandFlags {
+             personality_command_enabled: value.personality_command_enabled,
+             allow_elevate_sandbox: value.windows_degraded_sandbox_active,
+             side_conversation_active: value.side_conversation_active,
++            app_server_supports_detach: value.app_server_supports_detach,
+         }
+     }
+ }
+@@ -87,6 +90,7 @@ impl CommandPopup {
+             command_filter: String::new(),
+             commands,
+             state: ScrollState::new(),
++            app_server_supports_detach: flags.app_server_supports_detach,
+         }
+     }
+ 
+@@ -205,7 +209,9 @@ impl CommandPopup {
+             .into_iter()
+             .map(|(item, indices)| {
+                 let name = format!("/{}", item.command());
+-                let description = item.description().to_string();
++                let description = item
++                    .description(self.app_server_supports_detach)
++                    .to_string();
+                 GenericDisplayRow {
+                     name,
+                     name_prefix_spans: Vec::new(),
+@@ -253,9 +259,9 @@ impl CommandItem {
+         }
+     }
+ 
+-    fn description(&self) -> &str {
++    fn description(&self, app_server_supports_detach: bool) -> &str {
+         match self {
+-            Self::Builtin(cmd) => cmd.description(),
++            Self::Builtin(cmd) => cmd.description_for_app_server(app_server_supports_detach),
+             Self::ServiceTier(command) => &command.description,
+         }
+     }
+@@ -421,7 +427,7 @@ mod tests {
+             .into_iter()
+             .map(|item| {
+                 let command = item.command();
+-                let description = item.description();
++                let description = item.description(popup.app_server_supports_detach);
+                 format!("/{command} - {description}")
+             })
+             .collect::<Vec<_>>()
+@@ -493,6 +499,35 @@ mod tests {
+         assert!(items.contains(&CommandItem::Builtin(SlashCommand::Quit)));
+     }
+ 
++    #[test]
++    fn detached_app_server_exit_and_quit_descriptions_request_idle_shutdown() {
++        let mut popup = CommandPopup::new(
++            CommandPopupFlags {
++                app_server_supports_detach: true,
++                ..CommandPopupFlags::default()
++            },
++            Vec::new(),
++        );
++
++        popup.on_composer_text_change("/exit".to_string());
++        assert_eq!(
++            popup
++                .selected_item()
++                .as_ref()
++                .map(|item| item.description(popup.app_server_supports_detach)),
++            Some("exit Codex; app-server stops when no active clients remain")
++        );
++
++        popup.on_composer_text_change("/quit".to_string());
++        assert_eq!(
++            popup
++                .selected_item()
++                .as_ref()
++                .map(|item| item.description(popup.app_server_supports_detach)),
++            Some("exit Codex; app-server stops when no active clients remain")
++        );
++    }
++
+     #[test]
+     fn btw_hidden_in_empty_filter_but_shown_for_prefix() {
+         let mut popup = CommandPopup::new(CommandPopupFlags::default(), Vec::new());
+@@ -537,6 +572,7 @@ mod tests {
+                 personality_command_enabled: true,
+                 windows_degraded_sandbox_active: false,
+                 side_conversation_active: false,
++                app_server_supports_detach: false,
+             },
+             Vec::new(),
+         );
+@@ -564,6 +600,7 @@ mod tests {
+                 personality_command_enabled: false,
+                 windows_degraded_sandbox_active: false,
+                 side_conversation_active: false,
++                app_server_supports_detach: false,
+             },
+             Vec::new(),
+         );
+@@ -596,6 +633,7 @@ mod tests {
+                 personality_command_enabled: true,
+                 windows_degraded_sandbox_active: false,
+                 side_conversation_active: false,
++                app_server_supports_detach: false,
+             },
+             Vec::new(),
+         );
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+index c8446cbe92..57d1789b37 100644
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -439,6 +439,12 @@ impl BottomPane {
+         self.request_redraw();
+     }
+ 
++    pub(crate) fn set_app_server_supports_detach(&mut self, supports_detach: bool) {
++        self.composer
++            .set_app_server_supports_detach(supports_detach);
++        self.request_redraw();
++    }
++
+     pub(crate) fn set_placeholder_text(&mut self, placeholder: String) {
+         self.composer.set_placeholder_text(placeholder);
+         self.request_redraw();
+diff --git a/codex-rs/tui/src/bottom_pane/slash_commands.rs b/codex-rs/tui/src/bottom_pane/slash_commands.rs
+index 6ca1ba93d1..175f3ed81e 100644
+--- a/codex-rs/tui/src/bottom_pane/slash_commands.rs
++++ b/codex-rs/tui/src/bottom_pane/slash_commands.rs
+@@ -64,6 +64,7 @@ pub(crate) struct BuiltinCommandFlags {
+     pub(crate) personality_command_enabled: bool,
+     pub(crate) allow_elevate_sandbox: bool,
+     pub(crate) side_conversation_active: bool,
++    pub(crate) app_server_supports_detach: bool,
+ }
+ 
+ /// Return the built-ins that should be visible/usable for the current input.
+@@ -118,6 +119,7 @@ pub(crate) fn find_builtin_command(name: &str, flags: BuiltinCommandFlags) -> Op
+     builtins_for_input(BuiltinCommandFlags {
+         token_activity_command_enabled: true,
+         side_conversation_active: false,
++        app_server_supports_detach: flags.app_server_supports_detach,
+         ..flags
+     })
+     .into_iter()
+@@ -173,6 +175,7 @@ mod tests {
+             personality_command_enabled: true,
+             allow_elevate_sandbox: true,
+             side_conversation_active: false,
++            app_server_supports_detach: false,
+         }
+     }
+ 
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 549f098dd0..02f0e04bb2 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -543,6 +543,7 @@ pub(crate) struct ChatWidget {
+     active_collaboration_mask: Option<CollaborationModeMask>,
+     has_chatgpt_account: bool,
+     has_codex_backend_auth: bool,
++    app_server_supports_detach: bool,
+     model_catalog: Arc<ModelCatalog>,
+     session_telemetry: SessionTelemetry,
+     session_header: SessionHeader,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 5e5286962e..0e414e70d7 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -115,6 +115,7 @@ impl ChatWidget {
+             active_collaboration_mask,
+             has_chatgpt_account,
+             has_codex_backend_auth,
++            app_server_supports_detach: false,
+             model_catalog,
+             session_telemetry,
+             session_header: SessionHeader::new(header_model),
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index f60f9c41da..025021e62d 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -194,6 +194,7 @@ impl ChatWidget {
+             ServerNotification::ServerRequestResolved(_)
+             | ServerNotification::AccountUpdated(_)
+             | ServerNotification::AccountRateLimitsUpdated(_)
++            | ServerNotification::ActiveClientCountChanged(_)
+             | ServerNotification::ThreadStarted(_)
+             | ServerNotification::ThreadStatusChanged(_)
+             | ServerNotification::ThreadArchived(_)
+diff --git a/codex-rs/tui/src/chatwidget/settings.rs b/codex-rs/tui/src/chatwidget/settings.rs
+index 269606098f..f35a07814b 100644
+--- a/codex-rs/tui/src/chatwidget/settings.rs
++++ b/codex-rs/tui/src/chatwidget/settings.rs
+@@ -211,6 +211,12 @@ impl ChatWidget {
+         self.has_codex_backend_auth
+     }
+ 
++    pub(crate) fn set_app_server_supports_detach(&mut self, supports_detach: bool) {
++        self.app_server_supports_detach = supports_detach;
++        self.bottom_pane
++            .set_app_server_supports_detach(supports_detach);
++    }
++
+     pub(crate) fn update_account_state(
+         &mut self,
+         status_account_display: Option<StatusAccountDisplay>,
+diff --git a/codex-rs/tui/src/chatwidget/slash_dispatch.rs b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+index 6a4fcaadd0..f2b0e89dc5 100644
+--- a/codex-rs/tui/src/chatwidget/slash_dispatch.rs
++++ b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+@@ -1030,6 +1030,7 @@ impl ChatWidget {
+             personality_command_enabled: self.config.features.enabled(Feature::Personality),
+             allow_elevate_sandbox,
+             side_conversation_active: self.active_side_conversation,
++            app_server_supports_detach: self.app_server_supports_detach,
+         }
+     }
+ 
+diff --git a/codex-rs/tui/src/slash_command.rs b/codex-rs/tui/src/slash_command.rs
+index 4f7d7dba19..eca6c55a64 100644
+--- a/codex-rs/tui/src/slash_command.rs
++++ b/codex-rs/tui/src/slash_command.rs
+@@ -82,6 +82,10 @@ pub enum SlashCommand {
+ impl SlashCommand {
+     /// User-visible description shown in the popup.
+     pub fn description(self) -> &'static str {
++        self.description_for_app_server(/*supports_detach*/ false)
++    }
++
++    pub fn description_for_app_server(self, supports_detach: bool) -> &'static str {
+         match self {
+             SlashCommand::Feedback => "send logs to maintainers",
+             SlashCommand::New => "start a new chat during a conversation",
+@@ -96,7 +100,14 @@ impl SlashCommand {
+             SlashCommand::Clear => "clear the terminal and start a new chat",
+             SlashCommand::Fork => "fork the current chat",
+             SlashCommand::App => "continue this session in Codex Desktop",
+-            SlashCommand::Quit | SlashCommand::Exit => "exit Codex",
++            SlashCommand::Quit if supports_detach => {
++                "exit Codex; app-server stops when no active clients remain"
++            }
++            SlashCommand::Quit => "quit this TUI",
++            SlashCommand::Exit if supports_detach => {
++                "exit Codex; app-server stops when no active clients remain"
++            }
++            SlashCommand::Exit => "exit Codex",
+             SlashCommand::Copy => "copy last response as markdown",
+             SlashCommand::Raw => "toggle raw scrollback mode for copy-friendly terminal selection",
+             SlashCommand::Diff => "show git diff (including untracked files)",

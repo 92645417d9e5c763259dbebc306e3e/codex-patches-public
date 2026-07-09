@@ -1,0 +1,2887 @@
+diff --git a/codex-rs/codex-api/src/common.rs b/codex-rs/codex-api/src/common.rs
+index ce1fa83177..da87809ba3 100644
+--- a/codex-rs/codex-api/src/common.rs
++++ b/codex-rs/codex-api/src/common.rs
+@@ -220,6 +220,8 @@ pub struct ResponsesApiRequest {
+     pub model: String,
+     #[serde(skip_serializing_if = "String::is_empty")]
+     pub instructions: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub previous_response_id: Option<String>,
+     pub input: Vec<ResponseItem>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub tools: Option<Vec<serde_json::Value>>,
+@@ -246,7 +248,7 @@ impl From<&ResponsesApiRequest> for ResponseCreateWsRequest {
+         Self {
+             model: request.model.clone(),
+             instructions: request.instructions.clone(),
+-            previous_response_id: None,
++            previous_response_id: request.previous_response_id.clone(),
+             input: request.input.clone(),
+             tools: request.tools.clone(),
+             tool_choice: request.tool_choice.clone(),
+diff --git a/codex-rs/codex-api/src/endpoint/responses.rs b/codex-rs/codex-api/src/endpoint/responses.rs
+index 804f0027ff..e804be5b1c 100644
+--- a/codex-rs/codex-api/src/endpoint/responses.rs
++++ b/codex-rs/codex-api/src/endpoint/responses.rs
+@@ -8,6 +8,7 @@ use crate::requests::Compression;
+ use crate::requests::headers::build_session_headers;
+ use crate::requests::headers::insert_header;
+ use crate::requests::headers::subagent_header;
++use crate::sse::responses::ResponseParseCompatibility;
+ use crate::sse::spawn_response_stream;
+ use crate::telemetry::SseTelemetry;
+ use codex_client::EncodedJsonBody;
+@@ -36,6 +37,7 @@ pub struct ResponsesOptions {
+     pub extra_headers: HeaderMap,
+     pub compression: Compression,
+     pub turn_state: Option<Arc<OnceLock<String>>>,
++    pub response_parse_compatibility: ResponseParseCompatibility,
+ }
+ 
+ impl<T: HttpTransport> ResponsesClient<T> {
+@@ -79,6 +81,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
+             extra_headers,
+             compression,
+             turn_state,
++            response_parse_compatibility,
+         } = options;
+ 
+         let body = EncodedJsonBody::encode(&request)
+@@ -93,8 +96,14 @@ impl<T: HttpTransport> ResponsesClient<T> {
+             insert_header(&mut headers, "x-openai-subagent", &subagent);
+         }
+ 
+-        self.stream_encoded(body, headers, compression, turn_state)
+-            .await
++        self.stream_encoded(
++            body,
++            headers,
++            compression,
++            turn_state,
++            response_parse_compatibility,
++        )
++        .await
+     }
+ 
+     fn path() -> &'static str {
+@@ -121,8 +130,14 @@ impl<T: HttpTransport> ResponsesClient<T> {
+     ) -> Result<ResponseStream, ApiError> {
+         let body = EncodedJsonBody::encode(&body)
+             .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
+-        self.stream_encoded(body, extra_headers, compression, turn_state)
+-            .await
++        self.stream_encoded(
++            body,
++            extra_headers,
++            compression,
++            turn_state,
++            ResponseParseCompatibility::default(),
++        )
++        .await
+     }
+ 
+     async fn stream_encoded(
+@@ -131,6 +146,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
+         extra_headers: HeaderMap,
+         compression: Compression,
+         turn_state: Option<Arc<OnceLock<String>>>,
++        response_parse_compatibility: ResponseParseCompatibility,
+     ) -> Result<ResponseStream, ApiError> {
+         let request_compression = match compression {
+             Compression::None => RequestCompression::None,
+@@ -159,6 +175,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
+             self.session.provider().stream_idle_timeout,
+             self.sse_telemetry.clone(),
+             turn_state,
++            response_parse_compatibility,
+         ))
+     }
+ }
+diff --git a/codex-rs/codex-api/src/sse/responses.rs b/codex-rs/codex-api/src/sse/responses.rs
+index 723dbe64e8..4445aace54 100644
+--- a/codex-rs/codex-api/src/sse/responses.rs
++++ b/codex-rs/codex-api/src/sse/responses.rs
+@@ -31,11 +31,17 @@ const OPENAI_MODEL_HEADER: &str = "openai-model";
+ const REQUEST_ID_HEADER: &str = "x-request-id";
+ const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION: &str = "trusted_access_for_cyber";
+ 
++#[derive(Debug, Clone, Copy, Default)]
++pub struct ResponseParseCompatibility {
++    pub cached_tokens_optional: bool,
++}
++
+ pub fn spawn_response_stream(
+     stream_response: StreamResponse,
+     idle_timeout: Duration,
+     telemetry: Option<Arc<dyn SseTelemetry>>,
+     turn_state: Option<Arc<OnceLock<String>>>,
++    compatibility: ResponseParseCompatibility,
+ ) -> ResponseStream {
+     let rate_limit_snapshots = parse_all_rate_limits(&stream_response.headers);
+     let models_etag = stream_response
+@@ -89,6 +95,7 @@ pub fn spawn_response_stream(
+             idle_timeout,
+             telemetry,
+             safety_buffering_treatment,
++            compatibility,
+         )
+         .await;
+     });
+@@ -128,27 +135,40 @@ struct ResponseCompletedUsage {
+     total_tokens: i64,
+ }
+ 
+-impl From<ResponseCompletedUsage> for TokenUsage {
+-    fn from(val: ResponseCompletedUsage) -> Self {
+-        TokenUsage {
+-            input_tokens: val.input_tokens,
+-            cached_input_tokens: val
+-                .input_tokens_details
+-                .map(|d| d.cached_tokens)
+-                .unwrap_or(0),
+-            output_tokens: val.output_tokens,
+-            reasoning_output_tokens: val
++impl ResponseCompletedUsage {
++    fn into_token_usage(
++        self,
++        compatibility: ResponseParseCompatibility,
++    ) -> Result<TokenUsage, String> {
++        let cached_input_tokens = match self.input_tokens_details {
++            Some(details) => match details.cached_tokens {
++                Some(tokens) => tokens,
++                None if compatibility.cached_tokens_optional => 0,
++                None => {
++                    return Err(
++                        "missing response.completed usage.input_tokens_details.cached_tokens"
++                            .to_string(),
++                    );
++                }
++            },
++            None => 0,
++        };
++        Ok(TokenUsage {
++            input_tokens: self.input_tokens,
++            cached_input_tokens,
++            output_tokens: self.output_tokens,
++            reasoning_output_tokens: self
+                 .output_tokens_details
+                 .map(|d| d.reasoning_tokens)
+                 .unwrap_or(0),
+-            total_tokens: val.total_tokens,
+-        }
++            total_tokens: self.total_tokens,
++        })
+     }
+ }
+ 
+ #[derive(Debug, Deserialize)]
+ struct ResponseCompletedInputTokensDetails {
+-    cached_tokens: i64,
++    cached_tokens: Option<i64>,
+ }
+ 
+ #[derive(Debug, Deserialize)]
+@@ -325,6 +345,13 @@ impl ResponsesEventError {
+ 
+ pub fn process_responses_event(
+     event: ResponsesStreamEvent,
++) -> std::result::Result<Option<ResponseEvent>, ResponsesEventError> {
++    process_responses_event_with_compatibility(event, ResponseParseCompatibility::default())
++}
++
++fn process_responses_event_with_compatibility(
++    event: ResponsesStreamEvent,
++    compatibility: ResponseParseCompatibility,
+ ) -> std::result::Result<Option<ResponseEvent>, ResponsesEventError> {
+     match event.kind.as_str() {
+         "response.output_item.done" => {
+@@ -436,7 +463,11 @@ pub fn process_responses_event(
+                     Ok(resp) => {
+                         return Ok(Some(ResponseEvent::Completed {
+                             response_id: resp.id,
+-                            token_usage: resp.usage.map(Into::into),
++                            token_usage: resp
++                                .usage
++                                .map(|usage| usage.into_token_usage(compatibility))
++                                .transpose()
++                                .map_err(|err| ResponsesEventError::Api(ApiError::Stream(err)))?,
+                             response_performance: None,
+                             end_turn: resp.end_turn,
+                         }));
+@@ -492,6 +523,7 @@ pub async fn process_sse(
+         idle_timeout,
+         telemetry,
+         SafetyBufferingTreatment::default(),
++        ResponseParseCompatibility::default(),
+     )
+     .await;
+ }
+@@ -502,6 +534,7 @@ async fn process_sse_with_treatment(
+     idle_timeout: Duration,
+     telemetry: Option<Arc<dyn SseTelemetry>>,
+     safety_buffering_treatment: SafetyBufferingTreatment,
++    compatibility: ResponseParseCompatibility,
+ ) {
+     let mut stream = stream.eventsource();
+     let mut response_error: Option<ApiError> = None;
+@@ -589,7 +622,7 @@ async fn process_sse_with_treatment(
+             return;
+         }
+ 
+-        match process_responses_event(event) {
++        match process_responses_event_with_compatibility(event, compatibility) {
+             Ok(Some(event)) => {
+                 let is_completed = matches!(event, ResponseEvent::Completed { .. });
+                 if tx_event.send(Ok(event)).await.is_err() {
+@@ -845,6 +878,53 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn cached_tokens_missing_is_strict_unless_provider_marks_it_optional() {
++        let event = json!({
++            "type": "response.completed",
++            "response": {
++                "id": "resp1",
++                "usage": {
++                    "input_tokens": 12,
++                    "input_tokens_details": {},
++                    "output_tokens": 8,
++                    "output_tokens_details": {
++                        "reasoning_tokens": 3
++                    },
++                    "total_tokens": 20
++                }
++            }
++        });
++        let strict_event: ResponsesStreamEvent = serde_json::from_value(event.clone()).unwrap();
++        let compatible_event: ResponsesStreamEvent = serde_json::from_value(event).unwrap();
++
++        let strict_error = process_responses_event(strict_event)
++            .unwrap_err()
++            .into_api_error();
++        assert_matches!(
++            strict_error,
++            ApiError::Stream(message)
++                if message == "missing response.completed usage.input_tokens_details.cached_tokens"
++        );
++
++        let compatible = process_responses_event_with_compatibility(
++            compatible_event,
++            ResponseParseCompatibility {
++                cached_tokens_optional: true,
++            },
++        )
++        .unwrap()
++        .unwrap();
++        assert_matches!(
++            compatible,
++            ResponseEvent::Completed {
++                token_usage: Some(token_usage),
++                ..
++            } if token_usage.cached_input_tokens == 0
++                && token_usage.reasoning_output_tokens == 3
++        );
++    }
++
+     #[tokio::test]
+     async fn error_when_missing_completed() {
+         let item1 = json!({
+@@ -1227,6 +1307,7 @@ mod tests {
+             idle_timeout(),
+             /*telemetry*/ None,
+             /*turn_state*/ None,
++            ResponseParseCompatibility::default(),
+         );
+         assert_eq!(stream.upstream_request_id.as_deref(), Some("req-1"));
+         let event = stream
+@@ -1267,6 +1348,7 @@ mod tests {
+             idle_timeout(),
+             /*telemetry*/ None,
+             /*turn_state*/ None,
++            ResponseParseCompatibility::default(),
+         );
+         let mut events = Vec::new();
+         while let Some(event) = stream.rx_event.recv().await {
+diff --git a/codex-rs/codex-api/tests/clients.rs b/codex-rs/codex-api/tests/clients.rs
+index ab4ab1d08f..927b9fc9ae 100644
+--- a/codex-rs/codex-api/tests/clients.rs
++++ b/codex-rs/codex-api/tests/clients.rs
+@@ -308,6 +308,7 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
+     let request = ResponsesApiRequest {
+         model: "gpt-test".into(),
+         instructions: "Say hi".into(),
++        previous_response_id: None,
+         input: vec![ResponseItem::Message {
+             id: Some("msg_1".into()),
+             role: "user".into(),
+@@ -401,6 +402,7 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
+     let request = ResponsesApiRequest {
+         model: "gpt-test".into(),
+         instructions: "Say hi".into(),
++        previous_response_id: None,
+         input: Vec::new(),
+         tools: Some(Vec::new()),
+         tool_choice: "auto".into(),
+@@ -515,6 +517,7 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
+     let request = ResponsesApiRequest {
+         model: "gpt-test".into(),
+         instructions: "Say hi".into(),
++        previous_response_id: None,
+         input: vec![ResponseItem::Message {
+             id: Some("msg_1".into()),
+             role: "user".into(),
+@@ -548,6 +551,7 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
+                 extra_headers,
+                 compression: Compression::None,
+                 turn_state: None,
++                ..Default::default()
+             },
+         )
+         .await?;
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index 5bc9d93764..e2ab0422ee 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -27,6 +27,7 @@ use std::collections::HashMap;
+ use std::sync::Arc;
+ use std::sync::Mutex as StdMutex;
+ use std::sync::OnceLock;
++use std::sync::RwLock as StdRwLock;
+ 
+ use codex_api::AgentIdentityTelemetry;
+ use codex_api::ApiError;
+@@ -118,6 +119,9 @@ use crate::client_common::Prompt;
+ use crate::client_common::ResponseEvent;
+ use crate::client_common::ResponseStream;
+ use crate::feedback_tags;
++use crate::non_openai;
++use crate::non_openai::NonOpenAiConfig;
++use crate::non_openai::NonOpenAiRequestRoute;
+ use crate::responses_metadata::CodexResponsesMetadata;
+ use crate::responses_metadata::subagent_header_value;
+ use crate::turn_timing::response_item_records_turn_ttft;
+@@ -204,6 +208,7 @@ fn session_telemetry_for_request(
+ struct ModelClientState {
+     thread_id: ThreadId,
+     provider: SharedModelProvider,
++    non_openai: StdRwLock<NonOpenAiConfig>,
+     auth_env_telemetry: AuthEnvTelemetry,
+     session_source: SessionSource,
+     originator: String,
+@@ -226,6 +231,7 @@ struct ModelClientState {
+ /// share the same auth/provider setup flow.
+ struct CurrentClientSetup {
+     auth: Option<CodexAuth>,
++    provider_info: ModelProviderInfo,
+     api_provider: ApiProvider,
+     api_auth: SharedAuthProvider,
+     agent_identity_telemetry: Option<AgentIdentityTelemetry>,
+@@ -312,6 +318,7 @@ fn responses_request_properties_match(
+     let ResponsesApiRequest {
+         model: previous_model,
+         instructions: previous_instructions,
++        previous_response_id: previous_previous_response_id,
+         input: _,
+         tools: previous_tools,
+         tool_choice: previous_tool_choice,
+@@ -329,6 +336,7 @@ fn responses_request_properties_match(
+     let ResponsesApiRequest {
+         model: current_model,
+         instructions: current_instructions,
++        previous_response_id: current_previous_response_id,
+         input: _,
+         tools: current_tools,
+         tool_choice: current_tool_choice,
+@@ -346,6 +354,7 @@ fn responses_request_properties_match(
+ 
+     previous_model == current_model
+         && previous_instructions == current_instructions
++        && previous_previous_response_id == current_previous_response_id
+         && previous_tools == current_tools
+         && previous_tool_choice == current_tool_choice
+         && previous_parallel_tool_calls == current_parallel_tool_calls
+@@ -427,6 +436,45 @@ impl ModelClient {
+         attestation_provider: Option<Arc<dyn AttestationProvider>>,
+         tx_event: Option<async_channel::Sender<CodexEvent>>,
+         http_client_factory: HttpClientFactory,
++    ) -> Self {
++        Self::new_with_non_openai(
++            auth_manager,
++            agent_identity_policy,
++            thread_id,
++            provider_info,
++            session_source,
++            originator,
++            model_verbosity,
++            enable_request_compression,
++            include_timing_metrics,
++            beta_features_header,
++            item_ids_enabled,
++            concurrent_reasoning_summaries_enabled,
++            NonOpenAiConfig::default(),
++            attestation_provider,
++            tx_event,
++            http_client_factory,
++        )
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    pub(crate) fn new_with_non_openai(
++        auth_manager: Option<Arc<AuthManager>>,
++        agent_identity_policy: AgentIdentityAuthPolicy,
++        thread_id: ThreadId,
++        provider_info: ModelProviderInfo,
++        session_source: SessionSource,
++        originator: String,
++        model_verbosity: Option<VerbosityConfig>,
++        enable_request_compression: bool,
++        include_timing_metrics: bool,
++        beta_features_header: Option<String>,
++        item_ids_enabled: bool,
++        concurrent_reasoning_summaries_enabled: bool,
++        non_openai: NonOpenAiConfig,
++        attestation_provider: Option<Arc<dyn AttestationProvider>>,
++        tx_event: Option<async_channel::Sender<CodexEvent>>,
++        http_client_factory: HttpClientFactory,
+     ) -> Self {
+         let model_provider = create_model_provider(provider_info, auth_manager);
+         let codex_api_key_env_enabled = model_provider
+@@ -440,6 +488,7 @@ impl ModelClient {
+             state: Arc::new(ModelClientState {
+                 thread_id,
+                 provider: model_provider,
++                non_openai: StdRwLock::new(non_openai),
+                 auth_env_telemetry,
+                 session_source,
+                 originator,
+@@ -487,6 +536,30 @@ impl ModelClient {
+         }
+     }
+ 
++    pub(crate) fn refresh_non_openai_config(&self, non_openai: NonOpenAiConfig) {
++        *self
++            .state
++            .non_openai
++            .write()
++            .expect("non-openai route state poisoned") = non_openai;
++    }
++
++    fn non_openai_config(&self) -> NonOpenAiConfig {
++        self.state
++            .non_openai
++            .read()
++            .expect("non-openai route state poisoned")
++            .clone()
++    }
++
++    fn non_openai_route_for_model(
++        &self,
++        model: &str,
++        effort: Option<&ReasoningEffortConfig>,
++    ) -> Option<NonOpenAiRequestRoute> {
++        self.non_openai_config().route_for_model(model, effort)
++    }
++
+     pub(crate) fn auth_manager(&self) -> Option<Arc<AuthManager>> {
+         self.state.provider.auth_manager()
+     }
+@@ -529,7 +602,7 @@ impl ModelClient {
+         if prompt.input.is_empty() {
+             return Ok(Vec::new());
+         }
+-        let client_setup = self.current_client_setup().await?;
++        let client_setup = self.current_client_setup_for_model(model_info).await?;
+         let transport =
+             self.build_responses_transport(&client_setup.api_provider, RESPONSES_COMPACT_ENDPOINT)?;
+         let request_telemetry = Self::build_request_telemetry(
+@@ -809,6 +882,17 @@ impl ModelClient {
+         }
+     }
+ 
++    fn build_non_openai_reasoning(route: &NonOpenAiRequestRoute) -> Option<Reasoning> {
++        route
++            .upstream_reasoning_effort
++            .as_ref()
++            .map(|effort| Reasoning {
++                effort: Some(effort.clone()),
++                summary: None,
++                context: None,
++            })
++    }
++
+     #[allow(clippy::too_many_arguments)]
+     fn build_responses_request(
+         &self,
+@@ -821,7 +905,9 @@ impl ModelClient {
+         responses_metadata: &CodexResponsesMetadata,
+     ) -> Result<ResponsesApiRequest> {
+         let mut input = prompt.get_formatted_input_for_request(model_info.use_responses_lite);
+-        let is_openai = self.state.provider.info().is_openai();
++        let non_openai_route =
++            self.non_openai_route_for_model(model_info.slug.as_str(), effort.as_ref());
++        let is_openai = non_openai_route.is_none() && self.state.provider.info().is_openai();
+         if is_openai {
+             input
+                 .iter_mut()
+@@ -858,8 +944,11 @@ impl ModelClient {
+             .then_some(StreamOptions {
+                 reasoning_summary_delivery: codex_api::ReasoningSummaryDelivery::SequentialCutoff,
+             });
+-        let reasoning = Self::build_reasoning(model_info, effort, summary);
+-        let include = if reasoning.is_some() {
++        let reasoning = non_openai_route
++            .as_ref()
++            .and_then(Self::build_non_openai_reasoning)
++            .or_else(|| Self::build_reasoning(model_info, effort, summary));
++        let include = if reasoning.is_some() && non_openai_route.is_none() {
+             vec!["reasoning.encrypted_content".to_string()]
+         } else {
+             Vec::new()
+@@ -875,22 +964,39 @@ impl ModelClient {
+             }
+             None
+         };
+-        let text = create_text_param_for_request(
+-            verbosity,
+-            &prompt.output_schema,
+-            prompt.output_schema_strict,
+-        );
++        let output_schema = if non_openai_route
++            .as_ref()
++            .is_some_and(|route| !route.supports_json_schema_output)
++        {
++            None
++        } else {
++            prompt.output_schema.clone()
++        };
++        let text =
++            create_text_param_for_request(verbosity, &output_schema, prompt.output_schema_strict);
+         let prompt_cache_key = Some(self.prompt_cache_key());
+-        let service_tier = model_info.service_tier_for_request(service_tier);
++        let service_tier = if non_openai_route.is_some() {
++            None
++        } else {
++            model_info.service_tier_for_request(service_tier)
++        };
++        let store = provider.is_azure_responses_endpoint()
++            || non_openai_route
++                .as_ref()
++                .is_some_and(|route| route.supports_previous_response_id);
+         let request = ResponsesApiRequest {
+-            model: model_info.slug.clone(),
++            model: non_openai_route
++                .as_ref()
++                .map(|route| route.upstream_model.clone())
++                .unwrap_or_else(|| model_info.slug.clone()),
+             instructions,
++            previous_response_id: None,
+             input,
+             tools,
+             tool_choice: "auto".to_string(),
+             parallel_tool_calls: prompt.parallel_tool_calls && !model_info.use_responses_lite,
+             reasoning,
+-            store: provider.is_azure_responses_endpoint(),
++            store,
+             stream: true,
+             stream_options,
+             include,
+@@ -919,6 +1025,18 @@ impl ModelClient {
+         self.state.provider.info().supports_websockets
+     }
+ 
++    pub fn responses_websocket_enabled_for_model(&self, model_info: &ModelInfo) -> bool {
++        self.non_openai_route_for_model(model_info.slug.as_str(), None)
++            .map(|route| route.provider.supports_websockets)
++            .unwrap_or_else(|| self.responses_websocket_enabled())
++    }
++
++    fn wire_api_for_model(&self, model_info: &ModelInfo) -> WireApi {
++        self.non_openai_route_for_model(model_info.slug.as_str(), None)
++            .map(|route| route.provider.wire_api)
++            .unwrap_or(self.state.provider.info().wire_api)
++    }
++
+     /// Returns auth + provider configuration resolved from the current session auth state.
+     ///
+     /// This centralizes setup used by both prewarm and normal request paths so they stay in
+@@ -937,12 +1055,31 @@ impl ModelClient {
+             .await?;
+         Ok(CurrentClientSetup {
+             auth,
++            provider_info: self.state.provider.info().clone(),
+             api_provider,
+             api_auth: resolved_auth.auth,
+             agent_identity_telemetry: resolved_auth.agent_identity_telemetry,
+         })
+     }
+ 
++    async fn current_client_setup_for_model(
++        &self,
++        model_info: &ModelInfo,
++    ) -> Result<CurrentClientSetup> {
++        let non_openai = self.non_openai_config();
++        let Some(route) = non_openai.route_for_model(model_info.slug.as_str(), None) else {
++            return self.current_client_setup().await;
++        };
++        let api_key = non_openai.read_api_key(&route.provider_id).await?;
++        Ok(CurrentClientSetup {
++            auth: None,
++            provider_info: route.provider.clone(),
++            api_provider: non_openai::api_provider_for_route(&route)?,
++            api_auth: non_openai::api_auth_for_key(api_key),
++            agent_identity_telemetry: None,
++        })
++    }
++
+     fn build_responses_transport(
+         &self,
+         api_provider: &ApiProvider,
+@@ -1147,6 +1284,7 @@ impl ModelClientSession {
+             },
+             compression,
+             turn_state: Some(Arc::clone(&self.turn_state)),
++            response_parse_compatibility: Default::default(),
+         }
+     }
+ 
+@@ -1353,10 +1491,14 @@ impl ModelClientSession {
+             ))
+     }
+ 
+-    fn responses_request_compression(&self, auth: Option<&CodexAuth>) -> Compression {
++    fn responses_request_compression(
++        &self,
++        provider_info: &ModelProviderInfo,
++        auth: Option<&CodexAuth>,
++    ) -> Compression {
+         if self.client.state.enable_request_compression
+             && auth.is_some_and(CodexAuth::uses_codex_backend)
+-            && self.client.state.provider.info().is_openai()
++            && provider_info.is_openai()
+         {
+             Compression::Zstd
+         } else {
+@@ -1382,7 +1524,7 @@ impl ModelClientSession {
+         )
+     )]
+     async fn stream_responses_api(
+-        &self,
++        &mut self,
+         prompt: &Prompt,
+         model_info: &ModelInfo,
+         session_telemetry: &SessionTelemetry,
+@@ -1398,7 +1540,10 @@ impl ModelClientSession {
+             .map(AuthManager::unauthorized_recovery);
+         let mut pending_retry = PendingUnauthorizedRetry::default();
+         loop {
+-            let client_setup = self.client.current_client_setup().await?;
++            let client_setup = self
++                .client
++                .current_client_setup_for_model(model_info)
++                .await?;
+             let transport = self
+                 .client
+                 .build_responses_transport(&client_setup.api_provider, RESPONSES_ENDPOINT)?;
+@@ -1414,7 +1559,10 @@ impl ModelClientSession {
+                 RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
+                 self.client.state.auth_env_telemetry.clone(),
+             );
+-            let compression = self.responses_request_compression(client_setup.auth.as_ref());
++            let compression = self.responses_request_compression(
++                &client_setup.provider_info,
++                client_setup.auth.as_ref(),
++            );
+             let mut options = self
+                 .build_responses_options(
+                     responses_metadata,
+@@ -1432,6 +1580,30 @@ impl ModelClientSession {
+                 service_tier.clone(),
+                 responses_metadata,
+             )?;
++            if let Some(route) = self
++                .client
++                .non_openai_route_for_model(model_info.slug.as_str(), effort.as_ref())
++            {
++                options.response_parse_compatibility.cached_tokens_optional =
++                    route.cached_tokens_optional;
++            }
++            let logical_request = request.clone();
++            let use_previous_response_id = self
++                .client
++                .non_openai_route_for_model(model_info.slug.as_str(), effort.as_ref())
++                .is_some_and(|route| route.supports_previous_response_id);
++            if use_previous_response_id
++                && let Some(last_response) = self.get_last_response()
++                && !last_response.response_id.is_empty()
++                && let Some(incremental_items) = self.get_incremental_items(
++                    &request,
++                    Some(&last_response),
++                    /*allow_empty_delta*/ false,
++                )
++            {
++                request.previous_response_id = Some(last_response.response_id);
++                request.input = incremental_items;
++            }
+             let store = request.store;
+             self.client
+                 .prepare_response_items_for_request(&mut request.input, store);
+@@ -1450,12 +1622,16 @@ impl ModelClientSession {
+ 
+             match stream_result {
+                 Ok(stream) => {
+-                    let (stream, _) = map_response_stream(
++                    let (stream, last_request_rx) = map_response_stream(
+                         stream,
+                         request_session_telemetry,
+                         inference_trace_attempt,
+                         Arc::clone(&self.client.state.provider),
+                     );
++                    if use_previous_response_id {
++                        self.websocket_session.last_request = Some(logical_request);
++                        self.websocket_session.last_response_rx = Some(last_request_rx);
++                    }
+                     return Ok(stream);
+                 }
+                 Err(ApiError::Transport(
+@@ -1529,7 +1705,10 @@ impl ModelClientSession {
+             .map(AuthManager::unauthorized_recovery);
+         let mut pending_retry = PendingUnauthorizedRetry::default();
+         loop {
+-            let client_setup = self.client.current_client_setup().await?;
++            let client_setup = self
++                .client
++                .current_client_setup_for_model(model_info)
++                .await?;
+             let request_auth_context = AuthRequestTelemetryContext::new(
+                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                 client_setup.api_auth.as_ref(),
+@@ -1714,7 +1893,10 @@ impl ModelClientSession {
+         service_tier: Option<String>,
+         responses_metadata: &CodexResponsesMetadata,
+     ) -> Result<()> {
+-        if !self.client.responses_websocket_enabled() {
++        if !self
++            .client
++            .responses_websocket_enabled_for_model(model_info)
++        {
+             return Ok(());
+         }
+         if self.websocket_session.last_request.is_some() {
+@@ -1779,10 +1961,13 @@ impl ModelClientSession {
+         responses_metadata: &CodexResponsesMetadata,
+         inference_trace: &InferenceTraceContext,
+     ) -> Result<ResponseStream> {
+-        let wire_api = self.client.state.provider.info().wire_api;
++        let wire_api = self.client.wire_api_for_model(model_info);
+         match wire_api {
+             WireApi::Responses => {
+-                if self.client.responses_websocket_enabled() {
++                if self
++                    .client
++                    .responses_websocket_enabled_for_model(model_info)
++                {
+                     let request_trace = current_span_w3c_trace_context();
+                     match self
+                         .stream_responses_websocket(
+diff --git a/codex-rs/core/src/client_common_tests.rs b/codex-rs/core/src/client_common_tests.rs
+index b8d0a364a3..f2c0d053aa 100644
+--- a/codex-rs/core/src/client_common_tests.rs
++++ b/codex-rs/core/src/client_common_tests.rs
+@@ -109,6 +109,7 @@ fn serializes_text_verbosity_when_set() {
+     let req = ResponsesApiRequest {
+         model: "gpt-5.4".to_string(),
+         instructions: "i".to_string(),
++        previous_response_id: None,
+         input,
+         tools: Some(tools),
+         tool_choice: "auto".to_string(),
+@@ -157,6 +158,7 @@ fn serializes_text_schema_with_strict_format() {
+     let req = ResponsesApiRequest {
+         model: "gpt-5.4".to_string(),
+         instructions: "i".to_string(),
++        previous_response_id: None,
+         input,
+         tools: Some(tools),
+         tool_choice: "auto".to_string(),
+@@ -219,6 +221,7 @@ fn omits_text_when_not_set() {
+     let req = ResponsesApiRequest {
+         model: "gpt-5.4".to_string(),
+         instructions: "i".to_string(),
++        previous_response_id: None,
+         input,
+         tools: Some(tools),
+         tool_choice: "auto".to_string(),
+@@ -243,6 +246,7 @@ fn serializes_flex_service_tier_when_set() {
+     let req = ResponsesApiRequest {
+         model: "gpt-5.4".to_string(),
+         instructions: "i".to_string(),
++        previous_response_id: None,
+         input: vec![],
+         tools: Some(vec![]),
+         tool_choice: "auto".to_string(),
+@@ -264,3 +268,35 @@ fn serializes_flex_service_tier_when_set() {
+         Some("flex")
+     );
+ }
++
++#[test]
++fn serializes_previous_response_id_only_when_set() {
++    let mut req = ResponsesApiRequest {
++        model: "gpt-5.4".to_string(),
++        instructions: "i".to_string(),
++        previous_response_id: None,
++        input: vec![],
++        tools: Some(vec![]),
++        tool_choice: "auto".to_string(),
++        parallel_tool_calls: true,
++        reasoning: None,
++        store: false,
++        stream: true,
++        stream_options: None,
++        include: vec![],
++        prompt_cache_key: None,
++        service_tier: None,
++        text: None,
++        client_metadata: None,
++    };
++
++    let v = serde_json::to_value(&req).expect("json");
++    assert!(v.get("previous_response_id").is_none());
++
++    req.previous_response_id = Some("resp_123".to_string());
++    let v = serde_json::to_value(&req).expect("json");
++    assert_eq!(
++        v.get("previous_response_id").and_then(|id| id.as_str()),
++        Some("resp_123")
++    );
++}
+diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.rs
+index 2d150f4ee8..50a780d9f8 100644
+--- a/codex-rs/core/src/client_tests.rs
++++ b/codex-rs/core/src/client_tests.rs
+@@ -12,6 +12,7 @@ use super::X_OPENAI_SUBAGENT_HEADER;
+ use crate::AttestationContext;
+ use crate::AttestationProvider;
+ use crate::GenerateAttestationFuture;
++use crate::non_openai::NonOpenAiConfig;
+ use crate::responses_metadata::CodexResponsesMetadata;
+ use crate::test_support::TestCodexResponsesRequestKind;
+ use crate::test_support::responses_metadata as test_responses_metadata;
+@@ -40,6 +41,7 @@ use codex_protocol::models::BaseInstructions;
+ use codex_protocol::models::ContentItem;
+ use codex_protocol::models::ResponseItem;
+ use codex_protocol::openai_models::ModelInfo;
++use codex_protocol::openai_models::ModelServiceTier;
+ use codex_protocol::openai_models::ReasoningEffort;
+ use codex_protocol::protocol::InternalSessionSource;
+ use codex_protocol::protocol::SessionSource;
+@@ -83,6 +85,7 @@ use wiremock::matchers::path;
+ 
+ const TEST_CHATGPT_ID_TOKEN: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20iLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfdXNlcl9pZCI6InVzZXItMTIzNDUiLCJ1c2VyX2lkIjoidXNlci0xMjM0NSIsImNoYXRncHRfcGxhbl90eXBlIjoicHJvIiwiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjb3VudC0xMjMifX0.c2ln";
+ const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
++const TEST_NON_OPENAI_MODEL: &str = "provider-model";
+ 
+ fn test_model_client(session_source: SessionSource) -> ModelClient {
+     test_model_client_with_thread_id(ThreadId::new(), session_source)
+@@ -278,6 +281,401 @@ fn test_model_info() -> ModelInfo {
+     .expect("deserialize test model info")
+ }
+ 
++fn test_model_info_with_slug(slug: &str) -> ModelInfo {
++    let mut model_info = test_model_info();
++    model_info.slug = slug.to_string();
++    model_info.display_name = slug.to_string();
++    model_info
++}
++
++fn prompt_message(text: &str) -> ResponseItem {
++    ResponseItem::Message {
++        id: None,
++        role: "user".to_string(),
++        content: vec![ContentItem::InputText {
++            text: text.to_string(),
++        }],
++        phase: None,
++        internal_chat_message_metadata_passthrough: None,
++    }
++}
++
++fn prompt_with_text(text: &str) -> Prompt {
++    Prompt {
++        input: vec![prompt_message(text)],
++        ..Prompt::default()
++    }
++}
++
++async fn stream_until_completed(mut stream: super::ResponseStream) {
++    while let Some(event) = stream.next().await {
++        if matches!(
++            event.expect("stream event should succeed"),
++            ResponseEvent::Completed { .. }
++        ) {
++            return;
++        }
++    }
++    panic!("stream ended before response completed");
++}
++
++fn test_non_openai_config(base_url: &str, api_key: &str) -> (TempDir, NonOpenAiConfig) {
++    test_non_openai_config_with_previous_response_id(
++        base_url, api_key, /*previous_response_id*/ false,
++    )
++}
++
++fn test_non_openai_config_with_previous_response_id(
++    base_url: &str,
++    api_key: &str,
++    previous_response_id: bool,
++) -> (TempDir, NonOpenAiConfig) {
++    let codex_home = TempDir::new().expect("create codex home");
++    let catalog_path = codex_home.path().join("model-catalogs/model-catalogs.json");
++    std::fs::create_dir_all(catalog_path.parent().unwrap()).expect("create model catalog dir");
++    std::fs::write(
++        catalog_path,
++        json!({
++            "models": [
++                {
++                    "slug": TEST_NON_OPENAI_MODEL,
++                    "display_name": TEST_NON_OPENAI_MODEL,
++                    "description": null,
++                    "supported_reasoning_levels": [],
++                    "shell_type": "default",
++                    "visibility": "list",
++                    "supported_in_api": true,
++                    "priority": 80,
++                    "availability_nux": null,
++                    "upgrade": null,
++                    "base_instructions": "base",
++                    "model_messages": {
++                        "instructions_template": "base",
++                        "instructions_variables": null,
++                        "approvals": null
++                    },
++                    "include_skills_usage_instructions": false,
++                    "supports_reasoning_summaries": false,
++                    "default_reasoning_summary": "none",
++                    "support_verbosity": false,
++                    "default_verbosity": null,
++                    "apply_patch_tool_type": null,
++                    "truncation_policy": {"mode": "bytes", "limit": 10000},
++                    "supports_parallel_tool_calls": true,
++                    "context_window": 256000,
++                    "max_context_window": 256000,
++                    "effective_context_window_percent": 95,
++                    "experimental_supported_tools": [],
++                    "input_modalities": ["text"],
++                    "non_openai": {
++                        "api_key": api_key,
++                        "base_url": base_url,
++                        "supports_previous_response_id": previous_response_id,
++                        "reasoning": {}
++                    }
++                },
++            ]
++        })
++        .to_string(),
++    )
++    .expect("write model catalog");
++    let config = NonOpenAiConfig::load_and_heal(codex_home.path()).expect("load non-openai config");
++    (codex_home, config)
++}
++
++#[tokio::test]
++async fn current_client_setup_routes_by_model_not_previous_non_openai_selection() {
++    let (_codex_home, non_openai) =
++        test_non_openai_config("https://provider.example/v1", "sk-test");
++    let openai_provider = create_oss_provider_with_base_url(
++        "https://openai-compatible.example/v1",
++        WireApi::Responses,
++    );
++    let client = ModelClient::new_with_non_openai(
++        /*auth_manager*/ None,
++        AgentIdentityAuthPolicy::JwtOnly,
++        ThreadId::new(),
++        openai_provider,
++        SessionSource::Exec,
++        "test_originator".to_string(),
++        /*model_verbosity*/ None,
++        /*enable_request_compression*/ false,
++        /*include_timing_metrics*/ false,
++        /*beta_features_header*/ None,
++        /*item_ids_enabled*/ false,
++        /*concurrent_reasoning_summaries_enabled*/ false,
++        non_openai,
++        /*attestation_provider*/ None,
++        /*tx_event*/ None,
++        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
++    );
++
++    let provider_setup = client
++        .current_client_setup_for_model(&test_model_info_with_slug(TEST_NON_OPENAI_MODEL))
++        .await
++        .expect("provider setup");
++    assert_eq!(
++        provider_setup.api_provider.base_url,
++        "https://provider.example/v1"
++    );
++
++    let openai_setup = client
++        .current_client_setup_for_model(&test_model_info_with_slug("gpt-5.4"))
++        .await
++        .expect("openai setup");
++    assert_eq!(
++        openai_setup.api_provider.base_url,
++        "https://openai-compatible.example/v1"
++    );
++}
++
++#[tokio::test]
++async fn current_client_setup_uses_refreshed_non_openai_route_table() {
++    let (_old_home, old_non_openai) =
++        test_non_openai_config("https://old-provider.example/v1", "sk-old");
++    let openai_provider = create_oss_provider_with_base_url(
++        "https://openai-compatible.example/v1",
++        WireApi::Responses,
++    );
++    let client = ModelClient::new_with_non_openai(
++        /*auth_manager*/ None,
++        AgentIdentityAuthPolicy::JwtOnly,
++        ThreadId::new(),
++        openai_provider,
++        SessionSource::Exec,
++        "test_originator".to_string(),
++        /*model_verbosity*/ None,
++        /*enable_request_compression*/ false,
++        /*include_timing_metrics*/ false,
++        /*beta_features_header*/ None,
++        /*item_ids_enabled*/ false,
++        /*concurrent_reasoning_summaries_enabled*/ false,
++        old_non_openai,
++        /*attestation_provider*/ None,
++        /*tx_event*/ None,
++        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
++    );
++    let (_new_home, new_non_openai) =
++        test_non_openai_config("https://new-provider.example/v1", "sk-new");
++
++    client.refresh_non_openai_config(new_non_openai);
++
++    let setup = client
++        .current_client_setup_for_model(&test_model_info_with_slug(TEST_NON_OPENAI_MODEL))
++        .await
++        .expect("provider setup");
++    assert_eq!(
++        setup.api_provider.base_url,
++        "https://new-provider.example/v1"
++    );
++}
++
++#[tokio::test]
++async fn non_openai_previous_response_id_capability_stores_and_sends_incremental_http_requests() {
++    let server = MockServer::start().await;
++    let response_count = Arc::new(AtomicUsize::new(0));
++    let response_count_for_mock = Arc::clone(&response_count);
++    Mock::given(method("POST"))
++        .and(path("/v1/responses"))
++        .respond_with(move |_request: &wiremock::Request| {
++            let index = response_count_for_mock.fetch_add(1, Ordering::SeqCst) + 1;
++            let response_id = format!("resp-{index}");
++            ResponseTemplate::new(200)
++                .insert_header("content-type", "text/event-stream")
++                .set_body_raw(
++                    format!(
++                        "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"{response_id}\"}}}}\n\n\
++                         data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"{response_id}\"}}}}\n\n",
++                    ),
++                    "text/event-stream",
++                )
++        })
++        .expect(2)
++        .mount(&server)
++        .await;
++    let (_codex_home, non_openai) = test_non_openai_config_with_previous_response_id(
++        &format!("{}/v1", server.uri()),
++        "sk-test",
++        /*previous_response_id*/ true,
++    );
++    let client = ModelClient::new_with_non_openai(
++        /*auth_manager*/ None,
++        AgentIdentityAuthPolicy::JwtOnly,
++        ThreadId::new(),
++        create_oss_provider_with_base_url(
++            "https://openai-compatible.example/v1",
++            WireApi::Responses,
++        ),
++        SessionSource::Exec,
++        "test_originator".to_string(),
++        /*model_verbosity*/ None,
++        /*enable_request_compression*/ false,
++        /*include_timing_metrics*/ false,
++        /*beta_features_header*/ None,
++        /*item_ids_enabled*/ false,
++        /*concurrent_reasoning_summaries_enabled*/ false,
++        non_openai,
++        /*attestation_provider*/ None,
++        /*tx_event*/ None,
++        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
++    );
++    let model_info = test_model_info_with_slug(TEST_NON_OPENAI_MODEL);
++    let responses_metadata = test_responses_metadata_for_client(
++        &client,
++        /*turn_id*/ None,
++        format!("{}:0", client.state.thread_id),
++        /*parent_thread_id*/ None,
++        TestCodexResponsesRequestKind::Turn,
++    );
++    let session_telemetry = test_session_telemetry();
++    let inference_trace = InferenceTraceContext::disabled();
++    let mut client_session = client.new_session();
++    let prompt_one = prompt_with_text("hello");
++    let prompt_two = Prompt {
++        input: vec![prompt_message("hello"), prompt_message("second")],
++        ..Prompt::default()
++    };
++
++    stream_until_completed(
++        client_session
++            .stream(
++                &prompt_one,
++                &model_info,
++                &session_telemetry,
++                /*effort*/ None,
++                codex_protocol::config_types::ReasoningSummary::None,
++                /*service_tier*/ None,
++                &responses_metadata,
++                &inference_trace,
++            )
++            .await
++            .expect("first non-openai stream"),
++    )
++    .await;
++    stream_until_completed(
++        client_session
++            .stream(
++                &prompt_two,
++                &model_info,
++                &session_telemetry,
++                /*effort*/ None,
++                codex_protocol::config_types::ReasoningSummary::None,
++                /*service_tier*/ None,
++                &responses_metadata,
++                &inference_trace,
++            )
++            .await
++            .expect("second non-openai stream"),
++    )
++    .await;
++
++    let requests = server
++        .received_requests()
++        .await
++        .expect("server should record requests");
++    let response_requests: Vec<_> = requests
++        .iter()
++        .filter(|request| request.url.path() == "/v1/responses")
++        .collect();
++    assert_eq!(response_requests.len(), 2);
++    assert_eq!(response_count.load(Ordering::SeqCst), 2);
++    let first: serde_json::Value = serde_json::from_slice(&response_requests[0].body)
++        .expect("first request body should be json");
++    let second: serde_json::Value = serde_json::from_slice(&response_requests[1].body)
++        .expect("second request body should be json");
++
++    assert_eq!(first["store"], true);
++    assert!(first.get("previous_response_id").is_none());
++    assert_eq!(second["store"], true);
++    assert_eq!(second["previous_response_id"].as_str(), Some("resp-1"));
++    assert_eq!(
++        second["input"],
++        serde_json::to_value([prompt_message("second")]).expect("serialize expected delta")
++    );
++}
++
++#[tokio::test]
++async fn non_openai_request_omits_service_tier_even_when_model_metadata_allows_it() {
++    let server = MockServer::start().await;
++    Mock::given(method("POST"))
++        .and(path("/v1/responses"))
++        .respond_with(
++            ResponseTemplate::new(200)
++                .insert_header("content-type", "text/event-stream")
++                .set_body_raw(
++                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"}}\n\n",
++                    "text/event-stream",
++                ),
++        )
++        .expect(1)
++        .mount(&server)
++        .await;
++    let (_codex_home, non_openai) =
++        test_non_openai_config(&format!("{}/v1", server.uri()), "sk-test");
++    let client = ModelClient::new_with_non_openai(
++        /*auth_manager*/ None,
++        AgentIdentityAuthPolicy::JwtOnly,
++        ThreadId::new(),
++        create_oss_provider_with_base_url(
++            "https://openai-compatible.example/v1",
++            WireApi::Responses,
++        ),
++        SessionSource::Exec,
++        "test_originator".to_string(),
++        /*model_verbosity*/ None,
++        /*enable_request_compression*/ false,
++        /*include_timing_metrics*/ false,
++        /*beta_features_header*/ None,
++        /*item_ids_enabled*/ false,
++        /*concurrent_reasoning_summaries_enabled*/ false,
++        non_openai,
++        /*attestation_provider*/ None,
++        /*tx_event*/ None,
++        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
++    );
++    let mut model_info = test_model_info_with_slug(TEST_NON_OPENAI_MODEL);
++    model_info.service_tiers = vec![ModelServiceTier {
++        id: "priority".to_string(),
++        name: "Priority".to_string(),
++        description: "Priority".to_string(),
++    }];
++    let responses_metadata = test_responses_metadata_for_client(
++        &client,
++        /*turn_id*/ None,
++        format!("{}:0", client.state.thread_id),
++        /*parent_thread_id*/ None,
++        TestCodexResponsesRequestKind::Turn,
++    );
++    let session_telemetry = test_session_telemetry();
++    let inference_trace = InferenceTraceContext::disabled();
++    let mut client_session = client.new_session();
++
++    stream_until_completed(
++        client_session
++            .stream(
++                &prompt_with_text("hello"),
++                &model_info,
++                &session_telemetry,
++                /*effort*/ None,
++                codex_protocol::config_types::ReasoningSummary::None,
++                Some("priority".to_string()),
++                &responses_metadata,
++                &inference_trace,
++            )
++            .await
++            .expect("non-openai stream"),
++    )
++    .await;
++
++    let requests = server
++        .received_requests()
++        .await
++        .expect("server should record requests");
++    let request: serde_json::Value =
++        serde_json::from_slice(&requests[0].body).expect("request body should be json");
++    assert!(request.get("service_tier").is_none());
++}
++
+ #[test]
+ fn build_reasoning_omits_spark_summary_even_when_configured() {
+     let mut model_info = test_model_info();
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index 45d3df04d9..c0fadb1455 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -1,5 +1,6 @@
+ use crate::config::edit::ConfigEdit;
+ use crate::config::edit::ConfigEditsBuilder;
++use crate::non_openai::NonOpenAiConfig;
+ use crate::path_utils::normalize_for_native_workdir;
+ use crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS;
+ use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
+@@ -652,6 +653,9 @@ pub struct Config {
+     /// Info needed to make an API request to the model.
+     pub model_provider: ModelProviderInfo,
+ 
++    /// Non-OpenAI Responses-compatible side providers loaded from `non-openai.json`.
++    pub(crate) non_openai: NonOpenAiConfig,
++
+     /// Optionally specify the personality of the model
+     pub personality: Option<Personality>,
+ 
+@@ -1487,6 +1491,20 @@ impl Config {
+         }
+     }
+ 
++    pub(crate) fn provider_for_model(&self, model: &str) -> ModelProviderInfo {
++        self.non_openai
++            .route_for_model(model, None)
++            .map(|route| route.provider)
++            .unwrap_or_else(|| self.model_provider.clone())
++    }
++
++    pub(crate) fn provider_id_for_model(&self, model: &str) -> String {
++        self.non_openai
++            .route_for_model(model, None)
++            .map(|route| route.provider_id)
++            .unwrap_or_else(|| self.model_provider_id.clone())
++    }
++
+     pub fn auth_route_config(&self) -> Option<AuthRouteConfig> {
+         self.respect_system_proxy
+             .then(AuthRouteConfig::respect_system_proxy)
+@@ -3435,6 +3453,8 @@ impl Config {
+             .clone()
+             .filter(|value| !value.is_empty());
+ 
++        let non_openai = NonOpenAiConfig::load_and_heal(codex_home.as_path())?;
++
+         let model_providers =
+             merge_configured_model_providers(built_in_model_providers(openai_base_url), cfg.model_providers)
+                 .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?;
+@@ -3803,6 +3823,7 @@ impl Config {
+                 .unwrap_or_default(),
+             model_provider_id,
+             model_provider,
++            non_openai,
+             cwd: resolved_cwd,
+             workspace_roots: workspace_roots.clone(),
+             workspace_roots_explicit,
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index b7a8386fd4..e9afd7e107 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -60,6 +60,7 @@ mod mcp_tool_approval_templates;
+ mod mcp_tool_exposure;
+ mod network_policy_decision;
+ pub(crate) mod network_proxy_loader;
++mod non_openai;
+ pub use mcp::McpManager;
+ pub use network_proxy_loader::MtimeConfigReloader;
+ pub use network_proxy_loader::build_network_proxy_state;
+diff --git a/codex-rs/core/src/non_openai.rs b/codex-rs/core/src/non_openai.rs
+new file mode 100644
+index 0000000000..3b503addb6
+--- /dev/null
++++ b/codex-rs/core/src/non_openai.rs
+@@ -0,0 +1,952 @@
++use codex_api::Provider as ApiProvider;
++use codex_api::SharedAuthProvider;
++use codex_http_client::HttpClientFactory;
++use codex_model_provider::BearerAuthProvider;
++use codex_model_provider_info::ModelProviderInfo;
++use codex_model_provider_info::WireApi;
++use codex_models_manager::manager::ModelsManager;
++use codex_models_manager::manager::ModelsManagerFuture;
++use codex_models_manager::manager::RefreshStrategy;
++use codex_models_manager::manager::SharedModelsManager;
++use codex_models_manager::model_info::BASE_INSTRUCTIONS;
++use codex_protocol::config_types::CollaborationModeMask;
++use codex_protocol::error::CodexErr;
++use codex_protocol::error::Result as CodexResult;
++#[cfg(test)]
++use codex_protocol::openai_models::ConfigShellToolType;
++use codex_protocol::openai_models::InputModality;
++use codex_protocol::openai_models::ModelInfo;
++use codex_protocol::openai_models::ModelMessages;
++#[cfg(test)]
++use codex_protocol::openai_models::ModelVisibility;
++use codex_protocol::openai_models::ReasoningEffort;
++#[cfg(test)]
++use codex_protocol::openai_models::ReasoningEffortPreset;
++#[cfg(test)]
++use codex_protocol::openai_models::TruncationPolicyConfig;
++#[cfg(test)]
++use codex_protocol::openai_models::WebSearchToolType;
++use serde::Deserialize;
++use serde::Deserializer;
++use serde::Serialize;
++use std::collections::BTreeMap;
++use std::fmt;
++use std::fs;
++use std::io;
++use std::io::ErrorKind;
++use std::path::Path;
++use std::path::PathBuf;
++use std::sync::Arc;
++use tracing::warn;
++
++const CATALOG_FILE: &str = "model-catalogs/model-catalogs.json";
++const INSTRUCTIONS_DIR: &str = "instructions";
++const DEFAULT_API_KEY: &str = "sk-dummy";
++
++#[derive(Debug, Clone, PartialEq)]
++pub(crate) struct NonOpenAiConfig {
++    path: PathBuf,
++    models: BTreeMap<String, NonOpenAiModel>,
++}
++
++impl Default for NonOpenAiConfig {
++    fn default() -> Self {
++        Self {
++            path: PathBuf::from(CATALOG_FILE),
++            models: BTreeMap::new(),
++        }
++    }
++}
++
++#[derive(Debug, Clone, PartialEq)]
++pub(crate) struct NonOpenAiRequestRoute {
++    pub(crate) provider_id: String,
++    pub(crate) provider: ModelProviderInfo,
++    pub(crate) upstream_model: String,
++    pub(crate) upstream_reasoning_effort: Option<ReasoningEffort>,
++    pub(crate) supports_json_schema_output: bool,
++    pub(crate) supports_plaintext_reasoning: bool,
++    pub(crate) supports_previous_response_id: bool,
++    pub(crate) cached_tokens_optional: bool,
++}
++
++#[derive(Debug, Clone, PartialEq)]
++struct NonOpenAiModel {
++    info: ModelInfo,
++    route: ModelRouteConfig,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
++#[serde(default)]
++struct CatalogConfig {
++    models: Vec<CatalogModelConfig>,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++struct CatalogModelConfig {
++    #[serde(flatten)]
++    info: ModelInfo,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    non_openai: Option<ModelRouteConfig>,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++#[serde(default)]
++struct ModelRouteConfig {
++    api_key: String,
++    base_url: String,
++    websocket: bool,
++    supports_json_schema_output: bool,
++    supports_plaintext_reasoning: bool,
++    supports_previous_response_id: bool,
++    supports_namespace_tools: bool,
++    cached_tokens_optional: bool,
++    reasoning: BTreeMap<String, ReasoningRouteConfig>,
++}
++
++impl Default for ModelRouteConfig {
++    fn default() -> Self {
++        Self {
++            api_key: DEFAULT_API_KEY.to_string(),
++            base_url: String::new(),
++            websocket: false,
++            supports_json_schema_output: false,
++            supports_plaintext_reasoning: false,
++            supports_previous_response_id: false,
++            supports_namespace_tools: true,
++            cached_tokens_optional: false,
++            reasoning: BTreeMap::new(),
++        }
++    }
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++#[serde(default)]
++struct ReasoningRouteConfig {
++    upstream_model: String,
++    #[serde(
++        default,
++        deserialize_with = "deserialize_optional_reasoning_effort",
++        skip_serializing_if = "Option::is_none"
++    )]
++    upstream_reasoning_effort: Option<ReasoningEffort>,
++}
++
++impl Default for ReasoningRouteConfig {
++    fn default() -> Self {
++        Self {
++            upstream_model: String::new(),
++            upstream_reasoning_effort: None,
++        }
++    }
++}
++
++fn deserialize_optional_reasoning_effort<'de, D>(
++    deserializer: D,
++) -> Result<Option<ReasoningEffort>, D::Error>
++where
++    D: Deserializer<'de>,
++{
++    let Some(value) = Option::<String>::deserialize(deserializer)? else {
++        return Ok(None);
++    };
++    Ok(value.parse::<ReasoningEffort>().ok())
++}
++
++impl NonOpenAiConfig {
++    pub(crate) fn load_and_heal(codex_home: &Path) -> io::Result<Self> {
++        let path = codex_home.join(CATALOG_FILE);
++        let (normalized, should_write) = load_catalog_file(&path)?;
++        if should_write {
++            write_if_changed(&path, &normalized)?;
++        }
++        seed_instruction_overlays(codex_home, &normalized);
++        Ok(Self::from_catalog(path, normalized, codex_home))
++    }
++
++    pub(crate) fn models(&self) -> Vec<ModelInfo> {
++        self.models
++            .values()
++            .map(|model| model.info.clone())
++            .collect()
++    }
++
++    pub(crate) fn wrap_models_manager(&self, inner: SharedModelsManager) -> SharedModelsManager {
++        if self.models.is_empty() {
++            return inner;
++        }
++        Arc::new(NonOpenAiModelsManager {
++            inner,
++            non_openai: self.clone(),
++        })
++    }
++
++    pub(crate) fn route_for_model(
++        &self,
++        model: &str,
++        effort: Option<&ReasoningEffort>,
++    ) -> Option<NonOpenAiRequestRoute> {
++        let model = self.models.get(model)?;
++        let reasoning = select_reasoning_route(model, effort);
++        let upstream_model = reasoning
++            .as_ref()
++            .and_then(|route| (!route.upstream_model.trim().is_empty()).then_some(route))
++            .map(|route| route.upstream_model.clone())
++            .unwrap_or_else(|| model.info.slug.clone());
++        Some(NonOpenAiRequestRoute {
++            provider_id: model.info.slug.clone(),
++            provider: provider_from_model(model),
++            upstream_model,
++            upstream_reasoning_effort: reasoning
++                .and_then(|route| route.upstream_reasoning_effort.clone()),
++            supports_json_schema_output: model.route.supports_json_schema_output,
++            supports_plaintext_reasoning: model.route.supports_plaintext_reasoning,
++            supports_previous_response_id: model.route.supports_previous_response_id,
++            cached_tokens_optional: model.route.cached_tokens_optional,
++        })
++    }
++
++    pub(crate) fn supports_namespace_tools(&self, model: &str) -> Option<bool> {
++        self.models
++            .get(model)
++            .map(|model| model.route.supports_namespace_tools)
++    }
++
++    pub(crate) fn model_family(&self, model: &str) -> String {
++        self.models
++            .get(model)
++            .map(|model| format!("non-openai:{}", model.route.base_url))
++            .unwrap_or_else(|| "openai".to_string())
++    }
++
++    pub(crate) fn family_takeover_message(
++        &self,
++        previous_model: &str,
++        current_model: &str,
++    ) -> Option<String> {
++        let previous_family = self.model_family(previous_model);
++        let current_family = self.model_family(current_model);
++        (previous_family != current_family).then(|| {
++            format!(
++                "Cannot continue this conversation with `{current_model}` because the previous turn used `{previous_model}`. Start a new conversation to switch model families."
++            )
++        })
++    }
++
++    pub(crate) async fn read_api_key(&self, model: &str) -> CodexResult<String> {
++        read_api_key_from_catalog(&self.path, model).await
++    }
++
++    fn from_catalog(path: PathBuf, catalog: CatalogConfig, codex_home: &Path) -> Self {
++        let mut models = BTreeMap::new();
++        for model_config in catalog.models {
++            let Some(route) = model_config.non_openai else {
++                continue;
++            };
++            if route.base_url.trim().is_empty() {
++                warn!(model = %model_config.info.slug, "ignoring non-openai model without base_url");
++                continue;
++            }
++            if !model_config
++                .info
++                .input_modalities
++                .contains(&InputModality::Text)
++            {
++                warn!(model = %model_config.info.slug, "ignoring non-openai model without text support");
++                continue;
++            }
++            let model_id = model_config.info.slug.clone();
++            let mut model_info = model_config.info;
++            normalize_runtime_model_fields(&mut model_info);
++            apply_instruction_overlay(&mut model_info, codex_home);
++            if route.supports_plaintext_reasoning {
++                model_info.supports_plaintext_reasoning = true;
++                model_info.supports_reasoning_summaries = true;
++            }
++            models.insert(
++                model_id,
++                NonOpenAiModel {
++                    info: model_info,
++                    route,
++                },
++            );
++        }
++        Self { path, models }
++    }
++}
++
++struct NonOpenAiModelsManager {
++    inner: SharedModelsManager,
++    non_openai: NonOpenAiConfig,
++}
++
++impl fmt::Debug for NonOpenAiModelsManager {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("NonOpenAiModelsManager")
++            .field("inner", &self.inner)
++            .field(
++                "non_openai_models",
++                &self.non_openai.models.keys().collect::<Vec<_>>(),
++            )
++            .finish()
++    }
++}
++
++impl ModelsManager for NonOpenAiModelsManager {
++    fn raw_model_catalog(
++        &self,
++        refresh_strategy: RefreshStrategy,
++        http_client_factory: HttpClientFactory,
++    ) -> ModelsManagerFuture<'_, codex_protocol::openai_models::ModelsResponse> {
++        Box::pin(async move {
++            let mut catalog = self
++                .inner
++                .raw_model_catalog(refresh_strategy, http_client_factory)
++                .await;
++            merge_non_openai_models(&mut catalog.models, self.non_openai.models());
++            catalog
++        })
++    }
++
++    fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {
++        Box::pin(async move {
++            let mut models = self.inner.get_remote_models().await;
++            merge_non_openai_models(&mut models, self.non_openai.models());
++            models
++        })
++    }
++
++    fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, tokio::sync::TryLockError> {
++        let mut models = self.inner.try_get_remote_models()?;
++        merge_non_openai_models(&mut models, self.non_openai.models());
++        Ok(models)
++    }
++
++    fn auth_manager(&self) -> Option<&codex_login::AuthManager> {
++        self.inner.auth_manager()
++    }
++
++    fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
++        self.inner.list_collaboration_modes()
++    }
++
++    fn refresh_if_new_etag(
++        &self,
++        etag: String,
++        http_client_factory: HttpClientFactory,
++    ) -> ModelsManagerFuture<'_, ()> {
++        Box::pin(async move {
++            self.inner
++                .refresh_if_new_etag(etag, http_client_factory)
++                .await;
++        })
++    }
++}
++
++fn merge_non_openai_models(models: &mut Vec<ModelInfo>, non_openai_models: Vec<ModelInfo>) {
++    for model in non_openai_models {
++        match models
++            .iter()
++            .position(|existing| existing.slug == model.slug)
++        {
++            Some(index) => models[index] = model,
++            None => models.push(model),
++        }
++    }
++}
++
++fn provider_from_model(model: &NonOpenAiModel) -> ModelProviderInfo {
++    ModelProviderInfo {
++        name: model.info.display_name.clone(),
++        base_url: Some(model.route.base_url.clone()),
++        env_key: None,
++        env_key_instructions: None,
++        experimental_bearer_token: None,
++        auth: None,
++        aws: None,
++        wire_api: WireApi::Responses,
++        query_params: None,
++        http_headers: None,
++        env_http_headers: None,
++        request_max_retries: None,
++        stream_max_retries: None,
++        stream_idle_timeout_ms: None,
++        websocket_connect_timeout_ms: None,
++        requires_openai_auth: false,
++        supports_websockets: model.route.websocket,
++    }
++}
++
++fn select_reasoning_route<'a>(
++    model: &'a NonOpenAiModel,
++    effort: Option<&ReasoningEffort>,
++) -> Option<&'a ReasoningRouteConfig> {
++    let effort_key = effort.map(ReasoningEffort::as_str);
++    effort_key
++        .and_then(|effort| model.route.reasoning.get(effort))
++        .or_else(|| model.route.reasoning.get("high"))
++        .or_else(|| model.route.reasoning.values().next())
++}
++
++fn load_catalog_file(path: &Path) -> io::Result<(CatalogConfig, bool)> {
++    let contents = match fs::read_to_string(path) {
++        Ok(contents) => contents,
++        Err(err) if err.kind() == ErrorKind::NotFound => {
++            return Ok((CatalogConfig::default(), false));
++        }
++        Err(err) => return Err(err),
++    };
++    if contents.trim().is_empty() {
++        return Ok((CatalogConfig::default(), true));
++    }
++    let mut catalog = serde_json::from_str::<CatalogConfig>(&contents)
++        .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
++    heal_catalog_config(&mut catalog);
++    Ok((catalog, true))
++}
++
++fn heal_catalog_config(catalog: &mut CatalogConfig) {
++    for model in &mut catalog.models {
++        if let Some(route) = &mut model.non_openai {
++            heal_model_route_config(route);
++        }
++    }
++}
++
++fn heal_model_route_config(route: &mut ModelRouteConfig) {
++    route.reasoning.retain(|effort, reasoning| {
++        effort.parse::<ReasoningEffort>().is_ok()
++            && reasoning
++                .upstream_reasoning_effort
++                .as_ref()
++                .is_none_or(|effort| effort.as_str().parse::<ReasoningEffort>().is_ok())
++    });
++    if route.api_key.trim().is_empty() {
++        route.api_key = DEFAULT_API_KEY.to_string();
++    }
++}
++
++fn write_if_changed(path: &Path, config: &CatalogConfig) -> io::Result<()> {
++    let next = serde_json::to_string_pretty(config)
++        .map_err(|err| io::Error::new(ErrorKind::InvalidData, err.to_string()))?;
++    if fs::read_to_string(path).ok().as_deref() == Some(next.as_str()) {
++        return Ok(());
++    }
++    if let Some(parent) = path.parent() {
++        fs::create_dir_all(parent)?;
++    }
++    let tmp = path.with_extension("json.tmp");
++    fs::write(&tmp, next)?;
++    fs::rename(tmp, path)?;
++    Ok(())
++}
++
++fn normalize_runtime_model_fields(info: &mut ModelInfo) {
++    info.service_tiers.clear();
++    info.default_service_tier = None;
++    if info.comp_hash.is_none() {
++        info.comp_hash = Some(format!("non-openai:{}", info.slug));
++    }
++}
++
++fn apply_instruction_overlay(model_info: &mut ModelInfo, codex_home: &Path) {
++    let instruction_template = instruction_template_for_model(codex_home, model_info);
++    model_info.model_messages = Some(ModelMessages {
++        instructions_template: Some(instruction_template),
++        instructions_variables: model_info
++            .model_messages
++            .as_ref()
++            .and_then(|messages| messages.instructions_variables.clone()),
++        approvals: model_info
++            .model_messages
++            .as_ref()
++            .and_then(|messages| messages.approvals.clone()),
++    });
++}
++
++fn instruction_template_for_model(codex_home: &Path, model_info: &ModelInfo) -> String {
++    let path = codex_home
++        .join(INSTRUCTIONS_DIR)
++        .join(format!("{}.md", model_info.slug));
++    match fs::read_to_string(path) {
++        Ok(contents) if !contents.trim().is_empty() => contents,
++        _ => default_instruction_template(model_info).to_string(),
++    }
++}
++
++fn default_instruction_template(model_info: &ModelInfo) -> &str {
++    model_info
++        .model_messages
++        .as_ref()
++        .and_then(|messages| messages.instructions_template.as_deref())
++        .filter(|template| !template.trim().is_empty())
++        .unwrap_or_else(|| {
++            if model_info.base_instructions.trim().is_empty() {
++                BASE_INSTRUCTIONS
++            } else {
++                model_info.base_instructions.as_str()
++            }
++        })
++}
++
++fn seed_instruction_overlays(codex_home: &Path, config: &CatalogConfig) {
++    let dir = codex_home.join(INSTRUCTIONS_DIR);
++    if let Err(err) = fs::create_dir_all(&dir) {
++        warn!(path = %dir.display(), "failed to create instructions overlay directory: {err}");
++        return;
++    }
++    for model in &config.models {
++        if model.non_openai.is_none() {
++            continue;
++        }
++        let path = dir.join(format!("{}.md", model.info.slug));
++        if path.exists() {
++            continue;
++        }
++        if let Err(err) = fs::write(&path, default_instruction_template(&model.info)) {
++            warn!(model = %model.info.slug, path = %path.display(), "failed to seed instructions overlay file: {err}");
++        }
++    }
++}
++
++async fn read_api_key_from_catalog(path: &Path, model: &str) -> CodexResult<String> {
++    let contents = tokio::fs::read_to_string(path)
++        .await
++        .map_err(|err| CodexErr::Fatal(format!("failed to read non-openai catalog: {err}")))?;
++    let catalog = serde_json::from_str::<CatalogConfig>(&contents)
++        .map_err(|err| CodexErr::Fatal(format!("failed to parse non-openai catalog: {err}")))?;
++    let api_key = catalog
++        .models
++        .into_iter()
++        .find(|entry| entry.info.slug == model)
++        .and_then(|entry| entry.non_openai)
++        .map(|route| route.api_key)
++        .map(|api_key| api_key.trim().to_string())
++        .filter(|api_key| !api_key.is_empty())
++        .filter(|api_key| api_key != DEFAULT_API_KEY)
++        .ok_or_else(|| {
++            CodexErr::InvalidRequest(format!(
++                "non-openai model `{model}` needs a real api_key in {CATALOG_FILE}"
++            ))
++        })?;
++    Ok(api_key)
++}
++
++pub(crate) fn api_auth_for_key(api_key: String) -> SharedAuthProvider {
++    Arc::new(BearerAuthProvider::new(api_key))
++}
++
++pub(crate) fn api_provider_for_route(route: &NonOpenAiRequestRoute) -> CodexResult<ApiProvider> {
++    route.provider.to_api_provider(None)
++}
++
++#[cfg(test)]
++fn supported_reasoning_levels(
++    reasoning: &BTreeMap<String, ReasoningRouteConfig>,
++) -> Vec<ReasoningEffortPreset> {
++    let mut levels = reasoning
++        .keys()
++        .filter_map(|effort| effort.parse::<ReasoningEffort>().ok())
++        .map(|effort| ReasoningEffortPreset {
++            description: reasoning_effort_description(&effort),
++            effort,
++        })
++        .collect::<Vec<_>>();
++    levels.sort_by_key(|preset| reasoning_effort_rank(&preset.effort));
++    levels
++}
++
++#[cfg(test)]
++fn reasoning_effort_description(effort: &ReasoningEffort) -> String {
++    match effort {
++        ReasoningEffort::None => "No reasoning".to_string(),
++        ReasoningEffort::Minimal => "Minimal reasoning".to_string(),
++        ReasoningEffort::Low => "Fast responses with lighter reasoning".to_string(),
++        ReasoningEffort::Medium => {
++            "Balances speed and reasoning depth for everyday tasks".to_string()
++        }
++        ReasoningEffort::High => "Greater reasoning depth for complex problems".to_string(),
++        ReasoningEffort::XHigh => "Extra high reasoning depth for complex problems".to_string(),
++        ReasoningEffort::Max => "Maximum reasoning depth for the hardest problems".to_string(),
++        ReasoningEffort::Ultra => "Maximum reasoning with automatic task delegation".to_string(),
++        ReasoningEffort::Custom(effort) => format!("{effort} reasoning"),
++    }
++}
++
++#[cfg(test)]
++fn reasoning_effort_rank(effort: &ReasoningEffort) -> usize {
++    match effort {
++        ReasoningEffort::None => 0,
++        ReasoningEffort::Minimal => 1,
++        ReasoningEffort::Low => 2,
++        ReasoningEffort::Medium => 3,
++        ReasoningEffort::High => 4,
++        ReasoningEffort::XHigh => 5,
++        ReasoningEffort::Max => 6,
++        ReasoningEffort::Ultra => 7,
++        ReasoningEffort::Custom(_) => 8,
++    }
++}
++
++#[cfg(test)]
++struct ModelInfoParts<'a> {
++    slug: &'a str,
++    display_name: &'a str,
++    description: Option<&'a str>,
++    image: bool,
++    web_search: bool,
++    context_window: i64,
++    effective_context_window_percent: i64,
++    reasoning: &'a BTreeMap<String, ReasoningRouteConfig>,
++    plaintext_reasoning: bool,
++}
++
++#[cfg(test)]
++fn model_info_from_parts(parts: ModelInfoParts<'_>) -> ModelInfo {
++    let supported_reasoning_levels = supported_reasoning_levels(parts.reasoning);
++    let default_reasoning_level = supported_reasoning_levels
++        .iter()
++        .find(|preset| preset.effort == ReasoningEffort::High)
++        .or_else(|| supported_reasoning_levels.first())
++        .map(|preset| preset.effort.clone());
++    let input_modalities = if parts.image {
++        vec![InputModality::Text, InputModality::Image]
++    } else {
++        vec![InputModality::Text]
++    };
++    ModelInfo {
++        slug: parts.slug.to_string(),
++        display_name: parts.display_name.to_string(),
++        description: parts.description.map(str::to_string),
++        default_reasoning_level,
++        supported_reasoning_levels,
++        shell_type: ConfigShellToolType::Default,
++        visibility: ModelVisibility::List,
++        supported_in_api: true,
++        priority: 80,
++        additional_speed_tiers: Vec::new(),
++        service_tiers: Vec::new(),
++        default_service_tier: None,
++        availability_nux: None,
++        upgrade: None,
++        base_instructions: BASE_INSTRUCTIONS.to_string(),
++        model_messages: Some(ModelMessages {
++            instructions_template: Some(BASE_INSTRUCTIONS.to_string()),
++            instructions_variables: None,
++            approvals: None,
++        }),
++        include_skills_usage_instructions: false,
++        supports_reasoning_summaries: parts.plaintext_reasoning || !parts.reasoning.is_empty(),
++        supports_plaintext_reasoning: parts.plaintext_reasoning,
++        default_reasoning_summary: codex_protocol::config_types::ReasoningSummary::None,
++        support_verbosity: false,
++        default_verbosity: None,
++        apply_patch_tool_type: None,
++        web_search_tool_type: if parts.image {
++            WebSearchToolType::TextAndImage
++        } else {
++            WebSearchToolType::Text
++        },
++        truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
++        supports_parallel_tool_calls: true,
++        supports_image_detail_original: parts.image,
++        context_window: Some(parts.context_window),
++        max_context_window: Some(parts.context_window),
++        auto_compact_token_limit: None,
++        comp_hash: Some(format!("non-openai:{}", parts.slug)),
++        effective_context_window_percent: parts.effective_context_window_percent,
++        experimental_supported_tools: Vec::new(),
++        input_modalities,
++        used_fallback_model_metadata: false,
++        supports_search_tool: parts.web_search,
++        use_responses_lite: false,
++        auto_review_model_override: None,
++        tool_mode: None,
++        multi_agent_version: None,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::Value;
++    use tempfile::TempDir;
++
++    fn sample_catalog() -> CatalogConfig {
++        let mut catalog = CatalogConfig::default();
++        let mut reasoning = BTreeMap::new();
++        reasoning.insert(
++            "none".to_string(),
++            ReasoningRouteConfig {
++                upstream_model: "alpha-upstream".to_string(),
++                upstream_reasoning_effort: Some(ReasoningEffort::None),
++            },
++        );
++        reasoning.insert(
++            "high".to_string(),
++            ReasoningRouteConfig {
++                upstream_model: "alpha-upstream".to_string(),
++                upstream_reasoning_effort: Some(ReasoningEffort::High),
++            },
++        );
++        catalog.models.push(CatalogModelConfig {
++            info: model_info_from_parts(ModelInfoParts {
++                slug: "alpha-model",
++                display_name: "Alpha Model",
++                description: Some("Primary Responses-compatible model."),
++                image: true,
++                web_search: false,
++                context_window: 512_000,
++                effective_context_window_percent: 95,
++                reasoning: &reasoning,
++                plaintext_reasoning: false,
++            }),
++            non_openai: Some(ModelRouteConfig {
++                api_key: DEFAULT_API_KEY.to_string(),
++                base_url: "https://alpha.example/v1".to_string(),
++                websocket: false,
++                supports_json_schema_output: false,
++                supports_plaintext_reasoning: true,
++                supports_previous_response_id: false,
++                supports_namespace_tools: true,
++                cached_tokens_optional: true,
++                reasoning,
++            }),
++        });
++        catalog.models.push(CatalogModelConfig {
++            info: model_info_from_parts(ModelInfoParts {
++                slug: "beta-model",
++                display_name: "Beta Model",
++                description: Some("Secondary Responses-compatible model."),
++                image: false,
++                web_search: false,
++                context_window: 256_000,
++                effective_context_window_percent: 95,
++                reasoning: &BTreeMap::new(),
++                plaintext_reasoning: false,
++            }),
++            non_openai: Some(ModelRouteConfig {
++                api_key: DEFAULT_API_KEY.to_string(),
++                base_url: "https://beta.example/v1".to_string(),
++                websocket: true,
++                supports_json_schema_output: true,
++                supports_plaintext_reasoning: false,
++                supports_previous_response_id: true,
++                supports_namespace_tools: false,
++                cached_tokens_optional: false,
++                reasoning: BTreeMap::new(),
++            }),
++        });
++        catalog
++    }
++
++    fn write_catalog(codex_home: &Path, catalog: &CatalogConfig) {
++        let path = codex_home.join(CATALOG_FILE);
++        fs::create_dir_all(path.parent().unwrap()).unwrap();
++        fs::write(path, serde_json::to_string_pretty(catalog).unwrap()).unwrap();
++    }
++
++    #[test]
++    fn missing_catalog_loads_empty_without_creating_files() {
++        let codex_home = TempDir::new().unwrap();
++
++        let config = NonOpenAiConfig::load_and_heal(codex_home.path()).unwrap();
++
++        assert!(config.models().is_empty());
++        assert!(!codex_home.path().join(CATALOG_FILE).exists());
++    }
++
++    #[test]
++    fn catalog_model_non_openai_fields_drive_route_and_heal_defaults() {
++        let codex_home = TempDir::new().unwrap();
++        fs::create_dir_all(codex_home.path().join("model-catalogs")).unwrap();
++        fs::write(
++            codex_home.path().join(CATALOG_FILE),
++            r#"{
++  "models": [
++    {
++      "slug": "alpha-model",
++      "display_name": "Alpha Model",
++      "description": "Primary Responses-compatible model.",
++      "supported_reasoning_levels": [],
++      "shell_type": "default",
++      "visibility": "list",
++      "supported_in_api": true,
++      "priority": 80,
++      "availability_nux": null,
++      "upgrade": null,
++      "base_instructions": "catalog prompt",
++      "include_skills_usage_instructions": false,
++      "supports_reasoning_summaries": false,
++      "default_reasoning_summary": "none",
++      "support_verbosity": false,
++      "default_verbosity": null,
++      "apply_patch_tool_type": null,
++      "truncation_policy": {"mode": "bytes", "limit": 10000},
++      "supports_parallel_tool_calls": true,
++      "context_window": 256000,
++      "max_context_window": 256000,
++      "effective_context_window_percent": 95,
++      "experimental_supported_tools": [],
++      "input_modalities": ["text"],
++      "non_openai": {
++        "api_key": "sk-live",
++        "base_url": "https://alpha.example/v1",
++        "supports_plaintext_reasoning": true
++      }
++    }
++  ]
++}"#,
++        )
++        .unwrap();
++
++        let loaded = NonOpenAiConfig::load_and_heal(codex_home.path()).unwrap();
++        let healed = fs::read_to_string(codex_home.path().join(CATALOG_FILE)).unwrap();
++        let healed: Value = serde_json::from_str(&healed).unwrap();
++        let non_openai = &healed["models"][0]["non_openai"];
++        let route = loaded.route_for_model("alpha-model", None).unwrap();
++        let model = loaded.models().pop().unwrap();
++
++        assert_eq!(non_openai["websocket"], false);
++        assert_eq!(non_openai["supports_json_schema_output"], false);
++        assert_eq!(non_openai["supports_previous_response_id"], false);
++        assert_eq!(non_openai["supports_namespace_tools"], true);
++        assert_eq!(non_openai["cached_tokens_optional"], false);
++        assert_eq!(
++            route.provider.base_url.as_deref(),
++            Some("https://alpha.example/v1")
++        );
++        assert!(!route.provider.supports_websockets);
++        assert!(route.supports_plaintext_reasoning);
++        assert!(model.supports_plaintext_reasoning);
++        assert!(model.supports_reasoning_summaries);
++        assert_eq!(
++            fs::read_to_string(
++                codex_home
++                    .path()
++                    .join(INSTRUCTIONS_DIR)
++                    .join("alpha-model.md")
++            )
++            .unwrap(),
++            "catalog prompt"
++        );
++    }
++
++    #[test]
++    fn route_maps_local_reasoning_to_upstream_model_and_effort() {
++        let codex_home = TempDir::new().unwrap();
++        write_catalog(codex_home.path(), &sample_catalog());
++
++        let loaded = NonOpenAiConfig::load_and_heal(codex_home.path()).unwrap();
++        let none = loaded
++            .route_for_model("alpha-model", Some(&ReasoningEffort::None))
++            .unwrap();
++        let low_fallback = loaded
++            .route_for_model("alpha-model", Some(&ReasoningEffort::Low))
++            .unwrap();
++        let high = loaded
++            .route_for_model("alpha-model", Some(&ReasoningEffort::High))
++            .unwrap();
++
++        assert_eq!(none.upstream_model, "alpha-upstream");
++        assert_eq!(none.upstream_reasoning_effort, Some(ReasoningEffort::None));
++        assert_eq!(low_fallback.upstream_model, "alpha-upstream");
++        assert_eq!(
++            low_fallback.upstream_reasoning_effort,
++            Some(ReasoningEffort::High)
++        );
++        assert_eq!(high.upstream_reasoning_effort, Some(ReasoningEffort::High));
++    }
++
++    #[test]
++    fn model_capabilities_control_transport_tools_and_usage_compatibility() {
++        let codex_home = TempDir::new().unwrap();
++        write_catalog(codex_home.path(), &sample_catalog());
++
++        let loaded = NonOpenAiConfig::load_and_heal(codex_home.path()).unwrap();
++        let alpha = loaded.route_for_model("alpha-model", None).unwrap();
++        let beta = loaded.route_for_model("beta-model", None).unwrap();
++
++        assert!(!alpha.provider.supports_websockets);
++        assert!(beta.provider.supports_websockets);
++        assert!(!alpha.supports_json_schema_output);
++        assert!(beta.supports_json_schema_output);
++        assert!(!alpha.supports_previous_response_id);
++        assert!(beta.supports_previous_response_id);
++        assert_eq!(loaded.supports_namespace_tools("alpha-model"), Some(true));
++        assert_eq!(loaded.supports_namespace_tools("beta-model"), Some(false));
++        assert!(alpha.cached_tokens_optional);
++        assert!(!beta.cached_tokens_optional);
++    }
++
++    #[test]
++    fn generated_instruction_overlay_edit_applies_on_next_load() {
++        let codex_home = TempDir::new().unwrap();
++        write_catalog(codex_home.path(), &sample_catalog());
++
++        let loaded = NonOpenAiConfig::load_and_heal(codex_home.path()).unwrap();
++        let path = codex_home
++            .path()
++            .join(INSTRUCTIONS_DIR)
++            .join("alpha-model.md");
++        assert!(loaded.route_for_model("alpha-model", None).is_some());
++        assert_eq!(fs::read_to_string(&path).unwrap(), BASE_INSTRUCTIONS);
++
++        fs::write(&path, "edited non-openai instructions").unwrap();
++        let reloaded = NonOpenAiConfig::load_and_heal(codex_home.path()).unwrap();
++        let models = reloaded.models();
++        let alpha = models
++            .iter()
++            .find(|model| model.slug == "alpha-model")
++            .unwrap();
++
++        assert_eq!(
++            alpha
++                .model_messages
++                .as_ref()
++                .and_then(|messages| messages.instructions_template.as_deref()),
++            Some("edited non-openai instructions")
++        );
++    }
++
++    #[tokio::test]
++    async fn api_key_reload_reads_only_current_catalog_value() {
++        let codex_home = TempDir::new().unwrap();
++        let mut catalog = sample_catalog();
++        catalog.models[0].non_openai.as_mut().unwrap().api_key = "sk-old".to_string();
++        write_catalog(codex_home.path(), &catalog);
++        let loaded = NonOpenAiConfig::load_and_heal(codex_home.path()).unwrap();
++        catalog.models[0].non_openai.as_mut().unwrap().api_key = "sk-new".to_string();
++        write_catalog(codex_home.path(), &catalog);
++
++        assert_eq!(loaded.read_api_key("alpha-model").await.unwrap(), "sk-new");
++    }
++
++    #[test]
++    fn family_guard_allows_same_base_url_and_blocks_different_routes() {
++        let codex_home = TempDir::new().unwrap();
++        let mut catalog = sample_catalog();
++        let mut sibling = catalog.models[0].clone();
++        sibling.info.slug = "alpha-model-pro".to_string();
++        sibling.non_openai.as_mut().unwrap().api_key = "sk-other".to_string();
++        catalog.models.push(sibling);
++        write_catalog(codex_home.path(), &catalog);
++        let loaded = NonOpenAiConfig::load_and_heal(codex_home.path()).unwrap();
++
++        assert!(
++            loaded
++                .family_takeover_message("gpt-5.4", "alpha-model")
++                .is_some()
++        );
++        assert!(
++            loaded
++                .family_takeover_message("alpha-model", "beta-model")
++                .is_some()
++        );
++        assert!(
++            loaded
++                .family_takeover_message("alpha-model", "alpha-model-pro")
++                .is_none()
++        );
++    }
++}
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 3f7d5d1de2..98cd066b40 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -671,7 +671,7 @@ impl Codex {
+         let service_tier =
+             get_service_tier(config.service_tier.clone(), fast_mode_enabled, &model_info);
+         let session_configuration = SessionConfiguration {
+-            provider: config.model_provider.clone(),
++            provider: config.provider_for_model(model.as_str()),
+             collaboration_mode,
+             model_reasoning_summary: config.model_reasoning_summary,
+             service_tier,
+@@ -960,6 +960,13 @@ fn unsupported_service_tier_warning(
+     fast_mode_enabled: bool,
+     model_info: &ModelInfo,
+ ) -> Option<String> {
++    if model_info
++        .comp_hash
++        .as_deref()
++        .is_some_and(|comp_hash| comp_hash.starts_with("non-openai:"))
++    {
++        return None;
++    }
+     let service_tier = configured_service_tier.filter(|service_tier| {
+         fast_mode_enabled
+             && *service_tier != SERVICE_TIER_DEFAULT_REQUEST_VALUE
+@@ -1699,12 +1706,16 @@ impl Session {
+                 .with_user_layer_from(&next_config.config_layer_stack);
+             config.tool_suggest =
+                 resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
++            config.non_openai = next_config.non_openai.clone();
+             let config = Arc::new(config);
+             state.session_configuration.original_config_do_not_use = Arc::clone(&config);
+             let new_config = notify_config_contributors
+                 .then(|| Self::build_effective_session_config(&state.session_configuration));
+             (previous_config, new_config, config)
+         };
++        self.services
++            .model_client
++            .refresh_non_openai_config(config.non_openai.clone());
+         self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
+         self.services.skills_service.clear_cache();
+         self.services.plugins_manager.clear_cache();
+diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
+index d128800694..42a52ab058 100644
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -177,9 +177,10 @@ impl SessionConfiguration {
+     }
+ 
+     pub(super) fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {
++        let model = self.collaboration_mode.model();
+         ThreadConfigSnapshot {
+-            model: self.collaboration_mode.model().to_string(),
+-            model_provider_id: self.original_config_do_not_use.model_provider_id.clone(),
++            model: model.to_string(),
++            model_provider_id: self.original_config_do_not_use.provider_id_for_model(model),
+             service_tier: self.service_tier.clone(),
+             approval_policy: self.approval_policy.value(),
+             approvals_reviewer: self.approvals_reviewer,
+@@ -231,6 +232,9 @@ impl SessionConfiguration {
+         if let Some(collaboration_mode) = updates.collaboration_mode.clone() {
+             next_configuration.collaboration_mode = collaboration_mode;
+         }
++        next_configuration.provider = next_configuration
++            .original_config_do_not_use
++            .provider_for_model(next_configuration.collaboration_mode.model());
+         if let Some(summary) = updates.reasoning_summary {
+             next_configuration.model_reasoning_summary = Some(summary);
+         }
+@@ -1100,7 +1104,7 @@ impl Session {
+                 thread_store: Arc::clone(&thread_store),
+                 attestation_provider: attestation_provider.clone(),
+                 time_provider,
+-                model_client: ModelClient::new(
++                model_client: ModelClient::new_with_non_openai(
+                     Some(Arc::clone(&auth_manager)),
+                     if config.features.enabled(Feature::UseAgentIdentity) {
+                         AgentIdentityAuthPolicy::ChatGptAuth
+@@ -1108,7 +1112,7 @@ impl Session {
+                         AgentIdentityAuthPolicy::JwtOnly
+                     },
+                     thread_id,
+-                    session_configuration.provider.clone(),
++                    config.model_provider.clone(),
+                     session_configuration.session_source.clone(),
+                     session_configuration.originator.clone(),
+                     config.model_verbosity,
+@@ -1123,6 +1127,7 @@ impl Session {
+                     /*concurrent_reasoning_summaries_enabled*/ config
+                         .features
+                         .enabled(Feature::ConcurrentReasoningSummaries),
++                    config.non_openai.clone(),
+                     attestation_provider,
+                     Some(tx_event.clone()),
+                     config.http_client_factory(),
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index ebdb1f5959..b5d6e560da 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -4430,6 +4430,130 @@ fn get_service_tier_ignores_configured_tier_when_fast_mode_disabled() {
+     );
+ }
+ 
++#[test]
++fn unsupported_service_tier_warning_skips_non_openai_side_route_models() {
++    let mut model_info = model_with_default_service_tier(/*default_service_tier*/ None);
++    model_info.slug = "provider-model".to_string();
++    model_info.comp_hash = Some("non-openai:provider-model".to_string());
++    model_info.service_tiers.clear();
++
++    assert_eq!(
++        unsupported_service_tier_warning(
++            Some(ServiceTier::Fast.request_value()),
++            /*fast_mode_enabled*/ true,
++            &model_info,
++        ),
++        None
++    );
++    assert_eq!(
++        get_service_tier(
++            Some(ServiceTier::Fast.request_value().to_string()),
++            /*fast_mode_enabled*/ true,
++            &model_info,
++        ),
++        None
++    );
++}
++
++#[tokio::test]
++async fn session_model_update_rebinds_provider_to_selected_model_family() {
++    let mut session_configuration = make_session_configuration_for_tests().await;
++    std::fs::create_dir_all(session_configuration.codex_home.as_path()).expect("create codex home");
++    let config_path = session_configuration
++        .codex_home
++        .join("model-catalogs/model-catalogs.json");
++    std::fs::create_dir_all(config_path.parent().unwrap()).expect("create model catalog dir");
++    std::fs::write(
++        config_path,
++        serde_json::json!({
++            "models": [
++                {
++                    "slug": "provider-model",
++                    "display_name": "provider-model",
++                    "description": null,
++                    "supported_reasoning_levels": [],
++                    "shell_type": "default",
++                    "visibility": "list",
++                    "supported_in_api": true,
++                    "priority": 80,
++                    "availability_nux": null,
++                    "upgrade": null,
++                    "base_instructions": "base",
++                    "model_messages": {
++                        "instructions_template": "base",
++                        "instructions_variables": null,
++                        "approvals": null
++                    },
++                    "include_skills_usage_instructions": false,
++                    "supports_reasoning_summaries": false,
++                    "default_reasoning_summary": "none",
++                    "support_verbosity": false,
++                    "default_verbosity": null,
++                    "apply_patch_tool_type": null,
++                    "truncation_policy": {"mode": "bytes", "limit": 10000},
++                    "supports_parallel_tool_calls": true,
++                    "context_window": 256000,
++                    "max_context_window": 256000,
++                    "effective_context_window_percent": 95,
++                    "experimental_supported_tools": [],
++                    "input_modalities": ["text"],
++                    "non_openai": {
++                        "api_key": "sk-test",
++                        "base_url": "https://provider.example/v1",
++                        "reasoning": {}
++                    }
++                }
++            ]
++        })
++        .to_string(),
++    )
++    .expect("write model catalog");
++    let mut config = (*session_configuration.original_config_do_not_use).clone();
++    config.non_openai = crate::non_openai::NonOpenAiConfig::load_and_heal(
++        session_configuration.codex_home.as_path(),
++    )
++    .expect("load non-openai config");
++    session_configuration.original_config_do_not_use = Arc::new(config);
++
++    let non_openai = session_configuration
++        .apply(&SessionSettingsUpdate {
++            collaboration_mode: Some(CollaborationMode {
++                mode: ModeKind::Default,
++                settings: Settings {
++                    model: "provider-model".to_string(),
++                    reasoning_effort: None,
++                    developer_instructions: None,
++                },
++            }),
++            ..Default::default()
++        })
++        .expect("apply non-openai model");
++    assert_eq!(
++        non_openai.thread_config_snapshot().model_provider_id,
++        "provider-model"
++    );
++    assert_eq!(
++        non_openai.provider.base_url.as_deref(),
++        Some("https://provider.example/v1")
++    );
++
++    let openai = non_openai
++        .apply(&SessionSettingsUpdate {
++            collaboration_mode: Some(CollaborationMode {
++                mode: ModeKind::Default,
++                settings: Settings {
++                    model: "gpt-5.4".to_string(),
++                    reasoning_effort: None,
++                    developer_instructions: None,
++                },
++            }),
++            ..Default::default()
++        })
++        .expect("apply openai model");
++    assert_eq!(openai.thread_config_snapshot().model_provider_id, "openai");
++    assert!(openai.provider.requires_openai_auth);
++}
++
+ #[tokio::test]
+ async fn session_settings_null_service_tier_update_uses_default_service_tier() {
+     let session_configuration = make_session_configuration_for_tests().await;
+@@ -5612,11 +5736,11 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+         )),
+         attestation_provider: None,
+         time_provider: Arc::new(crate::current_time::SystemTimeProvider),
+-        model_client: ModelClient::new(
++        model_client: ModelClient::new_with_non_openai(
+             Some(auth_manager.clone()),
+             AgentIdentityAuthPolicy::JwtOnly,
+             thread_id,
+-            session_configuration.provider.clone(),
++            config.model_provider.clone(),
+             session_configuration.session_source.clone(),
+             session_configuration.originator.clone(),
+             config.model_verbosity,
+@@ -5628,6 +5752,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+             config
+                 .features
+                 .enabled(Feature::ConcurrentReasoningSummaries),
++            config.non_openai.clone(),
+             /*attestation_provider*/ None,
+             /*tx_event*/ None,
+             config.http_client_factory(),
+@@ -7750,11 +7875,11 @@ where
+         )),
+         attestation_provider: None,
+         time_provider: Arc::new(crate::current_time::SystemTimeProvider),
+-        model_client: ModelClient::new(
++        model_client: ModelClient::new_with_non_openai(
+             Some(Arc::clone(&auth_manager)),
+             AgentIdentityAuthPolicy::JwtOnly,
+             thread_id,
+-            session_configuration.provider.clone(),
++            config.model_provider.clone(),
+             session_configuration.session_source.clone(),
+             session_configuration.originator.clone(),
+             config.model_verbosity,
+@@ -7766,6 +7891,7 @@ where
+             config
+                 .features
+                 .enabled(Feature::ConcurrentReasoningSummaries),
++            config.non_openai.clone(),
+             /*attestation_provider*/ None,
+             /*tx_event*/ None,
+             config.http_client_factory(),
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index bffcdb2f8b..e1fd7b960f 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -155,6 +155,9 @@ pub(crate) async fn run_turn(
+ ) -> CodexResult<Option<String>> {
+     let mut client_session =
+         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
++    if reject_model_family_takeover(&sess, &turn_context).await {
++        return Ok(None);
++    }
+     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
+     // new user message are recorded. Estimate pending incoming items (context
+     // diffs/full reinjection + user input) and trigger compaction preemptively
+@@ -465,6 +468,33 @@ pub(crate) async fn run_turn(
+     Ok(last_agent_message)
+ }
+ 
++async fn reject_model_family_takeover(
++    sess: &Arc<Session>,
++    turn_context: &Arc<TurnContext>,
++) -> bool {
++    let Some(previous_turn_settings) = sess.previous_turn_settings().await else {
++        return false;
++    };
++    let Some(message) = turn_context.config.non_openai.family_takeover_message(
++        previous_turn_settings.model.as_str(),
++        turn_context.model_info.slug.as_str(),
++    ) else {
++        return false;
++    };
++    let error = CodexErrorInfo::BadRequest;
++    sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
++        .await;
++    sess.send_event(
++        turn_context,
++        EventMsg::Error(ErrorEvent {
++            message,
++            codex_error_info: Some(error),
++        }),
++    )
++    .await;
++    true
++}
++
+ #[instrument(level = "trace", skip_all)]
+ async fn turn_diff_display_roots(turn_context: &TurnContext) -> Vec<(String, PathBuf)> {
+     let mut display_roots = Vec::new();
+diff --git a/codex-rs/core/src/session/turn_context.rs b/codex-rs/core/src/session/turn_context.rs
+index 9940311673..2bb826b01d 100644
+--- a/codex-rs/core/src/session/turn_context.rs
++++ b/codex-rs/core/src/session/turn_context.rs
+@@ -256,6 +256,10 @@ impl TurnContext {
+                 config.http_client_factory(),
+             )
+             .await;
++        let provider = create_model_provider(
++            config.provider_for_model(model_info.slug.as_str()),
++            self.auth_manager.clone(),
++        );
+ 
+         Self {
+             sub_id: self.sub_id.clone(),
+@@ -268,7 +272,7 @@ impl TurnContext {
+                 .session_telemetry
+                 .clone()
+                 .with_model(model.as_str(), model_info.slug.as_str()),
+-            provider: self.provider.clone(),
++            provider,
+             reasoning_effort,
+             reasoning_summary: self.reasoning_summary,
+             session_source: self.session_source.clone(),
+@@ -471,7 +475,10 @@ impl Session {
+     ) -> Config {
+         let mut config =
+             Self::build_per_turn_config(session_configuration, session_configuration.cwd().clone());
+-        config.model = Some(session_configuration.collaboration_mode.model().to_string());
++        let model = session_configuration.collaboration_mode.model();
++        config.model = Some(model.to_string());
++        config.model_provider_id = config.provider_id_for_model(model);
++        config.model_provider = config.provider_for_model(model);
+         config.permissions.approval_policy = session_configuration.approval_policy.clone();
+         config.workspace_roots = session_configuration.workspace_roots.clone();
+         config
+@@ -486,7 +493,7 @@ impl Session {
+         session_id: SessionId,
+         auth_manager: Option<Arc<AuthManager>>,
+         session_telemetry: &SessionTelemetry,
+-        provider: ModelProviderInfo,
++        _provider: ModelProviderInfo,
+         session_configuration: &SessionConfiguration,
+         multi_agent_version: MultiAgentVersion,
+         user_shell: &shell::Shell,
+@@ -511,6 +518,7 @@ impl Session {
+         );
+         let session_source = session_configuration.session_source.clone();
+         let auth_manager_for_context = auth_manager.clone();
++        let provider = per_turn_config.provider_for_model(model_info.slug.as_str());
+         let provider_for_context = create_model_provider(provider, auth_manager);
+         let session_telemetry_for_context = session_telemetry;
+         let available_models = models_manager.try_list_models().unwrap_or_default();
+diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
+index 2ed02f7087..2faeafa05d 100644
+--- a/codex-rs/core/src/thread_manager.rs
++++ b/codex-rs/core/src/thread_manager.rs
+@@ -264,10 +264,11 @@ pub fn build_models_manager(
+     auth_manager: Arc<AuthManager>,
+ ) -> SharedModelsManager {
+     let provider = create_model_provider(config.model_provider.clone(), Some(auth_manager));
+-    provider.models_manager(
++    let manager = provider.models_manager(
+         config.codex_home.to_path_buf(),
+         config.model_catalog.clone(),
+-    )
++    );
++    config.non_openai.wrap_models_manager(manager)
+ }
+ 
+ pub fn thread_store_from_config(
+diff --git a/codex-rs/core/src/tools/spec_plan.rs b/codex-rs/core/src/tools/spec_plan.rs
+index 57879aeded..49cc286af4 100644
+--- a/codex-rs/core/src/tools/spec_plan.rs
++++ b/codex-rs/core/src/tools/spec_plan.rs
+@@ -306,7 +306,8 @@ fn hosted_model_tool_specs(context: &CoreToolPlanContext<'_>) -> Vec<ToolSpec> {
+     // `Some(Cached/Live/Disabled)` are the options for mode when standalone search is unavailable
+     // and the provider supports hosted search. `None` prevents emitting a hosted search tool.
+     let web_search_mode = (!standalone_web_search_available
+-        && turn_context.provider.capabilities().web_search)
++        && turn_context.provider.capabilities().web_search
++        && turn_context.model_info.supports_search_tool)
+         .then_some(turn_context.config.web_search_mode.value());
+     let web_search_config = web_search_mode
+         .as_ref()
+@@ -333,7 +334,11 @@ pub(crate) fn tool_suggest_enabled(turn_context: &TurnContext) -> bool {
+ }
+ 
+ fn namespace_tools_enabled(turn_context: &TurnContext) -> bool {
+-    turn_context.provider.capabilities().namespace_tools
++    turn_context
++        .config
++        .non_openai
++        .supports_namespace_tools(&turn_context.model_info.slug)
++        .unwrap_or_else(|| turn_context.provider.capabilities().namespace_tools)
+ }
+ 
+ fn multi_agent_v2_enabled(turn_context: &TurnContext) -> bool {
+diff --git a/codex-rs/core/src/tools/spec_plan_tests.rs b/codex-rs/core/src/tools/spec_plan_tests.rs
+index 7fd4c69cd5..d4d8a9a344 100644
+--- a/codex-rs/core/src/tools/spec_plan_tests.rs
++++ b/codex-rs/core/src/tools/spec_plan_tests.rs
+@@ -1,4 +1,5 @@
+ use std::collections::BTreeMap;
++use std::fs;
+ use std::sync::Arc;
+ 
+ use codex_features::Feature;
+@@ -29,8 +30,10 @@ use codex_tools::ToolOutput;
+ use codex_tools::ToolSpec;
+ use pretty_assertions::assert_eq;
+ use serde_json::json;
++use tempfile::TempDir;
+ 
+ use crate::config::CurrentTimeReminderConfig;
++use crate::non_openai::NonOpenAiConfig;
+ use crate::session::step_context::StepContext;
+ use crate::session::tests::make_session_and_context;
+ use crate::session::turn_context::TurnContext;
+@@ -706,6 +709,82 @@ async fn host_context_gates_agent_job_tools() {
+     worker_agent_job.assert_visible_contains(&["spawn_agents_on_csv", "report_agent_job_result"]);
+ }
+ 
++#[tokio::test]
++async fn non_openai_namespace_compatibility_hides_namespace_tools() {
++    let codex_home = TempDir::new().unwrap();
++    let catalog_path = codex_home.path().join("model-catalogs/model-catalogs.json");
++    fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
++    fs::write(
++        catalog_path,
++        r#"{
++  "models": [
++    {
++      "slug": "provider-model",
++      "display_name": "provider-model",
++      "description": null,
++      "supported_reasoning_levels": [],
++      "shell_type": "default",
++      "visibility": "list",
++      "supported_in_api": true,
++      "priority": 80,
++      "availability_nux": null,
++      "upgrade": null,
++      "base_instructions": "base",
++      "model_messages": {
++        "instructions_template": "base",
++        "instructions_variables": null,
++        "approvals": null
++      },
++      "include_skills_usage_instructions": false,
++      "supports_reasoning_summaries": false,
++      "default_reasoning_summary": "none",
++      "support_verbosity": false,
++      "default_verbosity": null,
++      "apply_patch_tool_type": null,
++      "truncation_policy": {"mode": "bytes", "limit": 10000},
++      "supports_parallel_tool_calls": true,
++      "context_window": 256000,
++      "max_context_window": 256000,
++      "effective_context_window_percent": 95,
++      "experimental_supported_tools": [],
++      "input_modalities": ["text"],
++      "non_openai": {
++        "api_key": "sk-live",
++        "base_url": "https://provider.example/v1",
++        "supports_namespace_tools": false
++      }
++    }
++  ]
++}"#,
++    )
++    .unwrap();
++    let non_openai = NonOpenAiConfig::load_and_heal(codex_home.path()).unwrap();
++    let model_info = non_openai
++        .models()
++        .into_iter()
++        .find(|model| model.slug == "provider-model")
++        .unwrap();
++
++    let plan = probe_with(
++        |turn| {
++            turn.model_info = model_info;
++            update_config(turn, |config| {
++                config.non_openai = non_openai;
++            });
++        },
++        ToolPlanInputs {
++            extension_tool_executors: vec![Arc::new(TestNamespaceExtensionTool {
++                namespace: "blocked",
++                tool_name: "lookup",
++            })],
++            ..ToolPlanInputs::default()
++        },
++    )
++    .await;
++
++    plan.assert_visible_lacks(&["blocked"]);
++}
++
+ #[tokio::test]
+ async fn sleep_tool_follows_current_time_config() {
+     let disabled = probe(|turn| {
+@@ -1567,6 +1646,7 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
+ 
+     let live_web_search = probe(|turn| {
+         set_web_search_mode(turn, WebSearchMode::Live);
++        turn.model_info.supports_search_tool = true;
+         turn.model_info.web_search_tool_type = WebSearchToolType::TextAndImage;
+     })
+     .await;
+@@ -1582,10 +1662,18 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
+         }
+     );
+ 
++    let model_without_web_search = probe(|turn| {
++        set_web_search_mode(turn, WebSearchMode::Live);
++        turn.model_info.supports_search_tool = false;
++    })
++    .await;
++    model_without_web_search.assert_visible_lacks(&["web_search"]);
++
+     let code_mode_only = probe(|turn| {
+         use_chatgpt_auth(turn);
+         set_features(turn, &[Feature::CodeModeOnly, Feature::MultiAgentV2]);
+         set_web_search_mode(turn, WebSearchMode::Live);
++        turn.model_info.supports_search_tool = true;
+         turn.model_info.input_modalities = vec![InputModality::Image];
+     })
+     .await;
+@@ -1606,6 +1694,7 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
+     let standalone_web_search_without_web_run = probe(|turn| {
+         set_feature(turn, Feature::StandaloneWebSearch, /*enabled*/ true);
+         set_web_search_mode(turn, WebSearchMode::Live);
++        turn.model_info.supports_search_tool = true;
+     })
+     .await;
+     standalone_web_search_without_web_run.assert_visible_contains(&["web_search"]);
+@@ -1614,6 +1703,7 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
+         |turn| {
+             set_feature(turn, Feature::StandaloneWebSearch, /*enabled*/ true);
+             set_web_search_mode(turn, WebSearchMode::Live);
++            turn.model_info.supports_search_tool = true;
+         },
+         ToolPlanInputs {
+             extension_tool_executors: vec![Arc::new(TestNamespaceExtensionTool {

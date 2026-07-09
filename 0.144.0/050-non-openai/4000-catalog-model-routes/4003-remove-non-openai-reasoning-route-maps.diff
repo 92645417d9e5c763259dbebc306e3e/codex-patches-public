@@ -1,0 +1,263 @@
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index e2ab0422ee..ec07f78095 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -882,17 +882,6 @@ impl ModelClient {
+         }
+     }
+ 
+-    fn build_non_openai_reasoning(route: &NonOpenAiRequestRoute) -> Option<Reasoning> {
+-        route
+-            .upstream_reasoning_effort
+-            .as_ref()
+-            .map(|effort| Reasoning {
+-                effort: Some(effort.clone()),
+-                summary: None,
+-                context: None,
+-            })
+-    }
+-
+     #[allow(clippy::too_many_arguments)]
+     fn build_responses_request(
+         &self,
+@@ -944,10 +933,7 @@ impl ModelClient {
+             .then_some(StreamOptions {
+                 reasoning_summary_delivery: codex_api::ReasoningSummaryDelivery::SequentialCutoff,
+             });
+-        let reasoning = non_openai_route
+-            .as_ref()
+-            .and_then(Self::build_non_openai_reasoning)
+-            .or_else(|| Self::build_reasoning(model_info, effort, summary));
++        let reasoning = Self::build_reasoning(model_info, effort, summary);
+         let include = if reasoning.is_some() && non_openai_route.is_none() {
+             vec!["reasoning.encrypted_content".to_string()]
+         } else {
+diff --git a/codex-rs/core/src/non_openai.rs b/codex-rs/core/src/non_openai.rs
+index 3b503addb6..02523771da 100644
+--- a/codex-rs/core/src/non_openai.rs
++++ b/codex-rs/core/src/non_openai.rs
+@@ -27,7 +27,6 @@ use codex_protocol::openai_models::TruncationPolicyConfig;
+ #[cfg(test)]
+ use codex_protocol::openai_models::WebSearchToolType;
+ use serde::Deserialize;
+-use serde::Deserializer;
+ use serde::Serialize;
+ use std::collections::BTreeMap;
+ use std::fmt;
+@@ -63,7 +62,6 @@ pub(crate) struct NonOpenAiRequestRoute {
+     pub(crate) provider_id: String,
+     pub(crate) provider: ModelProviderInfo,
+     pub(crate) upstream_model: String,
+-    pub(crate) upstream_reasoning_effort: Option<ReasoningEffort>,
+     pub(crate) supports_json_schema_output: bool,
+     pub(crate) supports_plaintext_reasoning: bool,
+     pub(crate) supports_previous_response_id: bool,
+@@ -101,7 +99,6 @@ struct ModelRouteConfig {
+     supports_previous_response_id: bool,
+     supports_namespace_tools: bool,
+     cached_tokens_optional: bool,
+-    reasoning: BTreeMap<String, ReasoningRouteConfig>,
+ }
+ 
+ impl Default for ModelRouteConfig {
+@@ -115,44 +112,10 @@ impl Default for ModelRouteConfig {
+             supports_previous_response_id: false,
+             supports_namespace_tools: true,
+             cached_tokens_optional: false,
+-            reasoning: BTreeMap::new(),
+         }
+     }
+ }
+ 
+-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+-#[serde(default)]
+-struct ReasoningRouteConfig {
+-    upstream_model: String,
+-    #[serde(
+-        default,
+-        deserialize_with = "deserialize_optional_reasoning_effort",
+-        skip_serializing_if = "Option::is_none"
+-    )]
+-    upstream_reasoning_effort: Option<ReasoningEffort>,
+-}
+-
+-impl Default for ReasoningRouteConfig {
+-    fn default() -> Self {
+-        Self {
+-            upstream_model: String::new(),
+-            upstream_reasoning_effort: None,
+-        }
+-    }
+-}
+-
+-fn deserialize_optional_reasoning_effort<'de, D>(
+-    deserializer: D,
+-) -> Result<Option<ReasoningEffort>, D::Error>
+-where
+-    D: Deserializer<'de>,
+-{
+-    let Some(value) = Option::<String>::deserialize(deserializer)? else {
+-        return Ok(None);
+-    };
+-    Ok(value.parse::<ReasoningEffort>().ok())
+-}
+-
+ impl NonOpenAiConfig {
+     pub(crate) fn load_and_heal(codex_home: &Path) -> io::Result<Self> {
+         let path = codex_home.join(CATALOG_FILE);
+@@ -184,21 +147,13 @@ impl NonOpenAiConfig {
+     pub(crate) fn route_for_model(
+         &self,
+         model: &str,
+-        effort: Option<&ReasoningEffort>,
++        _effort: Option<&ReasoningEffort>,
+     ) -> Option<NonOpenAiRequestRoute> {
+         let model = self.models.get(model)?;
+-        let reasoning = select_reasoning_route(model, effort);
+-        let upstream_model = reasoning
+-            .as_ref()
+-            .and_then(|route| (!route.upstream_model.trim().is_empty()).then_some(route))
+-            .map(|route| route.upstream_model.clone())
+-            .unwrap_or_else(|| model.info.slug.clone());
+         Some(NonOpenAiRequestRoute {
+             provider_id: model.info.slug.clone(),
+             provider: provider_from_model(model),
+-            upstream_model,
+-            upstream_reasoning_effort: reasoning
+-                .and_then(|route| route.upstream_reasoning_effort.clone()),
++            upstream_model: model.info.slug.clone(),
+             supports_json_schema_output: model.route.supports_json_schema_output,
+             supports_plaintext_reasoning: model.route.supports_plaintext_reasoning,
+             supports_previous_response_id: model.route.supports_previous_response_id,
+@@ -377,17 +332,6 @@ fn provider_from_model(model: &NonOpenAiModel) -> ModelProviderInfo {
+     }
+ }
+ 
+-fn select_reasoning_route<'a>(
+-    model: &'a NonOpenAiModel,
+-    effort: Option<&ReasoningEffort>,
+-) -> Option<&'a ReasoningRouteConfig> {
+-    let effort_key = effort.map(ReasoningEffort::as_str);
+-    effort_key
+-        .and_then(|effort| model.route.reasoning.get(effort))
+-        .or_else(|| model.route.reasoning.get("high"))
+-        .or_else(|| model.route.reasoning.values().next())
+-}
+-
+ fn load_catalog_file(path: &Path) -> io::Result<(CatalogConfig, bool)> {
+     let contents = match fs::read_to_string(path) {
+         Ok(contents) => contents,
+@@ -414,13 +358,6 @@ fn heal_catalog_config(catalog: &mut CatalogConfig) {
+ }
+ 
+ fn heal_model_route_config(route: &mut ModelRouteConfig) {
+-    route.reasoning.retain(|effort, reasoning| {
+-        effort.parse::<ReasoningEffort>().is_ok()
+-            && reasoning
+-                .upstream_reasoning_effort
+-                .as_ref()
+-                .is_none_or(|effort| effort.as_str().parse::<ReasoningEffort>().is_ok())
+-    });
+     if route.api_key.trim().is_empty() {
+         route.api_key = DEFAULT_API_KEY.to_string();
+     }
+@@ -541,12 +478,10 @@ pub(crate) fn api_provider_for_route(route: &NonOpenAiRequestRoute) -> CodexResu
+ }
+ 
+ #[cfg(test)]
+-fn supported_reasoning_levels(
+-    reasoning: &BTreeMap<String, ReasoningRouteConfig>,
+-) -> Vec<ReasoningEffortPreset> {
++fn supported_reasoning_levels(reasoning: &[ReasoningEffort]) -> Vec<ReasoningEffortPreset> {
+     let mut levels = reasoning
+-        .keys()
+-        .filter_map(|effort| effort.parse::<ReasoningEffort>().ok())
++        .iter()
++        .cloned()
+         .map(|effort| ReasoningEffortPreset {
+             description: reasoning_effort_description(&effort),
+             effort,
+@@ -597,7 +532,7 @@ struct ModelInfoParts<'a> {
+     web_search: bool,
+     context_window: i64,
+     effective_context_window_percent: i64,
+-    reasoning: &'a BTreeMap<String, ReasoningRouteConfig>,
++    reasoning: &'a [ReasoningEffort],
+     plaintext_reasoning: bool,
+ }
+ 
+@@ -674,21 +609,7 @@ mod tests {
+ 
+     fn sample_catalog() -> CatalogConfig {
+         let mut catalog = CatalogConfig::default();
+-        let mut reasoning = BTreeMap::new();
+-        reasoning.insert(
+-            "none".to_string(),
+-            ReasoningRouteConfig {
+-                upstream_model: "alpha-upstream".to_string(),
+-                upstream_reasoning_effort: Some(ReasoningEffort::None),
+-            },
+-        );
+-        reasoning.insert(
+-            "high".to_string(),
+-            ReasoningRouteConfig {
+-                upstream_model: "alpha-upstream".to_string(),
+-                upstream_reasoning_effort: Some(ReasoningEffort::High),
+-            },
+-        );
++        let reasoning = vec![ReasoningEffort::None, ReasoningEffort::High];
+         catalog.models.push(CatalogModelConfig {
+             info: model_info_from_parts(ModelInfoParts {
+                 slug: "alpha-model",
+@@ -710,7 +631,6 @@ mod tests {
+                 supports_previous_response_id: false,
+                 supports_namespace_tools: true,
+                 cached_tokens_optional: true,
+-                reasoning,
+             }),
+         });
+         catalog.models.push(CatalogModelConfig {
+@@ -722,7 +642,7 @@ mod tests {
+                 web_search: false,
+                 context_window: 256_000,
+                 effective_context_window_percent: 95,
+-                reasoning: &BTreeMap::new(),
++                reasoning: &[],
+                 plaintext_reasoning: false,
+             }),
+             non_openai: Some(ModelRouteConfig {
+@@ -734,7 +654,6 @@ mod tests {
+                 supports_previous_response_id: true,
+                 supports_namespace_tools: false,
+                 cached_tokens_optional: false,
+-                reasoning: BTreeMap::new(),
+             }),
+         });
+         catalog
+@@ -833,7 +752,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn route_maps_local_reasoning_to_upstream_model_and_effort() {
++    fn route_uses_catalog_model_slug_without_reasoning_map() {
+         let codex_home = TempDir::new().unwrap();
+         write_catalog(codex_home.path(), &sample_catalog());
+ 
+@@ -848,14 +767,9 @@ mod tests {
+             .route_for_model("alpha-model", Some(&ReasoningEffort::High))
+             .unwrap();
+ 
+-        assert_eq!(none.upstream_model, "alpha-upstream");
+-        assert_eq!(none.upstream_reasoning_effort, Some(ReasoningEffort::None));
+-        assert_eq!(low_fallback.upstream_model, "alpha-upstream");
+-        assert_eq!(
+-            low_fallback.upstream_reasoning_effort,
+-            Some(ReasoningEffort::High)
+-        );
+-        assert_eq!(high.upstream_reasoning_effort, Some(ReasoningEffort::High));
++        assert_eq!(none.upstream_model, "alpha-model");
++        assert_eq!(low_fallback.upstream_model, "alpha-model");
++        assert_eq!(high.upstream_model, "alpha-model");
+     }
+ 
+     #[test]
