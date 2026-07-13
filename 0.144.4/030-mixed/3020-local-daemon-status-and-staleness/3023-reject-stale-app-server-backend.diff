@@ -1,0 +1,78 @@
+diff --git a/codex-rs/app-server-daemon/src/lib.rs b/codex-rs/app-server-daemon/src/lib.rs
+index 6af963d050..a3388d1b11 100644
+--- a/codex-rs/app-server-daemon/src/lib.rs
++++ b/codex-rs/app-server-daemon/src/lib.rs
+@@ -12,6 +12,7 @@ use std::time::Duration;
+ use anyhow::Context;
+ use anyhow::Result;
+ use anyhow::anyhow;
++use anyhow::bail;
+ pub use backend::BackendKind;
+ use backend::BackendPaths;
+ use codex_app_server_protocol::RemoteControlConnectionStatus;
+@@ -306,6 +307,8 @@ impl Daemon {
+     async fn start(&self) -> Result<LifecycleOutput> {
+         let settings = self.load_settings().await?;
+         if let Ok(info) = client::probe(&self.socket_path).await {
++            let managed_version = self.managed_codex_version_best_effort().await;
++            ensure_running_version_is_current_for_attach(&info, managed_version.as_deref())?;
+             return Ok(self
+                 .output(
+                     LifecycleStatus::AlreadyRunning,
+@@ -856,6 +859,25 @@ fn should_reexec_updater(
+         && outcome == RestartIfRunningOutcome::Restarted
+ }
+ 
++fn ensure_running_version_is_current_for_attach(
++    info: &client::ProbeInfo,
++    managed_version: Option<&str>,
++) -> Result<()> {
++    if running_version_is_stale(info, managed_version) {
++        let managed_version = managed_version.unwrap_or("unknown");
++        bail!(
++            "app server {} is still active but managed Codex is {}; refusing to attach to stale daemon",
++            info.app_server_version,
++            managed_version
++        );
++    }
++    Ok(())
++}
++
++fn running_version_is_stale(info: &client::ProbeInfo, managed_version: Option<&str>) -> bool {
++    managed_version.is_some_and(|managed_version| info.app_server_version != managed_version)
++}
++
+ #[cfg(unix)]
+ fn try_lock_file(file: &tokio::fs::File) -> Result<bool> {
+     use std::os::fd::AsRawFd;
+@@ -894,9 +916,9 @@ mod tests {
+     use super::RestartIfRunningOutcome;
+     use super::RestartMode;
+     use super::UpdaterRefreshMode;
++    use super::ensure_running_version_is_current_for_attach;
+     use super::restart_decision;
+     use super::should_reexec_updater;
+-    use super::should_restart_running_backend_for_start;
+     use crate::client::ProbeInfo;
+ 
+     #[test]
+@@ -975,6 +997,19 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn stale_attach_error_mentions_refusing_to_attach() {
++        let active_stale = ProbeInfo {
++            app_server_version: "0.1.0".to_string(),
++            active_client_count: Some(1),
++            running_assistant_turn_count: Some(0),
++        };
++
++        let err = ensure_running_version_is_current_for_attach(&active_stale, Some("0.2.0"))
++            .expect_err("active stale daemon should be rejected");
++        assert!(err.to_string().contains("refusing to attach"));
++    }
++
+     #[test]
+     fn remote_control_start_output_serializes_inner_output_without_tag() {
+         let lifecycle_output = LifecycleOutput {

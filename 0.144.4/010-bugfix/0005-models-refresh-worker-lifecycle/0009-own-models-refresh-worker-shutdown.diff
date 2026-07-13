@@ -1,0 +1,306 @@
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 62eff72660..7dff5b39f9 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -499,7 +499,7 @@ impl MessageProcessor {
+     pub(crate) fn clear_runtime_references(&self) {
+         self.account_processor.clear_external_auth();
+         self.apps_processor.shutdown();
+-        self.models_refresh_worker.shutdown();
++        self.models_refresh_worker.cancel();
+         self.skills_watcher.shutdown();
+     }
+ 
+@@ -676,7 +676,7 @@ impl MessageProcessor {
+     }
+ 
+     pub(crate) async fn drain_background_tasks(&self) {
+-        self.models_refresh_worker.shutdown();
++        self.models_refresh_worker.shutdown().await;
+         self.thread_processor.drain_background_tasks().await;
+     }
+ 
+diff --git a/codex-rs/app-server/src/models_refresh_worker.rs b/codex-rs/app-server/src/models_refresh_worker.rs
+index ab785867a6..28827339f6 100644
+--- a/codex-rs/app-server/src/models_refresh_worker.rs
++++ b/codex-rs/app-server/src/models_refresh_worker.rs
+@@ -1,29 +1,50 @@
+ use std::sync::Arc;
++use std::sync::Mutex;
+ use std::time::Duration;
+ 
+ use codex_http_client::HttpClientFactory;
+ use codex_models_manager::manager::RefreshStrategy;
+ use codex_models_manager::manager::SharedModelsManager;
+-use tokio::task::JoinHandle;
+ use tokio_util::sync::CancellationToken;
++use tokio_util::task::AbortOnDropHandle;
+ 
+ const MODELS_REFRESH_INTERVAL: Duration = Duration::from_secs(3 * 60);
+ 
+ #[derive(Debug)]
+ pub(crate) struct ModelsRefreshWorker {
+     shutdown: CancellationToken,
+-    _task: JoinHandle<()>,
++    task: Mutex<Option<AbortOnDropHandle<()>>>,
+ }
+ 
+ impl ModelsRefreshWorker {
+-    pub(crate) fn shutdown(&self) {
++    pub(crate) fn cancel(&self) {
+         self.shutdown.cancel();
+     }
++
++    pub(crate) async fn shutdown(&self) {
++        self.cancel();
++        let task = self
++            .task
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .take();
++        if let Some(task) = task {
++            let _ = task.await;
++        }
++    }
+ }
+ 
+ impl Drop for ModelsRefreshWorker {
+     fn drop(&mut self) {
+-        self.shutdown();
++        self.cancel();
++        if let Some(task) = self
++            .task
++            .get_mut()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .take()
++        {
++            task.abort();
++        }
+     }
+ }
+ 
+@@ -50,9 +71,14 @@ fn spawn_with_interval(
+             let Some(models_manager) = models_manager.upgrade() else {
+                 break;
+             };
+-            models_manager
+-                .list_models(RefreshStrategy::Online, http_client_factory.clone())
+-                .await;
++            tokio::select! {
++                biased;
++                _ = worker_shutdown.cancelled() => break,
++                _ = models_manager.list_models(
++                    RefreshStrategy::Online,
++                    http_client_factory.clone(),
++                ) => {}
++            }
+             drop(models_manager);
+ 
+             tokio::select! {
+@@ -63,7 +89,7 @@ fn spawn_with_interval(
+     });
+     ModelsRefreshWorker {
+         shutdown,
+-        _task: task,
++        task: Mutex::new(Some(AbortOnDropHandle::new(task))),
+     }
+ }
+ 
+diff --git a/codex-rs/app-server/src/models_refresh_worker_tests.rs b/codex-rs/app-server/src/models_refresh_worker_tests.rs
+index 989bfd8608..3375210b52 100644
+--- a/codex-rs/app-server/src/models_refresh_worker_tests.rs
++++ b/codex-rs/app-server/src/models_refresh_worker_tests.rs
+@@ -1,4 +1,5 @@
+ use std::sync::Arc;
++use std::sync::Mutex;
+ use std::sync::atomic::AtomicUsize;
+ use std::sync::atomic::Ordering;
+ use std::time::Duration;
+@@ -13,35 +14,47 @@ use codex_protocol::error::CodexErr;
+ use codex_protocol::error::Result as CoreResult;
+ use codex_protocol::openai_models::ModelInfo;
+ use pretty_assertions::assert_eq;
++use tempfile::TempDir;
+ use tempfile::tempdir;
+-use tokio::sync::Notify;
++use tokio::sync::mpsc;
++use tokio::sync::oneshot;
+ 
+ use super::*;
+ 
+ #[derive(Debug)]
+ struct TestModelsEndpoint {
+     fetch_count: AtomicUsize,
+-    fetched: Notify,
+-    release_second_fetch: Notify,
++    fetch_started: mpsc::UnboundedSender<usize>,
++    second_fetch_dropped: Mutex<Option<oneshot::Sender<()>>>,
+ }
+ 
+ impl TestModelsEndpoint {
+-    fn new() -> Arc<Self> {
+-        Arc::new(Self {
+-            fetch_count: AtomicUsize::new(0),
+-            fetched: Notify::new(),
+-            release_second_fetch: Notify::new(),
+-        })
++    fn new() -> (
++        Arc<Self>,
++        mpsc::UnboundedReceiver<usize>,
++        oneshot::Receiver<()>,
++    ) {
++        let (fetch_started, fetch_started_rx) = mpsc::unbounded_channel();
++        let (second_fetch_dropped, second_fetch_dropped_rx) = oneshot::channel();
++        (
++            Arc::new(Self {
++                fetch_count: AtomicUsize::new(0),
++                fetch_started,
++                second_fetch_dropped: Mutex::new(Some(second_fetch_dropped)),
++            }),
++            fetch_started_rx,
++            second_fetch_dropped_rx,
++        )
+     }
++}
+ 
+-    async fn wait_for_fetch_count(&self, expected: usize) {
+-        tokio::time::timeout(Duration::from_secs(1), async {
+-            while self.fetch_count.load(Ordering::SeqCst) < expected {
+-                self.fetched.notified().await;
+-            }
+-        })
+-        .await
+-        .unwrap_or_else(|_| panic!("expected {expected} model fetches"));
++struct NotifyOnDrop(Option<oneshot::Sender<()>>);
++
++impl Drop for NotifyOnDrop {
++    fn drop(&mut self) {
++        if let Some(sender) = self.0.take() {
++            let _ = sender.send(());
++        }
+     }
+ }
+ 
+@@ -60,23 +73,37 @@ impl ModelsEndpointClient for TestModelsEndpoint {
+         _http_client_factory: HttpClientFactory,
+     ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
+         Box::pin(async move {
+-            let fetch_index = self.fetch_count.fetch_add(1, Ordering::SeqCst);
+-            self.fetched.notify_one();
+-            if fetch_index == 0 {
++            let fetch_number = self.fetch_count.fetch_add(1, Ordering::SeqCst) + 1;
++            self.fetch_started
++                .send(fetch_number)
++                .expect("test should keep the fetch receiver open");
++            if fetch_number == 1 {
+                 return Err(CodexErr::Io(std::io::Error::other("test failure")));
+             }
+-            if fetch_index == 1 {
+-                self.release_second_fetch.notified().await;
+-            }
+-            Ok((Vec::new(), None))
++            let drop_sender = self
++                .second_fetch_dropped
++                .lock()
++                .expect("drop-signal lock should not be poisoned")
++                .take()
++                .expect("only the second fetch should remain pending");
++            let _notify_on_drop = NotifyOnDrop(Some(drop_sender));
++            std::future::pending().await
+         })
+     }
+ }
+ 
+-#[tokio::test]
+-async fn refreshes_immediately_periodically_and_stops_when_dropped() {
++struct WorkerHarness {
++    worker: ModelsRefreshWorker,
++    endpoint: Arc<TestModelsEndpoint>,
++    fetch_started: mpsc::UnboundedReceiver<usize>,
++    second_fetch_dropped: oneshot::Receiver<()>,
++    _models_manager: SharedModelsManager,
++    _codex_home: TempDir,
++}
++
++fn worker_harness() -> WorkerHarness {
+     let codex_home = tempdir().expect("temp dir");
+-    let endpoint = TestModelsEndpoint::new();
++    let (endpoint, fetch_started, second_fetch_dropped) = TestModelsEndpoint::new();
+     let models_manager: SharedModelsManager = Arc::new(OpenAiModelsManager::new(
+         codex_home.path().to_path_buf(),
+         endpoint.clone(),
+@@ -85,13 +112,70 @@ async fn refreshes_immediately_periodically_and_stops_when_dropped() {
+     let worker = spawn_with_interval(
+         &models_manager,
+         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+-        Duration::from_millis(10),
++        Duration::ZERO,
+     );
++    WorkerHarness {
++        worker,
++        endpoint,
++        fetch_started,
++        second_fetch_dropped,
++        _models_manager: models_manager,
++        _codex_home: codex_home,
++    }
++}
++
++async fn expect_fetch_started(fetch_started: &mut mpsc::UnboundedReceiver<usize>, expected: usize) {
++    let actual = tokio::time::timeout(Duration::from_secs(1), fetch_started.recv())
++        .await
++        .unwrap_or_else(|_| panic!("timed out waiting for fetch {expected}"));
++    assert_eq!(actual, Some(expected));
++}
++
++#[tokio::test]
++async fn cancel_stops_inflight_refresh_and_shutdown_joins_worker() {
++    let WorkerHarness {
++        worker,
++        endpoint,
++        mut fetch_started,
++        second_fetch_dropped,
++        _models_manager,
++        _codex_home,
++    } = worker_harness();
++
++    expect_fetch_started(&mut fetch_started, 1).await;
++    expect_fetch_started(&mut fetch_started, 2).await;
++    worker.cancel();
++
++    tokio::time::timeout(Duration::from_secs(1), second_fetch_dropped)
++        .await
++        .expect("timed out waiting for the in-flight fetch to be cancelled")
++        .expect("in-flight fetch drop signal should be sent");
++    tokio::time::timeout(Duration::from_secs(1), worker.shutdown())
++        .await
++        .expect("timed out joining the cancelled models refresh worker");
+ 
+-    endpoint.wait_for_fetch_count(/*expected*/ 2).await;
++    assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 2);
++}
++
++#[tokio::test]
++async fn drop_aborts_inflight_refresh() {
++    let WorkerHarness {
++        worker,
++        endpoint,
++        mut fetch_started,
++        second_fetch_dropped,
++        _models_manager,
++        _codex_home,
++    } = worker_harness();
++
++    expect_fetch_started(&mut fetch_started, 1).await;
++    expect_fetch_started(&mut fetch_started, 2).await;
+     drop(worker);
+-    endpoint.release_second_fetch.notify_one();
+-    tokio::time::sleep(Duration::from_millis(30)).await;
++
++    tokio::time::timeout(Duration::from_secs(1), second_fetch_dropped)
++        .await
++        .expect("timed out waiting for the aborted fetch to be dropped")
++        .expect("aborted fetch drop signal should be sent");
+ 
+     assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 2);
+ }

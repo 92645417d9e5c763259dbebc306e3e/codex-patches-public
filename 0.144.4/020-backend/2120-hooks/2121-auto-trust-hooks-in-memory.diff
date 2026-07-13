@@ -1,0 +1,632 @@
+diff --git a/codex-rs/app-server/tests/suite/v2/hooks_list.rs b/codex-rs/app-server/tests/suite/v2/hooks_list.rs
+index 35b19addd8..f7e0c8accd 100644
+--- a/codex-rs/app-server/tests/suite/v2/hooks_list.rs
++++ b/codex-rs/app-server/tests/suite/v2/hooks_list.rs
+@@ -181,7 +181,7 @@ async fn hooks_list_shows_discovered_hook() -> Result<()> {
+                     /*timeout_sec*/ 5,
+                     Some("running listed hook"),
+                 ),
+-                trust_status: HookTrustStatus::Untrusted,
++                trust_status: HookTrustStatus::Trusted,
+             }],
+             warnings: Vec::new(),
+             errors: Vec::new(),
+@@ -263,7 +263,7 @@ async fn hooks_list_shows_discovered_plugin_hook() -> Result<()> {
+                     /*timeout_sec*/ 7,
+                     Some("running plugin hook"),
+                 ),
+-                trust_status: HookTrustStatus::Untrusted,
++                trust_status: HookTrustStatus::Trusted,
+             }],
+             warnings: Vec::new(),
+             errors: Vec::new(),
+@@ -477,7 +477,7 @@ timeout = 5
+                         /*timeout_sec*/ 5,
+                         /*status_message*/ None,
+                     ),
+-                    trust_status: HookTrustStatus::Untrusted,
++                    trust_status: HookTrustStatus::Trusted,
+                 }],
+                 warnings: Vec::new(),
+                 errors: Vec::new(),
+@@ -534,42 +534,6 @@ async fn hooks_list_uses_root_repo_hooks_for_linked_worktrees() -> Result<()> {
+     assert_eq!(repo_hook.source_path, repo_config_path);
+     assert_eq!(worktree_hook.source_path, repo_config_path);
+ 
+-    let write_id = mcp
+-        .send_config_batch_write_request(ConfigBatchWriteParams {
+-            edits: vec![ConfigEdit {
+-                key_path: "hooks.state".to_string(),
+-                value: serde_json::json!({
+-                    repo_hook.key.clone(): {
+-                        "trusted_hash": repo_hook.current_hash.clone()
+-                    }
+-                }),
+-                merge_strategy: MergeStrategy::Upsert,
+-            }],
+-            file_path: None,
+-            expected_version: None,
+-            reload_user_config: true,
+-        })
+-        .await?;
+-    let response: JSONRPCResponse = timeout(
+-        DEFAULT_TIMEOUT,
+-        mcp.read_stream_until_response_message(RequestId::Integer(write_id)),
+-    )
+-    .await??;
+-    let _: codex_app_server_protocol::ConfigWriteResponse = to_response(response)?;
+-
+-    let list_id = mcp
+-        .send_hooks_list_request(HooksListParams {
+-            cwds: vec![worktree_root],
+-        })
+-        .await?;
+-    let response: JSONRPCResponse = timeout(
+-        DEFAULT_TIMEOUT,
+-        mcp.read_stream_until_response_message(RequestId::Integer(list_id)),
+-    )
+-    .await??;
+-    let HooksListResponse { data } = to_response(response)?;
+-    assert_eq!(data[0].hooks[0].trust_status, HookTrustStatus::Trusted);
+-
+     Ok(())
+ }
+ 
+@@ -677,15 +641,14 @@ async fn config_batch_write_toggles_user_hook() -> Result<()> {
+ }
+ 
+ #[tokio::test]
+-async fn config_batch_write_updates_hook_trust_for_loaded_session() -> Result<()> {
++async fn config_batch_write_updates_hook_for_loaded_session() -> Result<()> {
+     skip_if_host_windows!(Ok(()));
+     // TODO(anp): Teach command-hook fixtures to run in selected remote environments.
+     skip_if_remote!(Ok(()), "command hooks use host-local script and log paths");
+ 
+     let responses = vec![
+         create_final_assistant_message_sse_response("Warmup")?,
+-        create_final_assistant_message_sse_response("Untrusted turn")?,
+-        create_final_assistant_message_sse_response("Trusted turn")?,
++        create_final_assistant_message_sse_response("Initial turn")?,
+         create_final_assistant_message_sse_response("Modified turn")?,
+     ];
+     let server = create_mock_responses_server_sequence_unchecked(responses).await;
+@@ -754,7 +717,7 @@ command = "python3 {hook_script_path}"
+     .await??;
+     let HooksListResponse { data } = to_response(response)?;
+     let hook = data[0].hooks[0].clone();
+-    assert_eq!(hook.trust_status, HookTrustStatus::Untrusted);
++    assert_eq!(hook.trust_status, HookTrustStatus::Trusted);
+ 
+     let thread_start_id = mcp
+         .send_thread_start_request_with_auto_env(ThreadStartParams {
+@@ -790,68 +753,6 @@ command = "python3 {hook_script_path}"
+         mcp.read_stream_until_notification_message("turn/completed"),
+     )
+     .await??;
+-    assert!(!std::fs::exists(&hook_log_path)?);
+-
+-    let write_id = mcp
+-        .send_config_batch_write_request(ConfigBatchWriteParams {
+-            edits: vec![ConfigEdit {
+-                key_path: "hooks.state".to_string(),
+-                value: serde_json::json!({
+-                    hook.key.clone(): {
+-                        "trusted_hash": hook.current_hash.clone()
+-                    }
+-                }),
+-                merge_strategy: MergeStrategy::Upsert,
+-            }],
+-            file_path: None,
+-            expected_version: None,
+-            reload_user_config: true,
+-        })
+-        .await?;
+-    let response: JSONRPCResponse = timeout(
+-        DEFAULT_TIMEOUT,
+-        mcp.read_stream_until_response_message(RequestId::Integer(write_id)),
+-    )
+-    .await??;
+-    let _: codex_app_server_protocol::ConfigWriteResponse = to_response(response)?;
+-
+-    let hook_list_id = mcp
+-        .send_hooks_list_request(HooksListParams {
+-            cwds: vec![codex_home.path().to_path_buf()],
+-        })
+-        .await?;
+-    let response: JSONRPCResponse = timeout(
+-        DEFAULT_TIMEOUT,
+-        mcp.read_stream_until_response_message(RequestId::Integer(hook_list_id)),
+-    )
+-    .await??;
+-    let HooksListResponse { data } = to_response(response)?;
+-    let trusted_hook = &data[0].hooks[0];
+-    assert_eq!(trusted_hook.key, hook.key);
+-    assert_eq!(trusted_hook.current_hash, hook.current_hash);
+-    assert_eq!(trusted_hook.trust_status, HookTrustStatus::Trusted);
+-
+-    let second_turn_id = mcp
+-        .send_turn_start_request(TurnStartParams {
+-            thread_id: thread.id.clone(),
+-            client_user_message_id: None,
+-            input: vec![V2UserInput::Text {
+-                text: "second turn".to_string(),
+-                text_elements: Vec::new(),
+-            }],
+-            ..Default::default()
+-        })
+-        .await?;
+-    timeout(
+-        DEFAULT_TIMEOUT,
+-        mcp.read_stream_until_response_message(RequestId::Integer(second_turn_id)),
+-    )
+-    .await??;
+-    timeout(
+-        DEFAULT_TIMEOUT,
+-        mcp.read_stream_until_notification_message("turn/completed"),
+-    )
+-    .await??;
+     assert_eq!(
+         std::fs::read_to_string(&hook_log_path)?
+             .lines()
+@@ -899,14 +800,14 @@ command = "python3 {hook_script_path}"
+     let modified_hook = &data[0].hooks[0];
+     assert_eq!(modified_hook.key, hook.key);
+     assert_ne!(modified_hook.current_hash, hook.current_hash);
+-    assert_eq!(modified_hook.trust_status, HookTrustStatus::Modified);
++    assert_eq!(modified_hook.trust_status, HookTrustStatus::Trusted);
+ 
+-    let third_turn_id = mcp
++    let second_turn_id = mcp
+         .send_turn_start_request(TurnStartParams {
+             thread_id: thread.id,
+             client_user_message_id: None,
+             input: vec![V2UserInput::Text {
+-                text: "third turn".to_string(),
++                text: "second turn".to_string(),
+                 text_elements: Vec::new(),
+             }],
+             ..Default::default()
+@@ -914,7 +815,7 @@ command = "python3 {hook_script_path}"
+         .await?;
+     timeout(
+         DEFAULT_TIMEOUT,
+-        mcp.read_stream_until_response_message(RequestId::Integer(third_turn_id)),
++        mcp.read_stream_until_response_message(RequestId::Integer(second_turn_id)),
+     )
+     .await??;
+     timeout(
+@@ -927,7 +828,7 @@ command = "python3 {hook_script_path}"
+             .lines()
+             .filter(|line| !line.is_empty())
+             .count(),
+-        1
++        2
+     );
+     Ok(())
+ }
+@@ -1011,29 +912,6 @@ command = "python3 {hook_script_path}"
+     let hook = &data[0].hooks[0];
+     assert_eq!(hook.enabled, true);
+ 
+-    let write_id = mcp
+-        .send_config_batch_write_request(ConfigBatchWriteParams {
+-            edits: vec![ConfigEdit {
+-                key_path: "hooks.state".to_string(),
+-                value: serde_json::json!({
+-                    hook.key.clone(): {
+-                        "trusted_hash": hook.current_hash.clone()
+-                    }
+-                }),
+-                merge_strategy: MergeStrategy::Upsert,
+-            }],
+-            file_path: None,
+-            expected_version: None,
+-            reload_user_config: true,
+-        })
+-        .await?;
+-    let response: JSONRPCResponse = timeout(
+-        DEFAULT_TIMEOUT,
+-        mcp.read_stream_until_response_message(RequestId::Integer(write_id)),
+-    )
+-    .await??;
+-    let _: codex_app_server_protocol::ConfigWriteResponse = to_response(response)?;
+-
+     let thread_start_id = mcp
+         .send_thread_start_request_with_auto_env(ThreadStartParams {
+             model: Some("mock-model".to_string()),
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index ff3adcaf1d..20e98bf616 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -1481,38 +1481,7 @@ async fn reload_user_config_layer_refreshes_hooks() -> anyhow::Result<()> {
+     };
+     assert!(session.hooks().preview_session_start(&request).is_empty());
+ 
+-    let config = session.get_config().await;
+-    let hook_list = codex_hooks::list_hooks(codex_hooks::HooksConfig {
+-        feature_enabled: true,
+-        config_layer_stack: Some(
+-            config
+-                .config_layer_stack
+-                .with_user_config(&config_toml_path, user_config.clone()),
+-        ),
+-        ..codex_hooks::HooksConfig::default()
+-    });
+-    assert_eq!(hook_list.hooks.len(), 1);
+-    assert_eq!(
+-        hook_list.hooks[0].trust_status,
+-        codex_protocol::protocol::HookTrustStatus::Untrusted
+-    );
+-
+-    let trusted_user_config: codex_config::TomlValue = serde_json::from_value(serde_json::json!({
+-        "hooks": {
+-            "SessionStart": [{
+-                "hooks": [{
+-                    "type": "command",
+-                    "command": "python3 /tmp/user.py",
+-                }],
+-            }],
+-            "state": {
+-                hook_list.hooks[0].key.clone(): {
+-                    "trusted_hash": hook_list.hooks[0].current_hash.clone(),
+-                },
+-            },
+-        },
+-    }))?;
+-    std::fs::write(&config_toml_path, toml::to_string(&trusted_user_config)?)?;
++    std::fs::write(&config_toml_path, toml::to_string(&user_config)?)?;
+ 
+     session.reload_user_config_layer().await;
+ 
+@@ -1535,31 +1504,7 @@ async fn refresh_runtime_config_refreshes_hooks() -> anyhow::Result<()> {
+     let codex_home = session.codex_home().await;
+     std::fs::create_dir_all(&codex_home)?;
+     let config_toml_path = codex_home.join(CONFIG_TOML_FILE);
+-    #[derive(serde::Serialize)]
+-    struct NormalizedHookIdentity {
+-        event_name: &'static str,
+-        #[serde(flatten)]
+-        group: codex_config::MatcherGroup,
+-    }
+-    let trusted_hash = {
+-        let identity = NormalizedHookIdentity {
+-            event_name: "session_start",
+-            group: codex_config::MatcherGroup {
+-                matcher: None,
+-                hooks: vec![codex_config::HookHandlerConfig::Command {
+-                    command: "python3 /tmp/user.py".to_string(),
+-                    command_windows: None,
+-                    timeout_sec: Some(600),
+-                    r#async: false,
+-                    status_message: None,
+-                }],
+-            },
+-        };
+-        let identity = codex_config::TomlValue::try_from(identity)?;
+-        codex_config::version_for_toml(&identity)
+-    };
+-    let hook_key = format!("{}:session_start:0:0", config_toml_path.display());
+-    let trusted_user_config: codex_config::TomlValue = serde_json::from_value(serde_json::json!({
++    let user_config: codex_config::TomlValue = serde_json::from_value(serde_json::json!({
+         "hooks": {
+             "SessionStart": [{
+                 "hooks": [{
+@@ -1567,14 +1512,9 @@ async fn refresh_runtime_config_refreshes_hooks() -> anyhow::Result<()> {
+                     "command": "python3 /tmp/user.py",
+                 }],
+             }],
+-            "state": {
+-                hook_key: {
+-                    "trusted_hash": trusted_hash,
+-                },
+-            },
+         },
+     }))?;
+-    std::fs::write(&config_toml_path, toml::to_string(&trusted_user_config)?)?;
++    std::fs::write(&config_toml_path, toml::to_string(&user_config)?)?;
+ 
+     let request = codex_hooks::SessionStartRequest {
+         session_id: session.thread_id,
+@@ -11261,7 +11201,7 @@ async fn unified_exec_rejects_escalated_permissions_when_policy_not_on_request()
+ }
+ 
+ #[tokio::test]
+-async fn session_start_hooks_only_load_from_trusted_project_layers() -> std::io::Result<()> {
++async fn session_start_hooks_load_from_all_eligible_project_layers() -> std::io::Result<()> {
+     let temp = tempfile::tempdir()?;
+     let codex_home = temp.path().join("home");
+     let project_root = temp.path().join("project");
+@@ -11290,25 +11230,35 @@ async fn session_start_hooks_only_load_from_trusted_project_layers() -> std::io:
+     let expected_source_path = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
+         nested_dot_codex.join("hooks.json"),
+     )?;
++    let expected_root_source_path = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
++        root_dot_codex.join("hooks.json"),
++    )?;
+     assert_eq!(
+         hook_list
+             .hooks
+             .iter()
+             .map(|hook| &hook.source_path)
+             .collect::<Vec<_>>(),
+-        vec![&expected_source_path],
++        vec![&expected_root_source_path, &expected_source_path],
+     );
+     assert_eq!(
+-        hook_list.hooks[0].trust_status,
+-        codex_protocol::protocol::HookTrustStatus::Untrusted
++        hook_list
++            .hooks
++            .iter()
++            .map(|hook| hook.trust_status)
++            .collect::<Vec<_>>(),
++        vec![
++            codex_protocol::protocol::HookTrustStatus::Trusted,
++            codex_protocol::protocol::HookTrustStatus::Trusted,
++        ],
+     );
+-    assert!(preview_session_start_hooks(&config).await?.is_empty());
++    assert_eq!(preview_session_start_hooks(&config).await?.len(), 2);
+ 
+     Ok(())
+ }
+ 
+ #[tokio::test]
+-async fn session_start_hooks_require_project_trust_without_config_toml() -> std::io::Result<()> {
++async fn session_start_hooks_load_unless_project_is_explicitly_untrusted() -> std::io::Result<()> {
+     let temp = tempfile::tempdir()?;
+     let project_root = temp.path().join("project");
+     let nested = project_root.join("nested");
+@@ -11318,20 +11268,27 @@ async fn session_start_hooks_require_project_trust_without_config_toml() -> std:
+     write_project_hooks(&dot_codex)?;
+ 
+     let cases = [
+-        ("unknown", Vec::<(&Path, TrustLevel)>::new(), 0_usize),
++        (
++            "unknown",
++            Vec::<(&Path, TrustLevel)>::new(),
++            1_usize,
++            1_usize,
++        ),
+         (
+             "untrusted",
+             vec![(&project_root as &Path, TrustLevel::Untrusted)],
+             0_usize,
++            0_usize,
+         ),
+         (
+             "trusted",
+             vec![(&project_root as &Path, TrustLevel::Trusted)],
+             1_usize,
++            1_usize,
+         ),
+     ];
+ 
+-    for (name, trust_entries, expected_hooks) in cases {
++    for (name, trust_entries, expected_hooks, expected_previews) in cases {
+         let codex_home = temp.path().join(format!("home_{name}"));
+         std::fs::create_dir_all(&codex_home)?;
+         write_project_trust_config(&codex_home, &trust_entries).await?;
+@@ -11352,11 +11309,15 @@ async fn session_start_hooks_require_project_trust_without_config_toml() -> std:
+             expected_hooks,
+             "unexpected discovered hook count for {name}",
+         );
+-        assert!(preview_session_start_hooks(&config).await?.is_empty());
++        assert_eq!(
++            preview_session_start_hooks(&config).await?.len(),
++            expected_previews,
++            "unexpected preview hook count for {name}"
++        );
+         if expected_hooks == 1 {
+             assert_eq!(
+                 hook_list.hooks[0].trust_status,
+-                codex_protocol::protocol::HookTrustStatus::Untrusted
++                codex_protocol::protocol::HookTrustStatus::Trusted
+             );
+         }
+     }
+diff --git a/codex-rs/hooks/src/engine/discovery.rs b/codex-rs/hooks/src/engine/discovery.rs
+index cab28b64a1..e89803f6cf 100644
+--- a/codex-rs/hooks/src/engine/discovery.rs
++++ b/codex-rs/hooks/src/engine/discovery.rs
+@@ -504,9 +504,7 @@ fn append_matcher_groups(
+                         crate::hook_key(&source.key_source, event_name, group_index, handler_index);
+                     let state = source.hook_states.get(&key);
+                     let enabled = hook_enabled(source.is_managed, state);
+-                    let trusted_hash = hook_trusted_hash(source.is_managed, state);
+-                    let trust_status =
+-                        hook_trust_status(source.is_managed, &current_hash, trusted_hash);
++                    let trust_status = hook_trust_status(source.is_managed);
+                     hook_entries.push(HookListEntry {
+                         key,
+                         event_name,
+@@ -586,19 +584,11 @@ fn command_hook_hash(
+     version_for_toml(&value)
+ }
+ 
+-fn hook_trust_status(
+-    is_managed: bool,
+-    current_hash: &str,
+-    trusted_hash: Option<&str>,
+-) -> HookTrustStatus {
++fn hook_trust_status(is_managed: bool) -> HookTrustStatus {
+     if is_managed {
+         HookTrustStatus::Managed
+     } else {
+-        match trusted_hash {
+-            Some(trusted_hash) if trusted_hash == current_hash => HookTrustStatus::Trusted,
+-            Some(_) => HookTrustStatus::Modified,
+-            None => HookTrustStatus::Untrusted,
+-        }
++        HookTrustStatus::Trusted
+     }
+ }
+ 
+@@ -606,12 +596,6 @@ fn hook_enabled(is_managed: bool, state: Option<&HookStateToml>) -> bool {
+     is_managed || state.and_then(|state| state.enabled) != Some(false)
+ }
+ 
+-fn hook_trusted_hash(is_managed: bool, state: Option<&HookStateToml>) -> Option<&str> {
+-    (!is_managed)
+-        .then(|| state.and_then(|state| state.trusted_hash.as_deref()))
+-        .flatten()
+-}
+-
+ fn hook_metadata_for_config_layer_source(source: &ConfigLayerSource) -> (HookSource, bool) {
+     match source {
+         ConfigLayerSource::System { .. } => (HookSource::System, true),
+@@ -832,7 +816,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn bypass_hook_trust_allows_enabled_untrusted_handlers() {
++    fn unmanaged_handlers_are_trusted_and_enabled_by_default() {
+         let mut handlers = Vec::new();
+         let mut hook_entries = Vec::new();
+         let mut warnings = Vec::new();
+@@ -848,7 +832,7 @@ mod tests {
+             &unmanaged_hook_handler_source(
+                 &source_path,
+                 &hook_states,
+-                /*bypass_hook_trust*/ true,
++                /*bypass_hook_trust*/ false,
+             ),
+             HookEventName::PreToolUse,
+             vec![command_group(Some("Bash"))],
+@@ -857,12 +841,12 @@ mod tests {
+         assert_eq!(warnings, Vec::<String>::new());
+         assert_eq!(handlers.len(), 1);
+         assert_eq!(hook_entries.len(), 1);
+-        assert_eq!(hook_entries[0].trust_status, HookTrustStatus::Untrusted);
++        assert_eq!(hook_entries[0].trust_status, HookTrustStatus::Trusted);
+         assert_eq!(hook_entries[0].enabled, true);
+     }
+ 
+     #[test]
+-    fn bypass_hook_trust_respects_disabled_handlers() {
++    fn auto_trust_respects_disabled_unmanaged_handlers() {
+         let mut handlers = Vec::new();
+         let mut hook_entries = Vec::new();
+         let mut warnings = Vec::new();
+@@ -884,7 +868,7 @@ mod tests {
+             &unmanaged_hook_handler_source(
+                 &source_path,
+                 &hook_states,
+-                /*bypass_hook_trust*/ true,
++                /*bypass_hook_trust*/ false,
+             ),
+             HookEventName::PreToolUse,
+             vec![command_group(Some("Bash"))],
+@@ -893,7 +877,7 @@ mod tests {
+         assert_eq!(warnings, Vec::<String>::new());
+         assert_eq!(handlers, Vec::<ConfiguredHandler>::new());
+         assert_eq!(hook_entries.len(), 1);
+-        assert_eq!(hook_entries[0].trust_status, HookTrustStatus::Untrusted);
++        assert_eq!(hook_entries[0].trust_status, HookTrustStatus::Trusted);
+         assert_eq!(hook_entries[0].enabled, false);
+     }
+ 
+diff --git a/codex-rs/hooks/src/engine/mod_tests.rs b/codex-rs/hooks/src/engine/mod_tests.rs
+index 544c67e7ce..e3fbbf752c 100644
+--- a/codex-rs/hooks/src/engine/mod_tests.rs
++++ b/codex-rs/hooks/src/engine/mod_tests.rs
+@@ -609,49 +609,6 @@ fn config_with_pre_tool_use_hook(command: &str) -> TomlValue {
+     .expect("config TOML should deserialize")
+ }
+ 
+-fn trusted_plugin_hook_stack(
+-    config_path: AbsolutePathBuf,
+-    plugin_hook_sources: &[PluginHookSource],
+-) -> ConfigLayerStack {
+-    let discovered = super::discovery::discover_handlers(
+-        /*config_layer_stack*/ None,
+-        plugin_hook_sources.to_vec(),
+-        Vec::new(),
+-        /*bypass_hook_trust*/ false,
+-    );
+-    let state = discovered
+-        .hook_entries
+-        .into_iter()
+-        .map(|entry| {
+-            (
+-                entry.key,
+-                serde_json::json!({
+-                    "trusted_hash": entry.current_hash,
+-                }),
+-            )
+-        })
+-        .collect::<serde_json::Map<_, _>>();
+-    let config = serde_json::from_value(serde_json::json!({
+-        "hooks": {
+-            "state": state,
+-        },
+-    }))
+-    .expect("config TOML should deserialize");
+-
+-    ConfigLayerStack::new(
+-        vec![ConfigLayerEntry::new(
+-            ConfigLayerSource::User {
+-                file: config_path,
+-                profile: None,
+-            },
+-            config,
+-        )],
+-        ConfigRequirements::default(),
+-        ConfigRequirementsToml::default(),
+-    )
+-    .expect("config layer stack")
+-}
+-
+ #[test]
+ fn requirements_managed_hooks_load_when_managed_dir_is_missing() {
+     let temp = tempdir().expect("create temp dir");
+@@ -757,7 +714,7 @@ fn allow_managed_hooks_only_false_keeps_unmanaged_hooks() {
+     );
+ 
+     assert!(engine.warnings().is_empty());
+-    assert!(engine.handlers.is_empty());
++    assert_eq!(engine.handlers.len(), 1);
+     let discovered = super::discovery::discover_handlers(
+         Some(&config_layer_stack),
+         Vec::new(),
+@@ -811,7 +768,7 @@ fn allow_managed_hooks_only_in_config_toml_does_not_enable_policy() {
+     );
+ 
+     assert!(engine.warnings().is_empty());
+-    assert!(engine.handlers.is_empty());
++    assert_eq!(engine.handlers.len(), 1);
+     let discovered = super::discovery::discover_handlers(
+         Some(&config_layer_stack),
+         Vec::new(),
+@@ -1325,14 +1282,10 @@ print(json.dumps({
+             ..Default::default()
+         },
+     }];
+-    let config_layer_stack = trusted_plugin_hook_stack(
+-        AbsolutePathBuf::try_from(temp.path().join("config.toml")).expect("absolute config path"),
+-        &plugin_hook_sources,
+-    );
+     let engine = ClaudeHooksEngine::new(
+         /*enabled*/ true,
+         /*bypass_hook_trust*/ false,
+-        Some(&config_layer_stack),
++        /*config_layer_stack*/ None,
+         plugin_hook_sources.clone(),
+         Vec::new(),
+         CommandShell {
+@@ -1444,14 +1397,10 @@ fn plugin_hook_sources_expand_plugin_placeholders() {
+             ..Default::default()
+         },
+     }];
+-    let config_layer_stack = trusted_plugin_hook_stack(
+-        AbsolutePathBuf::try_from(temp.path().join("config.toml")).expect("absolute config path"),
+-        &plugin_hook_sources,
+-    );
+     let engine = ClaudeHooksEngine::new(
+         /*enabled*/ true,
+         /*bypass_hook_trust*/ false,
+-        Some(&config_layer_stack),
++        /*config_layer_stack*/ None,
+         plugin_hook_sources,
+         Vec::new(),
+         CommandShell {

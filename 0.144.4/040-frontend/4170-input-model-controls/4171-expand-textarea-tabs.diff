@@ -1,0 +1,133 @@
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+index f313148abb..b541daab82 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+@@ -7716,7 +7716,7 @@ mod tests {
+             /*disable_paste_burst*/ false,
+         );
+ 
+-        let sanitized = "_count_rows\tindent\ntwo";
++        let sanitized = "_count_rows    indent\ntwo";
+         let needs_redraw =
+             composer.handle_paste("_count_r\x1b[13;2:3uows\tindent\n\0two\u{7f}".to_string());
+         assert!(needs_redraw);
+diff --git a/codex-rs/tui/src/bottom_pane/textarea.rs b/codex-rs/tui/src/bottom_pane/textarea.rs
+index 3a1f7af7f8..0373718f88 100644
+--- a/codex-rs/tui/src/bottom_pane/textarea.rs
++++ b/codex-rs/tui/src/bottom_pane/textarea.rs
+@@ -44,11 +44,32 @@ use self::vim::VimPending;
+ use self::vim::VimTextObjectScope;
+ 
+ const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
++const TAB_EXPANSION: &str = "    ";
+ 
+ fn is_word_separator(ch: char) -> bool {
+     WORD_SEPARATORS.contains(ch)
+ }
+ 
++fn expand_tabs(text: &str) -> String {
++    text.replace('\t', TAB_EXPANSION)
++}
++
++fn expanded_tab_byte_offset(text: &str, byte_offset: usize) -> usize {
++    let target = byte_offset.min(text.len());
++    let mut expanded = 0;
++    for (idx, ch) in text.char_indices() {
++        if idx >= target {
++            break;
++        }
++        expanded += if ch == '\t' {
++            TAB_EXPANSION.len()
++        } else {
++            ch.len_utf8()
++        };
++    }
++    expanded
++}
++
+ fn split_word_pieces(run: &str) -> Vec<(usize, &str)> {
+     let mut pieces = Vec::new();
+     for (segment_start, segment) in run.split_word_bound_indices() {
+@@ -191,14 +212,16 @@ impl TextArea {
+ 
+     fn set_text_inner(&mut self, text: &str, elements: Option<&[UserTextElement]>) {
+         // Stage 1: replace the raw text and keep the cursor in a safe byte range.
+-        self.text = text.to_string();
++        self.text = expand_tabs(text);
+         self.cursor_pos = self.cursor_pos.clamp(0, self.text.len());
+         // Stage 2: rebuild element ranges from scratch against the new text.
+         self.elements.clear();
+         if let Some(elements) = elements {
+             for elem in elements {
+-                let mut start = elem.byte_range.start.min(self.text.len());
+-                let mut end = elem.byte_range.end.min(self.text.len());
++                let mut start = expanded_tab_byte_offset(text, elem.byte_range.start);
++                let mut end = expanded_tab_byte_offset(text, elem.byte_range.end);
++                start = start.min(self.text.len());
++                end = end.min(self.text.len());
+                 start = self.clamp_pos_to_char_boundary(start);
+                 end = self.clamp_pos_to_char_boundary(end);
+                 if start >= end {
+@@ -345,7 +368,8 @@ impl TextArea {
+ 
+     pub fn insert_str_at(&mut self, pos: usize, text: &str) {
+         let pos = self.clamp_pos_for_insertion(pos);
+-        self.text.insert_str(pos, text);
++        let text = expand_tabs(text);
++        self.text.insert_str(pos, &text);
+         self.wrap_cache.replace(None);
+         if pos <= self.cursor_pos {
+             self.cursor_pos += text.len();
+@@ -364,13 +388,14 @@ impl TextArea {
+         let start = range.start.clamp(0, self.text.len());
+         let end = range.end.clamp(0, self.text.len());
+         let removed_len = end - start;
++        let text = expand_tabs(text);
+         let inserted_len = text.len();
+         if removed_len == 0 && inserted_len == 0 {
+             return;
+         }
+         let diff = inserted_len as isize - removed_len as isize;
+ 
+-        self.text.replace_range(range, text);
++        self.text.replace_range(range, &text);
+         self.wrap_cache.replace(None);
+         self.preferred_col = None;
+         self.update_elements_after_replace(start, end, inserted_len);
+@@ -2093,6 +2118,36 @@ mod tests {
+         assert_eq!(t.cursor(), 5);
+     }
+ 
++    #[test]
++    fn text_mutation_expands_tabs_to_spaces() {
++        let mut t = TextArea::new();
++        t.insert_str("a\tb");
++        assert_eq!(t.text(), "a    b");
++        assert_eq!(t.cursor(), "a    b".len());
++
++        t.replace_range(1..5, "\t");
++        assert_eq!(t.text(), "a    b");
++
++        t.set_text_clearing_elements("\tlead");
++        assert_eq!(t.text(), "    lead");
++    }
++
++    #[test]
++    fn set_text_with_elements_remaps_ranges_after_tab_expansion() {
++        let mut t = TextArea::new();
++        let elements = [UserTextElement::new(
++            ByteRange { start: 2, end: 7 },
++            Some("@file".to_string()),
++        )];
++
++        t.set_text_with_elements("a\t@file", &elements);
++
++        assert_eq!(t.text(), "a    @file");
++        assert_eq!(t.elements.len(), 1);
++        assert_eq!(t.elements[0].range, 5..10);
++        assert_eq!(&t.text()[t.elements[0].range.clone()], "@file");
++    }
++
+     #[test]
+     fn insert_str_at_clamps_to_char_boundary() {
+         let mut t = TextArea::new();

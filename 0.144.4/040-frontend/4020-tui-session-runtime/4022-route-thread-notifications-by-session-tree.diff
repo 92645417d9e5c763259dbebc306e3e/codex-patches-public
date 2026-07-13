@@ -1,0 +1,737 @@
+diff --git a/codex-rs/tui/src/app/agent_navigation.rs b/codex-rs/tui/src/app/agent_navigation.rs
+index e329de90ab..4038bb861e 100644
+--- a/codex-rs/tui/src/app/agent_navigation.rs
++++ b/codex-rs/tui/src/app/agent_navigation.rs
+@@ -197,6 +197,22 @@ impl AgentNavigationState {
+             .collect()
+     }
+ 
++    pub(crate) fn ordered_threads_for_display(
++        &self,
++        primary_thread_id: Option<ThreadId>,
++    ) -> Vec<(ThreadId, &AgentPickerThreadEntry)> {
++        let mut ordered_threads = self.ordered_threads();
++        if let Some(primary_thread_id) = primary_thread_id
++            && let Some(primary_idx) = ordered_threads
++                .iter()
++                .position(|(thread_id, _)| *thread_id == primary_thread_id)
++        {
++            let primary = ordered_threads.remove(primary_idx);
++            ordered_threads.insert(0, primary);
++        }
++        ordered_threads
++    }
++
+     pub(crate) fn ordered_path_backed_subagent_threads(
+         &self,
+         primary_thread_id: Option<ThreadId>,
+@@ -230,9 +246,10 @@ impl AgentNavigationState {
+     pub(crate) fn adjacent_thread_id(
+         &self,
+         current_displayed_thread_id: Option<ThreadId>,
++        primary_thread_id: Option<ThreadId>,
+         direction: AgentNavigationDirection,
+     ) -> Option<ThreadId> {
+-        let ordered_threads = self.ordered_threads();
++        let ordered_threads = self.ordered_threads_for_display(primary_thread_id);
+         if ordered_threads.len() < 2 {
+             return None;
+         }
+@@ -316,7 +333,7 @@ impl AgentNavigationState {
+     /// This helper exists so tests can assert on ordering without embedding the full picker entry
+     /// payload in every expectation.
+     pub(crate) fn ordered_thread_ids(&self) -> Vec<ThreadId> {
+-        self.ordered_threads()
++        self.ordered_threads_for_display(/*primary_thread_id*/ None)
+             .into_iter()
+             .map(|(thread_id, _)| thread_id)
+             .collect()
+@@ -376,20 +393,73 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn display_order_keeps_primary_first_after_late_primary_insert() {
++        let mut state = AgentNavigationState::default();
++        let main_thread_id =
++            ThreadId::from_string("00000000-0000-0000-0000-000000000001").expect("valid thread");
++        let first_agent_id =
++            ThreadId::from_string("00000000-0000-0000-0000-000000000002").expect("valid thread");
++        let second_agent_id =
++            ThreadId::from_string("00000000-0000-0000-0000-000000000003").expect("valid thread");
++
++        state.upsert(
++            first_agent_id,
++            Some("Robie".to_string()),
++            Some("explorer".to_string()),
++            /*is_closed*/ false,
++        );
++        state.upsert(
++            main_thread_id,
++            /*agent_nickname*/ None,
++            /*agent_role*/ None,
++            /*is_closed*/ false,
++        );
++        state.upsert(
++            second_agent_id,
++            Some("Bob".to_string()),
++            Some("worker".to_string()),
++            /*is_closed*/ false,
++        );
++
++        let ordered = state
++            .ordered_threads_for_display(Some(main_thread_id))
++            .into_iter()
++            .map(|(thread_id, _)| thread_id)
++            .collect::<Vec<_>>();
++
++        assert_eq!(
++            ordered,
++            vec![main_thread_id, first_agent_id, second_agent_id]
++        );
++    }
++
+     #[test]
+     fn adjacent_thread_id_wraps_in_spawn_order() {
+         let (state, main_thread_id, first_agent_id, second_agent_id) = populated_state();
+ 
+         assert_eq!(
+-            state.adjacent_thread_id(Some(second_agent_id), AgentNavigationDirection::Next),
++            state.adjacent_thread_id(
++                Some(second_agent_id),
++                Some(main_thread_id),
++                AgentNavigationDirection::Next,
++            ),
+             Some(main_thread_id)
+         );
+         assert_eq!(
+-            state.adjacent_thread_id(Some(second_agent_id), AgentNavigationDirection::Previous),
++            state.adjacent_thread_id(
++                Some(second_agent_id),
++                Some(main_thread_id),
++                AgentNavigationDirection::Previous,
++            ),
+             Some(first_agent_id)
+         );
+         assert_eq!(
+-            state.adjacent_thread_id(Some(main_thread_id), AgentNavigationDirection::Previous),
++            state.adjacent_thread_id(
++                Some(main_thread_id),
++                Some(main_thread_id),
++                AgentNavigationDirection::Previous,
++            ),
+             Some(second_agent_id)
+         );
+     }
+diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
+index 38455f93c3..fe6015d967 100644
+--- a/codex-rs/tui/src/app/session_lifecycle.rs
++++ b/codex-rs/tui/src/app/session_lifecycle.rs
+@@ -98,7 +98,7 @@ impl App {
+         let mut initial_selected_idx = None;
+         let items: Vec<SelectionItem> = self
+             .agent_navigation
+-            .ordered_threads()
++            .ordered_threads_for_display(self.primary_thread_id)
+             .into_iter()
+             .enumerate()
+             .map(|(idx, (thread_id, entry))| {
+@@ -727,10 +727,11 @@ impl App {
+         direction: AgentNavigationDirection,
+     ) -> Option<ThreadId> {
+         let current_thread = self.current_displayed_thread_id();
+-        if let Some(thread_id) = self
+-            .agent_navigation
+-            .adjacent_thread_id(current_thread, direction)
+-        {
++        if let Some(thread_id) = self.agent_navigation.adjacent_thread_id(
++            current_thread,
++            self.primary_thread_id,
++            direction,
++        ) {
+             return Some(thread_id);
+         }
+ 
+@@ -742,8 +743,11 @@ impl App {
+         if self.backfill_loaded_subagent_threads(app_server).await {
+             self.last_subagent_backfill_attempt = Some(primary_thread_id);
+         }
+-        self.agent_navigation
+-            .adjacent_thread_id(self.current_displayed_thread_id(), direction)
++        self.agent_navigation.adjacent_thread_id(
++            self.current_displayed_thread_id(),
++            self.primary_thread_id,
++            direction,
++        )
+     }
+ 
+     pub(super) fn fresh_session_config(&self) -> Config {
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index 65a21523c2..09920240d9 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -95,6 +95,7 @@ use codex_protocol::models::FileSystemPermissions;
+ use codex_protocol::models::NetworkPermissions;
+ use codex_protocol::models::PermissionProfile;
+ use codex_protocol::protocol::MAX_THREAD_GOAL_OBJECTIVE_CHARS;
++use codex_protocol::protocol::SubAgentSource;
+ use codex_protocol::request_permissions::RequestPermissionProfile;
+ use codex_protocol::user_input::TextElement;
+ use codex_utils_absolute_path::AbsolutePathBuf;
+@@ -1243,6 +1244,57 @@ async fn collab_receiver_notification_renders_metadata_without_app_server_read()
+     );
+ }
+ 
++#[tokio::test]
++async fn collab_receiver_notification_caches_thread_before_active_drain() -> Result<()> {
++    let mut app = make_test_app().await;
++    let primary_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000125").expect("valid thread id");
++    let receiver_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000126").expect("valid thread id");
++    app.primary_thread_id = Some(primary_thread_id);
++
++    app.enqueue_primary_thread_notification(ServerNotification::ItemCompleted(
++        codex_app_server_protocol::ItemCompletedNotification {
++            thread_id: primary_thread_id.to_string(),
++            turn_id: "turn-1".to_string(),
++            completed_at_ms: 0,
++            item: ThreadItem::CollabAgentToolCall {
++                id: "spawn-1".to_string(),
++                tool: codex_app_server_protocol::CollabAgentTool::SpawnAgent,
++                status: codex_app_server_protocol::CollabAgentToolCallStatus::Completed,
++                sender_thread_id: primary_thread_id.to_string(),
++                receiver_thread_ids: vec![receiver_thread_id.to_string()],
++                prompt: Some("start scout".to_string()),
++                model: None,
++                reasoning_effort: None,
++                agents_states: HashMap::from([(
++                    receiver_thread_id.to_string(),
++                    codex_app_server_protocol::CollabAgentState {
++                        status: codex_app_server_protocol::CollabAgentStatus::Running,
++                        message: None,
++                        agent_nickname: Some("Scout".to_string()),
++                        agent_role: Some("explorer".to_string()),
++                    },
++                )]),
++            },
++        },
++    ))
++    .await?;
++
++    assert_eq!(
++        app.agent_navigation.get(&receiver_thread_id),
++        Some(&AgentPickerThreadEntry {
++            agent_nickname: Some("Scout".to_string()),
++            agent_role: Some("explorer".to_string()),
++            agent_path: None,
++            is_running: false,
++            is_closed: false,
++        })
++    );
++
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn collab_receiver_notification_does_not_cache_not_found_thread() {
+     let mut app = make_test_app().await;
+@@ -2628,6 +2680,7 @@ async fn inactive_thread_exec_approval_splits_shell_wrapped_command() {
+ async fn inactive_thread_file_change_approval_recovers_buffered_changes() {
+     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+     let thread_id = ThreadId::new();
++    app.ensure_thread_channel(thread_id);
+     app.enqueue_thread_notification(
+         thread_id,
+         ServerNotification::ItemStarted(ItemStartedNotification {
+@@ -2940,7 +2993,7 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
+             thread: Thread {
+                 id: agent_thread_id.to_string(),
+                 extra: None,
+-                session_id: agent_thread_id.to_string(),
++                session_id: main_thread_id.to_string(),
+                 forked_from_id: None,
+                 parent_thread_id: None,
+                 preview: "agent thread".to_string(),
+@@ -3001,6 +3054,318 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn foreign_thread_started_notification_does_not_create_agent_picker_entry() -> Result<()> {
++    let mut app = make_test_app().await;
++    let main_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000401").expect("valid thread");
++    let foreign_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000402").expect("valid thread");
++    let primary_cwd = test_path_buf("/tmp/main").abs();
++    let primary_session = ThreadSessionState {
++        approval_policy: AskForApproval::OnRequest,
++        permission_profile: PermissionProfile::workspace_write(),
++        runtime_workspace_roots: vec![primary_cwd.clone()],
++        ..test_thread_session(main_thread_id, primary_cwd.to_path_buf())
++    };
++
++    app.primary_thread_id = Some(main_thread_id);
++    app.active_thread_id = Some(main_thread_id);
++    app.primary_session_configured = Some(primary_session.clone());
++    app.thread_event_channels.insert(
++        main_thread_id,
++        ThreadEventChannel::new_with_session(
++            /*capacity*/ 4,
++            primary_session.clone(),
++            Vec::new(),
++        ),
++    );
++
++    app.enqueue_thread_notification(
++        foreign_thread_id,
++        ServerNotification::ThreadStarted(ThreadStartedNotification {
++            thread: Thread {
++                id: foreign_thread_id.to_string(),
++                extra: None,
++                session_id: foreign_thread_id.to_string(),
++                forked_from_id: None,
++                parent_thread_id: None,
++                preview: "foreign main thread".to_string(),
++                ephemeral: false,
++                history_mode: Default::default(),
++                model_provider: "agent-provider".to_string(),
++                created_at: 1,
++                updated_at: 2,
++                recency_at: Some(2),
++                status: codex_app_server_protocol::ThreadStatus::Idle,
++                path: None,
++                cwd: test_path_buf("/tmp/foreign").abs(),
++                cli_version: "0.0.0".to_string(),
++                source: SessionSource::Cli,
++                thread_source: None,
++                agent_nickname: None,
++                agent_role: None,
++                git_info: None,
++                name: Some("foreign main thread".to_string()),
++                turns: Vec::new(),
++            },
++        }),
++    )
++    .await?;
++
++    assert!(!app.thread_event_channels.contains_key(&foreign_thread_id));
++    assert_eq!(app.agent_navigation.get(&foreign_thread_id), None);
++
++    Ok(())
++}
++
++#[tokio::test]
++async fn foreign_subagent_thread_started_notification_does_not_create_agent_picker_entry()
++-> Result<()> {
++    let mut app = make_test_app().await;
++    let main_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000501").expect("valid thread");
++    let foreign_parent_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000502").expect("valid thread");
++    let foreign_agent_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000503").expect("valid thread");
++    let primary_cwd = test_path_buf("/tmp/main").abs();
++    let primary_session = ThreadSessionState {
++        approval_policy: AskForApproval::OnRequest,
++        permission_profile: PermissionProfile::workspace_write(),
++        runtime_workspace_roots: vec![primary_cwd.clone()],
++        ..test_thread_session(main_thread_id, primary_cwd.to_path_buf())
++    };
++
++    app.primary_thread_id = Some(main_thread_id);
++    app.active_thread_id = Some(main_thread_id);
++    app.primary_session_configured = Some(primary_session.clone());
++    app.thread_event_channels.insert(
++        main_thread_id,
++        ThreadEventChannel::new_with_session(
++            /*capacity*/ 4,
++            primary_session.clone(),
++            Vec::new(),
++        ),
++    );
++
++    app.enqueue_thread_notification(
++        foreign_agent_thread_id,
++        ServerNotification::ThreadStarted(ThreadStartedNotification {
++            thread: Thread {
++                id: foreign_agent_thread_id.to_string(),
++                extra: None,
++                session_id: foreign_parent_thread_id.to_string(),
++                forked_from_id: None,
++                parent_thread_id: Some(foreign_parent_thread_id.to_string()),
++                preview: "foreign sub-agent thread".to_string(),
++                ephemeral: false,
++                history_mode: Default::default(),
++                model_provider: "agent-provider".to_string(),
++                created_at: 1,
++                updated_at: 2,
++                recency_at: Some(2),
++                status: codex_app_server_protocol::ThreadStatus::Idle,
++                path: None,
++                cwd: test_path_buf("/tmp/foreign-agent").abs(),
++                cli_version: "0.0.0".to_string(),
++                source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
++                    parent_thread_id: foreign_parent_thread_id,
++                    depth: 1,
++                    agent_path: None,
++                    agent_nickname: Some("Stray".to_string()),
++                    agent_role: Some("worker".to_string()),
++                }),
++                thread_source: None,
++                agent_nickname: Some("Stray".to_string()),
++                agent_role: Some("worker".to_string()),
++                git_info: None,
++                name: Some("foreign sub-agent thread".to_string()),
++                turns: Vec::new(),
++            },
++        }),
++    )
++    .await?;
++
++    assert!(
++        !app.thread_event_channels
++            .contains_key(&foreign_agent_thread_id)
++    );
++    assert_eq!(app.agent_navigation.get(&foreign_agent_thread_id), None);
++
++    Ok(())
++}
++
++#[tokio::test]
++async fn current_session_subagent_thread_started_notification_is_accepted_without_cached_parent()
++-> Result<()> {
++    let mut app = make_test_app().await;
++    let main_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000601").expect("valid thread");
++    let agent_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000602").expect("valid thread");
++    let parent_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000603").expect("valid thread");
++    let primary_cwd = test_path_buf("/tmp/main").abs();
++    let primary_session = ThreadSessionState {
++        approval_policy: AskForApproval::OnRequest,
++        permission_profile: PermissionProfile::workspace_write(),
++        runtime_workspace_roots: vec![primary_cwd.clone()],
++        ..test_thread_session(main_thread_id, primary_cwd.to_path_buf())
++    };
++
++    app.primary_thread_id = Some(main_thread_id);
++    app.active_thread_id = Some(main_thread_id);
++    app.primary_session_configured = Some(primary_session.clone());
++    app.thread_event_channels.insert(
++        main_thread_id,
++        ThreadEventChannel::new_with_session(
++            /*capacity*/ 4,
++            primary_session.clone(),
++            Vec::new(),
++        ),
++    );
++
++    app.enqueue_thread_notification(
++        agent_thread_id,
++        ServerNotification::ThreadStarted(ThreadStartedNotification {
++            thread: Thread {
++                id: agent_thread_id.to_string(),
++                extra: None,
++                session_id: main_thread_id.to_string(),
++                forked_from_id: None,
++                parent_thread_id: Some(parent_thread_id.to_string()),
++                preview: "current sub-agent thread".to_string(),
++                ephemeral: false,
++                history_mode: Default::default(),
++                model_provider: "agent-provider".to_string(),
++                created_at: 1,
++                updated_at: 2,
++                recency_at: Some(2),
++                status: codex_app_server_protocol::ThreadStatus::Idle,
++                path: None,
++                cwd: test_path_buf("/tmp/agent").abs(),
++                cli_version: "0.0.0".to_string(),
++                source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
++                    parent_thread_id,
++                    depth: 2,
++                    agent_path: None,
++                    agent_nickname: Some("Nested".to_string()),
++                    agent_role: Some("worker".to_string()),
++                }),
++                thread_source: None,
++                agent_nickname: Some("Nested".to_string()),
++                agent_role: Some("worker".to_string()),
++                git_info: None,
++                name: Some("current sub-agent thread".to_string()),
++                turns: Vec::new(),
++            },
++        }),
++    )
++    .await?;
++
++    assert_eq!(
++        app.agent_navigation.get(&agent_thread_id),
++        Some(&AgentPickerThreadEntry {
++            agent_nickname: Some("Nested".to_string()),
++            agent_role: Some("worker".to_string()),
++            agent_path: None,
++            is_running: false,
++            is_closed: false,
++        })
++    );
++
++    Ok(())
++}
++
++#[tokio::test]
++async fn current_session_grandchild_thread_started_notification_is_accepted_by_known_parent()
++-> Result<()> {
++    let mut app = make_test_app().await;
++    let main_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000701").expect("valid thread");
++    let parent_agent_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000702").expect("valid thread");
++    let grandchild_thread_id =
++        ThreadId::from_string("00000000-0000-0000-0000-000000000703").expect("valid thread");
++    let primary_cwd = test_path_buf("/tmp/main").abs();
++    let primary_session = ThreadSessionState {
++        approval_policy: AskForApproval::OnRequest,
++        permission_profile: PermissionProfile::workspace_write(),
++        runtime_workspace_roots: vec![primary_cwd.clone()],
++        ..test_thread_session(main_thread_id, primary_cwd.to_path_buf())
++    };
++
++    app.primary_thread_id = Some(main_thread_id);
++    app.active_thread_id = Some(main_thread_id);
++    app.primary_session_configured = Some(primary_session.clone());
++    app.thread_event_channels.insert(
++        main_thread_id,
++        ThreadEventChannel::new_with_session(
++            /*capacity*/ 4,
++            primary_session.clone(),
++            Vec::new(),
++        ),
++    );
++    app.agent_navigation.upsert(
++        parent_agent_thread_id,
++        Some("Parent".to_string()),
++        Some("worker".to_string()),
++        /*is_closed*/ false,
++    );
++
++    app.enqueue_thread_notification(
++        grandchild_thread_id,
++        ServerNotification::ThreadStarted(ThreadStartedNotification {
++            thread: Thread {
++                id: grandchild_thread_id.to_string(),
++                extra: None,
++                session_id: parent_agent_thread_id.to_string(),
++                forked_from_id: None,
++                parent_thread_id: Some(parent_agent_thread_id.to_string()),
++                preview: "grandchild sub-agent thread".to_string(),
++                ephemeral: false,
++                history_mode: Default::default(),
++                model_provider: "agent-provider".to_string(),
++                created_at: 1,
++                updated_at: 2,
++                recency_at: Some(2),
++                status: codex_app_server_protocol::ThreadStatus::Idle,
++                path: None,
++                cwd: test_path_buf("/tmp/grandchild").abs(),
++                cli_version: "0.0.0".to_string(),
++                source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
++                    parent_thread_id: parent_agent_thread_id,
++                    depth: 2,
++                    agent_path: None,
++                    agent_nickname: Some("Grandchild".to_string()),
++                    agent_role: Some("worker".to_string()),
++                }),
++                thread_source: None,
++                agent_nickname: Some("Grandchild".to_string()),
++                agent_role: Some("worker".to_string()),
++                git_info: None,
++                name: Some("grandchild sub-agent thread".to_string()),
++                turns: Vec::new(),
++            },
++        }),
++    )
++    .await?;
++
++    assert_eq!(
++        app.agent_navigation.get(&grandchild_thread_id),
++        Some(&AgentPickerThreadEntry {
++            agent_nickname: Some("Grandchild".to_string()),
++            agent_role: Some("worker".to_string()),
++            agent_path: None,
++            is_running: false,
++            is_closed: false,
++        })
++    );
++
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn inactive_thread_started_notification_preserves_primary_model_when_path_missing()
+ -> Result<()> {
+@@ -3035,7 +3400,7 @@ async fn inactive_thread_started_notification_preserves_primary_model_when_path_
+             thread: Thread {
+                 id: agent_thread_id.to_string(),
+                 extra: None,
+-                session_id: agent_thread_id.to_string(),
++                session_id: main_thread_id.to_string(),
+                 forked_from_id: None,
+                 parent_thread_id: None,
+                 preview: "agent thread".to_string(),
+@@ -3571,24 +3936,12 @@ async fn primary_thread_ignores_child_mcp_startup_notifications() {
+     .await;
+ 
+     assert!(app_event_rx.try_recv().is_err());
+-    let mut child_snapshot = app
+-        .thread_event_channels
+-        .get(&child_thread_id)
+-        .expect("child thread channel should be created")
+-        .store
+-        .lock()
+-        .await
+-        .snapshot();
+     assert!(
+-        matches!(
+-            child_snapshot.events.as_slice(),
+-            [ThreadBufferedEvent::Notification(
+-                ServerNotification::McpServerStatusUpdated(_)
+-            )]
+-        ),
+-        "child MCP startup notification should be buffered for the child thread"
++        !app.thread_event_channels.contains_key(&child_thread_id),
++        "child MCP startup notification should be ignored without creating local child state"
+     );
+ 
++    let mut child_snapshot = ThreadEventStore::new(/*capacity*/ 4).snapshot();
+     app.apply_refreshed_snapshot_thread(
+         child_thread_id,
+         AppServerStartedThread {
+@@ -3609,12 +3962,12 @@ async fn primary_thread_ignores_child_mcp_startup_notifications() {
+     }
+     let rendered = rendered_cells.join("\n");
+     assert_eq!(app.chat_widget.thread_id(), Some(child_thread_id));
+-    assert_eq!(rendered.matches("sentry is not logged in").count(), 1);
++    assert_eq!(rendered.matches("sentry is not logged in").count(), 0);
+     assert_eq!(
+         rendered
+             .matches("MCP startup incomplete (failed: sentry)")
+             .count(),
+-        1
++        0
+     );
+ }
+ 
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+index e7c214c9fa..99381afd1c 100644
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -966,6 +966,10 @@ impl App {
+         thread_id: ThreadId,
+         notification: ServerNotification,
+     ) -> Result<()> {
++        if !self.should_accept_thread_notification(thread_id, &notification) {
++            return Ok(());
++        }
++        self.cache_collab_receiver_threads_for_notification(&notification);
+         if matches!(notification, ServerNotification::ThreadSettingsUpdated(_))
+             && self.primary_thread_id.is_some()
+             && self.primary_thread_id != Some(thread_id)
+@@ -1021,6 +1025,64 @@ impl App {
+         Ok(())
+     }
+ 
++    fn should_accept_thread_notification(
++        &self,
++        thread_id: ThreadId,
++        notification: &ServerNotification,
++    ) -> bool {
++        if self.primary_thread_id == Some(thread_id)
++            || self.thread_event_channels.contains_key(&thread_id)
++            || self.agent_navigation.get(&thread_id).is_some()
++        {
++            return true;
++        }
++
++        let ServerNotification::ThreadStarted(notification) = notification else {
++            return false;
++        };
++
++        self.thread_belongs_to_current_session_tree(&notification.thread)
++    }
++
++    fn thread_belongs_to_current_session_tree(
++        &self,
++        thread: &codex_app_server_protocol::Thread,
++    ) -> bool {
++        let Some(primary_thread_id) = self.primary_thread_id else {
++            return true;
++        };
++
++        if thread.session_id == primary_thread_id.to_string() {
++            return true;
++        }
++
++        if let Some(parent_thread_id) = thread
++            .forked_from_id
++            .as_deref()
++            .and_then(|thread_id| ThreadId::from_string(thread_id).ok())
++            && self.is_current_session_thread(parent_thread_id)
++        {
++            return true;
++        }
++
++        let codex_app_server_protocol::SessionSource::SubAgent(
++            codex_protocol::protocol::SubAgentSource::ThreadSpawn {
++                parent_thread_id, ..
++            },
++        ) = &thread.source
++        else {
++            return false;
++        };
++
++        self.is_current_session_thread(*parent_thread_id)
++    }
++
++    fn is_current_session_thread(&self, thread_id: ThreadId) -> bool {
++        self.primary_thread_id == Some(thread_id)
++            || self.thread_event_channels.contains_key(&thread_id)
++            || self.agent_navigation.get(&thread_id).is_some()
++    }
++
+     /// Locally remembers receiver threads referenced by a collab notification.
+     ///
+     /// This intentionally avoids app-server reads on the active-thread rendering path. During large
+@@ -1056,15 +1118,23 @@ impl App {
+                 continue;
+             };
+ 
+-            let existing_entry = self.agent_navigation.get(&thread_id).cloned();
+             let (agent_nickname, agent_role) =
+                 collab_receiver_metadata(notification, receiver_thread_id);
+-            let agent_nickname =
+-                agent_nickname.or_else(|| existing_entry.as_ref()?.agent_nickname.clone());
+-            let agent_role = agent_role.or_else(|| existing_entry.as_ref()?.agent_role.clone());
+-            let is_closed = existing_entry.is_some_and(|entry| entry.is_closed);
+-
+-            self.upsert_agent_picker_thread(thread_id, agent_nickname, agent_role, is_closed);
++            let existing_entry = self.agent_navigation.get(&thread_id).cloned();
++            self.upsert_agent_picker_thread(
++                thread_id,
++                agent_nickname.or_else(|| {
++                    existing_entry
++                        .as_ref()
++                        .and_then(|entry| entry.agent_nickname.clone())
++                }),
++                agent_role.or_else(|| {
++                    existing_entry
++                        .as_ref()
++                        .and_then(|entry| entry.agent_role.clone())
++                }),
++                existing_entry.is_some_and(|entry| entry.is_closed),
++            );
+         }
+     }
+ 

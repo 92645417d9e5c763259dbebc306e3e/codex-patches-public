@@ -1,0 +1,93 @@
+diff --git a/codex-rs/tui/src/clipboard_paste.rs b/codex-rs/tui/src/clipboard_paste.rs
+index 55ca6ca659..1b181dec13 100644
+--- a/codex-rs/tui/src/clipboard_paste.rs
++++ b/codex-rs/tui/src/clipboard_paste.rs
+@@ -2,6 +2,9 @@ use std::path::Path;
+ use std::path::PathBuf;
+ use tempfile::Builder;
+ 
++const CLIPBOARD_TEMP_ROOT: &str = "codex";
++const CLIPBOARD_TEMP_DIR: &str = "clipboard";
++
+ #[derive(Debug, Clone)]
+ pub enum PasteImageError {
+     ClipboardUnavailable(String),
+@@ -122,18 +125,7 @@ pub fn paste_image_to_temp_png() -> Result<(PathBuf, PastedImageInfo), PasteImag
+     // First attempt: read image from system clipboard via arboard (native paths or image data).
+     match paste_image_as_png() {
+         Ok((png, info)) => {
+-            // Create a unique temporary file with a .png suffix to avoid collisions.
+-            let tmp = Builder::new()
+-                .prefix("codex-clipboard-")
+-                .suffix(".png")
+-                .tempfile()
+-                .map_err(|e| PasteImageError::IoError(e.to_string()))?;
+-            std::fs::write(tmp.path(), &png)
+-                .map_err(|e| PasteImageError::IoError(e.to_string()))?;
+-            // Persist the file (so it remains after the handle is dropped) and return its PathBuf.
+-            let (_file, path) = tmp
+-                .keep()
+-                .map_err(|e| PasteImageError::IoError(e.error.to_string()))?;
++            let path = write_clipboard_png_to_temp(&png)?;
+             Ok((path, info))
+         }
+         Err(e) => {
+@@ -149,6 +141,58 @@ pub fn paste_image_to_temp_png() -> Result<(PathBuf, PastedImageInfo), PasteImag
+     }
+ }
+ 
++#[cfg(not(target_os = "android"))]
++fn clipboard_temp_dir(temp_root: &Path) -> PathBuf {
++    temp_root.join(CLIPBOARD_TEMP_ROOT).join(CLIPBOARD_TEMP_DIR)
++}
++
++#[cfg(not(target_os = "android"))]
++fn write_clipboard_png_to_temp(png: &[u8]) -> Result<PathBuf, PasteImageError> {
++    write_clipboard_png_to_temp_in(png, &std::env::temp_dir())
++}
++
++#[cfg(not(target_os = "android"))]
++fn write_clipboard_png_to_temp_in(
++    png: &[u8],
++    temp_root: &Path,
++) -> Result<PathBuf, PasteImageError> {
++    let temp_dir = clipboard_temp_dir(temp_root);
++    std::fs::create_dir_all(&temp_dir).map_err(|e| PasteImageError::IoError(e.to_string()))?;
++    let tmp = Builder::new()
++        .prefix("codex-clipboard-")
++        .suffix(".png")
++        .tempfile_in(&temp_dir)
++        .map_err(|e| PasteImageError::IoError(e.to_string()))?;
++    std::fs::write(tmp.path(), png).map_err(|e| PasteImageError::IoError(e.to_string()))?;
++    let (_file, path) = tmp
++        .keep()
++        .map_err(|e| PasteImageError::IoError(e.error.to_string()))?;
++    Ok(path)
++}
++
++#[cfg(all(test, not(target_os = "android")))]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn clipboard_png_temp_file_uses_codex_clipboard_dir() {
++        let temp_root = tempfile::tempdir().expect("create isolated temp root");
++        let path =
++            write_clipboard_png_to_temp_in(b"png", temp_root.path()).expect("write clipboard png");
++
++        assert_eq!(
++            path.parent(),
++            Some(clipboard_temp_dir(temp_root.path()).as_path())
++        );
++        assert!(
++            path.file_name()
++                .and_then(|name| name.to_str())
++                .is_some_and(|name| name.starts_with("codex-clipboard-") && name.ends_with(".png"))
++        );
++        assert_eq!(std::fs::read(&path).expect("read clipboard png"), b"png");
++    }
++}
++
+ /// Attempt WSL fallback for clipboard image paste.
+ ///
+ /// If clipboard is unavailable (common under WSL because arboard cannot access

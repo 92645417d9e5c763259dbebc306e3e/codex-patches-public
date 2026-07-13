@@ -1,0 +1,195 @@
+diff --git a/codex-rs/tui/src/status/card.rs b/codex-rs/tui/src/status/card.rs
+index 61ffd3da7d..b6fc46827d 100644
+--- a/codex-rs/tui/src/status/card.rs
++++ b/codex-rs/tui/src/status/card.rs
+@@ -34,6 +34,7 @@ use super::format::FieldFormatter;
+ use super::format::line_display_width;
+ use super::format::push_label;
+ use super::format::truncate_line_to_width;
++use super::helpers::account_plan_style;
+ use super::helpers::compose_account_display;
+ use super::helpers::compose_model_display;
+ use super::helpers::format_directory_display;
+@@ -705,6 +706,53 @@ fn status_approval_label(
+     approval.to_string()
+ }
+ 
++fn account_display_spans(account: &StatusAccountDisplay) -> Vec<Span<'static>> {
++    match account {
++        StatusAccountDisplay::ChatGpt { email, plan } => match (email, plan) {
++            (Some(email), Some(plan)) => vec![
++                Span::from(mask_email(email)),
++                Span::from(" "),
++                Span::styled(plan.clone(), account_plan_style(plan)),
++            ],
++            (Some(email), None) => vec![Span::from(mask_email(email))],
++            (None, Some(plan)) => vec![Span::styled(plan.clone(), account_plan_style(plan))],
++            (None, None) => vec![Span::from("ChatGPT")],
++        },
++        StatusAccountDisplay::ApiKey => {
++            vec![Span::from(
++                "API key configured (run codex login to use ChatGPT)",
++            )]
++        }
++    }
++}
++
++fn mask_email(email: &str) -> String {
++    let Some((local, domain)) = email.split_once('@') else {
++        return email.to_string();
++    };
++    let Some((domain_name, suffix)) = domain.rsplit_once('.') else {
++        return email.to_string();
++    };
++    format!(
++        "{}@{}.{}",
++        mask_email_part(local),
++        mask_email_part(domain_name),
++        suffix
++    )
++}
++
++fn mask_email_part(part: &str) -> String {
++    let mut chars = part.chars();
++    let Some(first) = chars.next() else {
++        return String::new();
++    };
++    let last = chars.next_back();
++    match last {
++        Some(last) => format!("{first}***{last}"),
++        None => format!("{first}***"),
++    }
++}
++
+ impl HistoryCell for StatusHistoryCell {
+     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+         let mut lines: Vec<Line<'static>> = Vec::new();
+@@ -720,17 +768,7 @@ impl HistoryCell for StatusHistoryCell {
+             return Vec::new();
+         }
+ 
+-        let account_value = self.account.as_ref().map(|account| match account {
+-            StatusAccountDisplay::ChatGpt { email, plan } => match (email, plan) {
+-                (Some(email), Some(plan)) => format!("{email} ({plan})"),
+-                (Some(email), None) => email.clone(),
+-                (None, Some(plan)) => plan.clone(),
+-                (None, None) => "ChatGPT".to_string(),
+-            },
+-            StatusAccountDisplay::ApiKey => {
+-                "API key configured (run codex login to use ChatGPT)".to_string()
+-            }
+-        });
++        let account_value = self.account.as_ref().map(account_display_spans);
+ 
+         let mut labels: Vec<String> = vec!["Model", "Directory", "Permissions", "Agents.md"]
+             .into_iter()
+@@ -833,7 +871,7 @@ impl HistoryCell for StatusHistoryCell {
+         lines.push(formatter.line("Agents.md", vec![Span::from(agents_summary)]));
+ 
+         if let Some(account_value) = account_value {
+-            lines.push(formatter.line("Account", vec![Span::from(account_value)]));
++            lines.push(formatter.line("Account", account_value));
+         }
+ 
+         if let Some(thread_name) = thread_name {
+diff --git a/codex-rs/tui/src/status/helpers.rs b/codex-rs/tui/src/status/helpers.rs
+index c90db66c31..a754f4dc56 100644
+--- a/codex-rs/tui/src/status/helpers.rs
++++ b/codex-rs/tui/src/status/helpers.rs
+@@ -7,6 +7,8 @@ use chrono::Local;
+ use codex_protocol::account::PlanType;
+ use codex_utils_path_uri::PathConvention;
+ use codex_utils_path_uri::PathUri;
++use ratatui::style::Color;
++use ratatui::style::Style;
+ use std::path::Path;
+ use unicode_width::UnicodeWidthStr;
+ 
+@@ -108,6 +110,22 @@ pub(crate) fn plan_type_display_name(plan_type: PlanType) -> String {
+     }
+ }
+ 
++#[allow(clippy::disallowed_methods)]
++pub(crate) fn account_plan_style(plan: &str) -> Style {
++    match plan
++        .to_ascii_lowercase()
++        .replace([' ', '-', '_'], "")
++        .as_str()
++    {
++        "free" => Style::default().fg(Color::DarkGray),
++        "plus" => Style::default().fg(Color::Green),
++        "business" | "team" | "enterprise" => Style::default().fg(Color::Cyan),
++        "prolite" => Style::default().fg(Color::Yellow),
++        "pro" => Style::default().fg(Color::Magenta),
++        _ => Style::default().fg(Color::Blue),
++    }
++}
++
+ pub(crate) fn format_tokens_compact(value: i64) -> String {
+     let value = value.max(0);
+     if value == 0 {
+diff --git a/codex-rs/tui/src/status/tests.rs b/codex-rs/tui/src/status/tests.rs
+index c0365a5247..a84676fb50 100644
+--- a/codex-rs/tui/src/status/tests.rs
++++ b/codex-rs/tui/src/status/tests.rs
+@@ -1901,6 +1901,60 @@ async fn status_snapshot_shows_stale_limits_message() {
+     assert_snapshot!(sanitized);
+ }
+ 
++#[tokio::test]
++async fn status_account_line_masks_email_and_colors_plan() {
++    let temp_home = TempDir::new().expect("temp home");
++    let mut config = test_config(&temp_home).await;
++    config.cwd = test_path_buf("/workspace/tests").abs();
++    let account_display = StatusAccountDisplay::ChatGpt {
++        email: Some("sydney@gmail.com".to_string()),
++        plan: Some("Pro Lite".to_string()),
++    };
++    let usage = TokenUsage::default();
++    let model_slug = get_model_offline_for_tests(config.model.as_deref());
++    let composite = new_status_output(
++        &config,
++        Some(&account_display),
++        /*token_info*/ None,
++        &usage,
++        &None,
++        /*thread_name*/ None,
++        /*forked_from*/ None,
++        /*rate_display*/ None,
++        None,
++        chrono::Local
++            .with_ymd_and_hms(2024, 1, 2, 3, 4, 5)
++            .single()
++            .expect("timestamp"),
++        &model_slug,
++        /*collaboration_mode*/ None,
++        /*reasoning_effort_override*/ None,
++    );
++    let lines = composite.display_lines(/*width*/ 80);
++    let rendered_lines = render_lines(&lines);
++    assert!(
++        rendered_lines
++            .iter()
++            .any(|line| line.contains("Account:") && line.contains("s***y@g***l.com Pro Lite")),
++        "missing formatted account line: {rendered_lines:?}"
++    );
++
++    let account_line = lines
++        .iter()
++        .find(|line| {
++            line.spans
++                .iter()
++                .any(|span| span.content.as_ref() == "Pro Lite")
++        })
++        .expect("account line");
++    let plan_span = account_line
++        .spans
++        .iter()
++        .find(|span| span.content.as_ref() == "Pro Lite")
++        .expect("plan span");
++    assert_eq!(plan_span.style.fg, Some(Color::Yellow));
++}
++
+ #[tokio::test]
+ async fn status_snapshot_cached_limits_hide_credits_without_flag() {
+     let temp_home = TempDir::new().expect("temp home");

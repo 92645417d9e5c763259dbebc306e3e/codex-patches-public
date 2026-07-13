@@ -1,0 +1,101 @@
+diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
+index 66fbe42984..8851d760e9 100644
+--- a/codex-rs/core/src/thread_manager.rs
++++ b/codex-rs/core/src/thread_manager.rs
+@@ -722,11 +722,21 @@ impl ThreadManager {
+ 
+     // TODO(jif) merge with fork_agent
+     /// Spawn a subagent by forking persisted history from `forked_from_thread_id`.
++    /// `options.session_source` must identify a non-root runtime.
+     pub async fn spawn_subagent(
+         &self,
+         forked_from_thread_id: ThreadId,
+         mut options: StartThreadOptions,
+     ) -> CodexResult<NewThread> {
++        if !options
++            .session_source
++            .as_ref()
++            .is_some_and(SessionSource::is_non_root_agent)
++        {
++            return Err(CodexErr::InvalidRequest(
++                "spawn_subagent requires a non-root session source".to_string(),
++            ));
++        }
+         let fork_source = self.get_thread(forked_from_thread_id).await?;
+         // Persist queued rollout updates before reading the fork snapshot.
+         fork_source.ensure_rollout_materialized().await;
+diff --git a/codex-rs/core/src/thread_manager_tests.rs b/codex-rs/core/src/thread_manager_tests.rs
+index 7d00e9a9ce..850082976a 100644
+--- a/codex-rs/core/src/thread_manager_tests.rs
++++ b/codex-rs/core/src/thread_manager_tests.rs
+@@ -23,6 +23,7 @@ use codex_protocol::protocol::ResumedHistory;
+ use codex_protocol::protocol::SessionMeta;
+ use codex_protocol::protocol::SessionMetaLine;
+ use codex_protocol::protocol::SessionSource;
++use codex_protocol::protocol::SubAgentSource;
+ use codex_protocol::protocol::ThreadSource;
+ use codex_protocol::protocol::TurnStartedEvent;
+ use codex_protocol::protocol::UserMessageEvent;
+@@ -504,6 +505,62 @@ async fn start_thread_keeps_internal_threads_hidden_from_normal_lookups() {
+     assert!(manager.list_thread_ids().await.is_empty());
+ }
+ 
++#[tokio::test]
++async fn spawn_subagent_requires_non_root_session_source() {
++    let temp_dir = tempdir().expect("tempdir");
++    let mut config = test_config().await;
++    config.codex_home = temp_dir.path().join("codex-home").abs();
++    config.cwd = config.codex_home.abs();
++    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
++    let manager = ThreadManager::with_models_provider_and_home_for_tests(
++        CodexAuth::from_api_key("dummy"),
++        config.model_provider.clone(),
++        config.codex_home.to_path_buf(),
++        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
++    );
++    let options = |session_source| StartThreadOptions {
++        config: config.clone(),
++        allow_provider_model_fallback: false,
++        initial_history: InitialHistory::New,
++        history_mode: None,
++        session_source,
++        thread_source: None,
++        dynamic_tools: Vec::new(),
++        metrics_service_name: None,
++        parent_trace: None,
++        environments: Vec::new(),
++        thread_extension_init: Default::default(),
++        supports_openai_form_elicitation: false,
++    };
++
++    for session_source in [None, Some(SessionSource::Exec)] {
++        let result = manager
++            .spawn_subagent(ThreadId::new(), options(session_source))
++            .await;
++        assert!(
++            matches!(
++                result,
++                Err(CodexErr::InvalidRequest(message))
++                    if message == "spawn_subagent requires a non-root session source"
++            ),
++            "missing or root source must not create a provider-owning subagent"
++        );
++    }
++
++    let result = manager
++        .spawn_subagent(
++            ThreadId::new(),
++            options(Some(SessionSource::SubAgent(SubAgentSource::Other(
++                "test".to_string(),
++            )))),
++        )
++        .await;
++    assert!(
++        matches!(result, Err(CodexErr::ThreadNotFound(_))),
++        "a non-root source should pass validation and look up its fork source"
++    );
++}
++
+ #[tokio::test]
+ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() {
+     struct InitialDataRecorder {
