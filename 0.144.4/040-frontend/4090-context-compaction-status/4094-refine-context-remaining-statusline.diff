@@ -1,0 +1,135 @@
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+index 9b6e7a0428..ecb25007a3 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -148,6 +148,12 @@ where
+         if item == StatusLineItem::GitBranch {
+             line.spans.insert(0, Span::from("> "));
+         }
++        if item == StatusLineItem::ContextRemaining
++            && let Some(context_spans) = context_remaining_line_spans(&line, style)
++        {
++            spans.extend(context_spans);
++            continue;
++        }
+         let line_style = line.style;
+         let text: String = line
+             .spans
+@@ -223,6 +229,67 @@ fn soften_rgb_channel(channel: u8, luma: u16) -> u8 {
+     ((softened * STATUS_LINE_COLOR_BRIGHTNESS_PERCENT + 50) / 100) as u8
+ }
+ 
++fn parse_unsigned_percent(text: &str) -> Option<i64> {
++    if matches!(text.as_bytes().first(), Some(b'+' | b'-')) {
++        return None;
++    }
++    let percent = text.strip_suffix('%')?.parse::<i64>().ok()?;
++    Some(percent.clamp(0, 100))
++}
++
++fn context_remaining_line_spans(
++    line: &Line<'static>,
++    base_style: Style,
++) -> Option<Vec<Span<'static>>> {
++    let mut output = Vec::new();
++    let mut parsed_percent = false;
++
++    for span in &line.spans {
++        if span.style == Style::default()
++            && let Some(mut spans) = context_remaining_text_spans(span.content.as_ref(), base_style)
++        {
++            parsed_percent = true;
++            output.append(&mut spans);
++        } else {
++            output.push(span.clone());
++        }
++    }
++
++    parsed_percent.then_some(output)
++}
++
++fn context_remaining_text_spans(text: &str, base_style: Style) -> Option<Vec<Span<'static>>> {
++    let mut spans = Vec::new();
++    let mut saw_percent = false;
++
++    for part in text.split_whitespace() {
++        if !spans.is_empty() {
++            spans.push(" ".into());
++        }
++        if let Some(percent) = parse_unsigned_percent(part) {
++            saw_percent = true;
++            spans.push(Span::styled(
++                format!("{percent}%"),
++                context_remaining_percent_style(percent),
++            ));
++        } else {
++            spans.push(Span::styled(part.to_string(), base_style));
++        }
++    }
++
++    saw_percent.then_some(spans)
++}
++
++fn context_remaining_percent_style(percent: i64) -> Style {
++    let color = match percent {
++        75..=100 => Color::Green,
++        50..=74 => Color::Yellow,
++        25..=49 => Color::Rgb(255, 128, 0),
++        _ => Color::Red,
++    };
++    Style::default().fg(color).add_modifier(Modifier::BOLD)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -238,6 +305,36 @@ mod tests {
+             .collect::<String>()
+     }
+ 
++    #[test]
++    fn context_remaining_percent_uses_threshold_colors() {
++        let cases = [
++            ("100% of 258K left", Color::Green),
++            ("75% of 258K left", Color::Green),
++            ("74% of 258K left", Color::Yellow),
++            ("50% of 258K left", Color::Yellow),
++            ("49% of 258K left", Color::Rgb(255, 128, 0)),
++            ("25% of 258K left", Color::Rgb(255, 128, 0)),
++            ("24% of 258K left", Color::Red),
++            ("0% of 258K left", Color::Red),
++        ];
++
++        for (label, expected_color) in cases {
++            let line = status_line_from_segments_with_resolver(
++                [(StatusLineItem::ContextRemaining, label.to_string())],
++                /*use_theme_colors*/ true,
++                |_| Some(Style::default().cyan()),
++            )
++            .expect("status line");
++
++            assert_eq!(line_text(&line), label);
++            assert_eq!(line.spans[0].style.fg, Some(expected_color));
++            assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
++            assert_eq!(line.spans[2].style.fg, Some(Color::Cyan));
++            assert_eq!(line.spans[4].style.fg, Some(Color::Cyan));
++            assert_eq!(line.spans[6].style.fg, Some(Color::Cyan));
++        }
++    }
++
+     #[test]
+     fn status_line_segments_preserve_order_and_plain_text() {
+         let line = status_line_from_segments_with_resolver(
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+index 21a16fe1c8..f1a7515fd4 100644
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -58,7 +58,7 @@ impl StatusSurfacePreviewItem {
+             StatusSurfacePreviewItem::ApprovalMode => "on-request",
+             StatusSurfacePreviewItem::ActiveClients => "1",
+             StatusSurfacePreviewItem::ResponsesStreamConnection => "42ms",
+-            StatusSurfacePreviewItem::ContextRemaining => "Context 0% left",
++            StatusSurfacePreviewItem::ContextRemaining => "0% of 0 left",
+             StatusSurfacePreviewItem::ContextUsed => "Context 0% used",
+             StatusSurfacePreviewItem::FiveHourLimit => "primary 0%",
+             StatusSurfacePreviewItem::WeeklyLimit => "secondary 0%",

@@ -1,0 +1,99 @@
+diff --git a/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs b/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs
+index d0f061d817..25110651ad 100644
+--- a/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs
++++ b/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs
+@@ -52,9 +52,9 @@ impl ChatWidget {
+     /// input flow, which is important while a popup or modal has focus.
+     ///
+     /// Callers should route recognized shortcuts through this method rather than
+-    /// directly mutating reasoning state. It applies normal-mode changes without
+-    /// persisting them. In Plan mode, shortcuts apply only to the active
+-    /// Plan-mode override and skip the global-vs-Plan scope prompt.
++    /// directly mutating reasoning state. It persists shortcut changes
++    /// immediately. In Plan mode, shortcuts apply only to the active Plan-mode
++    /// override and skip the global-vs-Plan scope prompt.
+     pub(super) fn handle_reasoning_shortcut(&mut self, key_event: KeyEvent) -> bool {
+         let direction = if self
+             .chat_keymap
+@@ -125,14 +125,26 @@ impl ChatWidget {
+         if self.collaboration_modes_enabled() && self.active_mode_kind() == ModeKind::Plan {
+             let warning = self.ultra_reasoning_concurrency_warning(&next_effort);
+             self.app_event_tx
+-                .send(AppEvent::UpdatePlanModeReasoningEffort(Some(next_effort)));
++                .send(AppEvent::UpdatePlanModeReasoningEffort(Some(
++                    next_effort.clone(),
++                )));
++            self.app_event_tx
++                .send(AppEvent::PersistPlanModeReasoningEffort(Some(next_effort)));
+             if let Some(warning) = warning {
+                 self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                     crate::history_cell::new_warning_event(warning),
+                 )));
+             }
+         } else {
+-            self.apply_model_and_effort_without_persist(current_model, Some(next_effort));
++            self.apply_model_and_effort_without_persist(
++                current_model.clone(),
++                Some(next_effort.clone()),
++            );
++            self.app_event_tx.send(AppEvent::PersistModelSelection {
++                model: current_model,
++                effort: Some(next_effort),
++                show_footer_flash: false,
++            });
+         }
+ 
+         true
+diff --git a/codex-rs/tui/src/chatwidget/tests/plan_mode.rs b/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
+index dfc53a469f..4bac3d05c9 100644
+--- a/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
++++ b/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
+@@ -387,7 +387,7 @@ async fn reasoning_selection_in_plan_mode_matching_plan_effort_but_different_glo
+ }
+ 
+ #[tokio::test]
+-async fn reasoning_shortcut_in_plan_mode_updates_plan_override_without_prompt_or_persist() {
++async fn reasoning_shortcut_in_plan_mode_updates_and_persists_plan_override_without_prompt() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+     chat.thread_id = Some(ThreadId::new());
+     chat.set_feature_enabled(Feature::CollaborationModes, /*enabled*/ true);
+@@ -414,10 +414,11 @@ async fn reasoning_shortcut_in_plan_mode_updates_plan_override_without_prompt_or
+         "expected no Plan reasoning scope prompt event; events: {events:?}"
+     );
+     assert!(
+-        events
+-            .iter()
+-            .all(|event| !matches!(event, AppEvent::PersistPlanModeReasoningEffort(_))),
+-        "expected no Plan reasoning persistence event; events: {events:?}"
++        events.iter().any(|event| matches!(
++            event,
++            AppEvent::PersistPlanModeReasoningEffort(Some(ReasoningEffortConfig::High))
++        )),
++        "expected Plan reasoning persistence event; events: {events:?}"
+     );
+     assert!(
+         events
+diff --git a/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs b/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
+index 1f98b1f6db..ac105bb3a3 100644
+--- a/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
++++ b/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
+@@ -3342,10 +3342,15 @@ async fn assert_reasoning_shortcuts_update_effort(
+             "expected reasoning update event for {key_event:?}; events: {events:?}"
+         );
+         assert!(
+-            events
+-                .iter()
+-                .all(|event| !matches!(event, AppEvent::PersistModelSelection { .. })),
+-            "expected no model persistence event for {key_event:?}; events: {events:?}"
++            events.iter().any(|event| matches!(
++                event,
++                AppEvent::PersistModelSelection {
++                    model,
++                    effort: Some(effort),
++                    show_footer_flash: false,
++                } if model == "gpt-5.4" && effort == &expected_effort
++            )),
++            "expected model persistence event for {key_event:?}; events: {events:?}"
+         );
+     }
+ }

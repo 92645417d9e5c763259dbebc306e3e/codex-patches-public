@@ -201,7 +201,7 @@ index 67788d7d28..bfb3db5252 100644
  
      pub(super) fn take_retry_status_header(&mut self) -> Option<String> {
 diff --git a/codex-rs/tui/src/chatwidget/streaming.rs b/codex-rs/tui/src/chatwidget/streaming.rs
-index e0d90dad9b..3215f35ec5 100644
+index e0d90dad9b..db5c956688 100644
 --- a/codex-rs/tui/src/chatwidget/streaming.rs
 +++ b/codex-rs/tui/src/chatwidget/streaming.rs
 @@ -6,6 +6,18 @@
@@ -223,7 +223,7 @@ index e0d90dad9b..3215f35ec5 100644
      pub(super) fn restore_reasoning_status_header(&mut self) {
          if let Some(header) = extract_first_bold(&self.reasoning_buffer) {
              self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Thinking;
-@@ -248,16 +260,93 @@ impl ChatWidget {
+@@ -248,16 +260,74 @@ impl ChatWidget {
          }
      }
  
@@ -236,25 +236,6 @@ index e0d90dad9b..3215f35ec5 100644
 +            ));
 +            self.transcript.needs_final_message_separator = false;
 +        }
-+
-+        if self.reasoning_buffer.is_empty() && self.reasoning_summary_parts.is_empty() {
-+            return;
-+        }
-+
-+        if !self.reasoning_buffer.is_empty() {
-+            self.reasoning_summary_parts
-+                .push(std::mem::take(&mut self.reasoning_buffer));
-+        }
-+        if !self.reasoning_summary_parts.is_empty() {
-+            let reasoning_parts = std::mem::take(&mut self.reasoning_summary_parts);
-+            let cell = history_cell::new_reasoning_summary_block(reasoning_parts, &self.config.cwd);
-+            self.add_boxed_history(cell);
-+            self.add_to_history(history_cell::InterruptedStreamSeparator::new(
-+                history_cell::InterruptedStreamKind::Reasoning,
-+            ));
-+        }
-+        self.reasoning_buffer.clear();
-+        self.reasoning_summary_parts.clear();
 +    }
 +
 +    pub(super) fn on_stream_error(
@@ -544,10 +525,10 @@ index 519f5f3105..0504a4c269 100644
      assert_eq!(cells.len(), 1, "expected one info message");
      let rendered = lines_to_single_string(&cells[0]);
 diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
-index c45e3ac7ba..6223a38a94 100644
+index c45e3ac7ba..586ffaa164 100644
 --- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
 +++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
-@@ -2182,6 +2182,74 @@ async fn stream_error_restores_hidden_status_indicator() {
+@@ -2182,6 +2182,48 @@ async fn stream_error_restores_hidden_status_indicator() {
      assert_eq!(status.details(), Some(details));
  }
  
@@ -593,40 +574,14 @@ index c45e3ac7ba..6223a38a94 100644
 +    assert!(!rendered.contains("partial answer"));
 +}
 +
-+#[tokio::test]
-+async fn stream_error_marks_incomplete_reasoning() {
-+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-+    chat.on_task_started();
-+    chat.on_agent_reasoning_delta("**Thinking**\n\npartial reasoning".to_string());
-+
-+    handle_stream_error(&mut chat, "Reconnecting... 1/30", None);
-+
-+    let cells = drain_insert_history(&mut rx);
-+    assert!(
-+        cells
-+            .iter()
-+            .any(|cell| lines_to_single_string(cell).contains("partial reasoning")),
-+        "expected interrupted reasoning content, got {cells:?}"
-+    );
-+    assert!(
-+        cells
-+            .iter()
-+            .any(|cell| lines_to_single_string(cell)
-+                .contains("Received incomplete reasoning; retrying")),
-+        "expected interrupted reasoning separator, got {cells:?}"
-+    );
-+    assert!(chat.reasoning_buffer.is_empty());
-+    assert!(chat.reasoning_summary_parts.is_empty());
-+}
-+
  #[tokio::test]
  async fn warning_event_adds_warning_history_cell() {
      let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 diff --git a/codex-rs/tui/src/history_cell/separators.rs b/codex-rs/tui/src/history_cell/separators.rs
-index 1d9e1718f0..d795f52240 100644
+index 1d9e1718f0..dd5498fc24 100644
 --- a/codex-rs/tui/src/history_cell/separators.rs
 +++ b/codex-rs/tui/src/history_cell/separators.rs
-@@ -24,6 +24,37 @@ impl FinalMessageSeparator {
+@@ -24,6 +24,34 @@ impl FinalMessageSeparator {
          }
      }
  }
@@ -634,7 +589,6 @@ index 1d9e1718f0..d795f52240 100644
 +#[derive(Debug, Clone, Copy)]
 +pub enum InterruptedStreamKind {
 +    Answer,
-+    Reasoning,
 +}
 +
 +#[derive(Debug)]
@@ -650,21 +604,19 @@ index 1d9e1718f0..d795f52240 100644
 +    fn label(&self) -> &'static str {
 +        match self.kind {
 +            InterruptedStreamKind::Answer => "Received incomplete response; retrying",
-+            InterruptedStreamKind::Reasoning => "Received incomplete reasoning; retrying",
 +        }
 +    }
 +
 +    fn style(&self) -> Style {
 +        match self.kind {
 +            InterruptedStreamKind::Answer => Style::default().fg(Color::Yellow),
-+            InterruptedStreamKind::Reasoning => Style::default().fg(Color::Yellow),
 +        }
 +    }
 +}
  impl HistoryCell for FinalMessageSeparator {
      fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
          let mut label_parts = Vec::new();
-@@ -73,6 +104,36 @@ impl HistoryCell for FinalMessageSeparator {
+@@ -73,6 +101,36 @@ impl HistoryCell for FinalMessageSeparator {
      }
  }
  
@@ -701,41 +653,6 @@ index 1d9e1718f0..d795f52240 100644
  pub(crate) fn runtime_metrics_label(summary: RuntimeMetricsSummary) -> Option<String> {
      let mut parts = Vec::new();
      if summary.tool_calls.count > 0 {
-diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
-index 45441f1033..f650b17a66 100644
---- a/codex-rs/tui/src/history_cell/tests.rs
-+++ b/codex-rs/tui/src/history_cell/tests.rs
-@@ -21,6 +21,7 @@ use dirs::home_dir;
- use pretty_assertions::assert_eq;
- use ratatui::buffer::Buffer;
- use ratatui::layout::Rect;
-+use ratatui::style::Color;
- use reqwest::StatusCode;
- use serde_json::json;
- use std::collections::HashMap;
-@@ -605,6 +606,22 @@ fn final_message_separator_includes_worked_label_after_one_minute() {
-     assert!(rendered[0].contains("Worked for"));
- }
- 
-+#[test]
-+fn interrupted_reasoning_separator_uses_warning_color() {
-+    let cell = InterruptedStreamSeparator::new(InterruptedStreamKind::Reasoning);
-+    let lines = cell.display_lines(/*width*/ 120);
-+    let label_span = lines[0]
-+        .spans
-+        .iter()
-+        .find(|span| {
-+            span.content
-+                .contains("Received incomplete reasoning; retrying")
-+        })
-+        .expect("interrupted reasoning label should render");
-+
-+    assert_eq!(label_span.style.fg, Some(Color::Yellow));
-+}
-+
- #[test]
- fn ps_output_empty_snapshot() {
-     let cell = new_unified_exec_processes_output(Vec::new());
 diff --git a/codex-rs/tui/src/keymap.rs b/codex-rs/tui/src/keymap.rs
 index b4f00a4d2f..d8ecd14fad 100644
 --- a/codex-rs/tui/src/keymap.rs
