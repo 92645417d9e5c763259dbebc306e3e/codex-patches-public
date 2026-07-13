@@ -1,0 +1,118 @@
+diff --git a/codex-rs/core/src/tools/runtimes/shell/unix_escalation.rs b/codex-rs/core/src/tools/runtimes/shell/unix_escalation.rs
+index 10cb460205..6edeef53d5 100644
+--- a/codex-rs/core/src/tools/runtimes/shell/unix_escalation.rs
++++ b/codex-rs/core/src/tools/runtimes/shell/unix_escalation.rs
+@@ -228,9 +228,12 @@ pub(super) async fn try_run_zsh_fork(
+     if let Some(cancellation) = attempt.network_denial_cancellation_token.clone() {
+         cancel_token = cancel_when_either(cancel_token, cancellation);
+     }
+-    let approval_sandbox_permissions = approval_sandbox_permissions(
+-        req.sandbox_permissions,
+-        req.additional_permissions_preapproved,
++    let approval_sandbox_permissions = sandbox_permissions_preserving_denied_reads(
++        approval_sandbox_permissions(
++            req.sandbox_permissions,
++            req.additional_permissions_preapproved,
++        ),
++        &command_executor.file_system_sandbox_policy,
+     );
+     let escalation_policy = CoreShellActionProvider {
+         policy: Arc::clone(&exec_policy),
+@@ -327,9 +330,12 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
+         permission_profile: exec_request.permission_profile.clone(),
+         file_system_sandbox_policy: exec_request.file_system_sandbox_policy.clone(),
+         sandbox_permissions: req.sandbox_permissions,
+-        approval_sandbox_permissions: approval_sandbox_permissions(
+-            req.sandbox_permissions,
+-            req.additional_permissions_preapproved,
++        approval_sandbox_permissions: sandbox_permissions_preserving_denied_reads(
++            approval_sandbox_permissions(
++                req.sandbox_permissions,
++                req.additional_permissions_preapproved,
++            ),
++            &exec_request.file_system_sandbox_policy,
+         ),
+         prompt_permissions: req.additional_permissions.clone(),
+         stopwatch: Stopwatch::unlimited(),
+@@ -665,7 +671,7 @@ impl CoreShellActionProvider {
+         let unsandboxed_allowed = unsandboxed_execution_allowed(&self.file_system_sandbox_policy);
+         let needs_escalation = match self.sandbox_permissions {
+             SandboxPermissions::UseDefault => unsandboxed_allowed && decision_driven_by_policy,
+-            SandboxPermissions::RequireEscalated => unsandboxed_allowed,
++            SandboxPermissions::RequireEscalated => true,
+             SandboxPermissions::WithAdditionalPermissions => true,
+         };
+ 
+diff --git a/codex-rs/core/tests/suite/approvals.rs b/codex-rs/core/tests/suite/approvals.rs
+index 91887b8e76..f09f7813c5 100644
+--- a/codex-rs/core/tests/suite/approvals.rs
++++ b/codex-rs/core/tests/suite/approvals.rs
+@@ -3020,7 +3020,13 @@ exec {remote_bash_exec} "$@"
+         "the inner remote_bash.py script should run successfully: {}",
+         result.stdout
+     );
+-    let ssh_argv = shlex::split(result.stdout.trim()).context("parse printed ssh command")?;
++    let ssh_command = result
++        .stdout
++        .lines()
++        .rev()
++        .find(|line| line.trim_start().starts_with("ssh "))
++        .unwrap_or(result.stdout.trim());
++    let ssh_argv = shlex::split(ssh_command).context("parse printed ssh command")?;
+     assert_eq!(
+         ssh_argv.len(),
+         3,
+diff --git a/codex-rs/core/tests/suite/skill_approval.rs b/codex-rs/core/tests/suite/skill_approval.rs
+index 50ea9495ac..67f1ff0ab6 100644
+--- a/codex-rs/core/tests/suite/skill_approval.rs
++++ b/codex-rs/core/tests/suite/skill_approval.rs
+@@ -154,13 +154,13 @@ async fn shell_zsh_fork_skill_scripts_ignore_declared_permissions() -> Result<()
+         mcp_elicitations: true,
+     });
+     let workspace_write_profile = restrictive_workspace_write_profile();
+-    let outside_dir = tempfile::tempdir_in(std::env::current_dir()?)?;
++    let outside_dir = tempfile::tempdir()?;
+     let allowed_dir = outside_dir.path().join("allowed-output");
+     fs::create_dir_all(&allowed_dir)?;
+     let allowed_path = allowed_dir.join("allowed.txt");
+     let allowed_path_quoted = shlex::try_join([allowed_path.to_string_lossy().as_ref()])?;
+     let script_contents = format!(
+-        "#!/bin/sh\nprintf '%s' allowed > {allowed_path_quoted}\nif [ -f {allowed_path_quoted} ]; then cat {allowed_path_quoted}; fi\n"
++        "#!/bin/sh\n/usr/bin/touch {allowed_path_quoted}\nif [ -f {allowed_path_quoted} ]; then /usr/bin/cat {allowed_path_quoted}; fi\n"
+     );
+     let permissions_yaml = format!(
+         "permissions:\n  file_system:\n    write:\n      - \"{}\"\n",
+@@ -209,8 +209,6 @@ async fn shell_zsh_fork_skill_scripts_ignore_declared_permissions() -> Result<()
+         "expected skill script execution to skip the removed skill approval path"
+     );
+ 
+-    wait_for_turn_complete(&test).await;
+-
+     let call_output = mocks
+         .completion
+         .single_request()
+diff --git a/codex-rs/core/tests/suite/unified_exec_zsh_fork_approvals.rs b/codex-rs/core/tests/suite/unified_exec_zsh_fork_approvals.rs
+index 0d913d6541..089f54c038 100644
+--- a/codex-rs/core/tests/suite/unified_exec_zsh_fork_approvals.rs
++++ b/codex-rs/core/tests/suite/unified_exec_zsh_fork_approvals.rs
+@@ -52,7 +52,7 @@ use wiremock::MockServer;
+ async fn unified_exec_zsh_fork_parent_approval_preserves_denied_reads() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+-    let denied_dir = tempfile::tempdir_in(std::env::current_dir()?)?;
++    let denied_dir = tempfile::tempdir()?;
+     let denied_path = denied_dir.path().join("secret.env");
+     let secret = "unified-exec-zsh-fork-denied-read-secret";
+     fs::write(&denied_path, format!("{secret}\n"))?;
+@@ -294,7 +294,10 @@ where
+ }
+ 
+ fn denied_read_permission_profile(denied_path: &Path) -> Result<PermissionProfile> {
+-    let denied_path_key = TomlKey::new(denied_path.to_string_lossy().into_owned());
++    let denied_dir = denied_path
++        .parent()
++        .context("denied path should have a parent directory")?;
++    let denied_path_key = TomlKey::new(format!("{}/**/*.env", denied_dir.display()));
+     permission_profile_from_toml(&format!(
+         r#"
+ [filesystem]

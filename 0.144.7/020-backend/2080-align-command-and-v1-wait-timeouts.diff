@@ -1,0 +1,755 @@
+diff --git a/codex-rs/code-mode-protocol/src/description.rs b/codex-rs/code-mode-protocol/src/description.rs
+index d0504f54a4..0b7bfd655d 100644
+--- a/codex-rs/code-mode-protocol/src/description.rs
++++ b/codex-rs/code-mode-protocol/src/description.rs
+@@ -16,8 +16,8 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
+ - Nested tools return either an object or a string, based on the description.
+ - Runs raw JavaScript -- no Node, no file system, no network access, no console.
+ - Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
+-- You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.
+-- `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms.
++- You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 300000, "max_output_tokens": 1000}`.
++- `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 300000 ms.
+ - `max_output_tokens` sets the token budget for direct `exec` results. Defaults to 10000 tokens.
+ - When the JS code is fully evaluated, the isolate's lifetime ends and unawaited promises are silently discarded.
+ 
+@@ -35,7 +35,7 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
+ - `yield_control()`: yields the accumulated output to the model immediately while the script keeps running."#;
+ const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- Use `wait` only after `exec` returns `Script running with cell ID ...`.
+ - `cell_id` identifies the running `exec` cell to resume.
+-- `yield_time_ms` controls how long to wait for more output before yielding again. Defaults to 10000 ms.
++- `yield_time_ms` controls how long to wait for more output before yielding again. Defaults to 300000 ms.
+ - `max_tokens` limits how much new output this wait call returns. Defaults to 10000 tokens.
+ - `terminate: true` stops the running cell; false or omitted waits for output.
+ - `wait` returns only the new output since the last yield, or the final completion or termination result for that cell.
+@@ -163,7 +163,7 @@ pub struct ParsedExecSource {
+ pub fn parse_exec_source(input: &str) -> Result<ParsedExecSource, String> {
+     if input.trim().is_empty() {
+         return Err(
+-            "exec expects raw JavaScript source text (non-empty). Provide JS only, optionally with first-line `// @exec: {\"yield_time_ms\": 10000, \"max_output_tokens\": 1000}`.".to_string(),
++            "exec expects raw JavaScript source text (non-empty). Provide JS only, optionally with first-line `// @exec: {\"yield_time_ms\": 300000, \"max_output_tokens\": 1000}`.".to_string(),
+         );
+     }
+ 
+diff --git a/codex-rs/code-mode-protocol/src/runtime.rs b/codex-rs/code-mode-protocol/src/runtime.rs
+index 147822063f..5a09aa304a 100644
+--- a/codex-rs/code-mode-protocol/src/runtime.rs
++++ b/codex-rs/code-mode-protocol/src/runtime.rs
+@@ -8,8 +8,8 @@ use crate::CodeModeToolKind;
+ use crate::FunctionCallOutputContentItem;
+ use crate::ToolDefinition;
+ 
+-pub const DEFAULT_EXEC_YIELD_TIME_MS: u64 = 10_000;
+-pub const DEFAULT_WAIT_YIELD_TIME_MS: u64 = 10_000;
++pub const DEFAULT_EXEC_YIELD_TIME_MS: u64 = 300_000;
++pub const DEFAULT_WAIT_YIELD_TIME_MS: u64 = 300_000;
+ pub const DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 10_000;
+ 
+ #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+@@ -87,3 +87,14 @@ pub struct CodeModeNestedToolCall {
+     pub tool_kind: CodeModeToolKind,
+     pub input: Option<JsonValue>,
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn default_exec_and_wait_yields_are_five_minutes() {
++        assert_eq!(DEFAULT_EXEC_YIELD_TIME_MS, 300_000);
++        assert_eq!(DEFAULT_WAIT_YIELD_TIME_MS, 300_000);
++    }
++}
+diff --git a/codex-rs/core/src/exec.rs b/codex-rs/core/src/exec.rs
+index 015b20715a..f3ba17a23a 100644
+--- a/codex-rs/core/src/exec.rs
++++ b/codex-rs/core/src/exec.rs
+@@ -55,7 +55,7 @@ use codex_utils_path_uri::PathUri;
+ use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
+ use codex_utils_pty::process_group::kill_child_process_group;
+ 
+-pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 10_000;
++pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 300_000;
+ 
+ // Hardcode these since it does not seem worth including the libc crate just
+ // for these.
+diff --git a/codex-rs/core/src/exec_tests.rs b/codex-rs/core/src/exec_tests.rs
+index 1a4477599d..d007cc940a 100644
+--- a/codex-rs/core/src/exec_tests.rs
++++ b/codex-rs/core/src/exec_tests.rs
+@@ -26,6 +26,12 @@ fn make_exec_output(
+     }
+ }
+ 
++#[test]
++fn default_exec_command_timeout_is_five_minutes() {
++    assert_eq!(DEFAULT_EXEC_COMMAND_TIMEOUT_MS, 300_000);
++    assert_eq!(ExecExpiration::DefaultTimeout.timeout_ms(), Some(300_000));
++}
++
+ #[test]
+ fn sandbox_detection_requires_keywords() {
+     let output = make_exec_output(/*exit_code*/ 1, "", "", "");
+diff --git a/codex-rs/core/src/test_support.rs b/codex-rs/core/src/test_support.rs
+index 8c84330857..79183137c7 100644
+--- a/codex-rs/core/src/test_support.rs
++++ b/codex-rs/core/src/test_support.rs
+@@ -65,6 +65,10 @@ pub fn set_deterministic_process_ids(enabled: bool) {
+     unified_exec::set_deterministic_process_ids_for_tests(enabled);
+ }
+ 
++pub fn set_min_unified_exec_yield_time_for_tests(value: Option<u64>) {
++    unified_exec::set_min_yield_time_ms_override_for_tests(value);
++}
++
+ pub fn auth_manager_from_auth(auth: CodexAuth) -> Arc<AuthManager> {
+     AuthManager::from_auth_for_testing(auth)
+ }
+diff --git a/codex-rs/core/src/tools/code_mode/wait_spec.rs b/codex-rs/core/src/tools/code_mode/wait_spec.rs
+index 72bb09084c..f0d2deea58 100644
+--- a/codex-rs/core/src/tools/code_mode/wait_spec.rs
++++ b/codex-rs/core/src/tools/code_mode/wait_spec.rs
+@@ -12,7 +12,7 @@ pub(crate) fn create_wait_tool() -> ToolSpec {
+         (
+             "yield_time_ms".to_string(),
+             JsonSchema::number(Some(
+-                "Wait before yielding more output. Defaults to 10000 ms.".to_string(),
++                "Wait before yielding more output. Defaults to 300000 ms.".to_string(),
+             )),
+         ),
+         (
+@@ -90,7 +90,7 @@ mod tests {
+                         (
+                             "yield_time_ms".to_string(),
+                             JsonSchema::number(Some(
+-                                "Wait before yielding more output. Defaults to 10000 ms."
++                                "Wait before yielding more output. Defaults to 300000 ms."
+                                     .to_string(),
+                             )),
+                         ),
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents/wait.rs b/codex-rs/core/src/tools/handlers/multi_agents/wait.rs
+index 75fe4f0f9f..97a50fc4a2 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents/wait.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents/wait.rs
+@@ -16,11 +16,27 @@ use tokio::time::Instant;
+ 
+ use tokio::time::timeout_at;
+ 
+-#[derive(Default)]
++const V1_DEFAULT_WAIT_TIMEOUT_MS: i64 = 1_800_000;
++const V1_MIN_WAIT_TIMEOUT_MS: i64 = 1_800_000;
++
++pub(crate) fn v1_default_timeout_options() -> WaitAgentTimeoutOptions {
++    WaitAgentTimeoutOptions {
++        default_timeout_ms: V1_DEFAULT_WAIT_TIMEOUT_MS,
++        min_timeout_ms: V1_MIN_WAIT_TIMEOUT_MS,
++        max_timeout_ms: MAX_WAIT_TIMEOUT_MS,
++    }
++}
++
+ pub(crate) struct Handler {
+     options: WaitAgentTimeoutOptions,
+ }
+ 
++impl Default for Handler {
++    fn default() -> Self {
++        Self::new(v1_default_timeout_options())
++    }
++}
++
+ impl Handler {
+     pub(crate) fn new(options: WaitAgentTimeoutOptions) -> Self {
+         Self { options }
+@@ -62,6 +78,7 @@ impl Handler {
+         } = invocation;
+         let arguments = function_arguments(payload)?;
+         let args: WaitArgs = parse_arguments(&arguments)?;
++        let timeout_ms = resolve_wait_timeout_ms(&args, self.options)?;
+         let receiver_thread_ids = parse_agent_id_targets(args.targets)?;
+         let mut receiver_agents = Vec::with_capacity(receiver_thread_ids.len());
+         let mut target_by_thread_id = HashMap::with_capacity(receiver_thread_ids.len());
+@@ -85,17 +102,6 @@ impl Handler {
+                 agent_role: agent_metadata.agent_role,
+             });
+         }
+-
+-        let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS);
+-        let timeout_ms = match timeout_ms {
+-            ms if ms <= 0 => {
+-                return Err(FunctionCallError::RespondToModel(
+-                    "timeout_ms must be greater than zero".to_owned(),
+-                ));
+-            }
+-            ms => ms.clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS),
+-        };
+-
+         session
+             .emit_turn_item_started(
+                 &turn,
+@@ -277,6 +283,19 @@ struct WaitArgs {
+     timeout_ms: Option<i64>,
+ }
+ 
++fn resolve_wait_timeout_ms(
++    args: &WaitArgs,
++    options: WaitAgentTimeoutOptions,
++) -> Result<i64, FunctionCallError> {
++    let timeout_ms = args.timeout_ms.unwrap_or(options.default_timeout_ms);
++    match timeout_ms {
++        ms if ms <= 0 => Err(FunctionCallError::RespondToModel(
++            "timeout_ms must be greater than zero".to_owned(),
++        )),
++        ms => Ok(ms.clamp(options.min_timeout_ms, options.max_timeout_ms)),
++    }
++}
++
+ #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+ pub(crate) struct WaitAgentResult {
+     pub(crate) status: HashMap<String, AgentStatus>,
+@@ -322,3 +341,22 @@ async fn wait_for_final_status(
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn v1_wait_agent_defaults_and_minimum_are_half_hour() {
++        let options = v1_default_timeout_options();
++        assert_eq!(options.default_timeout_ms, 1_800_000);
++        assert_eq!(options.min_timeout_ms, 1_800_000);
++
++        let args = WaitArgs {
++            targets: vec!["agent".to_string()],
++            timeout_ms: Some(10),
++        };
++
++        assert_eq!(resolve_wait_timeout_ms(&args, options).unwrap(), 1_800_000);
++    }
++}
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+index a232bd729b..4b8902c463 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+@@ -11,6 +11,7 @@ use crate::session::turn_context::TurnContext;
+ use crate::session_prefix::format_inter_agent_completion_message;
+ use crate::thread_manager::thread_store_from_config;
+ use crate::tools::context::ToolOutput;
++use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
+ use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
+ use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
+ use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
+@@ -3376,13 +3377,17 @@ async fn wait_agent_times_out_when_status_is_not_final() {
+         "wait_agent",
+         function_payload(json!({
+             "targets": [agent_id.to_string()],
+-            "timeout_ms": MIN_WAIT_TIMEOUT_MS
++            "timeout_ms": 10
+         })),
+     );
+-    let output = WaitAgentHandler::default()
+-        .handle(invocation)
+-        .await
+-        .expect("wait_agent should succeed");
++    let output = WaitAgentHandler::new(WaitAgentTimeoutOptions {
++        default_timeout_ms: 10,
++        min_timeout_ms: 10,
++        max_timeout_ms: 50,
++    })
++    .handle(invocation)
++    .await
++    .expect("wait_agent should succeed");
+     let (content, success) = expect_text_output(output);
+     let result: wait::WaitAgentResult =
+         serde_json::from_str(&content).expect("wait_agent result should be json");
+diff --git a/codex-rs/core/src/tools/handlers/shell_spec.rs b/codex-rs/core/src/tools/handlers/shell_spec.rs
+index 3fb563b8d9..b8133dab43 100644
+--- a/codex-rs/core/src/tools/handlers/shell_spec.rs
++++ b/codex-rs/core/src/tools/handlers/shell_spec.rs
+@@ -45,7 +45,8 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
+         (
+             "yield_time_ms".to_string(),
+             JsonSchema::number(Some(
+-                "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms.".to_string(),
++                "Wait before yielding output. Defaults to 300000 ms and clamps to 300000 ms."
++                    .to_string(),
+             )),
+         ),
+         (
+@@ -124,7 +125,7 @@ pub fn create_write_stdin_tool() -> ToolSpec {
+         (
+             "yield_time_ms".to_string(),
+             JsonSchema::number(Some(
+-                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls wait 5000-300000 ms by default.".to_string(),
++                "Wait before yielding output. Non-empty writes default to 300000 ms and are capped at 300000 ms; empty polls default to and clamp to the configured background timeout.".to_string(),
+             )),
+         ),
+         (
+@@ -168,7 +169,7 @@ pub fn create_shell_command_tool(options: CommandToolOptions) -> ToolSpec {
+         (
+             "timeout_ms".to_string(),
+             JsonSchema::number(Some(
+-                "Maximum command runtime. Defaults to 10000 ms.".to_string(),
++                "Maximum command runtime. Defaults to 300000 ms.".to_string(),
+             )),
+         ),
+     ]);
+diff --git a/codex-rs/core/src/tools/handlers/shell_spec_tests.rs b/codex-rs/core/src/tools/handlers/shell_spec_tests.rs
+index b7bbfa54a1..0d628e4f6b 100644
+--- a/codex-rs/core/src/tools/handlers/shell_spec_tests.rs
++++ b/codex-rs/core/src/tools/handlers/shell_spec_tests.rs
+@@ -58,7 +58,8 @@ fn exec_command_tool_matches_expected_spec() {
+         (
+             "yield_time_ms".to_string(),
+             JsonSchema::number(Some(
+-                    "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms.".to_string(),
++                    "Wait before yielding output. Defaults to 300000 ms and clamps to 300000 ms."
++                        .to_string(),
+                 )),
+         ),
+         (
+@@ -130,7 +131,7 @@ fn write_stdin_tool_matches_expected_spec() {
+         (
+             "yield_time_ms".to_string(),
+             JsonSchema::number(Some(
+-                "Wait before yielding output. Non-empty writes default to 250 ms and cap at 30000 ms; empty polls wait 5000-300000 ms by default.".to_string(),
++                    "Wait before yielding output. Non-empty writes default to 300000 ms and are capped at 300000 ms; empty polls default to and clamp to the configured background timeout.".to_string(),
+             )),
+         ),
+         (
+@@ -241,7 +242,7 @@ Examples of valid command strings:
+         (
+             "timeout_ms".to_string(),
+             JsonSchema::number(Some(
+-                "Maximum command runtime. Defaults to 10000 ms.".to_string(),
++                "Maximum command runtime. Defaults to 300000 ms.".to_string(),
+             )),
+         ),
+         (
+diff --git a/codex-rs/core/src/tools/handlers/unified_exec.rs b/codex-rs/core/src/tools/handlers/unified_exec.rs
+index 71e776dbf0..751dc50b5a 100644
+--- a/codex-rs/core/src/tools/handlers/unified_exec.rs
++++ b/codex-rs/core/src/tools/handlers/unified_exec.rs
+@@ -58,11 +58,11 @@ struct ExecCommandEnvironmentArgs {
+ }
+ 
+ fn default_exec_yield_time_ms() -> u64 {
+-    10_000
++    crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS
+ }
+ 
+ fn default_write_stdin_yield_time_ms() -> u64 {
+-    250
++    crate::unified_exec::DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS
+ }
+ 
+ fn default_tty() -> bool {
+diff --git a/codex-rs/core/src/tools/handlers/unified_exec/write_stdin.rs b/codex-rs/core/src/tools/handlers/unified_exec/write_stdin.rs
+index 0b1f9d10c1..9e5d4559c7 100644
+--- a/codex-rs/core/src/tools/handlers/unified_exec/write_stdin.rs
++++ b/codex-rs/core/src/tools/handlers/unified_exec/write_stdin.rs
+@@ -23,14 +23,25 @@ struct WriteStdinArgs {
+     session_id: i32,
+     #[serde(default)]
+     chars: String,
+-    #[serde(default = "super::default_write_stdin_yield_time_ms")]
+-    yield_time_ms: u64,
++    #[serde(default)]
++    yield_time_ms: Option<u64>,
+     #[serde(default)]
+     max_output_tokens: Option<usize>,
+ }
+ 
+ pub struct WriteStdinHandler;
+ 
++fn resolve_yield_time_ms(args: &WriteStdinArgs, background_terminal_max_timeout: u64) -> u64 {
++    if args.chars.is_empty() {
++        args.yield_time_ms
++            .unwrap_or(background_terminal_max_timeout)
++            .max(background_terminal_max_timeout)
++    } else {
++        args.yield_time_ms
++            .unwrap_or_else(super::default_write_stdin_yield_time_ms)
++    }
++}
++
+ impl ToolExecutor<ToolInvocation> for WriteStdinHandler {
+     fn tool_name(&self) -> ToolName {
+         ToolName::plain("write_stdin")
+@@ -67,13 +78,15 @@ impl WriteStdinHandler {
+         };
+ 
+         let args: WriteStdinArgs = parse_arguments(&arguments)?;
++        let yield_time_ms =
++            resolve_yield_time_ms(&args, turn.config.background_terminal_max_timeout);
+         let response = session
+             .services
+             .unified_exec_manager
+             .write_stdin(WriteStdinRequest {
+                 process_id: args.session_id,
+                 input: &args.chars,
+-                yield_time_ms: args.yield_time_ms,
++                yield_time_ms,
+                 max_output_tokens: args.max_output_tokens,
+                 truncation_policy: turn.model_info.truncation_policy.into(),
+             })
+@@ -124,3 +137,33 @@ impl CoreToolRuntime for WriteStdinHandler {
+         post_unified_exec_tool_use_payload(invocation, result)
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn write_stdin_args_leave_yield_time_unset_when_omitted() -> anyhow::Result<()> {
++        let args: WriteStdinArgs = parse_arguments(r#"{"session_id":1}"#)?;
++        assert_eq!(args.yield_time_ms, None);
++        Ok(())
++    }
++
++    #[test]
++    fn empty_write_uses_configured_background_timeout_as_default_and_floor() -> anyhow::Result<()> {
++        let omitted: WriteStdinArgs = parse_arguments(r#"{"session_id":1}"#)?;
++        assert_eq!(resolve_yield_time_ms(&omitted, 3_600_000), 3_600_000);
++
++        let short: WriteStdinArgs = parse_arguments(r#"{"session_id":1,"yield_time_ms":1000}"#)?;
++        assert_eq!(resolve_yield_time_ms(&short, 3_600_000), 3_600_000);
++        Ok(())
++    }
++
++    #[test]
++    fn non_empty_write_keeps_requested_yield_time_before_manager_clamp() -> anyhow::Result<()> {
++        let args: WriteStdinArgs =
++            parse_arguments(r#"{"session_id":1,"chars":"x","yield_time_ms":1000}"#)?;
++        assert_eq!(resolve_yield_time_ms(&args, 300_000), 1000);
++        Ok(())
++    }
++}
+diff --git a/codex-rs/core/src/tools/handlers/unified_exec_tests.rs b/codex-rs/core/src/tools/handlers/unified_exec_tests.rs
+index 9b107dd83d..80ed990eef 100644
+--- a/codex-rs/core/src/tools/handlers/unified_exec_tests.rs
++++ b/codex-rs/core/src/tools/handlers/unified_exec_tests.rs
+@@ -49,6 +49,7 @@ fn test_get_command_uses_default_shell_when_unspecified() -> anyhow::Result<()>
+     let args: ExecCommandArgs = parse_arguments(json)?;
+ 
+     assert!(args.shell.is_none());
++    assert_eq!(args.yield_time_ms, 300_000);
+ 
+     let resolved = get_command(
+         &args,
+diff --git a/codex-rs/core/src/tools/spec_plan.rs b/codex-rs/core/src/tools/spec_plan.rs
+index e64c63b843..51fddbe7e1 100644
+--- a/codex-rs/core/src/tools/spec_plan.rs
++++ b/codex-rs/core/src/tools/spec_plan.rs
+@@ -39,9 +39,7 @@ use crate::tools::handlers::multi_agents::ResumeAgentHandler;
+ use crate::tools::handlers::multi_agents::SendInputHandler;
+ use crate::tools::handlers::multi_agents::SpawnAgentHandler;
+ use crate::tools::handlers::multi_agents::WaitAgentHandler;
+-use crate::tools::handlers::multi_agents_common::DEFAULT_WAIT_TIMEOUT_MS;
+-use crate::tools::handlers::multi_agents_common::MAX_WAIT_TIMEOUT_MS;
+-use crate::tools::handlers::multi_agents_common::MIN_WAIT_TIMEOUT_MS;
++use crate::tools::handlers::multi_agents::wait::v1_default_timeout_options;
+ use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
+ use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
+ use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
+@@ -407,11 +405,7 @@ fn wait_agent_timeout_options(turn_context: &TurnContext) -> WaitAgentTimeoutOpt
+         };
+     }
+ 
+-    WaitAgentTimeoutOptions {
+-        default_timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
+-        min_timeout_ms: MIN_WAIT_TIMEOUT_MS,
+-        max_timeout_ms: MAX_WAIT_TIMEOUT_MS,
+-    }
++    v1_default_timeout_options()
+ }
+ 
+ fn agent_type_description(
+diff --git a/codex-rs/core/src/unified_exec/mod.rs b/codex-rs/core/src/unified_exec/mod.rs
+index 21c1a17f09..054445fad5 100644
+--- a/codex-rs/core/src/unified_exec/mod.rs
++++ b/codex-rs/core/src/unified_exec/mod.rs
+@@ -54,6 +54,10 @@ pub(crate) fn set_deterministic_process_ids_for_tests(enabled: bool) {
+     process_manager::set_deterministic_process_ids_for_tests(enabled);
+ }
+ 
++pub(crate) fn set_min_yield_time_ms_override_for_tests(value: Option<u64>) {
++    process_manager::set_min_yield_time_ms_override_for_tests(value);
++}
++
+ pub(crate) use errors::UnifiedExecError;
+ pub(crate) use process::NoopSpawnLifecycle;
+ #[cfg(unix)]
+@@ -61,12 +65,11 @@ pub(crate) use process::SpawnLifecycle;
+ pub(crate) use process::SpawnLifecycleHandle;
+ pub(crate) use process::UnifiedExecProcess;
+ 
+-pub(crate) const MIN_YIELD_TIME_MS: u64 = 250;
+-pub(crate) const WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS: u64 = 2_000;
++pub(crate) const MIN_YIELD_TIME_MS: u64 = 300_000;
+ // Minimum yield time for an empty `write_stdin`.
+-pub(crate) const MIN_EMPTY_YIELD_TIME_MS: u64 = 5_000;
+-pub(crate) const MAX_YIELD_TIME_MS: u64 = 30_000;
++pub(crate) const MIN_EMPTY_YIELD_TIME_MS: u64 = 300_000;
+ pub(crate) const DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS: u64 = 300_000;
++pub(crate) const MAX_YIELD_TIME_MS: u64 = DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS;
+ pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
+ pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
+ pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_TOKENS: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES / 4;
+@@ -133,17 +136,46 @@ impl ProcessStore {
+ 
+ pub(crate) struct UnifiedExecProcessManager {
+     process_store: Mutex<ProcessStore>,
++    min_yield_time_ms: u64,
++    min_empty_yield_time_ms: u64,
+     max_write_stdin_yield_time_ms: u64,
+ }
+ 
+ impl UnifiedExecProcessManager {
+     pub(crate) fn new(max_write_stdin_yield_time_ms: u64) -> Self {
++        let min_yield_time_ms = configured_min_yield_time_ms(max_write_stdin_yield_time_ms);
++        Self {
++            process_store: Mutex::new(ProcessStore::default()),
++            min_yield_time_ms,
++            min_empty_yield_time_ms: min_yield_time_ms,
++            max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms.max(min_yield_time_ms),
++        }
++    }
++
++    #[cfg(test)]
++    pub(crate) fn new_for_tests(
++        max_write_stdin_yield_time_ms: u64,
++        min_yield_time_ms: u64,
++    ) -> Self {
+         Self {
+             process_store: Mutex::new(ProcessStore::default()),
+-            max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
+-                .max(MIN_EMPTY_YIELD_TIME_MS),
++            min_yield_time_ms,
++            min_empty_yield_time_ms: min_yield_time_ms,
++            max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms.max(min_yield_time_ms),
+         }
+     }
++
++    pub(crate) fn clamp_yield_time(&self, yield_time_ms: u64) -> u64 {
++        yield_time_ms.clamp(self.min_yield_time_ms, MAX_YIELD_TIME_MS)
++    }
++}
++
++fn configured_min_yield_time_ms(max_write_stdin_yield_time_ms: u64) -> u64 {
++    if let Some(value) = process_manager::min_yield_time_ms_override_for_tests() {
++        return value.min(max_write_stdin_yield_time_ms.max(1));
++    }
++
++    MIN_YIELD_TIME_MS
+ }
+ 
+ impl Default for UnifiedExecProcessManager {
+@@ -165,15 +197,6 @@ struct ProcessEntry {
+     last_used: tokio::time::Instant,
+ }
+ 
+-pub(crate) fn clamp_yield_time(yield_time_ms: u64) -> u64 {
+-    let yield_time_ms = if cfg!(windows) {
+-        yield_time_ms.max(WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS)
+-    } else {
+-        yield_time_ms
+-    };
+-    yield_time_ms.clamp(MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS)
+-}
+-
+ pub(crate) fn resolve_max_tokens(max_tokens: Option<usize>) -> usize {
+     max_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+ }
+diff --git a/codex-rs/core/src/unified_exec/mod_tests.rs b/codex-rs/core/src/unified_exec/mod_tests.rs
+index 7e3cf8083a..df57946498 100644
+--- a/codex-rs/core/src/unified_exec/mod_tests.rs
++++ b/codex-rs/core/src/unified_exec/mod_tests.rs
+@@ -37,10 +37,32 @@ use tokio::time::Duration;
+ use tokio::time::Instant;
+ 
+ async fn test_session_and_turn() -> (Arc<Session>, Arc<TurnContext>) {
+-    let (session, turn) = make_session_and_context().await;
++    let (mut session, turn) = make_session_and_context().await;
++    session.services.unified_exec_manager = UnifiedExecProcessManager::new_for_tests(
++        /*max_write_stdin_yield_time_ms*/ 2_500, /*min_yield_time_ms*/ 250,
++    );
+     (Arc::new(session), Arc::new(turn))
+ }
+ 
++#[test]
++fn default_manager_caps_empty_write_stdin_poll_at_five_minutes() {
++    let manager = UnifiedExecProcessManager::default();
++
++    assert_eq!(300_000, manager.max_write_stdin_yield_time_ms);
++}
++
++#[test]
++fn production_yield_floor_is_five_minutes() {
++    let manager = UnifiedExecProcessManager::new_for_tests(
++        /*max_write_stdin_yield_time_ms*/ 300_000,
++        /*min_yield_time_ms*/ MIN_YIELD_TIME_MS,
++    );
++
++    assert_eq!(MIN_YIELD_TIME_MS, 300_000);
++    assert_eq!(300_000, manager.clamp_yield_time(250));
++    assert_eq!(300_000, manager.min_empty_yield_time_ms);
++}
++
+ async fn exec_command(
+     session: &Arc<Session>,
+     turn: &Arc<TurnContext>,
+@@ -499,7 +521,7 @@ async fn unified_exec_timeouts() -> anyhow::Result<()> {
+ 
+     tokio::time::sleep(Duration::from_secs(7)).await;
+ 
+-    let out_3 = write_stdin(&session, process_id, "", /*yield_time_ms*/ 100).await?;
++    let out_3 = write_stdin(&session, process_id, ":\n", /*yield_time_ms*/ 100).await?;
+ 
+     assert!(
+         out_3
+diff --git a/codex-rs/core/src/unified_exec/process_manager.rs b/codex-rs/core/src/unified_exec/process_manager.rs
+index cf96ae7895..2ec23729fd 100644
+--- a/codex-rs/core/src/unified_exec/process_manager.rs
++++ b/codex-rs/core/src/unified_exec/process_manager.rs
+@@ -5,6 +5,7 @@ use std::collections::HashSet;
+ use std::num::NonZeroUsize;
+ use std::sync::Arc;
+ use std::sync::atomic::AtomicBool;
++use std::sync::atomic::AtomicU64;
+ use std::sync::atomic::Ordering;
+ use tokio::sync::Notify;
+ use tokio::sync::watch;
+@@ -38,8 +39,6 @@ use crate::tools::sandboxing::ToolError;
+ use crate::unified_exec::ExecCommandRequest;
+ use crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES;
+ use crate::unified_exec::MAX_YIELD_TIME_MS;
+-use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
+-use crate::unified_exec::MIN_YIELD_TIME_MS;
+ use crate::unified_exec::ProcessEntry;
+ use crate::unified_exec::ProcessStore;
+ use crate::unified_exec::UnifiedExecContext;
+@@ -50,7 +49,6 @@ use crate::unified_exec::async_watcher::emit_exec_end_for_unified_exec;
+ use crate::unified_exec::async_watcher::emit_failed_exec_end_for_unified_exec;
+ use crate::unified_exec::async_watcher::spawn_exit_watcher;
+ use crate::unified_exec::async_watcher::start_streaming_output;
+-use crate::unified_exec::clamp_yield_time;
+ use crate::unified_exec::generate_chunk_id;
+ use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
+ use crate::unified_exec::process::OutputBuffer;
+@@ -89,15 +87,25 @@ const INTERRUPT: &str = "\u{3}";
+ /// In production builds this value should remain at its default (`false`) and
+ /// must not be toggled.
+ static FORCE_DETERMINISTIC_PROCESS_IDS: AtomicBool = AtomicBool::new(false);
++static MIN_YIELD_TIME_MS_OVERRIDE_FOR_TESTS: AtomicU64 = AtomicU64::new(0);
+ 
+ pub(super) fn set_deterministic_process_ids_for_tests(enabled: bool) {
+     FORCE_DETERMINISTIC_PROCESS_IDS.store(enabled, Ordering::Relaxed);
+ }
+ 
++pub(super) fn set_min_yield_time_ms_override_for_tests(value: Option<u64>) {
++    MIN_YIELD_TIME_MS_OVERRIDE_FOR_TESTS.store(value.unwrap_or(0), Ordering::Relaxed);
++}
++
+ fn deterministic_process_ids_forced_for_tests() -> bool {
+     FORCE_DETERMINISTIC_PROCESS_IDS.load(Ordering::Relaxed)
+ }
+ 
++pub(super) fn min_yield_time_ms_override_for_tests() -> Option<u64> {
++    let value = MIN_YIELD_TIME_MS_OVERRIDE_FOR_TESTS.load(Ordering::Relaxed);
++    (value > 0).then_some(value)
++}
++
+ fn should_use_deterministic_process_ids() -> bool {
+     cfg!(test) || deterministic_process_ids_forced_for_tests()
+ }
+@@ -476,7 +484,7 @@ impl UnifiedExecProcessManager {
+             None
+         };
+ 
+-        let yield_time_ms = clamp_yield_time(request.yield_time_ms);
++        let yield_time_ms = self.clamp_yield_time(request.yield_time_ms);
+         // For the initial exec_command call, we both stream output to events
+         // (via start_streaming_output above) and collect a snapshot here for
+         // the tool response body.
+@@ -710,9 +718,12 @@ impl UnifiedExecProcessManager {
+         let yield_time_ms = {
+             // Empty polls use configurable background timeout bounds. Non-empty
+             // writes keep a fixed max cap so interactive stdin remains responsive.
+-            let time_ms = request.yield_time_ms.max(MIN_YIELD_TIME_MS);
++            let time_ms = request.yield_time_ms.max(self.min_yield_time_ms);
+             if request.input.is_empty() {
+-                time_ms.clamp(MIN_EMPTY_YIELD_TIME_MS, self.max_write_stdin_yield_time_ms)
++                time_ms.clamp(
++                    self.min_empty_yield_time_ms,
++                    self.max_write_stdin_yield_time_ms,
++                )
+             } else {
+                 time_ms.min(MAX_YIELD_TIME_MS)
+             }
+diff --git a/codex-rs/core/src/unified_exec/process_manager_tests.rs b/codex-rs/core/src/unified_exec/process_manager_tests.rs
+index 31f3b6d8c9..c8e89667c5 100644
+--- a/codex-rs/core/src/unified_exec/process_manager_tests.rs
++++ b/codex-rs/core/src/unified_exec/process_manager_tests.rs
+@@ -1,6 +1,5 @@
+ use super::*;
+ use crate::exec_env::CODEX_HOME_ENV_VAR;
+-use crate::unified_exec::clamp_yield_time;
+ use codex_network_proxy::ManagedNetworkSandboxContext;
+ use pretty_assertions::assert_eq;
+ use tokio::time::Duration;
+@@ -217,30 +216,19 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
+     assert_ne!(first.process_id, second.process_id);
+ }
+ 
+-#[cfg(windows)]
+ #[test]
+-fn initial_exec_yield_time_uses_windows_floor() {
++fn initial_exec_yield_time_uses_manager_floor() {
++    let manager = UnifiedExecProcessManager::new_for_tests(
++        /*max_write_stdin_yield_time_ms*/ 30_000, /*min_yield_time_ms*/ 250,
++    );
+     let above_max_yield_time_ms = crate::unified_exec::MAX_YIELD_TIME_MS + 1;
+ 
++    assert_eq!(manager.clamp_yield_time(/*yield_time_ms*/ 1_000), 1_000);
+     assert_eq!(
+-        clamp_yield_time(/*yield_time_ms*/ 1_000),
+-        crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS
+-    );
+-    assert_eq!(clamp_yield_time(/*yield_time_ms*/ 10_000), 10_000);
+-    assert_eq!(
+-        clamp_yield_time(/*yield_time_ms*/ above_max_yield_time_ms),
++        manager.clamp_yield_time(/*yield_time_ms*/ above_max_yield_time_ms),
+         crate::unified_exec::MAX_YIELD_TIME_MS
+     );
+-}
+-
+-#[cfg(not(windows))]
+-#[test]
+-fn initial_exec_yield_time_has_no_platform_floor() {
+-    assert_eq!(clamp_yield_time(/*yield_time_ms*/ 1_000), 1_000);
+-    assert_eq!(
+-        clamp_yield_time(/*yield_time_ms*/ 1),
+-        crate::unified_exec::MIN_YIELD_TIME_MS
+-    );
++    assert_eq!(manager.clamp_yield_time(/*yield_time_ms*/ 1), 250);
+ }
+ 
+ #[tokio::test]
+diff --git a/codex-rs/core/tests/common/lib.rs b/codex-rs/core/tests/common/lib.rs
+index 006bcbe215..099ee65bd0 100644
+--- a/codex-rs/core/tests/common/lib.rs
++++ b/codex-rs/core/tests/common/lib.rs
+@@ -52,6 +52,7 @@ static TEST_ARG0_PATH_ENTRY: OnceLock<Option<Arg0PathEntryGuard>> = OnceLock::ne
+ fn enable_deterministic_unified_exec_process_ids_for_tests() {
+     codex_core::test_support::set_thread_manager_test_mode(/*enabled*/ true);
+     codex_core::test_support::set_deterministic_process_ids(/*enabled*/ true);
++    codex_core::test_support::set_min_unified_exec_yield_time_for_tests(Some(250));
+ }
+ 
+ #[ctor]

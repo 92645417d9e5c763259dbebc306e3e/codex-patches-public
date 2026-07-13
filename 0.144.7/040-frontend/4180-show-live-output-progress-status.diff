@@ -1,0 +1,350 @@
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 0613baad85..7895951749 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -657,6 +657,8 @@ pub(crate) struct ChatWidget {
+     reasoning_buffer: String,
+     // Preserves reasoning-summary part boundaries for transcript-only recording.
+     reasoning_summary_parts: Vec<String>,
++    agent_message_phases: HashMap<String, MessagePhase>,
++    live_output_chars: usize,
+     status_state: StatusState,
+     review: ReviewState,
+     // Active hook runs render in a dedicated live cell so they can run alongside tools.
+diff --git a/codex-rs/tui/src/chatwidget/command_lifecycle.rs b/codex-rs/tui/src/chatwidget/command_lifecycle.rs
+index 612ad0d92f..245c68a4b1 100644
+--- a/codex-rs/tui/src/chatwidget/command_lifecycle.rs
++++ b/codex-rs/tui/src/chatwidget/command_lifecycle.rs
+@@ -255,6 +255,7 @@ impl ChatWidget {
+             command_execution_command_and_parsed(&command, &command_actions);
+         // Ensure the status indicator is visible while the command runs.
+         self.bottom_pane.ensure_status_indicator();
++        self.set_working_without_stream_count();
+         let parsed_cmd = self.annotate_skill_reads_in_parsed_cmd(parsed_cmd);
+         self.running_commands.insert(
+             id.clone(),
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index b89b28eb5f..c1d08b029f 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -183,6 +183,8 @@ impl ChatWidget {
+             interrupts: InterruptManager::new(),
+             reasoning_buffer: String::new(),
+             reasoning_summary_parts: Vec::new(),
++            agent_message_phases: HashMap::new(),
++            live_output_chars: 0,
+             status_state: StatusState::default(),
+             review: ReviewState::default(),
+             active_hook_cell: None,
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index e89720a304..2a3c62e06b 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -93,7 +93,7 @@ impl ChatWidget {
+                 self.handle_item_completed_notification(notification, replay_kind);
+             }
+             ServerNotification::AgentMessageDelta(notification) => {
+-                self.on_agent_message_delta(notification.delta);
++                self.on_agent_message_delta_for_item(notification.item_id, notification.delta);
+             }
+             ServerNotification::PlanDelta(notification) => self.on_plan_delta(notification.delta),
+             ServerNotification::ReasoningSummaryTextDelta(notification) => {
+@@ -332,6 +332,13 @@ impl ChatWidget {
+                     .insert(id, notification.started_at_ms);
+                 self.start_context_compaction_status();
+             }
++            ThreadItem::AgentMessage { id, phase, .. } => {
++                if let Some(phase) = phase {
++                    self.agent_message_phases.insert(id, phase);
++                } else {
++                    self.agent_message_phases.remove(&id);
++                }
++            }
+             ThreadItem::CollabAgentToolCall {
+                 id,
+                 tool,
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__preamble_keeps_working_status.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__preamble_keeps_working_status.snap
+index 0a2dd477b9..4784d51362 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__preamble_keeps_working_status.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__preamble_keeps_working_status.snap
+@@ -3,7 +3,7 @@ source: tui/src/chatwidget/tests/exec_flow.rs
+ expression: normalized_backend_snapshot(terminal.backend())
+ ---
+ "                                                                                "
+-"■ Working (0s ■ esc to interrupt)                                               "
++"■ Working · output ~4 tokens (0s ■ esc to interrupt)                            "
+ "                                                                                "
+ "────────────────────────────────────────────────────────────────────────────────"
+ "› Ask Codex to do anything                                                      "
+diff --git a/codex-rs/tui/src/chatwidget/streaming.rs b/codex-rs/tui/src/chatwidget/streaming.rs
+index efec6fc350..1f4ba64100 100644
+--- a/codex-rs/tui/src/chatwidget/streaming.rs
++++ b/codex-rs/tui/src/chatwidget/streaming.rs
+@@ -6,6 +6,26 @@
+ use super::*;
+ 
+ impl ChatWidget {
++    pub(super) fn clear_live_stream_progress(&mut self) {
++        self.live_output_chars = 0;
++    }
++
++    fn estimated_tokens_for_chars(chars: usize) -> usize {
++        chars.saturating_add(3) / 4
++    }
++
++    fn set_working_output_progress(&mut self) {
++        let tokens = Self::estimated_tokens_for_chars(self.live_output_chars);
++        self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Working;
++        self.set_status_header(format!("Working · output ~{tokens} tokens"));
++    }
++
++    pub(super) fn set_working_without_stream_count(&mut self) {
++        self.clear_live_stream_progress();
++        self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Working;
++        self.set_status_header(String::from("Working"));
++    }
++
+     pub(super) fn retry_countdown_header(base_header: &str, retry_at: Option<Instant>) -> String {
+         let Some(retry_at) = retry_at else {
+             return base_header.to_string();
+@@ -120,10 +140,29 @@ impl ChatWidget {
+         self.request_redraw();
+     }
+ 
++    #[cfg(test)]
+     pub(super) fn on_agent_message_delta(&mut self, delta: String) {
++        self.on_agent_message_delta_with_progress(delta, /*count_progress*/ true);
++    }
++
++    fn on_agent_message_delta_with_progress(&mut self, delta: String, count_progress: bool) {
++        if count_progress && !delta.is_empty() {
++            self.live_output_chars = self.live_output_chars.saturating_add(delta.chars().count());
++            if !self.safety_buffering_is_waiting() {
++                self.set_working_output_progress();
++            }
++        }
+         self.handle_streaming_delta(delta);
+     }
+ 
++    pub(super) fn on_agent_message_delta_for_item(&mut self, item_id: String, delta: String) {
++        let count_progress = !matches!(
++            self.agent_message_phases.get(&item_id),
++            Some(MessagePhase::Commentary)
++        );
++        self.on_agent_message_delta_with_progress(delta, count_progress);
++    }
++
+     pub(super) fn on_plan_delta(&mut self, delta: String) {
+         if self.active_mode_kind() != ModeKind::Plan {
+             return;
+@@ -347,6 +386,7 @@ impl ChatWidget {
+             }
+         }
+         let parsed = parse_assistant_markdown(&message, self.config.cwd.as_path());
++        self.agent_message_phases.remove(&item.id);
+         self.finalize_completed_assistant_message(
+             (!parsed.visible_markdown.is_empty()).then_some(parsed.visible_markdown.as_str()),
+         );
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index 8f5ec174eb..3e4cb352d6 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -1181,7 +1181,7 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
+         .bottom_pane
+         .status_widget()
+         .expect("status indicator should be visible");
+-    assert_eq!(status.header(), "Working");
++    assert_eq!(status.header(), "Working · output ~2 tokens");
+     assert_eq!(status.details(), None);
+     assert!(chat.status_state.retry_status_header.is_none());
+ }
+diff --git a/codex-rs/tui/src/chatwidget/tests/history_replay.rs b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
+index 75c9e81bbd..cc92741331 100644
+--- a/codex-rs/tui/src/chatwidget/tests/history_replay.rs
++++ b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
+@@ -1275,7 +1275,7 @@ async fn thread_snapshot_replayed_stream_recovery_restores_previous_status_heade
+         .bottom_pane
+         .status_widget()
+         .expect("status indicator should be visible");
+-    assert_eq!(status.header(), "Working");
++    assert_eq!(status.header(), "Working · output ~2 tokens");
+     assert_eq!(status.details(), None);
+     assert!(chat.status_state.retry_status_header.is_none());
+ }
+@@ -1297,7 +1297,7 @@ async fn stream_recovery_restores_previous_status_header() {
+         .bottom_pane
+         .status_widget()
+         .expect("status indicator should be visible");
+-    assert_eq!(status.header(), "Working");
++    assert_eq!(status.header(), "Working · output ~2 tokens");
+     assert_eq!(status.details(), None);
+     assert!(chat.status_state.retry_status_header.is_none());
+ }
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index df6462db5f..e7240c07fc 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -4417,3 +4417,114 @@ async fn chatwidget_tall() {
+         normalize_snapshot_paths(term.backend().vt100().screen().contents())
+     );
+ }
++
++#[tokio::test]
++async fn live_status_accumulates_normal_output_progress() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++
++    handle_turn_started(&mut chat, "turn-1");
++    handle_agent_message_delta(&mut chat, "abcd");
++    handle_agent_message_delta(&mut chat, "efgh");
++
++    assert_eq!(
++        chat.status_state.current_status.header,
++        "Working · output ~2 tokens"
++    );
++}
++
++#[tokio::test]
++async fn live_status_ignores_commentary_output_progress() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++
++    handle_turn_started(&mut chat, "turn-1");
++    handle_agent_message_delta(&mut chat, "abcdefgh");
++    let thread_id = chat.thread_id.map(|id| id.to_string()).unwrap_or_default();
++    chat.handle_server_notification(
++        ServerNotification::ItemStarted(ItemStartedNotification {
++            thread_id: thread_id.clone(),
++            turn_id: "turn-1".to_string(),
++            started_at_ms: 0,
++            item: AppServerThreadItem::AgentMessage {
++                id: "commentary-1".to_string(),
++                text: String::new(),
++                phase: Some(MessagePhase::Commentary),
++                memory_citation: None,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++    chat.handle_server_notification(
++        ServerNotification::AgentMessageDelta(
++            codex_app_server_protocol::AgentMessageDeltaNotification {
++                thread_id,
++                turn_id: "turn-1".to_string(),
++                item_id: "commentary-1".to_string(),
++                delta: "commentary should not count".to_string(),
++            },
++        ),
++        /*replay_kind*/ None,
++    );
++
++    assert_eq!(
++        chat.status_state.current_status.header,
++        "Working · output ~2 tokens"
++    );
++}
++
++#[tokio::test]
++async fn live_status_resets_at_command_boundary() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++
++    handle_turn_started(&mut chat, "turn-1");
++    handle_agent_message_delta(&mut chat, "abcdefgh");
++    begin_exec_with_source(&mut chat, "call-1", "echo hi", ExecCommandSource::Agent);
++
++    assert_eq!(chat.status_state.current_status.header, "Working");
++    handle_agent_message_delta(&mut chat, "abcd");
++    assert_eq!(
++        chat.status_state.current_status.header,
++        "Working · output ~1 tokens"
++    );
++}
++
++#[tokio::test]
++async fn live_status_resets_at_tool_boundary() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++
++    handle_turn_started(&mut chat, "turn-1");
++    handle_agent_message_delta(&mut chat, "abcdefgh");
++    handle_patch_apply_begin(
++        &mut chat,
++        "call-1",
++        "turn-1",
++        std::collections::HashMap::new(),
++    );
++
++    assert_eq!(chat.status_state.current_status.header, "Working");
++    handle_agent_message_delta(&mut chat, "abcd");
++    assert_eq!(
++        chat.status_state.current_status.header,
++        "Working · output ~1 tokens"
++    );
++}
++
++#[tokio::test]
++async fn live_status_resets_progress_at_turn_boundary() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++
++    handle_turn_started(&mut chat, "turn-1");
++    handle_agent_message_delta(&mut chat, "abcdefgh");
++    assert_eq!(
++        chat.status_state.current_status.header,
++        "Working · output ~2 tokens"
++    );
++
++    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
++    handle_turn_started(&mut chat, "turn-2");
++    handle_agent_message_delta(&mut chat, "abcd");
++
++    assert_eq!(
++        chat.status_state.current_status.header,
++        "Working · output ~1 tokens"
++    );
++}
+diff --git a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+index 403407d5f4..40eba02336 100644
+--- a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
++++ b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+@@ -9,6 +9,7 @@ use codex_utils_path_uri::LegacyAppPathString;
+ impl ChatWidget {
+     pub(super) fn on_patch_apply_begin(&mut self, changes: HashMap<PathBuf, FileChange>) {
+         self.record_visible_turn_activity();
++        self.set_working_without_stream_count();
+         self.add_to_history(history_cell::new_patch_event(changes, &self.config.cwd));
+     }
+ 
+@@ -169,6 +170,7 @@ impl ChatWidget {
+ 
+     pub(crate) fn handle_mcp_tool_call_started_now(&mut self, item: ThreadItem) {
+         self.record_visible_turn_activity();
++        self.set_working_without_stream_count();
+         let ThreadItem::McpToolCall {
+             id,
+             server,
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+index 56de48fcbf..afafb9501c 100644
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -71,6 +71,7 @@ impl ChatWidget {
+         if self.plan_stream_controller.take().is_some() {
+             self.request_pending_usage_output_insertion_after_stream_shutdown();
+         }
++        self.clear_live_stream_progress();
+         self.last_response_tps = None;
+         self.last_response_ttft_ms = None;
+         self.turn_runtime_metrics = RuntimeMetricsSummary::default();
+@@ -207,6 +208,7 @@ impl ChatWidget {
+         self.input_queue.user_turn_pending_start = false;
+         self.input_queue.submitted_turn_context = None;
+         self.clear_active_hook_cell();
++        self.clear_live_stream_progress();
+         self.turn_lifecycle.finish();
+         self.clear_safety_buffering();
+         self.update_task_running_state();
+@@ -380,6 +382,8 @@ impl ChatWidget {
+         self.unified_exec_wait_streak = None;
+         self.adaptive_chunking.reset();
+         self.stream_controller = None;
++        self.clear_live_stream_progress();
++        self.agent_message_phases.clear();
+         self.plan_stream_controller = None;
+         self.request_pending_usage_output_insertion_after_stream_shutdown();
+         self.status_state.pending_status_indicator_restore = false;

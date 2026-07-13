@@ -1,0 +1,200 @@
+diff --git a/codex-rs/tui/src/app/app_server_events.rs b/codex-rs/tui/src/app/app_server_events.rs
+index 06ed4320d8..26ebe3e844 100644
+--- a/codex-rs/tui/src/app/app_server_events.rs
++++ b/codex-rs/tui/src/app/app_server_events.rs
+@@ -103,6 +103,11 @@ impl App {
+                 );
+                 return;
+             }
++            ServerNotification::ActiveClientCountChanged(notification) => {
++                self.chat_widget
++                    .set_app_server_active_client_count(notification.active_client_count);
++                return;
++            }
+             ServerNotification::ExternalAgentConfigImportCompleted(notification) => {
+                 let should_report_completion =
+                     app_server_client.consume_external_agent_config_import_completion();
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+index 63ce4237db..d6e3429dc4 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -87,6 +87,9 @@ pub(crate) enum StatusLineItem {
+     #[strum(to_string = "run-state", serialize = "status")]
+     Status,
+ 
++    /// Active app-server client count.
++    ActiveClients,
++
+     /// Active permission profile or sandbox summary.
+     Permissions,
+ 
+@@ -161,6 +164,7 @@ impl StatusLineItem {
+                 "Committed branch changes against the default branch (omitted when unavailable)"
+             }
+             StatusLineItem::Status => "Compact session run-state text (Ready, Working, Thinking)",
++            StatusLineItem::ActiveClients => "Active app-server client count",
+             StatusLineItem::Permissions => "Active permission profile or sandbox mode",
+             StatusLineItem::ApprovalMode => "Active command approval mode",
+             StatusLineItem::ContextRemaining => {
+@@ -208,6 +212,7 @@ impl StatusLineItem {
+             StatusLineItem::PullRequestNumber => StatusSurfacePreviewItem::PullRequestNumber,
+             StatusLineItem::BranchChanges => StatusSurfacePreviewItem::BranchChanges,
+             StatusLineItem::Status => StatusSurfacePreviewItem::Status,
++            StatusLineItem::ActiveClients => StatusSurfacePreviewItem::ActiveClients,
+             StatusLineItem::Permissions => StatusSurfacePreviewItem::Permissions,
+             StatusLineItem::ApprovalMode => StatusSurfacePreviewItem::ApprovalMode,
+             StatusLineItem::ContextRemaining => StatusSurfacePreviewItem::ContextRemaining,
+@@ -432,6 +437,16 @@ mod tests {
+             "context-remaining"
+         );
+     }
++
++    #[test]
++    fn active_clients_is_selectable_id() {
++        assert_eq!(
++            "active-clients".parse::<StatusLineItem>(),
++            Ok(StatusLineItem::ActiveClients)
++        );
++        assert_eq!(StatusLineItem::ActiveClients.to_string(), "active-clients");
++    }
++
+     #[test]
+     fn project_name_is_canonical_and_accepts_legacy_ids() {
+         assert_eq!(StatusLineItem::ProjectRoot.to_string(), "project-name");
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+index 4198943a4f..4d8fb62bbd 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -45,7 +45,9 @@ impl StatusLineAccent {
+             | StatusLineItem::TotalInputTokens
+             | StatusLineItem::TotalOutputTokens => Self::Usage,
+             StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit => Self::Limit,
+-            StatusLineItem::CodexVersion | StatusLineItem::SessionId => Self::Metadata,
++            StatusLineItem::CodexVersion
++            | StatusLineItem::SessionId
++            | StatusLineItem::ActiveClients => Self::Metadata,
+             StatusLineItem::FastMode | StatusLineItem::RawOutput => Self::Mode,
+             StatusLineItem::Permissions => Self::Mode,
+             StatusLineItem::ApprovalMode => Self::Mode,
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+index b8b7a6fbd4..cccce6ac94 100644
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -18,6 +18,7 @@ pub(crate) enum StatusSurfacePreviewItem {
+     BranchChanges,
+     Permissions,
+     ApprovalMode,
++    ActiveClients,
+     ContextRemaining,
+     ContextUsed,
+     FiveHourLimit,
+@@ -51,6 +52,7 @@ impl StatusSurfacePreviewItem {
+             StatusSurfacePreviewItem::BranchChanges => "+12 -3",
+             StatusSurfacePreviewItem::Permissions => "Workspace",
+             StatusSurfacePreviewItem::ApprovalMode => "on-request",
++            StatusSurfacePreviewItem::ActiveClients => "1",
+             StatusSurfacePreviewItem::ContextRemaining => "Context 0% left",
+             StatusSurfacePreviewItem::ContextUsed => "Context 0% used",
+             StatusSurfacePreviewItem::FiveHourLimit => "primary 0%",
+@@ -84,6 +86,7 @@ impl StatusSurfacePreviewItem {
+             Self::BranchChanges,
+             Self::Permissions,
+             Self::ApprovalMode,
++            Self::ActiveClients,
+             Self::ContextRemaining,
+             Self::ContextUsed,
+             Self::FiveHourLimit,
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 35e08a5069..4d2d5e2389 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -474,7 +474,8 @@ const ASK_FOR_APPROVAL_LABEL: &str = "Ask for approval";
+ const APPROVE_FOR_ME_LABEL: &str = "Approve for me";
+ const AUTO_REVIEW_DESCRIPTION: &str = "Only ask for actions detected as potentially unsafe.";
+ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+-const DEFAULT_STATUS_LINE_ITEMS: [&str; 2] = ["model-with-reasoning", "current-dir"];
++const DEFAULT_STATUS_LINE_ITEMS: [&str; 3] =
++    ["model-with-reasoning", "active-clients", "current-dir"];
+ const MAX_AGENT_COPY_HISTORY: usize = 32;
+ 
+ /// Common initialization parameters shared by all `ChatWidget` constructors.
+@@ -544,6 +545,7 @@ pub(crate) struct ChatWidget {
+     has_chatgpt_account: bool,
+     has_codex_backend_auth: bool,
+     app_server_supports_detach: bool,
++    app_server_active_client_count: Option<usize>,
+     model_catalog: Arc<ModelCatalog>,
+     session_telemetry: SessionTelemetry,
+     session_header: SessionHeader,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 0e414e70d7..cd169fa2b2 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -116,6 +116,7 @@ impl ChatWidget {
+             has_chatgpt_account,
+             has_codex_backend_auth,
+             app_server_supports_detach: false,
++            app_server_active_client_count: None,
+             model_catalog,
+             session_telemetry,
+             session_header: SessionHeader::new(header_model),
+diff --git a/codex-rs/tui/src/chatwidget/settings.rs b/codex-rs/tui/src/chatwidget/settings.rs
+index bcba390ecb..4851321a11 100644
+--- a/codex-rs/tui/src/chatwidget/settings.rs
++++ b/codex-rs/tui/src/chatwidget/settings.rs
+@@ -217,6 +217,11 @@ impl ChatWidget {
+             .set_app_server_supports_detach(supports_detach);
+     }
+ 
++    pub(crate) fn set_app_server_active_client_count(&mut self, count: usize) {
++        self.app_server_active_client_count = Some(count);
++        self.refresh_status_line();
++    }
++
+     pub(crate) fn update_account_state(
+         &mut self,
+         status_account_display: Option<StatusAccountDisplay>,
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 7120462330..bd0cbd274b 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -682,6 +682,9 @@ impl ChatWidget {
+                     }
+                 }),
+             StatusLineItem::Status => Some(self.run_state_status_text()),
++            StatusLineItem::ActiveClients => self
++                .app_server_active_client_count
++                .map(|count| count.to_string()),
+             StatusLineItem::Permissions => Some(permissions_display(&self.config)),
+             StatusLineItem::ApprovalMode => Some(approval_mode_display(&self.config)),
+             StatusLineItem::UsedTokens => {
+@@ -776,6 +779,7 @@ impl ChatWidget {
+             StatusSurfacePreviewItem::BranchChanges => StatusLineItem::BranchChanges,
+             StatusSurfacePreviewItem::Permissions => StatusLineItem::Permissions,
+             StatusSurfacePreviewItem::ApprovalMode => StatusLineItem::ApprovalMode,
++            StatusSurfacePreviewItem::ActiveClients => StatusLineItem::ActiveClients,
+             StatusSurfacePreviewItem::ContextRemaining => StatusLineItem::ContextRemaining,
+             StatusSurfacePreviewItem::ContextUsed => StatusLineItem::ContextUsed,
+             StatusSurfacePreviewItem::FiveHourLimit => StatusLineItem::FiveHourLimit,
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index fe17933f52..9780eade9b 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -41,6 +41,17 @@ async fn token_count_none_resets_context_indicator() {
+     assert_eq!(chat.bottom_pane.context_window_percent(), None);
+ }
+ 
++#[tokio::test]
++async fn status_line_active_clients_displays_integer_only() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.set_app_server_active_client_count(3);
++
++    assert_eq!(
++        chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::ActiveClients),
++        Some("3".to_string())
++    );
++}
++
+ #[tokio::test]
+ async fn app_server_cyber_policy_error_renders_dedicated_notice() {
+     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;

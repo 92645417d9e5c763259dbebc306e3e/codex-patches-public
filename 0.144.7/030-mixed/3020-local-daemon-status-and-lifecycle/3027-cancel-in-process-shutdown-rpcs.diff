@@ -1,0 +1,126 @@
+diff --git a/codex-rs/app-server/src/connection_rpc_gate.rs b/codex-rs/app-server/src/connection_rpc_gate.rs
+index fb2aedd352..7bddff2d1d 100644
+--- a/codex-rs/app-server/src/connection_rpc_gate.rs
++++ b/codex-rs/app-server/src/connection_rpc_gate.rs
+@@ -1,6 +1,7 @@
+ use std::future::Future;
+ 
+ use tokio::sync::Mutex;
++use tokio_util::sync::CancellationToken;
+ use tokio_util::task::TaskTracker;
+ 
+ /// Per-connection gate for initialized RPC handler execution.
+@@ -10,6 +11,7 @@ use tokio_util::task::TaskTracker;
+ #[derive(Debug)]
+ pub(crate) struct ConnectionRpcGate {
+     accepting: Mutex<bool>,
++    cancel_running: CancellationToken,
+     tasks: TaskTracker,
+ }
+ 
+@@ -18,6 +20,7 @@ impl ConnectionRpcGate {
+         let accepting = true;
+         Self {
+             accepting: Mutex::new(accepting),
++            cancel_running: CancellationToken::new(),
+             tasks: TaskTracker::new(),
+         }
+     }
+@@ -34,7 +37,10 @@ impl ConnectionRpcGate {
+             self.tasks.token()
+         };
+ 
+-        future.await;
++        tokio::select! {
++            _ = self.cancel_running.cancelled() => {}
++            _ = future => {}
++        }
+         drop(token);
+     }
+ 
+@@ -49,6 +55,12 @@ impl ConnectionRpcGate {
+         self.tasks.wait().await;
+     }
+ 
++    pub(crate) async fn cancel_and_shutdown(&self) {
++        self.close().await;
++        self.cancel_running.cancel();
++        self.tasks.wait().await;
++    }
++
+     #[cfg(test)]
+     async fn is_accepting(&self) -> bool {
+         *self.accepting.lock().await
+@@ -169,6 +181,29 @@ mod tests {
+         assert_eq!(gate.inflight_count(), 0);
+     }
+ 
++    #[tokio::test]
++    async fn cancel_and_shutdown_cancels_started_run() {
++        let gate = Arc::new(ConnectionRpcGate::new());
++        let (started_tx, started_rx) = oneshot::channel();
++        let (_finish_tx, finish_rx) = oneshot::channel::<()>();
++        let gate_for_run = Arc::clone(&gate);
++        let run_task = tokio::spawn(async move {
++            gate_for_run
++                .run(async move {
++                    started_tx.send(()).expect("receiver should be open");
++                    let _ = finish_rx.await;
++                })
++                .await;
++        });
++
++        started_rx.await.expect("run should start");
++        timeout(Duration::from_secs(1), gate.cancel_and_shutdown())
++            .await
++            .expect("cancelled shutdown should complete promptly");
++        run_task.await.expect("run task should complete");
++        assert_eq!(gate.inflight_count(), 0);
++    }
++
+     #[tokio::test]
+     async fn shutdown_drops_late_runs_while_waiting_for_inflight_work() {
+         let gate = Arc::new(ConnectionRpcGate::new());
+diff --git a/codex-rs/app-server/src/in_process.rs b/codex-rs/app-server/src/in_process.rs
+index d8f40ec7d3..085544bd4f 100644
+--- a/codex-rs/app-server/src/in_process.rs
++++ b/codex-rs/app-server/src/in_process.rs
+@@ -528,7 +528,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
+             processor.clear_runtime_references();
+             processor.cancel_active_login().await;
+             processor
+-                .connection_closed(IN_PROCESS_CONNECTION_ID, &session)
++                .connection_closed_cancel_rpcs(IN_PROCESS_CONNECTION_ID, &session)
+                 .await;
+             processor.clear_all_thread_listeners().await;
+             processor.drain_background_tasks().await;
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 9b886446af..d91935832a 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -793,6 +793,25 @@ impl MessageProcessor {
+                 "timed out waiting for connection RPCs to drain"
+             );
+         }
++        self.finish_connection_closed(connection_id, session_state)
++            .await;
++    }
++
++    pub(crate) async fn connection_closed_cancel_rpcs(
++        &self,
++        connection_id: ConnectionId,
++        session_state: &ConnectionSessionState,
++    ) {
++        session_state.rpc_gate.cancel_and_shutdown().await;
++        self.finish_connection_closed(connection_id, session_state)
++            .await;
++    }
++
++    async fn finish_connection_closed(
++        &self,
++        connection_id: ConnectionId,
++        session_state: &ConnectionSessionState,
++    ) {
+         self.outgoing.connection_closed(connection_id).await;
+         self.fs_processor.connection_closed(connection_id).await;
+         self.command_exec_processor

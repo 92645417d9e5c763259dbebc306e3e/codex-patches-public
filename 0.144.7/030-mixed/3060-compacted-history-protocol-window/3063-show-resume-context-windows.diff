@@ -1,0 +1,493 @@
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index 266399a7a9..ad671c4b4a 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -1076,10 +1076,15 @@ See the Codex keymap documentation for supported actions and examples."
+         }
+         let initial_session_started_at = Instant::now();
+         if let Some(started) = initial_started_thread {
+-            let thread_id = started.session.thread_id;
++            let AppServerStartedThread {
++                session,
++                turns,
++                history_window_metadata,
++            } = started;
++            let thread_id = session.thread_id;
+             app.primary_thread_id = Some(thread_id);
+             app.backfill_loaded_subagent_threads(&mut app_server).await;
+-            app.enqueue_primary_thread_session(started.session, started.turns)
++            app.enqueue_primary_thread_session(session, turns, history_window_metadata)
+                 .await?;
+             if should_prompt_for_paused_goal_after_startup_resume {
+                 app.maybe_prompt_resume_paused_goal_after_resume(&mut app_server, thread_id)
+diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
+index d362b0039d..a1ac429b92 100644
+--- a/codex-rs/tui/src/app/session_lifecycle.rs
++++ b/codex-rs/tui/src/app/session_lifecycle.rs
+@@ -519,7 +519,12 @@ impl App {
+             .set_queue_submissions_until_session_configured(/*queue*/ false);
+         match result {
+             Ok(started) => {
+-                self.enqueue_primary_thread_session(started.session, started.turns)
++                let AppServerStartedThread {
++                    session,
++                    turns,
++                    history_window_metadata,
++                } = started;
++                self.enqueue_primary_thread_session(session, turns, history_window_metadata)
+                     .await?;
+                 self.chat_widget.maybe_send_next_queued_input();
+             }
+@@ -623,9 +628,14 @@ impl App {
+             initial_user_message,
+         );
+         self.replace_chat_widget(ChatWidget::new_with_app_event(init));
+-        self.primary_thread_id = Some(started.session.thread_id);
++        let AppServerStartedThread {
++            session,
++            turns,
++            history_window_metadata,
++        } = started;
++        self.primary_thread_id = Some(session.thread_id);
+         self.backfill_loaded_subagent_threads(app_server).await;
+-        self.enqueue_primary_thread_session(started.session, started.turns)
++        self.enqueue_primary_thread_session(session, turns, history_window_metadata)
+             .await?;
+         Ok(())
+     }
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index 3f9ce941cf..f7a5bbcc86 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -212,6 +212,7 @@ async fn enqueue_primary_thread_session_replays_buffered_approval_after_attach()
+     app.enqueue_primary_thread_session(
+         test_thread_session(thread_id, test_path_buf("/tmp/project")),
+         Vec::new(),
++        Default::default(),
+     )
+     .await?;
+ 
+@@ -260,6 +261,7 @@ async fn resolved_buffered_approval_does_not_become_actionable_after_drain() ->
+     app.enqueue_primary_thread_session(
+         test_thread_session(thread_id, test_path_buf("/tmp/project")),
+         Vec::new(),
++        Default::default(),
+     )
+     .await?;
+     while app_event_rx.try_recv().is_ok() {}
+@@ -357,6 +359,7 @@ async fn enqueue_primary_thread_session_replays_turns_before_initial_prompt_subm
+                 }],
+             }],
+         )],
++        Default::default(),
+     )
+     .await?;
+ 
+@@ -3592,6 +3595,7 @@ async fn primary_thread_ignores_child_mcp_startup_notifications() {
+         AppServerStartedThread {
+             session: test_thread_session(child_thread_id, test_path_buf("/tmp/child")),
+             turns: Vec::new(),
++            history_window_metadata: Default::default(),
+         },
+         &mut child_snapshot,
+     )
+@@ -4247,8 +4251,12 @@ async fn set_thread_goal_draft_materializes_long_objective_and_confirms_before_p
+         .start_thread(app.chat_widget.config_ref())
+         .await?;
+     let thread_id = started.session.thread_id;
+-    app.enqueue_primary_thread_session(started.session, started.turns)
+-        .await?;
++    app.enqueue_primary_thread_session(
++        started.session,
++        started.turns,
++        started.history_window_metadata,
++    )
++    .await?;
+     let objective = "x".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS + 1);
+ 
+     app.set_thread_goal_draft(
+@@ -5699,6 +5707,7 @@ async fn refreshed_snapshot_session_persists_resumed_turns() {
+         AppServerStartedThread {
+             session: resumed_session.clone(),
+             turns: resumed_turns.clone(),
++            history_window_metadata: Default::default(),
+         },
+         &mut snapshot,
+     )
+@@ -6044,9 +6053,13 @@ async fn interrupt_without_active_turn_is_treated_as_handled() {
+             .await
+             .expect("thread/start should succeed");
+         let thread_id = started.session.thread_id;
+-        app.enqueue_primary_thread_session(started.session, started.turns)
+-            .await
+-            .expect("primary thread should be registered");
++        app.enqueue_primary_thread_session(
++            started.session,
++            started.turns,
++            started.history_window_metadata,
++        )
++        .await
++        .expect("primary thread should be registered");
+         let op = AppCommand::interrupt();
+ 
+         let handled = Box::pin(app.try_submit_active_thread_op_via_app_server(
+@@ -6077,9 +6090,13 @@ async fn override_turn_context_sends_thread_settings_update() {
+         let thread_id = started.session.thread_id;
+         let initial_model = started.session.model.clone();
+         let initial_effort = started.session.reasoning_effort.clone();
+-        app.enqueue_primary_thread_session(started.session, started.turns)
+-            .await
+-            .expect("primary thread should be registered");
++        app.enqueue_primary_thread_session(
++            started.session,
++            started.turns,
++            started.history_window_metadata,
++        )
++        .await
++        .expect("primary thread should be registered");
+         let service_tier = ServiceTier::Fast.request_value().to_string();
+         let collaboration_mode = CollaborationMode {
+             mode: ModeKind::Plan,
+diff --git a/codex-rs/tui/src/app/tests/startup.rs b/codex-rs/tui/src/app/tests/startup.rs
+index 51d6622e16..3d9b199d78 100644
+--- a/codex-rs/tui/src/app/tests/startup.rs
++++ b/codex-rs/tui/src/app/tests/startup.rs
+@@ -162,6 +162,7 @@ async fn startup_thread_started_submits_queued_startup_input() {
+         Ok(AppServerStartedThread {
+             session: test_thread_session(thread_id, test_path_buf("/tmp/project")),
+             turns: Vec::new(),
++            history_window_metadata: Default::default(),
+         }),
+     )
+     .await
+@@ -239,6 +240,7 @@ fn stale_startup_thread_started_removes_local_routing_state() -> Result<()> {
+                 Ok(AppServerStartedThread {
+                     session: test_thread_session(stale_thread_id, test_path_buf("/tmp/project")),
+                     turns: Vec::new(),
++                    history_window_metadata: Default::default(),
+                 }),
+             )
+             .await?;
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+index 8d16081c32..24018d6aa6 100644
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -18,17 +18,21 @@ struct ResumeHistoryLoadSummary {
+     messages: u64,
+     turns: u64,
+     app_server_turns: u64,
+-    context_windows: u64,
++    loaded_context_windows: u64,
++    omitted_context_windows: u64,
+ }
+ 
+-fn resume_history_load_summary(turns: &[Turn]) -> Option<ResumeHistoryLoadSummary> {
++fn resume_history_load_summary(
++    turns: &[Turn],
++    metadata: codex_app_server_protocol::ThreadResumeHistoryWindowMetadata,
++) -> Option<ResumeHistoryLoadSummary> {
+     if turns.is_empty() {
+         return None;
+     }
+ 
+     let mut messages = 0;
+     let mut visible_turns = 0;
+-    let mut context_windows = 0;
++    let mut visible_context_windows = 0;
+     for turn in turns {
+         let mut has_visible_conversation = false;
+         for item in &turn.items {
+@@ -38,7 +42,7 @@ fn resume_history_load_summary(turns: &[Turn]) -> Option<ResumeHistoryLoadSummar
+                     has_visible_conversation = true;
+                 }
+                 ThreadItem::ContextCompaction { .. } => {
+-                    context_windows += 1;
++                    visible_context_windows += 1;
+                 }
+                 _ => {}
+             }
+@@ -52,7 +56,12 @@ fn resume_history_load_summary(turns: &[Turn]) -> Option<ResumeHistoryLoadSummar
+         messages,
+         turns: visible_turns,
+         app_server_turns: turns.len() as u64,
+-        context_windows,
++        loaded_context_windows: if metadata.loaded_context_windows == 0 {
++            visible_context_windows
++        } else {
++            u64::from(metadata.loaded_context_windows)
++        },
++        omitted_context_windows: u64::from(metadata.omitted_context_windows),
+     })
+ }
+ 
+@@ -1189,6 +1198,7 @@ impl App {
+         &mut self,
+         session: ThreadSessionState,
+         turns: Vec<Turn>,
++        history_window_metadata: codex_app_server_protocol::ThreadResumeHistoryWindowMetadata,
+     ) -> Result<()> {
+         let thread_id = session.thread_id;
+         self.primary_thread_id = Some(thread_id);
+@@ -1206,7 +1216,7 @@ impl App {
+         self.chat_widget
+             .set_initial_user_message_submit_suppressed(/*suppressed*/ true);
+         self.chat_widget.handle_thread_session(session);
+-        let resume_history_summary = resume_history_load_summary(&turns);
++        let resume_history_summary = resume_history_load_summary(&turns, history_window_metadata);
+         let should_buffer_initial_replay =
+             self.terminal_resize_reflow_enabled() && !turns.is_empty();
+         if should_buffer_initial_replay {
+@@ -1221,7 +1231,8 @@ impl App {
+                     summary.messages,
+                     summary.turns,
+                     summary.app_server_turns,
+-                    summary.context_windows,
++                    summary.loaded_context_windows,
++                    summary.omitted_context_windows,
+                 ),
+             )));
+         }
+@@ -1328,7 +1339,11 @@ impl App {
+         started: AppServerStartedThread,
+         snapshot: &mut ThreadEventSnapshot,
+     ) {
+-        let AppServerStartedThread { session, turns } = started;
++        let AppServerStartedThread {
++            session,
++            turns,
++            history_window_metadata: _,
++        } = started;
+         if let Some(channel) = self.thread_event_channels.get(&thread_id) {
+             let mut store = channel.store.lock().await;
+             store.set_session(session.clone(), turns.clone());
+@@ -1709,47 +1724,80 @@ mod tests {
+ 
+     #[test]
+     fn resume_history_summary_counts_visible_turns() {
+-        let summary = resume_history_load_summary(&[
+-            test_turn(
+-                "turn-1",
+-                vec![
+-                    ThreadItem::UserMessage {
+-                        id: "user-1".to_string(),
++        let summary = resume_history_load_summary(
++            &[
++                test_turn(
++                    "turn-1",
++                    vec![
++                        ThreadItem::UserMessage {
++                            id: "user-1".to_string(),
++                            client_id: None,
++                            content: Vec::new(),
++                        },
++                        ThreadItem::AgentMessage {
++                            id: "agent-1".to_string(),
++                            text: "reply".to_string(),
++                            phase: None,
++                            memory_citation: None,
++                        },
++                    ],
++                ),
++                test_turn(
++                    "compact-only",
++                    vec![ThreadItem::ContextCompaction {
++                        id: "compact-1".to_string(),
++                    }],
++                ),
++                test_turn(
++                    "turn-2",
++                    vec![ThreadItem::UserMessage {
++                        id: "user-2".to_string(),
+                         client_id: None,
+                         content: Vec::new(),
+-                    },
+-                    ThreadItem::AgentMessage {
+-                        id: "agent-1".to_string(),
+-                        text: "reply".to_string(),
+-                        phase: None,
+-                        memory_citation: None,
+-                    },
+-                ],
+-            ),
+-            test_turn(
++                    }],
++                ),
++            ],
++            Default::default(),
++        )
++        .expect("summary");
++
++        assert_eq!(
++            summary,
++            ResumeHistoryLoadSummary {
++                messages: 3,
++                turns: 2,
++                app_server_turns: 3,
++                loaded_context_windows: 1,
++                omitted_context_windows: 0,
++            }
++        );
++    }
++
++    #[test]
++    fn resume_history_summary_uses_metadata_window_counts_when_present() {
++        let summary = resume_history_load_summary(
++            &[test_turn(
+                 "compact-only",
+                 vec![ThreadItem::ContextCompaction {
+                     id: "compact-1".to_string(),
+                 }],
+-            ),
+-            test_turn(
+-                "turn-2",
+-                vec![ThreadItem::UserMessage {
+-                    id: "user-2".to_string(),
+-                    client_id: None,
+-                    content: Vec::new(),
+-                }],
+-            ),
+-        ])
++            )],
++            codex_app_server_protocol::ThreadResumeHistoryWindowMetadata {
++                loaded_context_windows: 1,
++                omitted_context_windows: 63,
++                ..Default::default()
++            },
++        )
+         .expect("summary");
+ 
+         assert_eq!(
+             summary,
+             ResumeHistoryLoadSummary {
+-                messages: 3,
+-                turns: 2,
+-                app_server_turns: 3,
+-                context_windows: 1,
++                messages: 0,
++                turns: 0,
++                app_server_turns: 1,
++                loaded_context_windows: 1,
++                omitted_context_windows: 63,
+             }
+         );
+     }
+diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+index dbc14e5939..47cd616151 100644
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -218,6 +218,8 @@ impl ThreadParamsMode {
+ pub(crate) struct AppServerStartedThread {
+     pub(crate) session: ThreadSessionState,
+     pub(crate) turns: Vec<Turn>,
++    pub(crate) history_window_metadata:
++        codex_app_server_protocol::ThreadResumeHistoryWindowMetadata,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -1625,6 +1627,7 @@ async fn started_thread_from_start_response(
+     Ok(AppServerStartedThread {
+         session,
+         turns: response.thread.turns,
++        history_window_metadata: Default::default(),
+     })
+ }
+ 
+@@ -1640,6 +1643,7 @@ async fn started_thread_from_resume_response(
+     Ok(AppServerStartedThread {
+         session,
+         turns: response.thread.turns,
++        history_window_metadata: response.history_window_metadata,
+     })
+ }
+ 
+@@ -1655,6 +1659,7 @@ async fn started_thread_from_fork_response(
+     Ok(AppServerStartedThread {
+         session,
+         turns: response.thread.turns,
++        history_window_metadata: Default::default(),
+     })
+ }
+ 
+diff --git a/codex-rs/tui/src/history_cell/separators.rs b/codex-rs/tui/src/history_cell/separators.rs
+index 226c986f50..e75b48cab7 100644
+--- a/codex-rs/tui/src/history_cell/separators.rs
++++ b/codex-rs/tui/src/history_cell/separators.rs
+@@ -58,7 +58,8 @@ pub struct ResumeHistoryLoadedSeparator {
+     messages: u64,
+     turns: u64,
+     app_server_turns: u64,
+-    context_windows: u64,
++    loaded_context_windows: u64,
++    omitted_context_windows: u64,
+ }
+ 
+ impl ResumeHistoryLoadedSeparator {
+@@ -66,13 +67,15 @@ impl ResumeHistoryLoadedSeparator {
+         messages: u64,
+         turns: u64,
+         app_server_turns: u64,
+-        context_windows: u64,
++        loaded_context_windows: u64,
++        omitted_context_windows: u64,
+     ) -> Self {
+         Self {
+             messages,
+             turns,
+             app_server_turns,
+-            context_windows,
++            loaded_context_windows,
++            omitted_context_windows,
+         }
+     }
+ 
+@@ -81,10 +84,21 @@ impl ResumeHistoryLoadedSeparator {
+         let turns = pluralize(self.turns, "turn", "turns");
+         let app_server_turns =
+             pluralize(self.app_server_turns, "app-server turn", "app-server turns");
+-        let context_windows = pluralize(self.context_windows, "context", "contexts");
++        let loaded_context_windows = pluralize(self.loaded_context_windows, "context", "contexts");
++        let context_windows = if self.omitted_context_windows == 0 {
++            format!(
++                "{} {loaded_context_windows} loaded",
++                self.loaded_context_windows
++            )
++        } else {
++            format!(
++                "{} {loaded_context_windows} loaded, {} omitted",
++                self.loaded_context_windows, self.omitted_context_windows
++            )
++        };
+         format!(
+-            "Loaded {} {messages}, {} {turns}, {} {app_server_turns}, {} {context_windows}",
+-            self.messages, self.turns, self.app_server_turns, self.context_windows
++            "Loaded {} {messages}, {} {turns}, {} {app_server_turns}, {context_windows}",
++            self.messages, self.turns, self.app_server_turns
+         )
+     }
+ }
+diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
+index aa7209280a..ce1835de22 100644
+--- a/codex-rs/tui/src/history_cell/tests.rs
++++ b/codex-rs/tui/src/history_cell/tests.rs
+@@ -607,14 +607,18 @@ fn final_message_separator_includes_worked_label_after_one_minute() {
+ 
+ #[test]
+ fn resume_history_loaded_separator_includes_resume_counts() {
+-    let cell = ResumeHistoryLoadedSeparator::new(3, 2, 4, 1);
++    let cell = ResumeHistoryLoadedSeparator::new(3, 2, 4, 1, 63);
+     let rendered = render_lines(&cell.display_lines(/*width*/ 120));
+ 
+     assert_eq!(rendered.len(), 1);
+-    assert!(rendered[0].contains("Loaded 3 messages, 2 turns, 4 app-server turns, 1 context"));
++    assert!(
++        rendered[0].contains(
++            "Loaded 3 messages, 2 turns, 4 app-server turns, 1 context loaded, 63 omitted"
++        )
++    );
+     assert_eq!(
+         render_lines(&cell.raw_lines()),
+-        vec!["Loaded 3 messages, 2 turns, 4 app-server turns, 1 context"]
++        vec!["Loaded 3 messages, 2 turns, 4 app-server turns, 1 context loaded, 63 omitted"]
+     );
+ }
+ 

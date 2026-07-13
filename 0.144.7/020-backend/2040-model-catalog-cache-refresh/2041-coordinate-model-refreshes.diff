@@ -1,0 +1,1131 @@
+diff --git a/codex-rs/models-manager/src/manager.rs b/codex-rs/models-manager/src/manager.rs
+index 3439ceafc5..019c24e432 100644
+--- a/codex-rs/models-manager/src/manager.rs
++++ b/codex-rs/models-manager/src/manager.rs
+@@ -1,3 +1,4 @@
++use super::cache::ModelsCache;
+ use super::cache::ModelsCacheManager;
+ use crate::collaboration_mode_presets::builtin_collaboration_mode_presets;
+ use crate::config::ModelsManagerConfig;
+@@ -18,6 +19,7 @@ use std::pin::Pin;
+ use std::sync::Arc;
+ use std::time::Duration;
+ use tokio::sync::RwLock;
++use tokio::sync::Semaphore;
+ use tokio::sync::TryLockError;
+ use tracing::Instrument as _;
+ use tracing::error;
+@@ -213,11 +215,20 @@ pub type SharedModelsManager = Arc<dyn ModelsManager>;
+ /// OpenAI-compatible model manager backed by bundled models, cache, and `/models`.
+ #[derive(Debug)]
+ pub struct OpenAiModelsManager {
+-    remote_models: RwLock<Vec<ModelInfo>>,
+-    etag: RwLock<Option<String>>,
++    catalog: RwLock<OpenAiModelCatalog>,
+     cache_manager: ModelsCacheManager,
+     endpoint_client: SharedModelsEndpointClient,
+     auth_manager: Option<Arc<AuthManager>>,
++    refresh_gate: Semaphore,
++    cache_io_gate: Semaphore,
++}
++
++#[derive(Debug)]
++struct OpenAiModelCatalog {
++    models: Vec<ModelInfo>,
++    etag: Option<String>,
++    successful_network_revision: u64,
++    successful_network_auth_revision: Option<u64>,
+ }
+ 
+ /// Static model manager backed by an authoritative in-process catalog.
+@@ -238,11 +249,17 @@ impl OpenAiModelsManager {
+         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
+         let remote_models = load_remote_models_from_file().unwrap_or_default();
+         Self {
+-            remote_models: RwLock::new(remote_models),
+-            etag: RwLock::new(None),
++            catalog: RwLock::new(OpenAiModelCatalog {
++                models: remote_models,
++                etag: None,
++                successful_network_revision: 0,
++                successful_network_auth_revision: None,
++            }),
+             cache_manager,
+             endpoint_client,
+             auth_manager,
++            refresh_gate: Semaphore::new(1),
++            cache_io_gate: Semaphore::new(1),
+         }
+     }
+ }
+@@ -271,11 +288,11 @@ impl ModelsManager for OpenAiModelsManager {
+     }
+ 
+     fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {
+-        Box::pin(async move { self.remote_models.read().await.clone() })
++        Box::pin(async move { self.catalog.read().await.models.clone() })
+     }
+ 
+     fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, TryLockError> {
+-        Ok(self.remote_models.try_read()?.clone())
++        Ok(self.catalog.try_read()?.models.clone())
+     }
+ 
+     fn auth_manager(&self) -> Option<&AuthManager> {
+@@ -317,15 +334,51 @@ impl OpenAiModelsManager {
+     }
+ 
+     async fn refresh_if_new_etag(&self, etag: String, http_client_factory: HttpClientFactory) {
+-        let current_etag = self.get_etag().await;
+-        if current_etag.clone().is_some() && current_etag.as_deref() == Some(etag.as_str()) {
+-            if let Err(err) = self.cache_manager.renew_cache_ttl().await {
+-                error!("failed to renew cache TTL: {err}");
++        let _refresh_permit = match self.refresh_gate.acquire().await {
++            Ok(permit) => permit,
++            Err(err) => {
++                error!("failed to acquire models refresh gate: {err}");
++                return;
++            }
++        };
++        let current_auth_revision = self.current_auth_revision();
++        let etag_matches_current_auth = {
++            let catalog = self.catalog.read().await;
++            current_auth_revision.is_some()
++                && catalog.successful_network_revision > 0
++                && catalog.successful_network_auth_revision == current_auth_revision
++                && catalog.etag.as_deref() == Some(etag.as_str())
++        };
++        if etag_matches_current_auth {
++            let renewal = {
++                let _cache_io_permit = match self.cache_io_gate.acquire().await {
++                    Ok(permit) => permit,
++                    Err(err) => {
++                        error!("failed to acquire models cache I/O gate: {err}");
++                        return;
++                    }
++                };
++                if self.current_auth_revision() == current_auth_revision {
++                    Some(self.cache_manager.renew_cache_ttl().await)
++                } else {
++                    None
++                }
++            };
++            if self.current_auth_revision() != current_auth_revision {
++                info!("models cache: auth changed before TTL renewal completed");
++            } else if let Some(renewal) = renewal {
++                if let Err(err) = renewal {
++                    error!("failed to renew cache TTL: {err}");
++                }
++                return;
+             }
++        }
++        if !self.should_refresh_models().await {
+             return;
+         }
++        let flight_auth_revision = self.current_auth_revision();
+         if let Err(err) = self
+-            .refresh_available_models(RefreshStrategy::Online, &http_client_factory)
++            .fetch_and_update_models_locked(&http_client_factory, flight_auth_revision)
+             .await
+         {
+             error!("failed to refresh available models: {err}");
+@@ -355,35 +408,76 @@ impl OpenAiModelsManager {
+                 Ok(())
+             }
+             RefreshStrategy::OnlineIfUncached => {
++                let observed_revision = self.successful_network_revision().await;
+                 // Try cache first, fall back to online if unavailable
+-                if self.try_load_cache().await {
++                if self.try_load_cache_at_revision(observed_revision).await {
+                     info!("models cache: using cached models for OnlineIfUncached");
+                     return Ok(());
+                 }
+                 info!("models cache: cache miss, fetching remote models");
+-                self.fetch_and_update_models(http_client_factory).await
++                self.fetch_and_update_models_if_unchanged(observed_revision, http_client_factory)
++                    .await
+             }
+             RefreshStrategy::Online => {
+                 // Always fetch from network
+-                self.fetch_and_update_models(http_client_factory).await
++                let observed_revision = self.successful_network_revision().await;
++                self.fetch_and_update_models_if_unchanged(observed_revision, http_client_factory)
++                    .await
+             }
+         }
+     }
+ 
+-    async fn fetch_and_update_models(
++    async fn fetch_and_update_models_if_unchanged(
+         &self,
++        observed_revision: u64,
+         http_client_factory: &HttpClientFactory,
++    ) -> CoreResult<()> {
++        let _refresh_permit = self.refresh_gate.acquire().await.map_err(|err| {
++            codex_protocol::error::CodexErr::Fatal(format!(
++                "failed to acquire models refresh gate: {err}"
++            ))
++        })?;
++        let current_auth_revision = self.current_auth_revision();
++        if self
++            .can_reuse_completed_refresh(observed_revision, current_auth_revision)
++            .await
++        {
++            return Ok(());
++        }
++        if !self.should_refresh_models().await {
++            return Ok(());
++        }
++        let flight_auth_revision = self.current_auth_revision();
++        self.fetch_and_update_models_locked(http_client_factory, flight_auth_revision)
++            .await
++    }
++
++    async fn fetch_and_update_models_locked(
++        &self,
++        http_client_factory: &HttpClientFactory,
++        flight_auth_revision: Option<u64>,
+     ) -> CoreResult<()> {
+         let client_version = crate::client_version_to_whole();
+         let (models, etag) = self
+             .endpoint_client
+             .list_models(&client_version, http_client_factory.clone())
+             .await?;
+-        self.apply_remote_models(models.clone()).await;
+-        *self.etag.write().await = etag.clone();
+-        self.cache_manager
+-            .persist_cache(&models, etag, client_version)
+-            .await;
++        let merged_models = self.merge_remote_models(models.clone());
++        {
++            let _cache_io_permit = self.cache_io_gate.acquire().await.map_err(|err| {
++                codex_protocol::error::CodexErr::Fatal(format!(
++                    "failed to acquire models cache I/O gate: {err}"
++                ))
++            })?;
++            self.cache_manager
++                .persist_cache(&models, etag.clone(), client_version)
++                .await;
++        }
++        let mut catalog = self.catalog.write().await;
++        catalog.models = merged_models;
++        catalog.etag = etag;
++        catalog.successful_network_revision = catalog.successful_network_revision.saturating_add(1);
++        catalog.successful_network_auth_revision = flight_auth_revision;
+         Ok(())
+     }
+ 
+@@ -391,12 +485,30 @@ impl OpenAiModelsManager {
+         self.endpoint_client.uses_codex_backend().await || self.endpoint_client.has_command_auth()
+     }
+ 
+-    async fn get_etag(&self) -> Option<String> {
+-        self.etag.read().await.clone()
++    fn current_auth_revision(&self) -> Option<u64> {
++        self.auth_manager.as_ref().map(|auth_manager| {
++            let receiver = auth_manager.auth_change_receiver();
++            *receiver.borrow()
++        })
++    }
++
++    async fn successful_network_revision(&self) -> u64 {
++        self.catalog.read().await.successful_network_revision
+     }
+ 
+-    /// Replace the cached remote models and rebuild the derived presets list.
+-    async fn apply_remote_models(&self, models: Vec<ModelInfo>) {
++    async fn can_reuse_completed_refresh(
++        &self,
++        observed_revision: u64,
++        current_auth_revision: Option<u64>,
++    ) -> bool {
++        let catalog = self.catalog.read().await;
++        current_auth_revision.is_some()
++            && catalog.successful_network_revision != observed_revision
++            && catalog.successful_network_auth_revision == current_auth_revision
++    }
++
++    /// Merge remote models with the bundled catalog according to the active auth mode.
++    fn merge_remote_models(&self, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+         // Use the remote models list as the source of truth if it contains at least one
+         // non-hidden model and the user is using ChatGPT auth.
+         let should_use_remote_models_only = !models.is_empty()
+@@ -409,8 +521,7 @@ impl OpenAiModelsManager {
+                     .is_some_and(AuthMode::has_chatgpt_account)
+             });
+         if should_use_remote_models_only {
+-            *self.remote_models.write().await = models;
+-            return;
++            return models;
+         }
+ 
+         let mut existing_models = load_remote_models_from_file().unwrap_or_default();
+@@ -424,34 +535,70 @@ impl OpenAiModelsManager {
+                 existing_models.push(model);
+             }
+         }
+-        *self.remote_models.write().await = existing_models;
++        existing_models
+     }
+ 
+     /// Attempt to satisfy the refresh from the cache when it matches the provider and TTL.
+     async fn try_load_cache(&self) -> bool {
++        let observed_revision = self.successful_network_revision().await;
++        self.try_load_cache_at_revision(observed_revision).await
++    }
++
++    async fn try_load_cache_at_revision(&self, observed_revision: u64) -> bool {
+         let _timer =
+             codex_otel::start_global_timer("codex.remote_models.load_cache.duration_ms", &[]);
+         let client_version = crate::client_version_to_whole();
+         info!(client_version, "models cache: evaluating cache eligibility");
+         // TODO(celia-oai): Include provider identity in cache eligibility so switching
+         // providers does not reuse a fresh models_cache.json entry from another provider.
+-        let cache = match self.cache_manager.load_fresh(&client_version).await {
++        let loaded_cache = {
++            let _cache_io_permit = match self.cache_io_gate.acquire().await {
++                Ok(permit) => permit,
++                Err(err) => {
++                    error!("failed to acquire models cache I/O gate: {err}");
++                    return false;
++                }
++            };
++            self.cache_manager.load_fresh(&client_version).await
++        };
++        let cache = match loaded_cache {
+             Some(cache) => cache,
+             None => {
+                 info!("models cache: no usable cache entry");
+                 return false;
+             }
+         };
+-        let models = cache.models.clone();
+-        *self.etag.write().await = cache.etag.clone();
+-        self.apply_remote_models(models.clone()).await;
++        let models_count = cache.models.len();
++        let etag = cache.etag.clone();
++        if !self
++            .apply_cached_models_if_revision_matches(observed_revision, cache)
++            .await
++        {
++            info!("models cache: newer network catalog kept instead of cached models");
++            return true;
++        }
+         info!(
+-            models_count = models.len(),
+-            etag = ?cache.etag,
++            models_count,
++            etag = ?etag,
+             "models cache: cache entry applied"
+         );
+         true
+     }
++
++    async fn apply_cached_models_if_revision_matches(
++        &self,
++        observed_revision: u64,
++        cache: ModelsCache,
++    ) -> bool {
++        let merged_models = self.merge_remote_models(cache.models);
++        let mut catalog = self.catalog.write().await;
++        if catalog.successful_network_revision != observed_revision {
++            return false;
++        }
++        catalog.models = merged_models;
++        catalog.etag = cache.etag;
++        true
++    }
+ }
+ 
+ impl ModelsManager for StaticModelsManager {
+diff --git a/codex-rs/models-manager/src/manager_tests.rs b/codex-rs/models-manager/src/manager_tests.rs
+index a590fc097b..54f38abb94 100644
+--- a/codex-rs/models-manager/src/manager_tests.rs
++++ b/codex-rs/models-manager/src/manager_tests.rs
+@@ -18,6 +18,7 @@ use std::collections::VecDeque;
+ use std::path::Path;
+ use std::sync::Arc;
+ use std::sync::Mutex;
++use std::sync::atomic::AtomicBool;
+ use std::sync::atomic::AtomicUsize;
+ use std::sync::atomic::Ordering;
+ use tempfile::tempdir;
+@@ -27,6 +28,7 @@ mod model_info_overrides_tests;
+ 
+ const DEFAULT_HTTP_CLIENT_FACTORY: HttpClientFactory =
+     HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
++const ASYNC_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+ 
+ fn remote_model(slug: &str, display: &str, priority: i32) -> ModelInfo {
+     remote_model_with_visibility(slug, display, priority, "list")
+@@ -184,6 +186,168 @@ impl ModelsEndpointClient for TestModelsEndpoint {
+     }
+ }
+ 
++#[derive(Debug)]
++enum ControlledModelsResponse {
++    Success(Vec<ModelInfo>, Option<String>),
++    Error(&'static str),
++}
++
++#[derive(Debug)]
++struct ControlledModelsFetch {
++    release: Option<Arc<tokio::sync::Semaphore>>,
++    response: ControlledModelsResponse,
++}
++
++impl ControlledModelsFetch {
++    fn success(models: Vec<ModelInfo>, etag: &str) -> Self {
++        Self {
++            release: None,
++            response: ControlledModelsResponse::Success(models, Some(etag.to_string())),
++        }
++    }
++
++    fn blocked_success(
++        models: Vec<ModelInfo>,
++        etag: &str,
++        release: Arc<tokio::sync::Semaphore>,
++    ) -> Self {
++        Self {
++            release: Some(release),
++            response: ControlledModelsResponse::Success(models, Some(etag.to_string())),
++        }
++    }
++
++    fn blocked_error(message: &'static str, release: Arc<tokio::sync::Semaphore>) -> Self {
++        Self {
++            release: Some(release),
++            response: ControlledModelsResponse::Error(message),
++        }
++    }
++}
++
++#[derive(Debug)]
++struct ControlledModelsEndpoint {
++    fetches: Mutex<VecDeque<ControlledModelsFetch>>,
++    fetch_count: AtomicUsize,
++    uses_codex_backend: AtomicBool,
++    started_tx: tokio::sync::mpsc::UnboundedSender<usize>,
++    observed_proxy_policies: Mutex<Vec<OutboundProxyPolicy>>,
++}
++
++impl ControlledModelsEndpoint {
++    fn new(
++        fetches: Vec<ControlledModelsFetch>,
++    ) -> (Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<usize>) {
++        let (started_tx, started_rx) = tokio::sync::mpsc::unbounded_channel();
++        (
++            Arc::new(Self {
++                fetches: Mutex::new(fetches.into()),
++                fetch_count: AtomicUsize::new(0),
++                uses_codex_backend: AtomicBool::new(true),
++                started_tx,
++                observed_proxy_policies: Mutex::new(Vec::new()),
++            }),
++            started_rx,
++        )
++    }
++
++    fn fetch_count(&self) -> usize {
++        self.fetch_count.load(Ordering::SeqCst)
++    }
++
++    fn set_uses_codex_backend(&self, uses_codex_backend: bool) {
++        self.uses_codex_backend
++            .store(uses_codex_backend, Ordering::SeqCst);
++    }
++
++    fn observed_proxy_policies(&self) -> Vec<OutboundProxyPolicy> {
++        self.observed_proxy_policies
++            .lock()
++            .expect("observed proxy policies lock should not be poisoned")
++            .clone()
++    }
++
++    async fn list_models(&self) -> CoreResult<(Vec<ModelInfo>, Option<String>)> {
++        let attempt = self.fetch_count.fetch_add(1, Ordering::SeqCst) + 1;
++        let fetch = self
++            .fetches
++            .lock()
++            .expect("controlled fetches lock should not be poisoned")
++            .pop_front()
++            .expect("unexpected model fetch");
++        self.started_tx
++            .send(attempt)
++            .expect("test should keep the fetch-start receiver open");
++
++        if let Some(release) = fetch.release {
++            let permit = release
++                .acquire_owned()
++                .await
++                .expect("test should keep the release semaphore open");
++            permit.forget();
++        }
++
++        match fetch.response {
++            ControlledModelsResponse::Success(models, etag) => Ok((models, etag)),
++            ControlledModelsResponse::Error(message) => {
++                Err(codex_protocol::error::CodexErr::Fatal(message.to_string()))
++            }
++        }
++    }
++}
++
++impl ModelsEndpointClient for ControlledModelsEndpoint {
++    fn has_command_auth(&self) -> bool {
++        false
++    }
++
++    fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool> {
++        Box::pin(async { self.uses_codex_backend.load(Ordering::SeqCst) })
++    }
++
++    fn list_models<'a>(
++        &'a self,
++        _client_version: &'a str,
++        http_client_factory: HttpClientFactory,
++    ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
++        Box::pin(async move {
++            self.observed_proxy_policies
++                .lock()
++                .expect("observed proxy policies lock should not be poisoned")
++                .push(http_client_factory.outbound_proxy_policy());
++            ControlledModelsEndpoint::list_models(self).await
++        })
++    }
++}
++
++async fn expect_pending_after_one_poll<F>(future: std::pin::Pin<&mut F>)
++where
++    F: std::future::Future,
++{
++    tokio::select! {
++        biased;
++        _ = future => panic!("future unexpectedly completed on its first poll"),
++        () = async {} => {}
++    }
++}
++
++async fn expect_fetch_started(
++    started_rx: &mut tokio::sync::mpsc::UnboundedReceiver<usize>,
++    expected_attempt: usize,
++) {
++    let attempt = tokio::time::timeout(ASYNC_TEST_TIMEOUT, started_rx.recv())
++        .await
++        .expect("timed out waiting for model fetch to start");
++    assert_eq!(attempt, Some(expected_attempt));
++}
++
++fn assert_no_fetch_started(started_rx: &mut tokio::sync::mpsc::UnboundedReceiver<usize>) {
++    assert!(matches!(
++        started_rx.try_recv(),
++        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
++    ));
++}
++
+ fn openai_manager_for_tests(
+     codex_home: std::path::PathBuf,
+     endpoint_client: Arc<dyn ModelsEndpointClient>,
+@@ -492,6 +656,569 @@ async fn refresh_available_models_sorts_by_priority() {
+     assert_eq!(endpoint.fetch_count(), 1, "expected a single model fetch");
+ }
+ 
++#[tokio::test]
++async fn concurrent_online_refreshes_share_successful_request() {
++    let remote_models = vec![remote_model("singleflight-success", "Singleflight", 0)];
++    let release = Arc::new(tokio::sync::Semaphore::new(0));
++    let (endpoint, mut started_rx) =
++        ControlledModelsEndpoint::new(vec![ControlledModelsFetch::blocked_success(
++            remote_models.clone(),
++            "singleflight-etag",
++            Arc::clone(&release),
++        )]);
++    let codex_home = tempdir().expect("temp dir");
++    let manager = Arc::new(openai_manager_for_tests(
++        codex_home.path().to_path_buf(),
++        endpoint.clone(),
++    ));
++    let first_factory = HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy);
++
++    let mut first =
++        Box::pin(manager.refresh_available_models(RefreshStrategy::Online, &first_factory));
++    expect_pending_after_one_poll(first.as_mut()).await;
++    expect_fetch_started(&mut started_rx, 1).await;
++
++    let mut second = Box::pin(
++        manager.refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY),
++    );
++    expect_pending_after_one_poll(second.as_mut()).await;
++
++    release.add_permits(1);
++    let (first_result, second_result) =
++        tokio::time::timeout(
++            ASYNC_TEST_TIMEOUT,
++            async move { tokio::join!(first, second) },
++        )
++        .await
++        .expect("timed out waiting for concurrent refreshes");
++    first_result.expect("first refresh succeeds");
++    second_result.expect("concurrent refresh joins the successful request");
++
++    let catalog = manager.catalog.read().await;
++    assert_eq!(catalog.models, remote_models);
++    assert_eq!(catalog.etag.as_deref(), Some("singleflight-etag"));
++    assert_eq!(catalog.successful_network_revision, 1);
++    assert_eq!(endpoint.fetch_count(), 1);
++    assert_eq!(
++        endpoint.observed_proxy_policies(),
++        vec![OutboundProxyPolicy::RespectSystemProxy],
++        "the waiter factory must not start another network flight"
++    );
++}
++
++#[tokio::test]
++async fn online_waiter_refetches_after_auth_revision_changes_during_leader_flight() {
++    let models_a = vec![remote_model("auth-a", "Auth A", 0)];
++    let models_b = vec![remote_model("auth-b", "Auth B", 0)];
++    let release = Arc::new(tokio::sync::Semaphore::new(0));
++    let (endpoint, mut started_rx) = ControlledModelsEndpoint::new(vec![
++        ControlledModelsFetch::blocked_success(
++            models_a.clone(),
++            "auth-a-etag",
++            Arc::clone(&release),
++        ),
++        ControlledModelsFetch::success(models_b.clone(), "auth-b-etag"),
++    ]);
++    let auth_manager =
++        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
++    let codex_home = tempdir().expect("temp dir");
++    let manager = Arc::new(openai_manager_for_tests_with_auth(
++        codex_home.path().to_path_buf(),
++        endpoint.clone(),
++        Some(Arc::clone(&auth_manager)),
++    ));
++    let auth_revision_a = manager.current_auth_revision();
++
++    let mut leader = Box::pin(
++        manager.refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY),
++    );
++    expect_pending_after_one_poll(leader.as_mut()).await;
++    expect_fetch_started(&mut started_rx, 1).await;
++
++    auth_manager
++        .set_external_auth(Arc::new(TestExternalApiKeyAuth))
++        .await
++        .expect("external API key auth should resolve");
++    let auth_revision_b = manager.current_auth_revision();
++    assert_ne!(auth_revision_a, auth_revision_b);
++
++    let mut waiter = Box::pin(
++        manager.refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY),
++    );
++    expect_pending_after_one_poll(waiter.as_mut()).await;
++    assert_eq!(endpoint.fetch_count(), 1);
++    assert_no_fetch_started(&mut started_rx);
++
++    release.add_permits(1);
++    let (leader_result, waiter_result) =
++        tokio::time::timeout(
++            ASYNC_TEST_TIMEOUT,
++            async move { tokio::join!(leader, waiter) },
++        )
++        .await
++        .expect("timed out waiting for auth-scoped model refreshes");
++    leader_result.expect("auth A refresh succeeds");
++    waiter_result.expect("auth B waiter refetches");
++    expect_fetch_started(&mut started_rx, 2).await;
++
++    let catalog = manager.catalog.read().await;
++    assert_models_contain(&catalog.models, &models_b);
++    assert!(!catalog.models.iter().any(|model| model.slug == "auth-a"));
++    assert_eq!(catalog.etag.as_deref(), Some("auth-b-etag"));
++    assert_eq!(catalog.successful_network_revision, 2);
++    assert_eq!(catalog.successful_network_auth_revision, auth_revision_b);
++    assert_eq!(endpoint.fetch_count(), 2);
++}
++
++#[tokio::test]
++async fn completed_refresh_without_auth_revision_is_not_reusable() {
++    let codex_home = tempdir().expect("temp dir");
++    let manager = openai_manager_for_tests_with_auth(
++        codex_home.path().to_path_buf(),
++        TestModelsEndpoint::without_refresh(Vec::new()),
++        None,
++    );
++    manager.catalog.write().await.successful_network_revision = 1;
++
++    assert!(!manager.can_reuse_completed_refresh(0, None).await);
++}
++
++#[tokio::test]
++async fn online_if_uncached_cache_hit_does_not_wait_for_inflight_online_refresh() {
++    let cached_models = vec![remote_model("cache-hit", "Cache Hit", 0)];
++    let release = Arc::new(tokio::sync::Semaphore::new(0));
++    let (endpoint, mut started_rx) = ControlledModelsEndpoint::new(vec![
++        ControlledModelsFetch::success(cached_models.clone(), "cached-etag"),
++        ControlledModelsFetch::blocked_success(
++            vec![remote_model(
++                "blocked-online-refresh",
++                "Blocked Online Refresh",
++                /*priority*/ 0,
++            )],
++            "blocked-etag",
++            Arc::clone(&release),
++        ),
++    ]);
++    let codex_home = tempdir().expect("temp dir");
++    let manager = Arc::new(openai_manager_for_tests(
++        codex_home.path().to_path_buf(),
++        endpoint.clone(),
++    ));
++
++    tokio::time::timeout(
++        ASYNC_TEST_TIMEOUT,
++        manager.refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY),
++    )
++    .await
++    .expect("timed out priming the models cache")
++    .expect("cache priming refresh succeeds");
++    expect_fetch_started(&mut started_rx, 1).await;
++
++    let mut blocked_online = Box::pin(
++        manager.refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY),
++    );
++    expect_pending_after_one_poll(blocked_online.as_mut()).await;
++    expect_fetch_started(&mut started_rx, 2).await;
++
++    let cache_io_permit =
++        match tokio::time::timeout(ASYNC_TEST_TIMEOUT, manager.cache_io_gate.acquire())
++            .await
++            .expect("timed out acquiring the models cache I/O gate")
++        {
++            Ok(permit) => permit,
++            Err(err) => panic!("models cache I/O gate unexpectedly closed: {err}"),
++        };
++    let mut cache_hit = Box::pin(manager.refresh_available_models(
++        RefreshStrategy::OnlineIfUncached,
++        &DEFAULT_HTTP_CLIENT_FACTORY,
++    ));
++    expect_pending_after_one_poll(cache_hit.as_mut()).await;
++    assert_eq!(endpoint.fetch_count(), 2);
++    drop(cache_io_permit);
++
++    tokio::time::timeout(ASYNC_TEST_TIMEOUT, cache_hit)
++        .await
++        .expect("cache hit should not wait for the in-flight network request")
++        .expect("cache refresh succeeds");
++
++    assert_eq!(endpoint.fetch_count(), 2);
++    assert_no_fetch_started(&mut started_rx);
++    drop(blocked_online);
++
++    let catalog = manager.catalog.read().await;
++    assert_eq!(catalog.models, cached_models);
++    assert_eq!(catalog.etag.as_deref(), Some("cached-etag"));
++    assert_eq!(catalog.successful_network_revision, 1);
++}
++
++#[tokio::test]
++async fn online_if_uncached_cache_miss_joins_inflight_online_refresh() {
++    let remote_models = vec![remote_model("cache-miss", "Cache Miss", 0)];
++    let release = Arc::new(tokio::sync::Semaphore::new(0));
++    let (endpoint, mut started_rx) =
++        ControlledModelsEndpoint::new(vec![ControlledModelsFetch::blocked_success(
++            remote_models.clone(),
++            "cache-miss-etag",
++            Arc::clone(&release),
++        )]);
++    let codex_home = tempdir().expect("temp dir");
++    let manager = Arc::new(openai_manager_for_tests(
++        codex_home.path().to_path_buf(),
++        endpoint.clone(),
++    ));
++    let cache_io_permit = match manager.cache_io_gate.acquire().await {
++        Ok(permit) => permit,
++        Err(err) => panic!("models cache I/O gate unexpectedly closed: {err}"),
++    };
++
++    let mut online = Box::pin(
++        manager.refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY),
++    );
++    expect_pending_after_one_poll(online.as_mut()).await;
++    expect_fetch_started(&mut started_rx, 1).await;
++
++    let mut cache_miss = Box::pin(manager.refresh_available_models(
++        RefreshStrategy::OnlineIfUncached,
++        &DEFAULT_HTTP_CLIENT_FACTORY,
++    ));
++    expect_pending_after_one_poll(cache_miss.as_mut()).await;
++    drop(cache_io_permit);
++
++    let cache_io_barrier = tokio::time::timeout(ASYNC_TEST_TIMEOUT, async {
++        tokio::select! {
++            biased;
++            result = &mut cache_miss => {
++                panic!("cache-miss waiter completed before the in-flight refresh: {result:?}")
++            },
++            permit = manager.cache_io_gate.acquire() => match permit {
++                Ok(permit) => permit,
++                Err(err) => panic!("models cache I/O gate unexpectedly closed: {err}"),
++            },
++        }
++    })
++    .await
++    .expect("timed out waiting for the cache-miss waiter to pass the cache I/O gate");
++    drop(cache_io_barrier);
++    assert_eq!(endpoint.fetch_count(), 1);
++    assert_no_fetch_started(&mut started_rx);
++
++    release.add_permits(1);
++    let (online_result, cache_miss_result) = tokio::time::timeout(ASYNC_TEST_TIMEOUT, async move {
++        tokio::join!(online, cache_miss)
++    })
++    .await
++    .expect("timed out waiting for the in-flight and cache-miss refreshes");
++    online_result.expect("in-flight refresh succeeds");
++    cache_miss_result.expect("cache-miss waiter joins the in-flight refresh");
++
++    let catalog = manager.catalog.read().await;
++    assert_eq!(catalog.models, remote_models);
++    assert_eq!(catalog.etag.as_deref(), Some("cache-miss-etag"));
++    assert_eq!(catalog.successful_network_revision, 1);
++    assert_eq!(endpoint.fetch_count(), 1);
++}
++
++#[tokio::test]
++async fn online_waiter_retries_after_leader_error() {
++    let recovered_models = vec![remote_model("error-retry", "Error Retry", 0)];
++    let release = Arc::new(tokio::sync::Semaphore::new(0));
++    let (endpoint, mut started_rx) = ControlledModelsEndpoint::new(vec![
++        ControlledModelsFetch::blocked_error("first fetch failed", Arc::clone(&release)),
++        ControlledModelsFetch::success(recovered_models.clone(), "recovered-etag"),
++    ]);
++    let codex_home = tempdir().expect("temp dir");
++    let manager = Arc::new(openai_manager_for_tests(
++        codex_home.path().to_path_buf(),
++        endpoint.clone(),
++    ));
++    let leader_factory = HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy);
++
++    let mut first =
++        Box::pin(manager.refresh_available_models(RefreshStrategy::Online, &leader_factory));
++    expect_pending_after_one_poll(first.as_mut()).await;
++    expect_fetch_started(&mut started_rx, 1).await;
++
++    let mut second = Box::pin(
++        manager.refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY),
++    );
++    expect_pending_after_one_poll(second.as_mut()).await;
++
++    release.add_permits(1);
++    let (first_result, second_result) =
++        tokio::time::timeout(
++            ASYNC_TEST_TIMEOUT,
++            async move { tokio::join!(first, second) },
++        )
++        .await
++        .expect("timed out waiting for the failed leader and retrying waiter");
++    assert!(first_result.is_err(), "the leader error should be returned");
++    second_result.expect("the waiter retries after the leader error");
++
++    let catalog = manager.catalog.read().await;
++    assert_eq!(catalog.models, recovered_models);
++    assert_eq!(catalog.etag.as_deref(), Some("recovered-etag"));
++    assert_eq!(catalog.successful_network_revision, 1);
++    assert_eq!(endpoint.fetch_count(), 2);
++    assert_eq!(
++        endpoint.observed_proxy_policies(),
++        vec![
++            OutboundProxyPolicy::RespectSystemProxy,
++            OutboundProxyPolicy::ReqwestDefault,
++        ]
++    );
++}
++
++#[tokio::test]
++async fn online_waiter_retries_after_leader_is_dropped() {
++    let recovered_models = vec![remote_model("drop-retry", "Drop Retry", 0)];
++    let blocked_release = Arc::new(tokio::sync::Semaphore::new(0));
++    let (endpoint, mut started_rx) = ControlledModelsEndpoint::new(vec![
++        ControlledModelsFetch::blocked_success(
++            vec![remote_model(
++                "singleflight-cancelled",
++                "Singleflight Cancelled",
++                /*priority*/ 0,
++            )],
++            "cancelled-etag",
++            Arc::clone(&blocked_release),
++        ),
++        ControlledModelsFetch::success(recovered_models.clone(), "after-drop-etag"),
++    ]);
++    let codex_home = tempdir().expect("temp dir");
++    let manager = Arc::new(openai_manager_for_tests(
++        codex_home.path().to_path_buf(),
++        endpoint.clone(),
++    ));
++    let leader_factory = HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy);
++
++    let mut leader =
++        Box::pin(manager.refresh_available_models(RefreshStrategy::Online, &leader_factory));
++    expect_pending_after_one_poll(leader.as_mut()).await;
++    expect_fetch_started(&mut started_rx, 1).await;
++
++    let mut waiter = Box::pin(
++        manager.refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY),
++    );
++    expect_pending_after_one_poll(waiter.as_mut()).await;
++
++    drop(leader);
++    tokio::time::timeout(ASYNC_TEST_TIMEOUT, waiter)
++        .await
++        .expect("timed out waiting for the waiter after dropping its leader")
++        .expect("the waiter retries after the leader future is dropped");
++
++    let catalog = manager.catalog.read().await;
++    assert_eq!(catalog.models, recovered_models);
++    assert_eq!(catalog.etag.as_deref(), Some("after-drop-etag"));
++    assert_eq!(catalog.successful_network_revision, 1);
++    assert_eq!(endpoint.fetch_count(), 2);
++    assert_eq!(
++        endpoint.observed_proxy_policies(),
++        vec![
++            OutboundProxyPolicy::RespectSystemProxy,
++            OutboundProxyPolicy::ReqwestDefault,
++        ]
++    );
++}
++
++#[tokio::test]
++async fn online_waiter_skips_retry_when_eligibility_is_lost_after_leader_drop() {
++    let blocked_release = Arc::new(tokio::sync::Semaphore::new(0));
++    let (endpoint, mut started_rx) =
++        ControlledModelsEndpoint::new(vec![ControlledModelsFetch::blocked_success(
++            vec![remote_model(
++                "singleflight-lost-eligibility",
++                "Singleflight Lost Eligibility",
++                /*priority*/ 0,
++            )],
++            "lost-eligibility-etag",
++            Arc::clone(&blocked_release),
++        )]);
++    let codex_home = tempdir().expect("temp dir");
++    let manager = Arc::new(openai_manager_for_tests(
++        codex_home.path().to_path_buf(),
++        endpoint.clone(),
++    ));
++    let initial_models = manager.get_remote_models().await;
++
++    let mut leader = Box::pin(
++        manager.refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY),
++    );
++    expect_pending_after_one_poll(leader.as_mut()).await;
++    expect_fetch_started(&mut started_rx, 1).await;
++
++    let mut waiter = Box::pin(
++        manager.refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY),
++    );
++    expect_pending_after_one_poll(waiter.as_mut()).await;
++
++    endpoint.set_uses_codex_backend(false);
++    drop(leader);
++    tokio::time::timeout(ASYNC_TEST_TIMEOUT, waiter)
++        .await
++        .expect("timed out waiting for the ineligible waiter")
++        .expect("the waiter should stop when endpoint eligibility is lost");
++
++    let catalog = manager.catalog.read().await;
++    assert_eq!(catalog.models, initial_models);
++    assert_eq!(catalog.etag, None);
++    assert_eq!(catalog.successful_network_revision, 0);
++    assert_eq!(endpoint.fetch_count(), 1);
++}
++
++#[tokio::test]
++async fn etag_refresh_rechecks_after_inflight_refresh() {
++    let initial_models = vec![remote_model(
++        "etag-inflight-old",
++        "ETag Inflight Old",
++        /*priority*/ 0,
++    )];
++    let refreshed_models = vec![remote_model(
++        "etag-inflight-new",
++        "ETag Inflight New",
++        /*priority*/ 0,
++    )];
++    let release = Arc::new(tokio::sync::Semaphore::new(0));
++    let (endpoint, mut started_rx) = ControlledModelsEndpoint::new(vec![
++        ControlledModelsFetch::blocked_success(initial_models, "old-etag", Arc::clone(&release)),
++        ControlledModelsFetch::success(refreshed_models.clone(), "new-etag"),
++    ]);
++    let codex_home = tempdir().expect("temp dir");
++    let manager = Arc::new(openai_manager_for_tests(
++        codex_home.path().to_path_buf(),
++        endpoint.clone(),
++    ));
++
++    let mut online = Box::pin(
++        manager.refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY),
++    );
++    expect_pending_after_one_poll(online.as_mut()).await;
++    expect_fetch_started(&mut started_rx, 1).await;
++
++    let mut etag_refresh =
++        Box::pin(manager.refresh_if_new_etag("new-etag".to_string(), DEFAULT_HTTP_CLIENT_FACTORY));
++    expect_pending_after_one_poll(etag_refresh.as_mut()).await;
++    assert_eq!(endpoint.fetch_count(), 1);
++    assert_no_fetch_started(&mut started_rx);
++
++    release.add_permits(1);
++    let (online_result, ()) = tokio::time::timeout(ASYNC_TEST_TIMEOUT, async move {
++        tokio::join!(online, etag_refresh)
++    })
++    .await
++    .expect("timed out waiting for the in-flight and ETag refreshes");
++    online_result.expect("in-flight refresh succeeds");
++
++    let catalog = manager.catalog.read().await;
++    assert_eq!(catalog.models, refreshed_models);
++    assert_eq!(catalog.etag.as_deref(), Some("new-etag"));
++    assert_eq!(catalog.successful_network_revision, 2);
++    assert_eq!(endpoint.fetch_count(), 2);
++}
++
++#[tokio::test]
++async fn etag_refresh_joins_inflight_refresh_that_returns_requested_etag() {
++    let remote_models = vec![remote_model("etag-match", "ETag Match", 0)];
++    let release = Arc::new(tokio::sync::Semaphore::new(0));
++    let (endpoint, mut started_rx) =
++        ControlledModelsEndpoint::new(vec![ControlledModelsFetch::blocked_success(
++            remote_models.clone(),
++            "requested-etag",
++            Arc::clone(&release),
++        )]);
++    let codex_home = tempdir().expect("temp dir");
++    let manager = Arc::new(openai_manager_for_tests(
++        codex_home.path().to_path_buf(),
++        endpoint.clone(),
++    ));
++
++    let mut online = Box::pin(
++        manager.refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY),
++    );
++    expect_pending_after_one_poll(online.as_mut()).await;
++    expect_fetch_started(&mut started_rx, 1).await;
++
++    let mut etag_refresh = Box::pin(
++        manager.refresh_if_new_etag("requested-etag".to_string(), DEFAULT_HTTP_CLIENT_FACTORY),
++    );
++    expect_pending_after_one_poll(etag_refresh.as_mut()).await;
++    assert_eq!(endpoint.fetch_count(), 1);
++    assert_no_fetch_started(&mut started_rx);
++
++    release.add_permits(1);
++    let (online_result, ()) = tokio::time::timeout(ASYNC_TEST_TIMEOUT, async move {
++        tokio::join!(online, etag_refresh)
++    })
++    .await
++    .expect("timed out waiting for the in-flight and matching ETag refreshes");
++    online_result.expect("in-flight refresh succeeds");
++
++    let catalog = manager.catalog.read().await;
++    assert_eq!(catalog.models, remote_models);
++    assert_eq!(catalog.etag.as_deref(), Some("requested-etag"));
++    assert_eq!(catalog.successful_network_revision, 1);
++    assert_eq!(endpoint.fetch_count(), 1);
++}
++
++#[tokio::test]
++async fn etag_refresh_refetches_after_auth_changes_while_waiting_for_cache_io() {
++    let models_a = vec![remote_model("etag-auth-a", "ETag Auth A", 0)];
++    let models_b = vec![remote_model("etag-auth-b", "ETag Auth B", 0)];
++    let (endpoint, mut started_rx) = ControlledModelsEndpoint::new(vec![
++        ControlledModelsFetch::success(models_a, "etag-auth-a"),
++        ControlledModelsFetch::success(models_b.clone(), "etag-auth-b"),
++    ]);
++    let auth_manager =
++        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
++    let codex_home = tempdir().expect("temp dir");
++    let manager = openai_manager_for_tests_with_auth(
++        codex_home.path().to_path_buf(),
++        endpoint.clone(),
++        Some(Arc::clone(&auth_manager)),
++    );
++
++    manager
++        .refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY)
++        .await
++        .expect("auth A refresh succeeds");
++    expect_fetch_started(&mut started_rx, 1).await;
++    let auth_revision_a = manager.current_auth_revision();
++
++    let cache_io_permit = manager
++        .cache_io_gate
++        .acquire()
++        .await
++        .expect("models cache I/O gate should remain open");
++    let mut etag_refresh = Box::pin(
++        manager.refresh_if_new_etag("etag-auth-a".to_string(), DEFAULT_HTTP_CLIENT_FACTORY),
++    );
++    expect_pending_after_one_poll(etag_refresh.as_mut()).await;
++    assert!(
++        manager.refresh_gate.try_acquire().is_err(),
++        "ETag refresh should hold the refresh gate while waiting for cache I/O"
++    );
++
++    auth_manager
++        .set_external_auth(Arc::new(TestExternalApiKeyAuth))
++        .await
++        .expect("external API key auth should resolve");
++    let auth_revision_b = manager.current_auth_revision();
++    assert_ne!(auth_revision_a, auth_revision_b);
++    drop(cache_io_permit);
++
++    tokio::time::timeout(ASYNC_TEST_TIMEOUT, etag_refresh)
++        .await
++        .expect("timed out waiting for auth B ETag refresh");
++    expect_fetch_started(&mut started_rx, 2).await;
++
++    let catalog = manager.catalog.read().await;
++    assert_models_contain(&catalog.models, &models_b);
++    assert_eq!(catalog.etag.as_deref(), Some("etag-auth-b"));
++    assert_eq!(catalog.successful_network_revision, 2);
++    assert_eq!(catalog.successful_network_auth_revision, auth_revision_b);
++    assert_eq!(endpoint.fetch_count(), 2);
++}
++
+ #[tokio::test]
+ async fn refresh_available_models_uses_remote_only_catalog_for_chatgpt_auth() {
+     let remote_models = vec![remote_model(
+@@ -864,6 +1591,31 @@ async fn refresh_available_models_skips_network_without_chatgpt_auth() {
+     );
+ }
+ 
++#[tokio::test]
++async fn etag_refresh_skips_network_without_chatgpt_auth() {
++    let codex_home = tempdir().expect("temp dir");
++    let endpoint = TestModelsEndpoint::without_refresh(vec![vec![remote_model(
++        "etag-noauth",
++        "ETag No Auth",
++        /*priority*/ 1,
++    )]]);
++    let manager = openai_manager_for_tests_with_auth(
++        codex_home.path().to_path_buf(),
++        endpoint.clone(),
++        /*auth_manager*/ None,
++    );
++
++    manager
++        .refresh_if_new_etag("new-etag".to_string(), DEFAULT_HTTP_CLIENT_FACTORY)
++        .await;
++
++    assert_eq!(
++        endpoint.fetch_count(),
++        0,
++        "ETag refresh should preserve the endpoint eligibility gate"
++    );
++}
++
+ #[derive(Debug)]
+ struct TestAuthAwareModelsEndpoint {
+     auth_manager: Option<Arc<AuthManager>>,
