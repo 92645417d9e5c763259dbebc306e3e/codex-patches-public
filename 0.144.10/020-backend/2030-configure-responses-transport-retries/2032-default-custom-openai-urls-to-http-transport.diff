@@ -1,0 +1,1212 @@
+diff --git a/codex-rs/app-server/src/config_manager_service_tests.rs b/codex-rs/app-server/src/config_manager_service_tests.rs
+index 1ec79a749b..706c95ea0d 100644
+--- a/codex-rs/app-server/src/config_manager_service_tests.rs
++++ b/codex-rs/app-server/src/config_manager_service_tests.rs
+@@ -672,7 +672,7 @@ async fn invalid_user_value_rejected_even_if_overridden_by_managed() {
+ }
+ 
+ #[tokio::test]
+-async fn reserved_builtin_provider_override_rejected() {
++async fn unsupported_openai_provider_override_rejected() {
+     let tmp = tempdir().expect("tempdir");
+     std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "model = \"user\"\n").unwrap();
+ 
+@@ -686,19 +686,121 @@ async fn reserved_builtin_provider_override_rejected() {
+             expected_version: None,
+         })
+         .await
+-        .expect_err("should reject reserved provider override");
++        .expect_err("should reject unsupported OpenAI override");
++
++    assert_eq!(
++        error.write_error_code(),
++        Some(ConfigWriteErrorCode::ConfigValidationError)
++    );
++    assert!(
++        error
++            .to_string()
++            .contains("model_providers.openai only supports changing")
++    );
++    assert!(error.to_string().contains("`name`"));
++
++    let contents = std::fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE)).expect("read config");
++    assert_eq!(contents, "model = \"user\"\n");
++}
++
++#[tokio::test]
++async fn reserved_builtin_provider_override_rejected() {
++    let tmp = tempdir().expect("tempdir");
++    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "model = \"user\"\n").unwrap();
++
++    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
++    let error = service
++        .write_value(ConfigValueWriteParams {
++            file_path: Some(tmp.path().join(CONFIG_TOML_FILE).display().to_string()),
++            key_path: "model_providers.ollama.name".to_string(),
++            value: serde_json::json!("Ollama Override"),
++            merge_strategy: MergeStrategy::Replace,
++            expected_version: None,
++        })
++        .await
++        .expect_err("should reject reserved built-in provider override");
+ 
+     assert_eq!(
+         error.write_error_code(),
+         Some(ConfigWriteErrorCode::ConfigValidationError)
+     );
+     assert!(error.to_string().contains("reserved built-in provider IDs"));
+-    assert!(error.to_string().contains("`openai`"));
++    assert!(error.to_string().contains("`ollama`"));
+ 
+     let contents = std::fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE)).expect("read config");
+     assert_eq!(contents, "model = \"user\"\n");
+ }
+ 
++#[tokio::test]
++async fn openai_transport_overrides_allowed() {
++    let tmp = tempdir().expect("tempdir");
++    let config_path = tmp.path().join(CONFIG_TOML_FILE);
++    std::fs::write(&config_path, "model = \"user\"\n").unwrap();
++
++    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
++    for (field, value) in [
++        ("request_max_retries", serde_json::json!(3)),
++        ("stream_max_retries", serde_json::json!(30)),
++        ("stream_idle_timeout_ms", serde_json::json!(120_000)),
++        ("websocket_connect_timeout_ms", serde_json::json!(15_000)),
++        ("supports_websockets", serde_json::json!(false)),
++    ] {
++        service
++            .write_value(ConfigValueWriteParams {
++                file_path: Some(config_path.display().to_string()),
++                key_path: format!("model_providers.openai.{field}"),
++                value,
++                merge_strategy: MergeStrategy::Replace,
++                expected_version: None,
++            })
++            .await
++            .unwrap_or_else(|error| {
++                panic!("should allow OpenAI transport override {field}: {error}")
++            });
++    }
++
++    let contents = std::fs::read_to_string(config_path).expect("read config");
++    let config: TomlValue = toml::from_str(&contents).expect("parse updated config");
++    let openai = config
++        .get("model_providers")
++        .and_then(TomlValue::as_table)
++        .and_then(|providers| providers.get("openai"))
++        .and_then(TomlValue::as_table)
++        .expect("OpenAI provider overrides");
++
++    assert_eq!(openai.len(), 5);
++    assert_eq!(
++        openai
++            .get("request_max_retries")
++            .and_then(TomlValue::as_integer),
++        Some(3)
++    );
++    assert_eq!(
++        openai
++            .get("stream_max_retries")
++            .and_then(TomlValue::as_integer),
++        Some(30)
++    );
++    assert_eq!(
++        openai
++            .get("stream_idle_timeout_ms")
++            .and_then(TomlValue::as_integer),
++        Some(120_000)
++    );
++    assert_eq!(
++        openai
++            .get("websocket_connect_timeout_ms")
++            .and_then(TomlValue::as_integer),
++        Some(15_000)
++    );
++    assert_eq!(
++        openai
++            .get("supports_websockets")
++            .and_then(TomlValue::as_bool),
++        Some(false)
++    );
++}
++
+ #[tokio::test]
+ async fn write_value_rejects_feature_requirement_conflict() {
+     let tmp = tempdir().expect("tempdir");
+diff --git a/codex-rs/config/src/config_toml.rs b/codex-rs/config/src/config_toml.rs
+index 3a74b697ea..aea4a2bc73 100644
+--- a/codex-rs/config/src/config_toml.rs
++++ b/codex-rs/config/src/config_toml.rs
+@@ -29,6 +29,7 @@ use crate::types::UriBasedFileOpener;
+ use crate::types::WindowsToml;
+ use codex_features::FeaturesToml;
+ use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
++use codex_model_provider_info::ConfiguredModelProvider;
+ use codex_model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
+ use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
+ use codex_model_provider_info::ModelProviderInfo;
+@@ -282,10 +283,10 @@ pub struct ConfigToml {
+     /// to 127.0.0.1 (using `mcp_oauth_callback_port` when provided).
+     pub mcp_oauth_callback_url: Option<String>,
+ 
+-    /// User-defined provider entries that extend the built-in list. Built-in
+-    /// IDs cannot be overridden.
++    /// User-defined provider entries that extend the built-in list. The
++    /// built-in OpenAI provider only accepts transport overrides here.
+     #[serde(default, deserialize_with = "deserialize_model_providers")]
+-    pub model_providers: HashMap<String, ModelProviderInfo>,
++    pub model_providers: HashMap<String, ConfiguredModelProvider>,
+ 
+     /// Maximum number of bytes to include from an AGENTS.md project doc file.
+     #[serde(default = "default_project_doc_max_bytes")]
+@@ -890,12 +891,13 @@ fn project_config_for_lookup_key(
+ }
+ 
+ pub fn validate_reserved_model_provider_ids(
+-    model_providers: &HashMap<String, ModelProviderInfo>,
++    model_providers: &HashMap<String, ConfiguredModelProvider>,
+ ) -> Result<(), String> {
+     let mut conflicts = model_providers
+         .keys()
+         .filter(|key| {
+             key.as_str() != AMAZON_BEDROCK_PROVIDER_ID
++                && key.as_str() != OPENAI_PROVIDER_ID
+                 && RESERVED_MODEL_PROVIDER_IDS.contains(&key.as_str())
+         })
+         .map(|key| format!("`{key}`"))
+@@ -913,18 +915,23 @@ Built-in providers cannot be overridden. Rename your custom provider (for exampl
+ }
+ 
+ pub fn validate_model_providers(
+-    model_providers: &HashMap<String, ModelProviderInfo>,
++    model_providers: &HashMap<String, ConfiguredModelProvider>,
+ ) -> Result<(), String> {
+     validate_reserved_model_provider_ids(model_providers)?;
+     for (key, provider) in model_providers {
+         if key == AMAZON_BEDROCK_PROVIDER_ID {
+             continue;
+         }
++        if key == OPENAI_PROVIDER_ID {
++            validate_openai_provider_override(provider)?;
++            continue;
++        }
+         if provider.aws.is_some() {
+             return Err(format!(
+                 "model_providers.{key}: provider aws is only supported for `{AMAZON_BEDROCK_PROVIDER_ID}`"
+             ));
+         }
++        let provider = ModelProviderInfo::from(provider.clone());
+         if provider.name.trim().is_empty() {
+             return Err(format!(
+                 "model_providers.{key}: provider name must not be empty"
+@@ -937,13 +944,68 @@ pub fn validate_model_providers(
+     Ok(())
+ }
+ 
++fn validate_openai_provider_override(provider: &ConfiguredModelProvider) -> Result<(), String> {
++    let mut unsupported = Vec::new();
++    if provider.name.is_some() {
++        unsupported.push("`name`");
++    }
++    if provider.base_url.is_some() {
++        unsupported.push("`base_url`");
++    }
++    if provider.env_key.is_some() {
++        unsupported.push("`env_key`");
++    }
++    if provider.env_key_instructions.is_some() {
++        unsupported.push("`env_key_instructions`");
++    }
++    if provider.experimental_bearer_token.is_some() {
++        unsupported.push("`experimental_bearer_token`");
++    }
++    if provider.auth.is_some() {
++        unsupported.push("`auth`");
++    }
++    if provider.aws.is_some() {
++        unsupported.push("`aws`");
++    }
++    if provider.wire_api.is_some() {
++        unsupported.push("`wire_api`");
++    }
++    if provider.query_params.is_some() {
++        unsupported.push("`query_params`");
++    }
++    if provider.http_headers.is_some() {
++        unsupported.push("`http_headers`");
++    }
++    if provider.env_http_headers.is_some() {
++        unsupported.push("`env_http_headers`");
++    }
++    if provider.requires_openai_auth.is_some() {
++        unsupported.push("`requires_openai_auth`");
++    }
++
++    if unsupported.is_empty() {
++        return Ok(());
++    }
++
++    let mut message = format!(
++        "model_providers.{OPENAI_PROVIDER_ID} only supports changing \
++`request_max_retries`, `stream_max_retries`, `stream_idle_timeout_ms`, \
++`websocket_connect_timeout_ms`, and `supports_websockets`; unsupported fields: {}",
++        unsupported.join(", ")
++    );
++    if provider.base_url.is_some() {
++        message.push_str("; use `openai_base_url` for `base_url`");
++    }
++    Err(message)
++}
++
+ fn deserialize_model_providers<'de, D>(
+     deserializer: D,
+-) -> Result<HashMap<String, ModelProviderInfo>, D::Error>
++) -> Result<HashMap<String, ConfiguredModelProvider>, D::Error>
+ where
+     D: serde::Deserializer<'de>,
+ {
+-    let model_providers = HashMap::<String, ModelProviderInfo>::deserialize(deserializer)?;
++    let model_providers = HashMap::<String, ConfiguredModelProvider>::deserialize(deserializer)?;
+     validate_model_providers(&model_providers).map_err(serde::de::Error::custom)?;
+     Ok(model_providers)
+ }
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+index 15b6a26ef2..a1849521bd 100644
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -814,6 +814,110 @@
+       },
+       "type": "object"
+     },
++    "ConfiguredModelProvider": {
++      "additionalProperties": false,
++      "description": "Provider fields read from `model_providers` in config.toml.\n\nDefault-sensitive fields remain optional so validation can distinguish an omitted field from an explicitly configured default value.",
++      "properties": {
++        "auth": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/ModelProviderAuthInfo"
++            }
++          ],
++          "description": "Command-backed bearer-token configuration for this provider."
++        },
++        "aws": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/ModelProviderAwsAuthInfo"
++            }
++          ],
++          "description": "AWS SigV4 auth configuration for this provider."
++        },
++        "base_url": {
++          "description": "Base URL for the provider's OpenAI-compatible API.",
++          "type": "string"
++        },
++        "env_http_headers": {
++          "additionalProperties": {
++            "type": "string"
++          },
++          "description": "Optional HTTP headers to include in requests to this provider where the (key, value) pairs are the header name and _environment variable_ whose value should be used. If the environment variable is not set, or the value is empty, the header will not be included in the request.",
++          "type": "object"
++        },
++        "env_key": {
++          "description": "Environment variable that stores the user's API key for this provider.",
++          "type": "string"
++        },
++        "env_key_instructions": {
++          "description": "Optional instructions to help the user get a valid value for the variable and set it.",
++          "type": "string"
++        },
++        "experimental_bearer_token": {
++          "description": "Value to use with `Authorization: Bearer <token>` header. Use of this config is discouraged in favor of `env_key` for security reasons, but this may be necessary when using this programmatically.",
++          "type": "string"
++        },
++        "http_headers": {
++          "additionalProperties": {
++            "type": "string"
++          },
++          "description": "Additional HTTP headers to include in requests to this provider where the (key, value) pairs are the header name and value.",
++          "type": "object"
++        },
++        "name": {
++          "description": "Friendly display name.",
++          "type": "string"
++        },
++        "query_params": {
++          "additionalProperties": {
++            "type": "string"
++          },
++          "description": "Optional query parameters to append to the base URL.",
++          "type": "object"
++        },
++        "request_max_retries": {
++          "description": "Maximum number of times to retry a failed HTTP request to this provider.",
++          "format": "uint64",
++          "minimum": 0.0,
++          "type": "integer"
++        },
++        "requires_openai_auth": {
++          "description": "Does this provider require an OpenAI API Key or ChatGPT login token?",
++          "type": "boolean"
++        },
++        "stream_idle_timeout_ms": {
++          "description": "Idle timeout (in milliseconds) to wait for activity on a streaming response before treating the connection as lost.",
++          "format": "uint64",
++          "minimum": 0.0,
++          "type": "integer"
++        },
++        "stream_max_retries": {
++          "description": "Number of times to retry reconnecting a dropped streaming response before failing.",
++          "format": "uint64",
++          "minimum": 0.0,
++          "type": "integer"
++        },
++        "supports_websockets": {
++          "description": "Whether this provider supports the Responses API WebSocket transport.",
++          "type": "boolean"
++        },
++        "websocket_connect_timeout_ms": {
++          "description": "Maximum time (in milliseconds) to wait for a websocket connection attempt before treating it as failed.",
++          "format": "uint64",
++          "minimum": 0.0,
++          "type": "integer"
++        },
++        "wire_api": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/WireApi"
++            }
++          ],
++          "description": "Which wire protocol this provider expects."
++        }
++      },
++      "type": "object"
++    },
+     "CurrentTimeReminderConfigToml": {
+       "additionalProperties": false,
+       "properties": {
+@@ -1617,114 +1721,6 @@
+       },
+       "type": "object"
+     },
+-    "ModelProviderInfo": {
+-      "additionalProperties": false,
+-      "description": "Serializable representation of a provider definition.",
+-      "properties": {
+-        "auth": {
+-          "allOf": [
+-            {
+-              "$ref": "#/definitions/ModelProviderAuthInfo"
+-            }
+-          ],
+-          "description": "Command-backed bearer-token configuration for this provider."
+-        },
+-        "aws": {
+-          "allOf": [
+-            {
+-              "$ref": "#/definitions/ModelProviderAwsAuthInfo"
+-            }
+-          ],
+-          "description": "AWS SigV4 auth configuration for this provider."
+-        },
+-        "base_url": {
+-          "description": "Base URL for the provider's OpenAI-compatible API.",
+-          "type": "string"
+-        },
+-        "env_http_headers": {
+-          "additionalProperties": {
+-            "type": "string"
+-          },
+-          "description": "Optional HTTP headers to include in requests to this provider where the (key, value) pairs are the header name and _environment variable_ whose value should be used. If the environment variable is not set, or the value is empty, the header will not be included in the request.",
+-          "type": "object"
+-        },
+-        "env_key": {
+-          "description": "Environment variable that stores the user's API key for this provider.",
+-          "type": "string"
+-        },
+-        "env_key_instructions": {
+-          "description": "Optional instructions to help the user get a valid value for the variable and set it.",
+-          "type": "string"
+-        },
+-        "experimental_bearer_token": {
+-          "description": "Value to use with `Authorization: Bearer <token>` header. Use of this config is discouraged in favor of `env_key` for security reasons, but this may be necessary when using this programmatically.",
+-          "type": "string"
+-        },
+-        "http_headers": {
+-          "additionalProperties": {
+-            "type": "string"
+-          },
+-          "description": "Additional HTTP headers to include in requests to this provider where the (key, value) pairs are the header name and value.",
+-          "type": "object"
+-        },
+-        "name": {
+-          "default": "",
+-          "description": "Friendly display name.",
+-          "type": "string"
+-        },
+-        "query_params": {
+-          "additionalProperties": {
+-            "type": "string"
+-          },
+-          "description": "Optional query parameters to append to the base URL.",
+-          "type": "object"
+-        },
+-        "request_max_retries": {
+-          "description": "Maximum number of times to retry a failed HTTP request to this provider.",
+-          "format": "uint64",
+-          "minimum": 0.0,
+-          "type": "integer"
+-        },
+-        "requires_openai_auth": {
+-          "default": false,
+-          "description": "Does this provider require an OpenAI API Key or ChatGPT login token? If true, user is presented with login screen on first run, and login preference and token/key are stored in auth.json. If false (which is the default), login screen is skipped, and API key (if needed) comes from the \"env_key\" environment variable.",
+-          "type": "boolean"
+-        },
+-        "stream_idle_timeout_ms": {
+-          "description": "Idle timeout (in milliseconds) to wait for activity on a streaming response before treating the connection as lost.",
+-          "format": "uint64",
+-          "minimum": 0.0,
+-          "type": "integer"
+-        },
+-        "stream_max_retries": {
+-          "description": "Number of times to retry reconnecting a dropped streaming response before failing.",
+-          "format": "uint64",
+-          "minimum": 0.0,
+-          "type": "integer"
+-        },
+-        "supports_websockets": {
+-          "default": false,
+-          "description": "Whether this provider supports the Responses API WebSocket transport.",
+-          "type": "boolean"
+-        },
+-        "websocket_connect_timeout_ms": {
+-          "description": "Maximum time (in milliseconds) to wait for a websocket connection attempt before treating it as failed.",
+-          "format": "uint64",
+-          "minimum": 0.0,
+-          "type": "integer"
+-        },
+-        "wire_api": {
+-          "allOf": [
+-            {
+-              "$ref": "#/definitions/WireApi"
+-            }
+-          ],
+-          "default": "responses",
+-          "description": "Which wire protocol this provider expects."
+-        }
+-      },
+-      "type": "object"
+-    },
+     "MultiAgentV2ConfigToml": {
+       "additionalProperties": false,
+       "properties": {
+@@ -5290,10 +5286,10 @@
+     },
+     "model_providers": {
+       "additionalProperties": {
+-        "$ref": "#/definitions/ModelProviderInfo"
++        "$ref": "#/definitions/ConfiguredModelProvider"
+       },
+       "default": {},
+-      "description": "User-defined provider entries that extend the built-in list. Built-in IDs cannot be overridden.",
++      "description": "User-defined provider entries that extend the built-in list. The built-in OpenAI provider only accepts transport overrides here.",
+       "type": "object"
+     },
+     "model_reasoning_effort": {
+@@ -5541,4 +5537,4 @@
+   },
+   "title": "ConfigToml",
+   "type": "object"
+-}
++}
+\ No newline at end of file
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index 5aff35f5b3..ea5fd1b7f8 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -909,6 +909,137 @@ region = "us-west-2"
+     ));
+ }
+ 
++#[tokio::test]
++async fn load_config_applies_openai_websocket_override_with_custom_base_url() {
++    let cfg = toml::from_str::<ConfigToml>(
++        r#"
++openai_base_url = "http://127.0.0.1:18080/backend-api/codex"
++
++[model_providers.openai]
++supports_websockets = true
++"#,
++    )
++    .expect("OpenAI websocket override should deserialize");
++
++    let config = Config::load_from_base_config_with_overrides(
++        cfg,
++        ConfigOverrides::default(),
++        tempdir().expect("tempdir").abs(),
++    )
++    .await
++    .expect("load config");
++
++    assert_eq!(config.model_provider_id, "openai");
++    assert_eq!(
++        config.model_provider.base_url.as_deref(),
++        Some("http://127.0.0.1:18080/backend-api/codex")
++    );
++    assert!(config.model_provider.supports_websockets);
++}
++
++#[tokio::test]
++async fn load_config_accepts_disabled_openai_websocket_override() {
++    let cfg = toml::from_str::<ConfigToml>(
++        r#"
++[model_providers.openai]
++supports_websockets = false
++"#,
++    )
++    .expect("OpenAI websocket override should deserialize");
++
++    let config = Config::load_from_base_config_with_overrides(
++        cfg,
++        ConfigOverrides::default(),
++        tempdir().expect("tempdir").abs(),
++    )
++    .await
++    .expect("load config");
++
++    assert_eq!(config.model_provider_id, "openai");
++    assert!(!config.model_provider.supports_websockets);
++}
++
++#[tokio::test]
++async fn load_config_applies_openai_transport_overrides_without_enabling_custom_url_websockets() {
++    let cfg = toml::from_str::<ConfigToml>(
++        r#"
++openai_base_url = "http://127.0.0.1:18080/backend-api/codex"
++
++[model_providers.openai]
++request_max_retries = 3
++stream_max_retries = 7
++stream_idle_timeout_ms = 1234
++websocket_connect_timeout_ms = 4321
++"#,
++    )
++    .expect("OpenAI transport overrides should deserialize");
++
++    let config = Config::load_from_base_config_with_overrides(
++        cfg,
++        ConfigOverrides::default(),
++        tempdir().expect("tempdir").abs(),
++    )
++    .await
++    .expect("load config");
++
++    assert_eq!(config.model_provider_id, "openai");
++    assert_eq!(
++        config.model_provider.base_url.as_deref(),
++        Some("http://127.0.0.1:18080/backend-api/codex")
++    );
++    assert_eq!(config.model_provider.request_max_retries, Some(3));
++    assert_eq!(config.model_provider.stream_max_retries, Some(7));
++    assert_eq!(config.model_provider.stream_idle_timeout_ms, Some(1234));
++    assert_eq!(
++        config.model_provider.websocket_connect_timeout_ms,
++        Some(4321)
++    );
++    assert!(!config.model_provider.supports_websockets);
++    assert!(config.model_provider.requires_openai_auth);
++}
++
++#[test]
++fn load_config_rejects_each_unsupported_openai_provider_override() {
++    let unsupported: [(&str, &str); 12] = [
++        ("name", "name = \"\""),
++        ("base_url", "base_url = \"https://api.openai.com/v1\""),
++        ("env_key", "env_key = \"\""),
++        ("env_key_instructions", "env_key_instructions = \"\""),
++        (
++            "experimental_bearer_token",
++            "experimental_bearer_token = \"\"",
++        ),
++        ("auth", "auth = { command = \"print-token\" }"),
++        ("aws", "aws = {}"),
++        ("wire_api", "wire_api = \"responses\""),
++        ("query_params", "query_params = {}"),
++        ("http_headers", "http_headers = {}"),
++        ("env_http_headers", "env_http_headers = {}"),
++        ("requires_openai_auth", "requires_openai_auth = false"),
++    ];
++
++    for (field, value) in unsupported {
++        let input = format!("[model_providers.openai]\n{value}\n");
++        let err = toml::from_str::<ConfigToml>(&input)
++            .expect_err(&format!("OpenAI `{field}` override should be rejected"));
++        let message = err.to_string();
++        assert!(
++            message.contains("model_providers.openai only supports changing"),
++            "unexpected error for `{field}`: {message}"
++        );
++        assert!(
++            message.contains(&format!("`{field}`")),
++            "error should name `{field}`: {message}"
++        );
++        if field == "base_url" {
++            assert!(
++                message.contains("use `openai_base_url` for `base_url`"),
++                "base_url error should direct users to openai_base_url: {message}"
++            );
++        }
++    }
++}
++
+ #[test]
+ fn config_toml_deserializes_model_availability_nux() {
+     let toml = r#"
+diff --git a/codex-rs/core/tests/common/responses.rs b/codex-rs/core/tests/common/responses.rs
+index 1ab3a70cbb..4c2a7098cf 100644
+--- a/codex-rs/core/tests/common/responses.rs
++++ b/codex-rs/core/tests/common/responses.rs
+@@ -488,6 +488,7 @@ pub struct WebSocketTestServer {
+     uri: String,
+     connections: Arc<Mutex<Vec<Vec<WebSocketRequest>>>>,
+     handshakes: Arc<Mutex<Vec<WebSocketHandshake>>>,
++    http_request_methods: Arc<Mutex<Vec<String>>>,
+     request_log_updated: Arc<Notify>,
+     shutdown: oneshot::Sender<()>,
+     task: tokio::task::JoinHandle<()>,
+@@ -534,6 +535,10 @@ impl WebSocketTestServer {
+         self.handshakes.lock().unwrap().clone()
+     }
+ 
++    pub fn http_request_methods(&self) -> Vec<String> {
++        self.http_request_methods.lock().unwrap().clone()
++    }
++
+     /// Waits until at least `expected` websocket handshakes have been observed or timeout elapses.
+     ///
+     /// Uses a short bounded polling interval so tests can deterministically wait for background
+@@ -1273,9 +1278,11 @@ pub async fn start_websocket_server_with_headers(
+     let uri = format!("ws://{addr}");
+     let connections_log = Arc::new(Mutex::new(Vec::new()));
+     let handshakes_log = Arc::new(Mutex::new(Vec::new()));
++    let http_request_methods_log = Arc::new(Mutex::new(Vec::new()));
+     let request_log_updated = Arc::new(Notify::new());
+     let requests = Arc::clone(&connections_log);
+     let handshakes = Arc::clone(&handshakes_log);
++    let http_request_methods = Arc::clone(&http_request_methods_log);
+     let request_log = Arc::clone(&request_log_updated);
+     let connections = Arc::new(Mutex::new(VecDeque::from(connections)));
+     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+@@ -1290,6 +1297,9 @@ pub async fn start_websocket_server_with_headers(
+                 Ok(value) => value,
+                 Err(_) => return,
+             };
++            if let Some(method) = peek_http_request_method(&stream).await {
++                http_request_methods.lock().unwrap().push(method);
++            }
+             // Ordinary HTTP probes can share this listener with websocket tests. Only a
+             // successful websocket handshake should consume a scripted connection.
+             let connection = {
+@@ -1434,12 +1444,35 @@ pub async fn start_websocket_server_with_headers(
+         uri,
+         connections: connections_log,
+         handshakes: handshakes_log,
++        http_request_methods: http_request_methods_log,
+         request_log_updated,
+         shutdown: shutdown_tx,
+         task,
+     }
+ }
+ 
++async fn peek_http_request_method(stream: &tokio::net::TcpStream) -> Option<String> {
++    let mut prefix = [0_u8; 16];
++    let length = tokio::time::timeout(Duration::from_secs(1), async {
++        loop {
++            let length = stream.peek(&mut prefix).await.ok()?;
++            if length == 0 {
++                return None;
++            }
++            if prefix[..length].contains(&b' ') || length == prefix.len() {
++                return Some(length);
++            }
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .ok()??;
++    let method_end = prefix[..length].iter().position(|byte| *byte == b' ')?;
++    std::str::from_utf8(&prefix[..method_end])
++        .ok()
++        .map(str::to_string)
++}
++
+ fn parse_ws_request_body(message: Message) -> Option<Value> {
+     match message {
+         Message::Text(text) => serde_json::from_str(&text).ok(),
+diff --git a/codex-rs/core/tests/suite/client_websockets.rs b/codex-rs/core/tests/suite/client_websockets.rs
+index 9bf39425ab..be25d20600 100755
+--- a/codex-rs/core/tests/suite/client_websockets.rs
++++ b/codex-rs/core/tests/suite/client_websockets.rs
+@@ -11,8 +11,12 @@ use codex_features::Feature;
+ use codex_http_client::OutboundProxyPolicy;
+ use codex_login::CodexAuth;
+ use codex_login::auth::AgentIdentityAuthPolicy;
++use codex_model_provider_info::ConfiguredModelProvider;
+ use codex_model_provider_info::ModelProviderInfo;
++use codex_model_provider_info::OPENAI_PROVIDER_ID;
+ use codex_model_provider_info::WireApi;
++use codex_model_provider_info::built_in_model_providers;
++use codex_model_provider_info::merge_configured_model_providers;
+ use codex_otel::MetricsClient;
+ use codex_otel::MetricsConfig;
+ use codex_otel::SessionTelemetry;
+@@ -286,6 +290,59 @@ async fn responses_websocket_streams_without_feature_flag_when_provider_supports
+     server.shutdown().await;
+ }
+ 
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn custom_openai_url_explicit_websocket_override_uses_websocket_transport() {
++    skip_if_no_network!();
++
++    let server = start_websocket_server(vec![vec![vec![
++        ev_response_created("resp-1"),
++        ev_completed("resp-1"),
++    ]]])
++    .await;
++    let custom_base_url = format!(
++        "http://{}/v1",
++        server
++            .uri()
++            .strip_prefix("ws://")
++            .expect("test websocket URI")
++    );
++    let configured_model_providers = std::collections::HashMap::from([(
++        OPENAI_PROVIDER_ID.to_string(),
++        ConfiguredModelProvider {
++            supports_websockets: Some(true),
++            ..ConfiguredModelProvider::default()
++        },
++    )]);
++    let mut providers = merge_configured_model_providers(
++        built_in_model_providers(Some(custom_base_url.clone())),
++        configured_model_providers,
++    )
++    .expect("explicit OpenAI websocket override should be accepted");
++    let provider = providers
++        .remove(OPENAI_PROVIDER_ID)
++        .expect("OpenAI provider should remain built in");
++    assert_eq!(provider.base_url.as_deref(), Some(custom_base_url.as_str()));
++    assert!(provider.supports_websockets);
++
++    let harness = websocket_harness_with_provider_options(
++        provider,
++        /*runtime_metrics_enabled*/ false,
++        /*concurrent_reasoning_summaries_enabled*/ false,
++        /*enabled_features*/ &[],
++    )
++    .await;
++    let mut client_session = harness.client.new_session();
++    let prompt = prompt_with_input(vec![message_item("hello")]);
++
++    stream_until_complete(&mut client_session, &harness, &prompt).await;
++
++    assert_eq!(server.handshakes().len(), 1);
++    assert_eq!(server.single_connection().len(), 1);
++    assert_eq!(server.http_request_methods(), vec!["GET".to_string()]);
++
++    server.shutdown().await;
++}
++
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn responses_websocket_streams_with_system_proxy_feature() {
+     skip_if_no_network!();
+diff --git a/codex-rs/model-provider-info/src/lib.rs b/codex-rs/model-provider-info/src/lib.rs
+index 61cd717d58..beb0d8db2c 100644
+--- a/codex-rs/model-provider-info/src/lib.rs
++++ b/codex-rs/model-provider-info/src/lib.rs
+@@ -35,6 +35,7 @@ const MAX_REQUEST_MAX_RETRIES: u64 = 100;
+ const OPENAI_PROVIDER_NAME: &str = "OpenAI";
+ const OPENAI_ACTOR_AUTHORIZATION_HEADER: &str = "x-openai-actor-authorization";
+ pub const OPENAI_PROVIDER_ID: &str = "openai";
++const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+ pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+ const AMAZON_BEDROCK_PROVIDER_NAME: &str = "Amazon Bedrock";
+ pub const AMAZON_BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
+@@ -140,6 +141,103 @@ pub struct ModelProviderInfo {
+     pub supports_websockets: bool,
+ }
+ 
++/// Provider fields read from `model_providers` in config.toml.
++///
++/// Default-sensitive fields remain optional so validation can distinguish an
++/// omitted field from an explicitly configured default value.
++#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, JsonSchema)]
++#[serde(deny_unknown_fields)]
++#[schemars(deny_unknown_fields)]
++pub struct ConfiguredModelProvider {
++    /// Friendly display name.
++    pub name: Option<String>,
++    /// Base URL for the provider's OpenAI-compatible API.
++    pub base_url: Option<String>,
++    /// Environment variable that stores the user's API key for this provider.
++    pub env_key: Option<String>,
++
++    /// Optional instructions to help the user get a valid value for the
++    /// variable and set it.
++    pub env_key_instructions: Option<String>,
++    /// Value to use with `Authorization: Bearer <token>` header. Use of this
++    /// config is discouraged in favor of `env_key` for security reasons, but
++    /// this may be necessary when using this programmatically.
++    pub experimental_bearer_token: Option<String>,
++    /// Command-backed bearer-token configuration for this provider.
++    pub auth: Option<ModelProviderAuthInfo>,
++    /// AWS SigV4 auth configuration for this provider.
++    pub aws: Option<ModelProviderAwsAuthInfo>,
++    /// Which wire protocol this provider expects.
++    pub wire_api: Option<WireApi>,
++    /// Optional query parameters to append to the base URL.
++    pub query_params: Option<HashMap<String, String>>,
++    /// Additional HTTP headers to include in requests to this provider where
++    /// the (key, value) pairs are the header name and value.
++    pub http_headers: Option<HashMap<String, String>>,
++    /// Optional HTTP headers to include in requests to this provider where the
++    /// (key, value) pairs are the header name and _environment variable_ whose
++    /// value should be used. If the environment variable is not set, or the
++    /// value is empty, the header will not be included in the request.
++    pub env_http_headers: Option<HashMap<String, String>>,
++    /// Maximum number of times to retry a failed HTTP request to this provider.
++    pub request_max_retries: Option<u64>,
++    /// Number of times to retry reconnecting a dropped streaming response before failing.
++    pub stream_max_retries: Option<u64>,
++    /// Idle timeout (in milliseconds) to wait for activity on a streaming response before treating
++    /// the connection as lost.
++    pub stream_idle_timeout_ms: Option<u64>,
++    /// Maximum time (in milliseconds) to wait for a websocket connection attempt before treating
++    /// it as failed.
++    pub websocket_connect_timeout_ms: Option<u64>,
++    /// Does this provider require an OpenAI API Key or ChatGPT login token?
++    pub requires_openai_auth: Option<bool>,
++    /// Whether this provider supports the Responses API WebSocket transport.
++    pub supports_websockets: Option<bool>,
++}
++
++impl From<ConfiguredModelProvider> for ModelProviderInfo {
++    fn from(provider: ConfiguredModelProvider) -> Self {
++        let ConfiguredModelProvider {
++            name,
++            base_url,
++            env_key,
++            env_key_instructions,
++            experimental_bearer_token,
++            auth,
++            aws,
++            wire_api,
++            query_params,
++            http_headers,
++            env_http_headers,
++            request_max_retries,
++            stream_max_retries,
++            stream_idle_timeout_ms,
++            websocket_connect_timeout_ms,
++            requires_openai_auth,
++            supports_websockets,
++        } = provider;
++        Self {
++            name: name.unwrap_or_default(),
++            base_url,
++            env_key,
++            env_key_instructions,
++            experimental_bearer_token,
++            auth,
++            aws,
++            wire_api: wire_api.unwrap_or_default(),
++            query_params,
++            http_headers,
++            env_http_headers,
++            request_max_retries,
++            stream_max_retries,
++            stream_idle_timeout_ms,
++            websocket_connect_timeout_ms,
++            requires_openai_auth: requires_openai_auth.unwrap_or_default(),
++            supports_websockets: supports_websockets.unwrap_or_default(),
++        }
++    }
++}
++
+ /// AWS SigV4 auth configuration for a model provider.
+ #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+ #[schemars(deny_unknown_fields)]
+@@ -251,7 +349,7 @@ impl ModelProviderInfo {
+         ) {
+             CHATGPT_CODEX_BASE_URL
+         } else {
+-            "https://api.openai.com/v1"
++            OPENAI_DEFAULT_BASE_URL
+         };
+         let base_url = self
+             .base_url
+@@ -327,6 +425,9 @@ impl ModelProviderInfo {
+     }
+ 
+     pub fn create_openai_provider(base_url: Option<String>) -> ModelProviderInfo {
++        let supports_websockets = base_url
++            .as_deref()
++            .is_none_or(|base_url| base_url == OPENAI_DEFAULT_BASE_URL);
+         ModelProviderInfo {
+             name: OPENAI_PROVIDER_NAME.into(),
+             base_url,
+@@ -359,7 +460,7 @@ impl ModelProviderInfo {
+             stream_idle_timeout_ms: None,
+             websocket_connect_timeout_ms: None,
+             requires_openai_auth: true,
+-            supports_websockets: true,
++            supports_websockets,
+         }
+     }
+ 
+@@ -457,16 +558,17 @@ pub fn built_in_model_providers(
+ 
+ /// Merge configured providers into the built-in provider catalog.
+ ///
+-/// Configured providers extend the built-in set. Built-in providers are not
+-/// generally overridable, but the built-in Amazon Bedrock provider allows the
+-/// user to set `aws.profile` and `aws.region`.
++/// Configured providers extend the built-in set. The built-in OpenAI provider
++/// accepts transport-only overrides, and the built-in Amazon Bedrock provider
++/// allows `aws.profile` and `aws.region`.
+ pub fn merge_configured_model_providers(
+     mut model_providers: HashMap<String, ModelProviderInfo>,
+-    configured_model_providers: HashMap<String, ModelProviderInfo>,
++    configured_model_providers: HashMap<String, ConfiguredModelProvider>,
+ ) -> Result<HashMap<String, ModelProviderInfo>, String> {
+     for (key, mut provider) in configured_model_providers {
+         if key == AMAZON_BEDROCK_PROVIDER_ID {
+             let aws_override = provider.aws.take();
++            let provider = ModelProviderInfo::from(provider);
+             if provider != ModelProviderInfo::default() {
+                 return Err(format!(
+                     "model_providers.{AMAZON_BEDROCK_PROVIDER_ID} only supports changing \
+@@ -485,14 +587,36 @@ pub fn merge_configured_model_providers(
+                     built_in_aws.region = Some(region);
+                 }
+             }
++        } else if key == OPENAI_PROVIDER_ID {
++            if let Some(built_in_provider) = model_providers.get_mut(OPENAI_PROVIDER_ID) {
++                overlay_openai_provider(built_in_provider, provider);
++            }
+         } else {
+-            model_providers.entry(key).or_insert(provider);
++            model_providers.entry(key).or_insert(provider.into());
+         }
+     }
+ 
+     Ok(model_providers)
+ }
+ 
++fn overlay_openai_provider(base: &mut ModelProviderInfo, provider: ConfiguredModelProvider) {
++    if let Some(request_max_retries) = provider.request_max_retries {
++        base.request_max_retries = Some(request_max_retries);
++    }
++    if let Some(stream_max_retries) = provider.stream_max_retries {
++        base.stream_max_retries = Some(stream_max_retries);
++    }
++    if let Some(stream_idle_timeout_ms) = provider.stream_idle_timeout_ms {
++        base.stream_idle_timeout_ms = Some(stream_idle_timeout_ms);
++    }
++    if let Some(websocket_connect_timeout_ms) = provider.websocket_connect_timeout_ms {
++        base.websocket_connect_timeout_ms = Some(websocket_connect_timeout_ms);
++    }
++    if let Some(supports_websockets) = provider.supports_websockets {
++        base.supports_websockets = supports_websockets;
++    }
++}
++
+ pub fn create_oss_provider(default_provider_port: u16, wire_api: WireApi) -> ModelProviderInfo {
+     // These CODEX_OSS_ environment variables are experimental: we may
+     // switch to reading values from config.toml instead.
+diff --git a/codex-rs/model-provider-info/src/model_provider_info_tests.rs b/codex-rs/model-provider-info/src/model_provider_info_tests.rs
+index 9dbb23ecc1..8050991684 100644
+--- a/codex-rs/model-provider-info/src/model_provider_info_tests.rs
++++ b/codex-rs/model-provider-info/src/model_provider_info_tests.rs
+@@ -157,6 +157,110 @@ fn test_header_auth_uses_chatgpt_codex_base_url() {
+     assert_eq!(api_provider.base_url, CHATGPT_CODEX_BASE_URL);
+ }
+ 
++#[test]
++fn openai_default_base_url_supports_websockets() {
++    let provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
++    let api_provider = provider
++        .to_api_provider(/*auth_mode*/ None)
++        .expect("OpenAI provider should build API provider");
++
++    assert!(provider.supports_websockets);
++    assert_eq!(api_provider.base_url, OPENAI_DEFAULT_BASE_URL);
++}
++
++#[test]
++fn custom_openai_base_url_requires_explicit_websocket_opt_in() {
++    let canonical =
++        ModelProviderInfo::create_openai_provider(Some(OPENAI_DEFAULT_BASE_URL.to_string()));
++    let custom =
++        ModelProviderInfo::create_openai_provider(Some("http://127.0.0.1:12345/v1".to_string()));
++
++    assert!(canonical.supports_websockets);
++    assert!(!custom.supports_websockets);
++}
++
++#[test]
++fn configured_model_provider_round_trips_default_field_presence() {
++    let omitted = ConfiguredModelProvider::default();
++    let omitted_toml = toml::to_string(&omitted).expect("serialize omitted provider fields");
++    assert!(omitted_toml.is_empty());
++    let omitted_reloaded: ConfiguredModelProvider =
++        toml::from_str(&omitted_toml).expect("reload omitted provider fields");
++    assert_eq!(omitted_reloaded, omitted);
++
++    let explicit = ConfiguredModelProvider {
++        name: Some(String::new()),
++        wire_api: Some(WireApi::Responses),
++        requires_openai_auth: Some(false),
++        supports_websockets: Some(false),
++        ..ConfiguredModelProvider::default()
++    };
++    let explicit_toml = toml::to_string(&explicit).expect("serialize explicit provider defaults");
++    let explicit_reloaded: ConfiguredModelProvider =
++        toml::from_str(&explicit_toml).expect("reload explicit provider defaults");
++    assert_eq!(explicit_reloaded, explicit);
++    assert_eq!(explicit_reloaded.name, Some(String::new()));
++    assert_eq!(explicit_reloaded.wire_api, Some(WireApi::Responses));
++    assert_eq!(explicit_reloaded.requires_openai_auth, Some(false));
++    assert_eq!(explicit_reloaded.supports_websockets, Some(false));
++}
++
++#[test]
++fn configured_model_provider_rejects_unknown_fields() {
++    let err = toml::from_str::<ConfiguredModelProvider>("unknown = true")
++        .expect_err("configured providers should reject unknown fields");
++
++    assert!(err.to_string().contains("unknown field `unknown`"));
++}
++
++#[test]
++fn test_merge_configured_model_providers_applies_openai_websocket_override() {
++    let configured_model_providers = std::collections::HashMap::from([(
++        OPENAI_PROVIDER_ID.to_string(),
++        ConfiguredModelProvider {
++            supports_websockets: Some(true),
++            ..ConfiguredModelProvider::default()
++        },
++    )]);
++
++    let mut expected = built_in_model_providers(Some("http://127.0.0.1:12345/v1".to_string()));
++    expected
++        .get_mut(OPENAI_PROVIDER_ID)
++        .expect("OpenAI provider should be built in")
++        .supports_websockets = true;
++
++    assert_eq!(
++        merge_configured_model_providers(
++            built_in_model_providers(Some("http://127.0.0.1:12345/v1".to_string())),
++            configured_model_providers,
++        ),
++        Ok(expected)
++    );
++}
++
++#[test]
++fn test_merge_configured_model_providers_preserves_openai_websockets_when_not_overridden() {
++    let configured_model_providers = std::collections::HashMap::from([(
++        OPENAI_PROVIDER_ID.to_string(),
++        ConfiguredModelProvider {
++            request_max_retries: Some(3),
++            ..ConfiguredModelProvider::default()
++        },
++    )]);
++
++    let providers = merge_configured_model_providers(
++        built_in_model_providers(/*openai_base_url*/ None),
++        configured_model_providers,
++    )
++    .expect("OpenAI retry override should be accepted");
++    let openai = providers
++        .get(OPENAI_PROVIDER_ID)
++        .expect("OpenAI provider should remain built in");
++
++    assert_eq!(openai.request_max_retries, Some(3));
++    assert!(openai.supports_websockets);
++}
++
+ #[test]
+ fn test_supports_remote_compaction_for_azure_name() {
+     let provider = ModelProviderInfo {
+@@ -348,8 +452,14 @@ fn test_merge_configured_model_providers_adds_custom_provider() {
+         base_url: Some("https://example.com/v1".to_string()),
+         ..ModelProviderInfo::default()
+     };
+-    let configured_model_providers =
+-        std::collections::HashMap::from([("custom".to_string(), custom_provider.clone())]);
++    let configured_model_providers = std::collections::HashMap::from([(
++        "custom".to_string(),
++        ConfiguredModelProvider {
++            name: Some("Custom".to_string()),
++            base_url: Some("https://example.com/v1".to_string()),
++            ..ConfiguredModelProvider::default()
++        },
++    )]);
+ 
+     let mut expected = built_in_model_providers(/*openai_base_url*/ None);
+     expected.insert("custom".to_string(), custom_provider);
+@@ -367,12 +477,12 @@ fn test_merge_configured_model_providers_adds_custom_provider() {
+ fn test_merge_configured_model_providers_applies_amazon_bedrock_profile_override() {
+     let configured_model_providers = std::collections::HashMap::from([(
+         AMAZON_BEDROCK_PROVIDER_ID.to_string(),
+-        ModelProviderInfo {
++        ConfiguredModelProvider {
+             aws: Some(ModelProviderAwsAuthInfo {
+                 profile: Some("codex-bedrock".to_string()),
+                 region: Some("us-west-2".to_string()),
+             }),
+-            ..ModelProviderInfo::default()
++            ..ConfiguredModelProvider::default()
+         },
+     )]);
+ 
+@@ -398,13 +508,13 @@ fn test_merge_configured_model_providers_applies_amazon_bedrock_profile_override
+ fn test_merge_configured_model_providers_rejects_amazon_bedrock_non_default_fields() {
+     let configured_model_providers = std::collections::HashMap::from([(
+         AMAZON_BEDROCK_PROVIDER_ID.to_string(),
+-        ModelProviderInfo {
+-            name: "Custom Bedrock".to_string(),
++        ConfiguredModelProvider {
++            name: Some("Custom Bedrock".to_string()),
+             aws: Some(ModelProviderAwsAuthInfo {
+                 profile: Some("codex-bedrock".to_string()),
+                 region: None,
+             }),
+-            ..ModelProviderInfo::default()
++            ..ConfiguredModelProvider::default()
+         },
+     )]);
+ 
+@@ -424,13 +534,16 @@ fn test_merge_configured_model_providers_rejects_amazon_bedrock_non_default_fiel
+ fn test_merge_configured_model_providers_allows_amazon_bedrock_default_fields() {
+     let configured_model_providers = std::collections::HashMap::from([(
+         AMAZON_BEDROCK_PROVIDER_ID.to_string(),
+-        ModelProviderInfo {
++        ConfiguredModelProvider {
++            name: Some(String::new()),
+             aws: Some(ModelProviderAwsAuthInfo {
+                 profile: None,
+                 region: None,
+             }),
+-            wire_api: WireApi::Responses,
+-            ..ModelProviderInfo::default()
++            wire_api: Some(WireApi::Responses),
++            requires_openai_auth: Some(false),
++            supports_websockets: Some(false),
++            ..ConfiguredModelProvider::default()
+         },
+     )]);
+ 

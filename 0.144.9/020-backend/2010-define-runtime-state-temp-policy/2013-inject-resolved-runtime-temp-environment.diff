@@ -1,0 +1,796 @@
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index 350fe41fa4..81dcfa47d5 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -2022,6 +2022,7 @@ dependencies = [
+  "codex-utils-absolute-path",
+  "codex-utils-cargo-bin",
+  "codex-utils-cli",
++ "codex-utils-home-dir",
+  "codex-utils-json-to-toml",
+  "codex-utils-path-uri",
+  "codex-utils-pty",
+diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
+index dd4485b70c..3b9385868a 100644
+--- a/codex-rs/app-server/Cargo.toml
++++ b/codex-rs/app-server/Cargo.toml
+@@ -117,6 +117,7 @@ axum = { workspace = true, default-features = false, features = [
+ base64 = { workspace = true }
+ codex-model-provider-info = { workspace = true }
+ codex-utils-cargo-bin = { workspace = true }
++codex-utils-home-dir = { workspace = true }
+ core_test_support = { workspace = true }
+ flate2 = { workspace = true }
+ hmac = { workspace = true }
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+index e09123c811..55e239d4bf 100644
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -336,7 +336,7 @@ use codex_core::connectors::AccessibleConnectorsStatus;
+ use codex_core::exec::ExecCapturePolicy;
+ use codex_core::exec::ExecExpiration;
+ use codex_core::exec::ExecParams;
+-use codex_core::exec_env::create_env;
++use codex_core::exec_env::create_runtime_env;
+ use codex_core::path_utils;
+ #[cfg(test)]
+ use codex_core::read_head_for_summary;
+diff --git a/codex-rs/app-server/src/request_processors/command_exec_processor.rs b/codex-rs/app-server/src/request_processors/command_exec_processor.rs
+index 78f5ba62d6..a80622833d 100644
+--- a/codex-rs/app-server/src/request_processors/command_exec_processor.rs
++++ b/codex-rs/app-server/src/request_processors/command_exec_processor.rs
+@@ -147,9 +147,11 @@ impl CommandExecRequestProcessor {
+         }
+ 
+         let cwd = cwd.map_or_else(|| self.config.cwd.clone(), |cwd| self.config.cwd.join(cwd));
+-        let mut env = create_env(
++        let mut env = create_runtime_env(
+             &self.config.permissions.shell_environment_policy,
+             /*thread_id*/ None,
++            Some(cwd.as_path()),
++            self.config.codex_home.as_path(),
+         );
+         if let Some(env_overrides) = env_overrides {
+             for (key, value) in env_overrides {
+diff --git a/codex-rs/app-server/tests/suite/v2/command_exec.rs b/codex-rs/app-server/tests/suite/v2/command_exec.rs
+index edd704c9fb..a0cbfc6709 100644
+--- a/codex-rs/app-server/tests/suite/v2/command_exec.rs
++++ b/codex-rs/app-server/tests/suite/v2/command_exec.rs
+@@ -19,6 +19,13 @@ use codex_app_server_protocol::RequestId;
+ use codex_app_server_protocol::SandboxPolicy;
+ use codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR;
+ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
++use codex_utils_home_dir::find_codex_tmp_root;
++use codex_utils_home_dir::find_project_name;
++use codex_utils_home_dir::find_project_scratch_root;
++use codex_utils_home_dir::find_project_working_root;
++use codex_utils_home_dir::find_runtime_state_root;
++use codex_utils_home_dir::find_runtime_tmp_root;
++use codex_utils_home_dir::find_system_tmp_root;
+ use pretty_assertions::assert_eq;
+ use std::collections::HashMap;
+ use std::path::Path;
+@@ -202,6 +209,72 @@ async fn command_exec_env_overrides_merge_with_server_environment_and_support_un
+     Ok(())
+ }
+ 
++#[cfg(unix)]
++#[tokio::test]
++async fn command_exec_injects_runtime_temp_env() -> Result<()> {
++    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
++    let codex_tmp_root = find_codex_tmp_root()?;
++    std::fs::create_dir_all(codex_tmp_root.as_path())?;
++    let codex_home = TempDir::new_in(codex_tmp_root.as_path())?;
++    let command_dir = codex_home.path().join("command-cwd");
++    std::fs::create_dir(&command_dir)?;
++    create_config_toml(codex_home.path(), &server.uri(), "never")?;
++    let mut mcp = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .without_auto_env()
++        .build()
++        .await?;
++    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
++
++    let command_request_id = mcp
++        .send_command_exec_request(CommandExecParams {
++            command: vec![
++                "/bin/sh".to_string(),
++                "-lc".to_string(),
++                "printf '%s|%s|%s|%s|%s|%s|%s|%s' \"$TMPDIR\" \"$CODEX_HOME\" \"$CODEX_TMP\" \"$PROJECT_NAME\" \"$PROJECT_SCRATCH_ROOT\" \"$PROJECT_WORKING_ROOT\" \"$RUNTIME_TMP_ROOT\" \"$RUNTIME_STATE_ROOT\"".to_string(),
++            ],
++            process_id: None,
++            tty: false,
++            stream_stdin: false,
++            stream_stdout_stderr: false,
++            output_bytes_cap: None,
++            disable_output_cap: false,
++            disable_timeout: false,
++            timeout_ms: None,
++            cwd: Some("command-cwd".into()),
++            env: None,
++            size: None,
++            sandbox_policy: None,
++            permission_profile: None,
++        })
++        .await?;
++
++    let response = mcp
++        .read_stream_until_response_message(RequestId::Integer(command_request_id))
++        .await?;
++    let response: CommandExecResponse = to_response(response)?;
++    assert_eq!(
++        response,
++        CommandExecResponse {
++            exit_code: 0,
++            stdout: format!(
++                "{}|{}|{}|{}|{}|{}|{}|{}",
++                find_system_tmp_root()?.display(),
++                codex_home.path().canonicalize()?.display(),
++                find_codex_tmp_root()?.display(),
++                find_project_name(&command_dir),
++                find_project_scratch_root(&command_dir)?.display(),
++                find_project_working_root(&command_dir)?.display(),
++                find_runtime_tmp_root(&command_dir)?.display(),
++                find_runtime_state_root(&command_dir)?.display()
++            ),
++            stderr: String::new(),
++        }
++    );
++
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn command_exec_accepts_permission_profile() -> Result<()> {
+     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+diff --git a/codex-rs/core/src/exec_env.rs b/codex-rs/core/src/exec_env.rs
+index f33061698b..70f6532fbb 100644
+--- a/codex-rs/core/src/exec_env.rs
++++ b/codex-rs/core/src/exec_env.rs
+@@ -4,13 +4,28 @@ use codex_protocol::config_types::EnvironmentVariablePattern;
+ use codex_protocol::config_types::ShellEnvironmentPolicy;
+ use codex_protocol::models::ActivePermissionProfile;
+ use codex_protocol::shell_environment;
++use codex_utils_home_dir::find_codex_tmp_root;
++use codex_utils_home_dir::find_project_name;
++use codex_utils_home_dir::find_project_scratch_root;
++use codex_utils_home_dir::find_project_working_root;
++use codex_utils_home_dir::find_runtime_state_root;
++use codex_utils_home_dir::find_runtime_tmp_root;
++use codex_utils_home_dir::find_system_tmp_root;
+ use std::collections::HashMap;
++use std::path::Path;
+ 
+ pub use codex_protocol::shell_environment::CODEX_THREAD_ID_ENV_VAR;
+ 
+ /// Informational name of the active permission profile. Child processes can
+ /// overwrite this value, so it must not be treated as proof of enforcement.
+ pub const CODEX_PERMISSION_PROFILE_ENV_VAR: &str = "CODEX_PERMISSION_PROFILE";
++pub const CODEX_HOME_ENV_VAR: &str = "CODEX_HOME";
++pub const CODEX_TMP_ENV_VAR: &str = "CODEX_TMP";
++pub const PROJECT_SCRATCH_ROOT_ENV_VAR: &str = "PROJECT_SCRATCH_ROOT";
++pub const PROJECT_WORKING_ROOT_ENV_VAR: &str = "PROJECT_WORKING_ROOT";
++pub const PROJECT_NAME_ENV_VAR: &str = "PROJECT_NAME";
++pub const RUNTIME_TMP_ROOT_ENV_VAR: &str = "RUNTIME_TMP_ROOT";
++pub const RUNTIME_STATE_ROOT_ENV_VAR: &str = "RUNTIME_STATE_ROOT";
+ 
+ /// Construct an environment map based on the rules in the specified policy. The
+ /// resulting map can be passed directly to `Command::envs()` after calling
+@@ -30,6 +45,22 @@ pub fn create_env(
+     shell_environment::create_env(policy, thread_id.as_deref())
+ }
+ 
++/// Construct a child environment with authoritative Codex runtime paths.
++///
++/// `resolved_codex_home` always replaces inherited or policy-provided values.
++/// Local runtime roots are included in the returned map only when `local_cwd`
++/// is present.
++pub fn create_runtime_env(
++    policy: &ShellEnvironmentPolicy,
++    thread_id: Option<ThreadId>,
++    local_cwd: Option<&Path>,
++    resolved_codex_home: &Path,
++) -> HashMap<String, String> {
++    let mut env = create_env(policy, thread_id);
++    inject_runtime_path_env(&mut env, local_cwd, resolved_codex_home);
++    env
++}
++
+ /// Injects the selected named permission profile into a shell tool's environment.
+ ///
+ /// This is applied after the shell environment policy so the runtime-selected
+@@ -51,6 +82,77 @@ pub(crate) fn inject_permission_profile_env(
+     }
+ }
+ 
++fn inject_runtime_path_env(
++    env: &mut HashMap<String, String>,
++    local_cwd: Option<&Path>,
++    resolved_codex_home: &Path,
++) {
++    for key in [
++        "TMPDIR",
++        CODEX_HOME_ENV_VAR,
++        CODEX_TMP_ENV_VAR,
++        PROJECT_SCRATCH_ROOT_ENV_VAR,
++        PROJECT_WORKING_ROOT_ENV_VAR,
++        PROJECT_NAME_ENV_VAR,
++        RUNTIME_TMP_ROOT_ENV_VAR,
++        RUNTIME_STATE_ROOT_ENV_VAR,
++    ] {
++        remove_env_var(env, key);
++    }
++
++    env.insert(
++        CODEX_HOME_ENV_VAR.to_string(),
++        resolved_codex_home.to_string_lossy().into_owned(),
++    );
++
++    let Some(cwd) = local_cwd else {
++        return;
++    };
++
++    if let Ok(tmpdir) = find_system_tmp_root() {
++        env.insert("TMPDIR".to_string(), tmpdir.to_string_lossy().into_owned());
++    }
++    if let Ok(codex_tmp) = find_codex_tmp_root() {
++        env.insert(
++            CODEX_TMP_ENV_VAR.to_string(),
++            codex_tmp.to_string_lossy().into_owned(),
++        );
++    }
++    if let Ok(project_scratch_root) = find_project_scratch_root(cwd) {
++        env.insert(
++            PROJECT_SCRATCH_ROOT_ENV_VAR.to_string(),
++            project_scratch_root.to_string_lossy().into_owned(),
++        );
++    }
++    if let Ok(project_working_root) = find_project_working_root(cwd) {
++        env.insert(
++            PROJECT_WORKING_ROOT_ENV_VAR.to_string(),
++            project_working_root.to_string_lossy().into_owned(),
++        );
++    }
++    env.insert(PROJECT_NAME_ENV_VAR.to_string(), find_project_name(cwd));
++    if let Ok(runtime_tmp_root) = find_runtime_tmp_root(cwd) {
++        env.insert(
++            RUNTIME_TMP_ROOT_ENV_VAR.to_string(),
++            runtime_tmp_root.to_string_lossy().into_owned(),
++        );
++    }
++    if let Ok(runtime_state_root) = find_runtime_state_root(cwd) {
++        env.insert(
++            RUNTIME_STATE_ROOT_ENV_VAR.to_string(),
++            runtime_state_root.to_string_lossy().into_owned(),
++        );
++    }
++}
++
++fn remove_env_var(env: &mut HashMap<String, String>, key: &str) {
++    if cfg!(windows) {
++        env.retain(|candidate, _| !candidate.eq_ignore_ascii_case(key));
++    } else {
++        env.remove(key);
++    }
++}
++
+ #[cfg(all(test, target_os = "windows"))]
+ fn create_env_from_vars<I>(
+     vars: I,
+diff --git a/codex-rs/core/src/exec_env_tests.rs b/codex-rs/core/src/exec_env_tests.rs
+index 73c0944c14..9ee911286a 100644
+--- a/codex-rs/core/src/exec_env_tests.rs
++++ b/codex-rs/core/src/exec_env_tests.rs
+@@ -1,7 +1,15 @@
+ use super::*;
+ use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
++use codex_utils_home_dir::find_codex_tmp_root;
++use codex_utils_home_dir::find_project_name;
++use codex_utils_home_dir::find_project_scratch_root;
++use codex_utils_home_dir::find_project_working_root;
++use codex_utils_home_dir::find_runtime_state_root;
++use codex_utils_home_dir::find_runtime_tmp_root;
++use codex_utils_home_dir::find_system_tmp_root;
+ use maplit::hashmap;
+ use pretty_assertions::assert_eq;
++use tempfile::TempDir;
+ 
+ fn make_vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+     pairs
+@@ -310,3 +318,128 @@ fn test_inherit_none() {
+     expected.insert(CODEX_THREAD_ID_ENV_VAR.to_string(), thread_id.to_string());
+     assert_eq!(result, expected);
+ }
++
++#[test]
++fn create_runtime_env_injects_local_runtime_temp_paths() {
++    let codex_tmp_root = find_codex_tmp_root().expect("codex tmp root");
++    std::fs::create_dir_all(codex_tmp_root.as_path()).expect("create codex tmp root");
++    let temp = TempDir::new_in(codex_tmp_root.as_path()).expect("temp dir");
++    let codex_home = temp.path().join("codex-home");
++    let cwd = temp.path().join("workspace");
++    std::fs::create_dir_all(&codex_home).expect("create codex home");
++    std::fs::create_dir_all(&cwd).expect("create cwd");
++
++    let env = create_runtime_env(
++        &ShellEnvironmentPolicy {
++            inherit: ShellEnvironmentPolicyInherit::None,
++            ignore_default_excludes: true,
++            ..Default::default()
++        },
++        /*thread_id*/ None,
++        Some(cwd.as_path()),
++        codex_home.as_path(),
++    );
++
++    assert_eq!(
++        env.get("TMPDIR"),
++        Some(
++            &find_system_tmp_root()
++                .expect("system tmp")
++                .to_string_lossy()
++                .into_owned()
++        )
++    );
++    assert_eq!(
++        env.get(CODEX_HOME_ENV_VAR),
++        Some(&codex_home.to_string_lossy().into_owned())
++    );
++    assert_eq!(
++        env.get(CODEX_TMP_ENV_VAR),
++        Some(
++            &find_codex_tmp_root()
++                .expect("codex tmp")
++                .to_string_lossy()
++                .into_owned()
++        )
++    );
++    assert_eq!(
++        env.get(PROJECT_SCRATCH_ROOT_ENV_VAR),
++        Some(
++            &find_project_scratch_root(cwd.as_path())
++                .expect("project scratch root")
++                .to_string_lossy()
++                .into_owned()
++        )
++    );
++    assert_eq!(
++        env.get(PROJECT_WORKING_ROOT_ENV_VAR),
++        Some(
++            &find_project_working_root(cwd.as_path())
++                .expect("project working root")
++                .to_string_lossy()
++                .into_owned()
++        )
++    );
++    assert_eq!(
++        env.get(PROJECT_NAME_ENV_VAR),
++        Some(&find_project_name(cwd.as_path()))
++    );
++    assert_eq!(
++        env.get(RUNTIME_TMP_ROOT_ENV_VAR),
++        Some(
++            &find_runtime_tmp_root(cwd.as_path())
++                .expect("runtime tmp root")
++                .to_string_lossy()
++                .into_owned()
++        )
++    );
++    assert_eq!(
++        env.get(RUNTIME_STATE_ROOT_ENV_VAR),
++        Some(
++            &find_runtime_state_root(cwd.as_path())
++                .expect("runtime state root")
++                .to_string_lossy()
++                .into_owned()
++        )
++    );
++}
++
++#[test]
++fn create_runtime_env_omits_runtime_temp_paths_without_local_cwd() {
++    let mut policy = ShellEnvironmentPolicy {
++        inherit: ShellEnvironmentPolicyInherit::None,
++        ignore_default_excludes: true,
++        ..Default::default()
++    };
++    for (key, value) in [
++        ("TMPDIR", "/stale/tmpdir"),
++        (CODEX_HOME_ENV_VAR, "/stale/codex-home"),
++        (CODEX_TMP_ENV_VAR, "/stale/codex"),
++        (PROJECT_SCRATCH_ROOT_ENV_VAR, "/stale/scratch"),
++        (PROJECT_WORKING_ROOT_ENV_VAR, "/stale/working"),
++        (PROJECT_NAME_ENV_VAR, "stale-project"),
++        (RUNTIME_TMP_ROOT_ENV_VAR, "/stale/runtime-tmp"),
++        (RUNTIME_STATE_ROOT_ENV_VAR, "/stale/runtime-state"),
++    ] {
++        policy.r#set.insert(key.to_string(), value.to_string());
++    }
++
++    let env = create_runtime_env(
++        &policy,
++        /*thread_id*/ None,
++        /*local_cwd*/ None,
++        Path::new("/resolved/codex-home"),
++    );
++
++    assert_eq!(env.get("TMPDIR"), None);
++    assert_eq!(
++        env.get(CODEX_HOME_ENV_VAR),
++        Some(&"/resolved/codex-home".to_string())
++    );
++    assert_eq!(env.get(CODEX_TMP_ENV_VAR), None);
++    assert_eq!(env.get(PROJECT_SCRATCH_ROOT_ENV_VAR), None);
++    assert_eq!(env.get(PROJECT_WORKING_ROOT_ENV_VAR), None);
++    assert_eq!(env.get(PROJECT_NAME_ENV_VAR), None);
++    assert_eq!(env.get(RUNTIME_TMP_ROOT_ENV_VAR), None);
++    assert_eq!(env.get(RUNTIME_STATE_ROOT_ENV_VAR), None);
++}
+diff --git a/codex-rs/core/src/tasks/user_shell.rs b/codex-rs/core/src/tasks/user_shell.rs
+index ddf664c2c4..d857b67fa4 100644
+--- a/codex-rs/core/src/tasks/user_shell.rs
++++ b/codex-rs/core/src/tasks/user_shell.rs
+@@ -13,7 +13,7 @@ use uuid::Uuid;
+ use crate::exec::ExecCapturePolicy;
+ use crate::exec::StdoutStream;
+ use crate::exec::execute_exec_request;
+-use crate::exec_env::create_env;
++use crate::exec_env::create_runtime_env;
+ use crate::sandboxing::ExecRequest;
+ use crate::session::TurnInput;
+ use crate::session::turn_context::TurnContext;
+@@ -156,9 +156,11 @@ pub(crate) async fn execute_user_shell_command(
+         return;
+     };
+     let shell_snapshot_location = turn_environment.shell_snapshot(&cwd);
+-    let mut exec_env_map = create_env(
++    let mut exec_env_map = create_runtime_env(
+         &turn_context.config.permissions.shell_environment_policy,
+         Some(session.thread_id),
++        Some(cwd.as_path()),
++        turn_context.config.codex_home.as_path(),
+     );
+     if exec_env_map.contains_key(PROXY_ACTIVE_ENV_KEY) {
+         strip_managed_proxy_env(&mut exec_env_map);
+@@ -404,7 +406,7 @@ fn prepare_user_shell_exec_command(
+             shell_environment_set,
+             exec_env_map,
+             // On non-Unix targets, arg0 has already prepended the package path
+-            // to the process PATH before create_env() builds exec_env_map.
++            // to the process PATH before create_runtime_env() builds exec_env_map.
+             // RuntimePathPrepends is only needed for Unix shell snapshot replay.
+             &RuntimePathPrepends::default(),
+         )
+diff --git a/codex-rs/core/src/tools/handlers/shell/shell_command.rs b/codex-rs/core/src/tools/handlers/shell/shell_command.rs
+index 62bcee8bdf..0da7a72687 100644
+--- a/codex-rs/core/src/tools/handlers/shell/shell_command.rs
++++ b/codex-rs/core/src/tools/handlers/shell/shell_command.rs
+@@ -5,7 +5,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
+ 
+ use crate::exec::ExecCapturePolicy;
+ use crate::exec::ExecParams;
+-use crate::exec_env::create_env;
++use crate::exec_env::create_runtime_env;
+ use crate::exec_env::inject_permission_profile_env;
+ use crate::function_tool::FunctionCallError;
+ use crate::maybe_emit_implicit_skill_invocation;
+@@ -100,9 +100,11 @@ impl ShellCommandHandler {
+         let use_login_shell = Self::resolve_use_login_shell(params.login, allow_login_shell)?;
+         let command = Self::base_command(shell, &params.command, use_login_shell);
+ 
+-        let mut env = create_env(
++        let mut env = create_runtime_env(
+             &turn_context.config.permissions.shell_environment_policy,
+             Some(session.thread_id),
++            (!turn_environment.environment.is_remote()).then_some(cwd.as_path()),
++            turn_context.config.codex_home.as_path(),
+         );
+         let active_permission_profile = turn_context.config.permissions.active_permission_profile();
+         inject_permission_profile_env(&mut env, active_permission_profile.as_ref());
+diff --git a/codex-rs/core/src/tools/handlers/shell_tests.rs b/codex-rs/core/src/tools/handlers/shell_tests.rs
+index ebfbf9127c..3d1bceda74 100644
+--- a/codex-rs/core/src/tools/handlers/shell_tests.rs
++++ b/codex-rs/core/src/tools/handlers/shell_tests.rs
+@@ -7,7 +7,7 @@ use pretty_assertions::assert_eq;
+ 
+ use crate::config::PermissionProfileSnapshot;
+ use crate::exec_env::CODEX_PERMISSION_PROFILE_ENV_VAR;
+-use crate::exec_env::create_env;
++use crate::exec_env::create_runtime_env;
+ use crate::exec_env::inject_permission_profile_env;
+ use crate::sandboxing::SandboxPermissions;
+ use crate::session::step_context::StepContext;
+@@ -111,9 +111,11 @@ async fn shell_command_handler_to_exec_params_uses_selected_environment() {
+         PathUri::from_abs_path(&selected_cwd),
+         Some(selected_shell),
+     );
+-    let mut expected_env = create_env(
++    let mut expected_env = create_runtime_env(
+         &turn_context.config.permissions.shell_environment_policy,
+         Some(session.thread_id),
++        Some(expected_cwd.as_path()),
++        turn_context.config.codex_home.as_path(),
+     );
+     let active_permission_profile = turn_context.config.permissions.active_permission_profile();
+     inject_permission_profile_env(&mut expected_env, active_permission_profile.as_ref());
+diff --git a/codex-rs/core/src/tools/runtimes/mod.rs b/codex-rs/core/src/tools/runtimes/mod.rs
+index 1a83ef5657..8419b0d699 100644
+--- a/codex-rs/core/src/tools/runtimes/mod.rs
++++ b/codex-rs/core/src/tools/runtimes/mod.rs
+@@ -4,8 +4,15 @@ Module: runtimes
+ Concrete ToolRuntime implementations for specific tools. Each runtime stays
+ small and focused and reuses the orchestrator for approvals + sandbox + retry.
+ */
++use crate::exec_env::CODEX_HOME_ENV_VAR;
+ use crate::exec_env::CODEX_PERMISSION_PROFILE_ENV_VAR;
+ use crate::exec_env::CODEX_THREAD_ID_ENV_VAR;
++use crate::exec_env::CODEX_TMP_ENV_VAR;
++use crate::exec_env::PROJECT_NAME_ENV_VAR;
++use crate::exec_env::PROJECT_SCRATCH_ROOT_ENV_VAR;
++use crate::exec_env::PROJECT_WORKING_ROOT_ENV_VAR;
++use crate::exec_env::RUNTIME_STATE_ROOT_ENV_VAR;
++use crate::exec_env::RUNTIME_TMP_ROOT_ENV_VAR;
+ use crate::sandboxing::SandboxPermissions;
+ use crate::shell::Shell;
+ use crate::shell::ShellType;
+@@ -288,14 +295,38 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot(
+         .map(|arg| format!(" '{}'", shell_single_quote(arg)))
+         .collect::<String>();
+     let mut override_env = explicit_env_overrides.clone();
+-    for key in [CODEX_THREAD_ID_ENV_VAR, CODEX_PERMISSION_PROFILE_ENV_VAR] {
++    for key in [
++        CODEX_THREAD_ID_ENV_VAR,
++        CODEX_PERMISSION_PROFILE_ENV_VAR,
++        "TMPDIR",
++        CODEX_HOME_ENV_VAR,
++        CODEX_TMP_ENV_VAR,
++        PROJECT_NAME_ENV_VAR,
++        PROJECT_SCRATCH_ROOT_ENV_VAR,
++        PROJECT_WORKING_ROOT_ENV_VAR,
++        RUNTIME_TMP_ROOT_ENV_VAR,
++        RUNTIME_STATE_ROOT_ENV_VAR,
++    ] {
+         if let Some(value) = env.get(key) {
+             override_env.insert(key.to_string(), value.clone());
+         }
+     }
+-    // Do not let a snapshot resurrect a stale profile when no named profile is active.
+-    let (override_captures, override_exports) =
+-        build_override_exports(&override_env, &[CODEX_PERMISSION_PROFILE_ENV_VAR]);
++    // Do not let a snapshot resurrect stale runtime-only environment values
++    // when the live process does not define them.
++    let (override_captures, override_exports) = build_override_exports(
++        &override_env,
++        &[
++            CODEX_PERMISSION_PROFILE_ENV_VAR,
++            "TMPDIR",
++            CODEX_HOME_ENV_VAR,
++            CODEX_TMP_ENV_VAR,
++            PROJECT_NAME_ENV_VAR,
++            PROJECT_SCRATCH_ROOT_ENV_VAR,
++            PROJECT_WORKING_ROOT_ENV_VAR,
++            RUNTIME_TMP_ROOT_ENV_VAR,
++            RUNTIME_STATE_ROOT_ENV_VAR,
++        ],
++    );
+     let (proxy_captures, proxy_exports) = build_proxy_env_exports();
+     let runtime_path_prepend_exports =
+         runtime_path_prepends.shell_exports_after_snapshot(explicit_env_overrides);
+diff --git a/codex-rs/core/src/tools/runtimes/mod_tests.rs b/codex-rs/core/src/tools/runtimes/mod_tests.rs
+index f6ec38f6c2..bc5d70f201 100644
+--- a/codex-rs/core/src/tools/runtimes/mod_tests.rs
++++ b/codex-rs/core/src/tools/runtimes/mod_tests.rs
+@@ -1,6 +1,13 @@
+ use super::*;
+ use crate::exec::ExecCapturePolicy;
+ use crate::exec::ExecExpiration;
++use crate::exec_env::CODEX_HOME_ENV_VAR;
++use crate::exec_env::CODEX_TMP_ENV_VAR;
++use crate::exec_env::PROJECT_NAME_ENV_VAR;
++use crate::exec_env::PROJECT_SCRATCH_ROOT_ENV_VAR;
++use crate::exec_env::PROJECT_WORKING_ROOT_ENV_VAR;
++use crate::exec_env::RUNTIME_STATE_ROOT_ENV_VAR;
++use crate::exec_env::RUNTIME_TMP_ROOT_ENV_VAR;
+ use crate::sandboxing::ExecOptions;
+ use crate::shell::ShellType;
+ use crate::tools::sandboxing::SandboxAttempt;
+@@ -607,6 +614,72 @@ fn maybe_wrap_shell_lc_with_snapshot_unsets_absent_permission_profile() {
+     assert_eq!(output.stdout, b"");
+ }
+ 
++#[test]
++fn maybe_wrap_shell_lc_with_snapshot_restores_runtime_temp_env() {
++    let dir = tempdir().expect("create temp dir");
++    let snapshot_path = dir.path().join("snapshot.sh");
++    std::fs::write(
++        &snapshot_path,
++        "# Snapshot file\n\
++         export TMPDIR='/snapshot/tmp'\n\
++         export CODEX_HOME='/snapshot/home'\n\
++         export CODEX_TMP='/snapshot/codex'\n\
++         export PROJECT_NAME='snapshot-project'\n\
++         export PROJECT_SCRATCH_ROOT='/snapshot/project'\n\
++         export PROJECT_WORKING_ROOT='/snapshot/working'\n\
++         export RUNTIME_TMP_ROOT='/snapshot/runtime-tmp'\n\
++         export RUNTIME_STATE_ROOT='/snapshot/runtime-state'\n",
++    )
++    .expect("write snapshot");
++    let (session_shell, shell_snapshot) =
++        shell_with_snapshot(ShellType::Bash, "/bin/bash", snapshot_path.abs());
++    let command = vec![
++        "/bin/bash".to_string(),
++        "-lc".to_string(),
++        "printf '%s|%s|%s|%s|%s|%s|%s|%s' \"$TMPDIR\" \"$CODEX_HOME\" \"$CODEX_TMP\" \"${PROJECT_NAME-unset}\" \"${PROJECT_SCRATCH_ROOT-unset}\" \"${PROJECT_WORKING_ROOT-unset}\" \"${RUNTIME_TMP_ROOT-unset}\" \"${RUNTIME_STATE_ROOT-unset}\"".to_string(),
++    ];
++    let env = HashMap::from([
++        ("TMPDIR".to_string(), "/live/tmp".to_string()),
++        (CODEX_HOME_ENV_VAR.to_string(), "/live/home".to_string()),
++        (CODEX_TMP_ENV_VAR.to_string(), "/live/codex".to_string()),
++        (PROJECT_NAME_ENV_VAR.to_string(), "live-project".to_string()),
++        (
++            PROJECT_WORKING_ROOT_ENV_VAR.to_string(),
++            "/live/working".to_string(),
++        ),
++        (
++            RUNTIME_TMP_ROOT_ENV_VAR.to_string(),
++            "/live/runtime-tmp".to_string(),
++        ),
++    ]);
++    let rewritten = maybe_wrap_shell_lc_with_snapshot(
++        &command,
++        &session_shell,
++        Some(&shell_snapshot),
++        &HashMap::new(),
++        &env,
++        &RuntimePathPrepends::default(),
++    );
++    let output = Command::new(&rewritten[0])
++        .args(&rewritten[1..])
++        .env("TMPDIR", "/live/tmp")
++        .env(CODEX_HOME_ENV_VAR, "/live/home")
++        .env(CODEX_TMP_ENV_VAR, "/live/codex")
++        .env(PROJECT_NAME_ENV_VAR, "live-project")
++        .env_remove(PROJECT_SCRATCH_ROOT_ENV_VAR)
++        .env(PROJECT_WORKING_ROOT_ENV_VAR, "/live/working")
++        .env(RUNTIME_TMP_ROOT_ENV_VAR, "/live/runtime-tmp")
++        .env_remove(RUNTIME_STATE_ROOT_ENV_VAR)
++        .output()
++        .expect("run rewritten command");
++
++    assert!(output.status.success(), "command failed: {output:?}");
++    assert_eq!(
++        String::from_utf8_lossy(&output.stdout),
++        "/live/tmp|/live/home|/live/codex|live-project|unset|/live/working|/live/runtime-tmp|unset"
++    );
++}
++
+ #[test]
+ fn maybe_wrap_shell_lc_with_snapshot_restores_proxy_env_from_process_env() {
+     let dir = tempdir().expect("create temp dir");
+diff --git a/codex-rs/core/src/unified_exec/process_manager.rs b/codex-rs/core/src/unified_exec/process_manager.rs
+index f5112dce3b..77a03f95f2 100644
+--- a/codex-rs/core/src/unified_exec/process_manager.rs
++++ b/codex-rs/core/src/unified_exec/process_manager.rs
+@@ -16,7 +16,7 @@ use uuid::Uuid;
+ use crate::codex_thread::BackgroundTerminalInfo;
+ use crate::exec_env::CODEX_PERMISSION_PROFILE_ENV_VAR;
+ use crate::exec_env::CODEX_THREAD_ID_ENV_VAR;
+-use crate::exec_env::create_env;
++use crate::exec_env::create_runtime_env;
+ use crate::exec_env::inject_permission_profile_env;
+ use crate::exec_policy::ExecApprovalRequest;
+ use crate::sandboxing::ExecOptions;
+@@ -1139,9 +1139,16 @@ impl UnifiedExecProcessManager {
+         cwd: PathUri,
+         context: &UnifiedExecContext,
+     ) -> Result<(UnifiedExecProcess, Option<DeferredNetworkApproval>), UnifiedExecError> {
+-        let local_policy_env = create_env(
++        let runtime_env_cwd = if request.turn_environment.environment.is_remote() {
++            None
++        } else {
++            request.cwd.to_abs_path().ok()
++        };
++        let local_policy_env = create_runtime_env(
+             &context.turn.config.permissions.shell_environment_policy,
+             /*thread_id*/ None,
++            runtime_env_cwd.as_deref(),
++            context.turn.config.codex_home.as_path(),
+         );
+         let mut env = local_policy_env.clone();
+         env.insert(
+diff --git a/codex-rs/core/src/unified_exec/process_manager_tests.rs b/codex-rs/core/src/unified_exec/process_manager_tests.rs
+index 9163862ae7..31f3b6d8c9 100644
+--- a/codex-rs/core/src/unified_exec/process_manager_tests.rs
++++ b/codex-rs/core/src/unified_exec/process_manager_tests.rs
+@@ -1,4 +1,5 @@
+ use super::*;
++use crate::exec_env::CODEX_HOME_ENV_VAR;
+ use crate::unified_exec::clamp_yield_time;
+ use codex_network_proxy::ManagedNetworkSandboxContext;
+ use pretty_assertions::assert_eq;
+@@ -42,6 +43,10 @@ fn env_overlay_for_exec_server_keeps_runtime_changes_only() {
+         ("HOME".to_string(), "/client-home".to_string()),
+         ("PATH".to_string(), "/client-path".to_string()),
+         ("SHELL_SET".to_string(), "policy".to_string()),
++        (
++            CODEX_HOME_ENV_VAR.to_string(),
++            "/host/codex-home".to_string(),
++        ),
+         (
+             CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
+             "current-profile".to_string(),
+@@ -51,6 +56,10 @@ fn env_overlay_for_exec_server_keeps_runtime_changes_only() {
+         ("HOME".to_string(), "/client-home".to_string()),
+         ("PATH".to_string(), "/sandbox-path".to_string()),
+         ("SHELL_SET".to_string(), "policy".to_string()),
++        (
++            CODEX_HOME_ENV_VAR.to_string(),
++            "/host/codex-home".to_string(),
++        ),
+         ("CODEX_THREAD_ID".to_string(), "thread-1".to_string()),
+         (
+             CODEX_PERMISSION_PROFILE_ENV_VAR.to_string(),
+diff --git a/codex-rs/core/tests/suite/compact_remote_parity.rs b/codex-rs/core/tests/suite/compact_remote_parity.rs
+index d4042a8c2e..00cc098781 100644
+--- a/codex-rs/core/tests/suite/compact_remote_parity.rs
++++ b/codex-rs/core/tests/suite/compact_remote_parity.rs
+@@ -1005,6 +1005,28 @@ fn normalize_tmp_prefix_before_marker(text: &mut String, marker: &str) {
+     while let Some(relative_marker_index) = text[search_start..].find(marker) {
+         let marker_index = search_start + relative_marker_index;
+         let prefix = &text[..marker_index];
++        let nested_tmp_start = prefix.rfind("/.tmp").and_then(|temp_index| {
++            ["/private/tmp/", "/tmp/"]
++                .into_iter()
++                .find_map(|candidate| {
++                    let start = prefix[..temp_index].rfind(candidate)?;
++                    let has_path_boundary = start == 0
++                        || matches!(
++                            prefix.as_bytes()[start - 1],
++                            b' ' | b'\t'
++                                | b'\n'
++                                | b'\r'
++                                | b'"'
++                                | b'\''
++                                | b'='
++                                | b'('
++                                | b'['
++                                | b'{'
++                                | b'`'
++                        );
++                    has_path_boundary.then_some(start)
++                })
++        });
+         let windows_appdata_temp_start = prefix
+             .rfind("/AppData/Local/Temp/.tmp")
+             .and_then(|temp_index| prefix[..temp_index].rfind(":/Users/"))
+@@ -1020,6 +1042,7 @@ fn normalize_tmp_prefix_before_marker(text: &mut String, marker: &str) {
+             .or_else(|| prefix.rfind("/var/folders/"))
+             .or_else(|| prefix.rfind("/private/tmp/.tmp"))
+             .or_else(|| prefix.rfind("/tmp/.tmp"))
++            .or(nested_tmp_start)
+             .or(windows_appdata_temp_start);
+         if let Some(start_index) = start {
+             text.replace_range(start_index..marker_index, "<CODEX_HOME>");
+@@ -1044,6 +1067,22 @@ fn normalize_string_rewrites_linux_temp_skill_paths() {
+     );
+ }
+ 
++#[test]
++fn normalize_string_rewrites_project_scratch_tmp_skill_paths() {
++    let text = normalize_string(
++        "file: /tmp/codex/repos/codex/.tmp5YYdK3/skills/.system/imagegen/SKILL.md",
++    );
++
++    assert_eq!(text, "file: <CODEX_HOME>/skills/.system/imagegen/SKILL.md");
++}
++
++#[test]
++fn normalize_string_preserves_non_system_nested_tmp_skill_paths() {
++    let text = "file: /home/user/tmp/project/.tmp5YYdK3/skills/custom/SKILL.md";
++
++    assert_eq!(normalize_string(text), text);
++}
++
+ #[test]
+ fn normalize_string_rewrites_windows_temp_skill_paths() {
+     let text = normalize_string(

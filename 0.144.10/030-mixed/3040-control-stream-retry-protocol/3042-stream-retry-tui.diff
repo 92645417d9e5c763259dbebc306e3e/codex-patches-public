@@ -1,0 +1,700 @@
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index f76b53c833..a867d30e5c 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -445,6 +445,12 @@ impl App {
+             AppEvent::SubmitThreadOp { thread_id, op } => {
+                 self.submit_thread_op(app_server, thread_id, op).await?;
+             }
++            AppEvent::RetryCurrentStream { thread_id, turn_id } => {
++                if let Err(err) = app_server.turn_retry_now(thread_id, turn_id).await {
++                    self.chat_widget
++                        .add_error_message(format!("Failed to retry stream now: {err}"));
++                }
++            }
+             AppEvent::ThreadHistoryEntryResponse { thread_id, event } => {
+                 self.enqueue_thread_history_entry_response(thread_id, event)
+                     .await?;
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+index 372193493d..a568c820a5 100644
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -172,6 +172,12 @@ pub(crate) enum AppEvent {
+         turn: AppCommand,
+     },
+ 
++    /// Reset the current stream retry budget and wake the retry loop.
++    RetryCurrentStream {
++        thread_id: ThreadId,
++        turn_id: String,
++    },
++
+     /// Deliver a synthetic history lookup response to a specific thread channel.
+     ThreadHistoryEntryResponse {
+         thread_id: ThreadId,
+diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+index 4cccedd331..43d7cf13f9 100644
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -107,6 +107,8 @@ use codex_app_server_protocol::TurnClearPendingSteersParams;
+ use codex_app_server_protocol::TurnClearPendingSteersResponse;
+ use codex_app_server_protocol::TurnInterruptParams;
+ use codex_app_server_protocol::TurnInterruptResponse;
++use codex_app_server_protocol::TurnRetryNowParams;
++use codex_app_server_protocol::TurnRetryNowResponse;
+ use codex_app_server_protocol::TurnStartParams;
+ use codex_app_server_protocol::TurnStartResponse;
+ use codex_app_server_protocol::TurnSteerParams;
+@@ -870,6 +872,24 @@ impl AppServerSession {
+         self.turn_interrupt(thread_id, String::new()).await
+     }
+ 
++    pub(crate) async fn turn_retry_now(
++        &mut self,
++        thread_id: ThreadId,
++        turn_id: String,
++    ) -> Result<TurnRetryNowResponse> {
++        let request_id = self.next_request_id();
++        self.client
++            .request_typed(ClientRequest::TurnRetryNow {
++                request_id,
++                params: TurnRetryNowParams {
++                    thread_id: thread_id.to_string(),
++                    turn_id,
++                },
++            })
++            .await
++            .wrap_err("turn/retryNow failed in TUI")
++    }
++
+     pub(crate) async fn turn_steer(
+         &mut self,
+         thread_id: ThreadId,
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 6d27c1174f..9a968ab8de 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -405,6 +405,7 @@ use self::safety_buffering::SafetyBufferingState;
+ mod status_state;
+ mod windows_sandbox_prompts;
+ use self::status_state::ResponsesStreamConnectionStatus;
++use self::status_state::RetryCountdownStatus;
+ use self::status_state::StatusIndicatorState;
+ use self::status_state::StatusState;
+ use self::status_state::TerminalTitleStatusKind;
+@@ -1197,6 +1198,7 @@ impl ChatWidget {
+     pub(crate) fn pre_draw_tick(&mut self) {
+         self.update_due_hook_visibility();
+         self.schedule_hook_timer_if_needed();
++        self.refresh_retry_countdown_status_for_time_tick();
+         self.bottom_pane.pre_draw_tick();
+         if let Some(pet) = self.ambient_pet.as_ref() {
+             pet.schedule_next_frame();
+@@ -1214,6 +1216,26 @@ impl ChatWidget {
+         self.refresh_status_line_if_workspace_headline_due();
+     }
+ 
++    fn refresh_retry_countdown_status_for_time_tick(&mut self) {
++        let Some(status) = self.status_state.retry_countdown_status.clone() else {
++            return;
++        };
++        let now = Instant::now();
++        let header = Self::retry_countdown_header(&status.base_header, Some(status.retry_at));
++        if self.status_state.current_status.header != header {
++            self.set_status(
++                header,
++                status.details.clone(),
++                StatusDetailsCapitalization::Preserve,
++                status.details_max_lines,
++            );
++            self.status_state.retry_countdown_status = Some(status.clone());
++        }
++        if now < status.retry_at {
++            self.frame_requester
++                .schedule_frame_in(Duration::from_secs(1));
++        }
++    }
+     fn flush_active_cell(&mut self) {
+         if let Some(active) = self.transcript.active_cell.take() {
+             self.transcript.needs_final_message_separator = true;
+diff --git a/codex-rs/tui/src/chatwidget/interaction.rs b/codex-rs/tui/src/chatwidget/interaction.rs
+index 54d2eed6a0..03fd43c8be 100644
+--- a/codex-rs/tui/src/chatwidget/interaction.rs
++++ b/codex-rs/tui/src/chatwidget/interaction.rs
+@@ -37,6 +37,13 @@ impl ChatWidget {
+             return;
+         }
+ 
++        if self.handle_retry_now_shortcut(key_event) {
++            self.bottom_pane.clear_quit_shortcut_hint();
++            self.quit_shortcut_expires_at = None;
++            self.quit_shortcut_key = None;
++            return;
++        }
++
+         if key_event.kind == KeyEventKind::Press
+             && self.copy_last_response_binding.is_pressed(key_event)
+         {
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index 54d5e18c75..e917a70e3a 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -127,6 +127,8 @@ impl ChatWidget {
+                         self.on_stream_error(
+                             notification.error.message,
+                             notification.error.additional_details,
++                            notification.turn_id,
++                            notification.retry_info,
+                         );
+                     }
+                 } else {
+diff --git a/codex-rs/tui/src/chatwidget/status_state.rs b/codex-rs/tui/src/chatwidget/status_state.rs
+index 67788d7d28..bfb3db5252 100644
+--- a/codex-rs/tui/src/chatwidget/status_state.rs
++++ b/codex-rs/tui/src/chatwidget/status_state.rs
+@@ -1,6 +1,7 @@
+ //! Status indicator and terminal-title state for `ChatWidget`.
+ 
+ use crate::status_indicator_widget::STATUS_DETAILS_DEFAULT_MAX_LINES;
++use std::time::Instant;
+ 
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub(super) struct StatusIndicatorState {
+@@ -15,6 +16,15 @@ pub(super) struct ResponsesStreamConnectionStatus {
+     pub(super) rtt_ms: Option<u64>,
+ }
+ 
++#[derive(Clone, Debug)]
++pub(super) struct RetryCountdownStatus {
++    pub(super) turn_id: String,
++    pub(super) base_header: String,
++    pub(super) details: Option<String>,
++    pub(super) details_max_lines: usize,
++    pub(super) retry_at: Instant,
++}
++
+ impl StatusIndicatorState {
+     pub(super) fn working() -> Self {
+         Self {
+@@ -116,6 +126,7 @@ pub(super) struct StatusState {
+     pub(super) pending_guardian_review_status: PendingGuardianReviewStatus,
+     pub(super) terminal_title_status_kind: TerminalTitleStatusKind,
+     pub(super) retry_status_header: Option<String>,
++    pub(super) retry_countdown_status: Option<RetryCountdownStatus>,
+     pub(super) pending_status_indicator_restore: bool,
+ }
+ 
+@@ -126,6 +137,7 @@ impl Default for StatusState {
+             pending_guardian_review_status: PendingGuardianReviewStatus::default(),
+             terminal_title_status_kind: TerminalTitleStatusKind::Working,
+             retry_status_header: None,
++            retry_countdown_status: None,
+             pending_status_indicator_restore: false,
+         }
+     }
+@@ -134,6 +146,7 @@ impl Default for StatusState {
+ impl StatusState {
+     pub(super) fn set_status(&mut self, status: StatusIndicatorState) {
+         self.current_status = status;
++        self.retry_countdown_status = None;
+     }
+ 
+     pub(super) fn take_retry_status_header(&mut self) -> Option<String> {
+diff --git a/codex-rs/tui/src/chatwidget/streaming.rs b/codex-rs/tui/src/chatwidget/streaming.rs
+index e0d90dad9b..650436478a 100644
+--- a/codex-rs/tui/src/chatwidget/streaming.rs
++++ b/codex-rs/tui/src/chatwidget/streaming.rs
+@@ -6,6 +6,18 @@
+ use super::*;
+ 
+ impl ChatWidget {
++    pub(super) fn retry_countdown_header(base_header: &str, retry_at: Option<Instant>) -> String {
++        let Some(retry_at) = retry_at else {
++            return base_header.to_string();
++        };
++        let remaining = retry_at.saturating_duration_since(Instant::now());
++        if remaining.is_zero() {
++            return format!("{base_header} ▪ retrying now");
++        }
++        let remaining_secs = remaining.as_millis().div_ceil(1000);
++        format!("{base_header} ▪ next retry in {remaining_secs}s ▪ ctrl+x reset retry budget")
++    }
++
+     pub(super) fn restore_reasoning_status_header(&mut self) {
+         if let Some(header) = extract_first_bold(&self.reasoning_buffer) {
+             self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Thinking;
+@@ -248,16 +260,74 @@ impl ChatWidget {
+         }
+     }
+ 
+-    pub(super) fn on_stream_error(&mut self, message: String, additional_details: Option<String>) {
++    fn mark_interrupted_streams_for_retry(&mut self) {
++        if self.stream_controller.is_some() {
++            self.flush_answer_stream_with_separator();
++            self.add_to_history(history_cell::InterruptedStreamSeparator::new(
++                history_cell::InterruptedStreamKind::Answer,
++            ));
++            self.transcript.needs_final_message_separator = false;
++        }
++    }
++
++    pub(super) fn on_stream_error(
++        &mut self,
++        message: String,
++        additional_details: Option<String>,
++        turn_id: String,
++        retry_info: Option<codex_app_server_protocol::StreamRetryInfo>,
++    ) {
++        self.mark_interrupted_streams_for_retry();
+         self.status_state.remember_retry_status_header();
+         self.bottom_pane.ensure_status_indicator();
+         self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Thinking;
++        let retry_at = retry_info
++            .as_ref()
++            .map(|info| Instant::now() + Duration::from_millis(info.retry_delay_ms));
+         self.set_status(
+-            message,
+-            additional_details,
++            Self::retry_countdown_header(&message, retry_at),
++            additional_details.clone(),
+             StatusDetailsCapitalization::CapitalizeFirst,
+             STATUS_DETAILS_DEFAULT_MAX_LINES,
+         );
++        if let Some(retry_at) = retry_at {
++            self.status_state.retry_countdown_status = Some(RetryCountdownStatus {
++                turn_id,
++                base_header: message,
++                details: additional_details,
++                details_max_lines: STATUS_DETAILS_DEFAULT_MAX_LINES,
++                retry_at,
++            });
++            self.frame_requester
++                .schedule_frame_in(Duration::from_secs(1));
++        }
++    }
++
++    pub(super) fn handle_retry_now_shortcut(&mut self, key_event: KeyEvent) -> bool {
++        if !key_hint::ctrl(KeyCode::Char('x')).is_press(key_event)
++            || !self.bottom_pane.no_modal_or_popup_active()
++        {
++            return false;
++        }
++        let Some(status) = self.status_state.retry_countdown_status.clone() else {
++            return false;
++        };
++        let Some(thread_id) = self.thread_id else {
++            return false;
++        };
++
++        self.set_status(
++            format!("{} ▪ resetting retry budget", status.base_header),
++            status.details,
++            StatusDetailsCapitalization::Preserve,
++            status.details_max_lines,
++        );
++        self.app_event_tx.send(AppEvent::RetryCurrentStream {
++            thread_id,
++            turn_id: status.turn_id,
++        });
++        self.request_redraw();
++        true
+     }
+ 
+     /// Handle completion of an `AgentMessage` turn item.
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index 908324ffde..1d9864a56e 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -975,6 +975,7 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
+                 additional_details: None,
+             },
+             will_retry: false,
++            retry_info: None,
+             thread_id: "thread-1".to_string(),
+             turn_id: "turn-1".to_string(),
+         }),
+@@ -1074,6 +1075,7 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
+                 additional_details: None,
+             },
+             will_retry: true,
++            retry_info: None,
+             thread_id: "thread-1".to_string(),
+             turn_id: "turn-1".to_string(),
+         }),
+@@ -1102,6 +1104,119 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
+     assert!(chat.status_state.retry_status_header.is_none());
+ }
+ 
++#[tokio::test]
++async fn live_app_server_stream_recovery_shows_retry_countdown() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++
++    chat.handle_server_notification(
++        ServerNotification::Error(ErrorNotification {
++            error: AppServerTurnError {
++                message: "Reconnecting... 2/30".to_string(),
++                codex_error_info: Some(CodexErrorInfo::Other),
++                additional_details: None,
++            },
++            will_retry: true,
++            retry_info: Some(codex_app_server_protocol::StreamRetryInfo {
++                retry_count: 2,
++                retry_limit: 30,
++                retry_delay_ms: 5_000,
++            }),
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++        }),
++        /*replay_kind*/ None,
++    );
++    drain_insert_history(&mut rx);
++
++    let status = chat
++        .bottom_pane
++        .status_widget()
++        .expect("status indicator should be visible");
++    assert!(status.header().starts_with("Reconnecting... 2/30"));
++    assert!(status.header().contains("next retry in 5s"));
++    assert!(status.header().contains("ctrl+x reset retry budget"));
++    assert_eq!(status.details(), None);
++}
++
++#[tokio::test]
++async fn live_app_server_stream_recovery_ctrl_x_resets_retry_budget() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    let thread_id = ThreadId::new();
++    chat.thread_id = Some(thread_id);
++
++    chat.handle_server_notification(
++        ServerNotification::Error(ErrorNotification {
++            error: AppServerTurnError {
++                message: "Reconnecting... 2/30".to_string(),
++                codex_error_info: Some(CodexErrorInfo::Other),
++                additional_details: None,
++            },
++            will_retry: true,
++            retry_info: Some(codex_app_server_protocol::StreamRetryInfo {
++                retry_count: 2,
++                retry_limit: 30,
++                retry_delay_ms: 5_000,
++            }),
++            thread_id: thread_id.to_string(),
++            turn_id: "turn-1".to_string(),
++        }),
++        /*replay_kind*/ None,
++    );
++    drain_insert_history(&mut rx);
++
++    chat.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
++
++    match rx.try_recv() {
++        Ok(AppEvent::RetryCurrentStream {
++            thread_id: event_thread_id,
++            turn_id,
++        }) => {
++            assert_eq!(event_thread_id, thread_id);
++            assert_eq!(turn_id, "turn-1");
++        }
++        other => panic!("expected RetryCurrentStream event, got {other:?}"),
++    }
++    let status = chat
++        .bottom_pane
++        .status_widget()
++        .expect("status indicator should be visible");
++    assert_eq!(
++        status.header(),
++        "Reconnecting... 2/30 ▪ resetting retry budget"
++    );
++}
++
++#[tokio::test]
++async fn live_app_server_stream_recovery_zero_delay_shows_retrying_now() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++
++    chat.handle_server_notification(
++        ServerNotification::Error(ErrorNotification {
++            error: AppServerTurnError {
++                message: "Reconnecting... 1/30".to_string(),
++                codex_error_info: Some(CodexErrorInfo::Other),
++                additional_details: None,
++            },
++            will_retry: true,
++            retry_info: Some(codex_app_server_protocol::StreamRetryInfo {
++                retry_count: 1,
++                retry_limit: 30,
++                retry_delay_ms: 0,
++            }),
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++        }),
++        /*replay_kind*/ None,
++    );
++    drain_insert_history(&mut rx);
++
++    let status = chat
++        .bottom_pane
++        .status_widget()
++        .expect("status indicator should be visible");
++    assert_eq!(status.header(), "Reconnecting... 1/30 ▪ retrying now");
++}
++
+ #[tokio::test]
+ async fn live_app_server_server_overloaded_error_renders_warning() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+@@ -1132,6 +1247,7 @@ async fn live_app_server_server_overloaded_error_renders_warning() {
+                 additional_details: None,
+             },
+             will_retry: false,
++            retry_info: None,
+             thread_id: "thread-1".to_string(),
+             turn_id: "turn-1".to_string(),
+         }),
+@@ -1174,6 +1290,7 @@ async fn live_app_server_cyber_policy_error_renders_dedicated_notice() {
+                 additional_details: None,
+             },
+             will_retry: false,
++            retry_info: None,
+             thread_id: "thread-1".to_string(),
+             turn_id: "turn-1".to_string(),
+         }),
+diff --git a/codex-rs/tui/src/chatwidget/tests/helpers.rs b/codex-rs/tui/src/chatwidget/tests/helpers.rs
+index f3aa558d67..1242f12c49 100644
+--- a/codex-rs/tui/src/chatwidget/tests/helpers.rs
++++ b/codex-rs/tui/src/chatwidget/tests/helpers.rs
+@@ -418,6 +418,7 @@ pub(super) fn handle_error(
+                 additional_details: None,
+             },
+             will_retry: false,
++            retry_info: None,
+             thread_id: thread_id(chat),
+             turn_id: chat
+                 .turn_lifecycle
+@@ -451,6 +452,7 @@ pub(super) fn handle_stream_error_with_replay(
+                 additional_details,
+             },
+             will_retry: true,
++            retry_info: None,
+             thread_id: thread_id(chat),
+             turn_id: chat
+                 .turn_lifecycle
+diff --git a/codex-rs/tui/src/chatwidget/tests/history_replay.rs b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
+index 45c3b5cb0d..2398253c60 100644
+--- a/codex-rs/tui/src/chatwidget/tests/history_replay.rs
++++ b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
+@@ -873,6 +873,7 @@ async fn replayed_retryable_app_server_error_keeps_turn_running() {
+                 additional_details: Some("Idle timeout waiting for SSE".to_string()),
+             },
+             will_retry: true,
++            retry_info: None,
+             thread_id: "thread-1".to_string(),
+             turn_id: "turn-1".to_string(),
+         }),
+diff --git a/codex-rs/tui/src/chatwidget/tests/mcp_startup.rs b/codex-rs/tui/src/chatwidget/tests/mcp_startup.rs
+index 49588ba157..f9e1578775 100644
+--- a/codex-rs/tui/src/chatwidget/tests/mcp_startup.rs
++++ b/codex-rs/tui/src/chatwidget/tests/mcp_startup.rs
+@@ -38,6 +38,8 @@ async fn mcp_startup_ignores_status_for_other_thread() {
+     chat.on_stream_error(
+         "Connection interrupted, retrying".to_string(),
+         /*additional_details*/ None,
++        "turn-1".to_string(),
++        /*retry_info*/ None,
+     );
+     let status_before = chat.status_state.current_status.clone();
+     let retry_status_header_before = chat.status_state.retry_status_header.clone();
+diff --git a/codex-rs/tui/src/chatwidget/tests/slash_commands.rs b/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
+index 519f5f3105..0504a4c269 100644
+--- a/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
++++ b/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
+@@ -1905,7 +1905,7 @@ async fn copy_shortcut_can_be_remapped() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+     let mut keymap_config = chat.config_ref().tui_keymap.clone();
+     keymap_config.global.copy = Some(codex_config::types::KeybindingsSpec::One(
+-        codex_config::types::KeybindingSpec("ctrl-x".to_string()),
++        codex_config::types::KeybindingSpec("page-down".to_string()),
+     ));
+     let runtime_keymap =
+         crate::keymap::RuntimeKeymap::from_config(&keymap_config).expect("valid copy remap");
+@@ -1917,7 +1917,7 @@ async fn copy_shortcut_can_be_remapped() {
+         "old copy shortcut should no longer copy"
+     );
+ 
+-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
++    chat.handle_key_event(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+     let cells = drain_insert_history(&mut rx);
+     assert_eq!(cells.len(), 1, "expected one info message");
+     let rendered = lines_to_single_string(&cells[0]);
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index 8899a21bd7..82bd4225a3 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -2182,6 +2182,48 @@ async fn stream_error_restores_hidden_status_indicator() {
+     assert_eq!(status.details(), Some(details));
+ }
+ 
++#[tokio::test]
++async fn stream_error_marks_incomplete_answer_and_starts_next_delta_fresh() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.on_task_started();
++    chat.on_agent_message_delta("partial answer".to_string());
++
++    handle_stream_error(&mut chat, "Reconnecting... 1/30", None);
++
++    let cells = drain_insert_history(&mut rx);
++    assert!(
++        cells
++            .iter()
++            .any(|cell| lines_to_single_string(cell)
++                .contains("Received incomplete response; retrying")),
++        "expected interrupted response separator, got {cells:?}"
++    );
++    assert!(
++        !chat.has_active_stream_tail(),
++        "interrupted stream tail should be cleared before retry deltas"
++    );
++
++    chat.on_agent_message_delta("retry answer\n".to_string());
++    chat.on_commit_tick();
++    let inserted = drain_insert_history(&mut rx);
++    assert!(
++        !inserted.iter().flatten().any(|line| {
++            let text = line.to_string();
++            !text.is_empty() && text.chars().all(|ch| ch == '─')
++        }),
++        "retry should not insert an empty final message separator"
++    );
++    let mut rendered = inserted
++        .iter()
++        .map(|cell| lines_to_single_string(cell))
++        .collect::<String>();
++    if let Some(active) = chat.transcript.active_cell.as_ref() {
++        rendered.push_str(&lines_to_single_string(&active.display_lines(/*width*/ 80)));
++    }
++    assert!(rendered.contains("retry answer"));
++    assert!(!rendered.contains("partial answer"));
++}
++
+ #[tokio::test]
+ async fn warning_event_adds_warning_history_cell() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/history_cell/separators.rs b/codex-rs/tui/src/history_cell/separators.rs
+index e32efee866..670245f898 100644
+--- a/codex-rs/tui/src/history_cell/separators.rs
++++ b/codex-rs/tui/src/history_cell/separators.rs
+@@ -24,6 +24,34 @@ impl FinalMessageSeparator {
+         }
+     }
+ }
++
++#[derive(Debug, Clone, Copy)]
++pub enum InterruptedStreamKind {
++    Answer,
++}
++
++#[derive(Debug)]
++pub struct InterruptedStreamSeparator {
++    kind: InterruptedStreamKind,
++}
++
++impl InterruptedStreamSeparator {
++    pub(crate) fn new(kind: InterruptedStreamKind) -> Self {
++        Self { kind }
++    }
++
++    fn label(&self) -> &'static str {
++        match self.kind {
++            InterruptedStreamKind::Answer => "Received incomplete response; retrying",
++        }
++    }
++
++    fn style(&self) -> Style {
++        match self.kind {
++            InterruptedStreamKind::Answer => Style::default().fg(Color::Yellow),
++        }
++    }
++}
+ impl HistoryCell for FinalMessageSeparator {
+     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+         let mut label_parts = Vec::new();
+@@ -73,6 +101,36 @@ impl HistoryCell for FinalMessageSeparator {
+     }
+ }
+ 
++impl HistoryCell for InterruptedStreamSeparator {
++    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
++        let label_text = self.label();
++        let label = format!("─ {label_text} ─");
++        let label_width = UnicodeWidthStr::width(label.as_str());
++        if label_width > width as usize {
++            let (label, _suffix, label_width) = take_prefix_by_width(&label, width as usize);
++            return vec![Line::from_iter([
++                Span::styled(label, self.style()),
++                "─"
++                    .repeat((width as usize).saturating_sub(label_width))
++                    .dim(),
++            ])];
++        }
++
++        vec![Line::from(vec![
++            "─ ".dim(),
++            label_text.to_string().set_style(self.style()),
++            " ─".dim(),
++            "─"
++                .repeat((width as usize).saturating_sub(label_width))
++                .dim(),
++        ])]
++    }
++
++    fn raw_lines(&self) -> Vec<Line<'static>> {
++        vec![Line::from(self.label())]
++    }
++}
++
+ pub(crate) fn runtime_metrics_label(summary: RuntimeMetricsSummary) -> Option<String> {
+     let mut parts = Vec::new();
+     if summary.tool_calls.count > 0 {
+diff --git a/codex-rs/tui/src/keymap.rs b/codex-rs/tui/src/keymap.rs
+index b4f00a4d2f..d8ecd14fad 100644
+--- a/codex-rs/tui/src/keymap.rs
++++ b/codex-rs/tui/src/keymap.rs
+@@ -1793,6 +1793,7 @@ const MAIN_RESERVED_BINDINGS: &[(&str, KeyBinding)] = &[
+         "fixed.cycle_collaboration_mode",
+         key_hint::shift(KeyCode::Tab),
+     ),
++    ("fixed.retry_stream_now", key_hint::ctrl(KeyCode::Char('x'))),
+     ("fixed.backtrack", key_hint::plain(KeyCode::Esc)),
+     ("fixed.previous_agent", key_hint::alt(KeyCode::Left)),
+     ("fixed.next_agent", key_hint::alt(KeyCode::Right)),
+@@ -2692,6 +2693,14 @@ mod tests {
+         expect_conflict(&keymap, "composer.submit", "fixed.paste_image");
+     }
+ 
++    #[test]
++    fn rejects_main_bindings_that_collide_with_retry_stream_now() {
++        let mut keymap = TuiKeymap::default();
++        keymap.composer.submit = Some(one("ctrl-x"));
++
++        expect_conflict(&keymap, "composer.submit", "fixed.retry_stream_now");
++    }
++
+     #[test]
+     fn interrupt_turn_allows_backtrack_escape_and_can_be_remapped_or_unbound() {
+         let mut keymap = TuiKeymap::default();
+diff --git a/codex-rs/tui/src/keymap_setup.rs b/codex-rs/tui/src/keymap_setup.rs
+index 8c64cf8189..3b38c3d595 100644
+--- a/codex-rs/tui/src/keymap_setup.rs
++++ b/codex-rs/tui/src/keymap_setup.rs
+@@ -1383,11 +1383,11 @@ mod tests {
+     #[test]
+     fn debug_view_uses_custom_binding_source() {
+         let keymap =
+-            keymap_with_replacement(&TuiKeymap::default(), "global", "copy", "ctrl-x").unwrap();
++            keymap_with_replacement(&TuiKeymap::default(), "global", "copy", "page-down").unwrap();
+         let runtime = RuntimeKeymap::from_config(&keymap).unwrap();
+         let mut view = build_keymap_debug_view(&runtime, &keymap);
+ 
+-        view.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
++        view.handle_key_event(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+ 
+         let rendered = render_debug(&view, /*width*/ 100);
+         assert!(rendered.contains("global.copy (Copy)"));

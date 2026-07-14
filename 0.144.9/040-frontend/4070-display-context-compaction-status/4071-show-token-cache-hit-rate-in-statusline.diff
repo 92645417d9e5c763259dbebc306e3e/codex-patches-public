@@ -1,0 +1,158 @@
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+index f9fdcd9510..b0d6eb8618 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -14,7 +14,7 @@
+ //! - Git information (branch name)
+ //! - Permissions profile
+ //! - Approval mode
+-//! - Context usage (remaining %, used %, window size)
++//! - Context usage (remaining %, used %, window size, cache hit rate)
+ //! - Usage limits (primary, secondary)
+ //! - Responses stream connection latency
+ //! - Session info (thread title, thread ID, tokens used)
+@@ -136,6 +136,8 @@ pub(crate) enum StatusLineItem {
+     /// Total output tokens generated.
+     TotalOutputTokens,
+ 
++    /// Prompt cache hit rate for input tokens.
++    CacheHitRate,
+     /// Full thread UUID.
+     #[strum(to_string = "thread-id", serialize = "session-id")]
+     SessionId,
+@@ -198,6 +200,9 @@ impl StatusLineItem {
+             StatusLineItem::UsedTokens => "Total tokens used in session (omitted when zero)",
+             StatusLineItem::TotalInputTokens => "Total input tokens used in session",
+             StatusLineItem::TotalOutputTokens => "Total output tokens used in session",
++            StatusLineItem::CacheHitRate => {
++                "Prompt cache hit rate for input tokens (omitted when unavailable)"
++            }
+             StatusLineItem::SessionId => "Current thread identifier (omitted until thread starts)",
+             StatusLineItem::FastMode => "Whether Fast mode is currently active",
+             StatusLineItem::RawOutput => "Whether raw scrollback mode is active",
+@@ -239,6 +244,7 @@ impl StatusLineItem {
+             StatusLineItem::UsedTokens => StatusSurfacePreviewItem::UsedTokens,
+             StatusLineItem::TotalInputTokens => StatusSurfacePreviewItem::TotalInputTokens,
+             StatusLineItem::TotalOutputTokens => StatusSurfacePreviewItem::TotalOutputTokens,
++            StatusLineItem::CacheHitRate => StatusSurfacePreviewItem::CacheHitRate,
+             StatusLineItem::SessionId => StatusSurfacePreviewItem::SessionId,
+             StatusLineItem::FastMode => StatusSurfacePreviewItem::FastMode,
+             StatusLineItem::RawOutput => StatusSurfacePreviewItem::RawOutput,
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+index 030e0f78af..6cfe2c1c1e 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -42,7 +42,8 @@ impl StatusLineAccent {
+             | StatusLineItem::ContextWindowSize
+             | StatusLineItem::UsedTokens
+             | StatusLineItem::TotalInputTokens
+-            | StatusLineItem::TotalOutputTokens => Self::Usage,
++            | StatusLineItem::TotalOutputTokens
++            | StatusLineItem::CacheHitRate => Self::Usage,
+             StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit => Self::Limit,
+             StatusLineItem::CodexVersion
+             | StatusLineItem::SessionId
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+index 127ac8e18a..9f292cac89 100644
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -29,6 +29,7 @@ pub(crate) enum StatusSurfacePreviewItem {
+     UsedTokens,
+     TotalInputTokens,
+     TotalOutputTokens,
++    CacheHitRate,
+     SessionId,
+     FastMode,
+     RawOutput,
+@@ -64,6 +65,7 @@ impl StatusSurfacePreviewItem {
+             StatusSurfacePreviewItem::UsedTokens => "0 used",
+             StatusSurfacePreviewItem::TotalInputTokens => "0 in",
+             StatusSurfacePreviewItem::TotalOutputTokens => "0 out",
++            StatusSurfacePreviewItem::CacheHitRate => "Cache 0.0% hit",
+             StatusSurfacePreviewItem::SessionId => "550e8400-e29b-41d4",
+             StatusSurfacePreviewItem::FastMode => "Fast on",
+             StatusSurfacePreviewItem::RawOutput => "raw output",
+@@ -99,6 +101,7 @@ impl StatusSurfacePreviewItem {
+             Self::UsedTokens,
+             Self::TotalInputTokens,
+             Self::TotalOutputTokens,
++            Self::CacheHitRate,
+             Self::SessionId,
+             Self::FastMode,
+             Self::RawOutput,
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 439899d9bd..62249317dc 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -755,6 +755,10 @@ impl ChatWidget {
+                 "{} out",
+                 format_tokens_compact(self.status_line_total_usage().output_tokens)
+             )),
++            StatusLineItem::CacheHitRate => self
++                .status_line_total_usage()
++                .cache_hit_rate_percent()
++                .map(|rate| format!("{rate:.1}% hit")),
+             StatusLineItem::SessionId => self.thread_id.map(|id| id.to_string()),
+             StatusLineItem::FastMode => Some(
+                 if self.current_service_tier() == Some(ServiceTier::Fast.request_value()) {
+@@ -845,6 +849,7 @@ impl ChatWidget {
+             StatusSurfacePreviewItem::UsedTokens => StatusLineItem::UsedTokens,
+             StatusSurfacePreviewItem::TotalInputTokens => StatusLineItem::TotalInputTokens,
+             StatusSurfacePreviewItem::TotalOutputTokens => StatusLineItem::TotalOutputTokens,
++            StatusSurfacePreviewItem::CacheHitRate => StatusLineItem::CacheHitRate,
+             StatusSurfacePreviewItem::SessionId => StatusLineItem::SessionId,
+             StatusSurfacePreviewItem::FastMode => StatusLineItem::FastMode,
+             StatusSurfacePreviewItem::RawOutput => StatusLineItem::RawOutput,
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs b/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
+index b71862a06c..09ba81fc10 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_surface_previews.rs
+@@ -305,6 +305,48 @@ async fn status_surface_preview_omits_unavailable_rate_limit_items() {
+     );
+ }
+ 
++#[tokio::test]
++async fn cache_hit_rate_status_line_item_uses_token_info() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.set_token_info(Some(TokenUsageInfo {
++        total_token_usage: TokenUsage {
++            input_tokens: 1_000,
++            cached_input_tokens: 800,
++            output_tokens: 50,
++            reasoning_output_tokens: 0,
++            total_tokens: 1_050,
++        },
++        last_token_usage: TokenUsage::default(),
++        model_context_window: Some(100_000),
++    }));
++
++    assert_eq!(
++        status_preview_line(&mut chat, &[StatusLineItem::CacheHitRate]),
++        "80.0% hit"
++    );
++}
++
++#[tokio::test]
++async fn cache_hit_rate_status_line_item_omits_missing_cache_data() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.set_token_info(Some(TokenUsageInfo {
++        total_token_usage: TokenUsage {
++            input_tokens: 1_000,
++            cached_input_tokens: 0,
++            output_tokens: 50,
++            reasoning_output_tokens: 0,
++            total_tokens: 1_050,
++        },
++        last_token_usage: TokenUsage::default(),
++        model_context_window: Some(100_000),
++    }));
++
++    assert_eq!(
++        chat.status_line_value_for_item(StatusLineItem::CacheHitRate),
++        None
++    );
++}
++
+ #[tokio::test]
+ async fn status_line_setup_popup_rate_limits_snapshot() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;

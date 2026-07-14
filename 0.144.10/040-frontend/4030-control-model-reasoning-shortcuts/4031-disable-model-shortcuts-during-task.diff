@@ -1,0 +1,144 @@
+diff --git a/codex-rs/tui/src/chatwidget/model_shortcuts.rs b/codex-rs/tui/src/chatwidget/model_shortcuts.rs
+index 2718eb6b3b..15e5d6fec4 100644
+--- a/codex-rs/tui/src/chatwidget/model_shortcuts.rs
++++ b/codex-rs/tui/src/chatwidget/model_shortcuts.rs
+@@ -27,6 +27,14 @@ impl ChatWidget {
+             return false;
+         }
+ 
++        if self.bottom_pane.is_task_running() {
++            self.add_to_history(crate::history_cell::new_error_event(
++                "Model shortcuts are disabled while a task is in progress.".to_string(),
++            ));
++            self.request_redraw();
++            return true;
++        }
++
+         if !self.is_session_configured() {
+             return true;
+         }
+diff --git a/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs b/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs
+index b247ca9e65..4ca6aca457 100644
+--- a/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs
++++ b/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs
+@@ -72,6 +72,14 @@ impl ChatWidget {
+             return false;
+         }
+ 
++        if self.bottom_pane.is_task_running() {
++            self.add_to_history(crate::history_cell::new_error_event(
++                "Reasoning shortcuts are disabled while a task is in progress.".to_string(),
++            ));
++            self.request_redraw();
++            return true;
++        }
++
+         if !self.is_session_configured() {
+             self.add_info_message(
+                 "Reasoning shortcuts are disabled until startup completes.".to_string(),
+diff --git a/codex-rs/tui/src/chatwidget/tests/helpers.rs b/codex-rs/tui/src/chatwidget/tests/helpers.rs
+index 39ea349bb7..84f710186e 100644
+--- a/codex-rs/tui/src/chatwidget/tests/helpers.rs
++++ b/codex-rs/tui/src/chatwidget/tests/helpers.rs
+@@ -348,6 +348,22 @@ pub(super) fn drain_insert_history(
+     out
+ }
+ 
++pub(super) fn drain_insert_history_from_events(
++    events: &[AppEvent],
++) -> Vec<Vec<ratatui::text::Line<'static>>> {
++    let mut out = Vec::new();
++    for ev in events {
++        if let AppEvent::InsertHistoryCell(cell) = ev {
++            let mut lines = cell.display_lines(/*width*/ 80);
++            if !cell.is_stream_continuation() && !out.is_empty() && !lines.is_empty() {
++                lines.insert(0, "".into());
++            }
++            out.push(lines)
++        }
++    }
++    out
++}
++
+ pub(super) fn lines_to_single_string(lines: &[ratatui::text::Line<'static>]) -> String {
+     let mut s = String::new();
+     for line in lines {
+diff --git a/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs b/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
+index 6c72ad94e4..3221660564 100644
+--- a/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
++++ b/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
+@@ -3582,6 +3582,33 @@ async fn reasoning_down_shortcut_can_leave_advanced_effort() {
+     }
+ }
+ 
++#[tokio::test]
++async fn reasoning_shortcut_is_disabled_while_task_is_running() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
++    chat.thread_id = Some(ThreadId::new());
++    chat.set_reasoning_effort(Some(ReasoningEffortConfig::Medium));
++    chat.bottom_pane.set_task_running(/*running*/ true);
++
++    chat.handle_key_event(KeyEvent::new(KeyCode::Char('.'), KeyModifiers::ALT));
++
++    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
++    assert!(
++        events
++            .iter()
++            .all(|event| !matches!(event, AppEvent::UpdateReasoningEffort(_))),
++        "did not expect reasoning update while task is running; events: {events:?}"
++    );
++    let rendered = drain_insert_history_from_events(&events)
++        .into_iter()
++        .map(|lines| lines_to_single_string(&lines))
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert!(
++        rendered.contains("Reasoning shortcuts are disabled while a task is in progress."),
++        "expected disabled-command message, got: {rendered:?}"
++    );
++}
++
+ #[tokio::test]
+ async fn alt_apostrophe_selects_next_model_without_submitting_prompt() {
+     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+@@ -3617,6 +3644,40 @@ async fn alt_apostrophe_selects_next_model_without_submitting_prompt() {
+     assert_no_submit_op(&mut op_rx);
+ }
+ 
++#[tokio::test]
++async fn model_shortcut_is_disabled_while_task_is_running() {
++    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
++    chat.thread_id = Some(ThreadId::new());
++    set_fast_mode_test_catalog(&mut chat);
++    chat.bottom_pane.set_task_running(/*running*/ true);
++
++    chat.handle_key_event(KeyEvent::new(KeyCode::Char('\''), KeyModifiers::ALT));
++
++    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
++    assert!(
++        events
++            .iter()
++            .all(|event| !matches!(event, AppEvent::UpdateModel(_))),
++        "did not expect model update while task is running; events: {events:?}"
++    );
++    assert!(
++        events
++            .iter()
++            .all(|event| !matches!(event, AppEvent::UpdateReasoningEffort(_))),
++        "did not expect reasoning update while task is running; events: {events:?}"
++    );
++    let rendered = drain_insert_history_from_events(&events)
++        .into_iter()
++        .map(|lines| lines_to_single_string(&lines))
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert!(
++        rendered.contains("Model shortcuts are disabled while a task is in progress."),
++        "expected disabled-command message, got: {rendered:?}"
++    );
++    assert_no_submit_op(&mut op_rx);
++}
++
+ #[tokio::test]
+ async fn alt_semicolon_selects_previous_model_with_wraparound() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
