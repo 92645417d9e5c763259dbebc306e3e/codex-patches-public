@@ -1,0 +1,789 @@
+diff --git a/codex-rs/core/src/codex_delegate.rs b/codex-rs/core/src/codex_delegate.rs
+index d7ab4f61b3..e5373edbb7 100644
+--- a/codex-rs/core/src/codex_delegate.rs
++++ b/codex-rs/core/src/codex_delegate.rs
+@@ -130,6 +130,7 @@ pub(crate) async fn run_codex_thread_interactive(
+             .load(std::sync::atomic::Ordering::Relaxed),
+         analytics_events_client: Some(parent_session.services.analytics_events_client.clone()),
+         thread_store: Arc::clone(&parent_session.services.thread_store),
++        persistence_health: Arc::clone(&parent_session.services.persistence_health),
+         attestation_provider: parent_session.services.attestation_provider.clone(),
+         external_time_provider: Some(Arc::clone(&parent_session.services.time_provider)),
+         inherited_multi_agent_version: Some(MultiAgentVersion::Disabled),
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index e0c3ffb585..6f508291d7 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -112,6 +112,7 @@ pub use client::X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER;
+ pub use codex_protocol::config_types::ModelProviderAuthInfo;
+ mod event_mapping;
+ pub use codex_prompts as review_prompts;
++mod persistence_health;
+ mod thread_manager;
+ pub(crate) mod web_search;
+ pub(crate) mod windows_sandbox_read_grants;
+diff --git a/codex-rs/core/src/persistence_health.rs b/codex-rs/core/src/persistence_health.rs
+new file mode 100644
+index 0000000000..a18a6f1243
+--- /dev/null
++++ b/codex-rs/core/src/persistence_health.rs
+@@ -0,0 +1,101 @@
++use crate::session::session::Session;
++use codex_protocol::error::CodexErr;
++use codex_protocol::error::Result as CodexResult;
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::sync::Weak;
++use std::sync::atomic::AtomicBool;
++use std::sync::atomic::Ordering;
++
++const PERSISTENCE_UNAVAILABLE_MESSAGE: &str = "Conversation persistence stopped because durable storage is full. Free disk space, then restart or resume Codex before continuing.";
++
++/// Process-manager-scoped health state for durable conversation persistence.
++pub(crate) struct PersistenceHealth {
++    failed: AtomicBool,
++    sessions: Mutex<Vec<Weak<Session>>>,
++}
++
++impl PersistenceHealth {
++    pub(crate) fn new() -> Arc<Self> {
++        Arc::new(Self {
++            failed: AtomicBool::new(false),
++            sessions: Mutex::new(Vec::new()),
++        })
++    }
++
++    pub(crate) fn register(self: &Arc<Self>, session: &Arc<Session>) {
++        let handle_immediately = {
++            let mut sessions = self
++                .sessions
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner);
++            if self.is_failed() {
++                true
++            } else {
++                sessions.push(Arc::downgrade(session));
++                false
++            }
++        };
++        if handle_immediately {
++            let session = Arc::clone(session);
++            tokio::spawn(async move {
++                session.handle_persistence_failure().await;
++            });
++        }
++    }
++
++    pub(crate) fn is_failed(&self) -> bool {
++        self.failed.load(Ordering::Acquire)
++    }
++
++    pub(crate) fn ensure_healthy(&self) -> CodexResult<()> {
++        if self.is_failed() {
++            Err(CodexErr::Fatal(PERSISTENCE_UNAVAILABLE_MESSAGE.to_string()))
++        } else {
++            Ok(())
++        }
++    }
++
++    /// Atomically marks persistence unavailable and schedules one incident fan-out.
++    pub(crate) fn trip(self: &Arc<Self>) -> bool {
++        if self
++            .failed
++            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
++            .is_err()
++        {
++            return false;
++        }
++
++        let health = Arc::clone(self);
++        tokio::spawn(async move {
++            health.handle_incident().await;
++        });
++        true
++    }
++
++    async fn handle_incident(&self) {
++        let sessions = {
++            let mut registered = self
++                .sessions
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner);
++            let sessions = registered
++                .iter()
++                .filter_map(Weak::upgrade)
++                .collect::<Vec<_>>();
++            registered.retain(|session| session.strong_count() > 0);
++            sessions
++        };
++
++        futures::future::join_all(
++            sessions
++                .into_iter()
++                .map(|session| async move { session.handle_persistence_failure().await }),
++        )
++        .await;
++    }
++}
++
++pub(crate) fn persistence_unavailable_message() -> &'static str {
++    PERSISTENCE_UNAVAILABLE_MESSAGE
++}
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 67b2b3b07b..fc197c5871 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -444,6 +444,7 @@ pub(crate) struct SessionSpawnArgs {
+     pub(crate) supports_openai_form_elicitation: bool,
+     pub(crate) analytics_events_client: Option<AnalyticsEventsClient>,
+     pub(crate) thread_store: Arc<dyn ThreadStore>,
++    pub(crate) persistence_health: Arc<crate::persistence_health::PersistenceHealth>,
+     pub(crate) attestation_provider: Option<Arc<dyn AttestationProvider>>,
+     pub(crate) external_time_provider: Option<Arc<dyn TimeProvider>>,
+     pub(crate) inherited_multi_agent_version: Option<MultiAgentVersion>,
+@@ -533,10 +534,12 @@ impl Session {
+             supports_openai_form_elicitation,
+             analytics_events_client,
+             thread_store,
++            persistence_health,
+             attestation_provider,
+             external_time_provider,
+             inherited_multi_agent_version,
+         } = args;
++        persistence_health.ensure_healthy()?;
+         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
+         let (tx_event, rx_event) = async_channel::unbounded();
+ 
+@@ -706,6 +709,7 @@ impl Session {
+             inherited_environments,
+             analytics_events_client,
+             thread_store,
++            persistence_health,
+             parent_rollout_thread_trace,
+             attestation_provider,
+             external_time_provider,
+@@ -1143,16 +1147,37 @@ impl Session {
+     /// Flush rollout writes and return the final durability-barrier result.
+     #[instrument(name = "session.flush_rollout", level = "trace", skip_all)]
+     pub(crate) async fn flush_rollout(&self) -> std::io::Result<()> {
++        self.services
++            .persistence_health
++            .ensure_healthy()
++            .map_err(|err| std::io::Error::new(std::io::ErrorKind::StorageFull, err.to_string()))?;
+         if let Some(live_thread) = self.live_thread() {
+-            live_thread.flush().await.map_err(std::io::Error::other)
++            match live_thread.flush().await {
++                Ok(()) => Ok(()),
++                Err(err) => {
++                    if err.is_storage_full() {
++                        self.services.persistence_health.trip();
++                    }
++                    Err(std::io::Error::other(err))
++                }
++            }
+         } else {
+             Ok(())
+         }
+     }
+ 
+     pub(crate) async fn try_ensure_rollout_materialized(&self) -> std::io::Result<()> {
++        self.services
++            .persistence_health
++            .ensure_healthy()
++            .map_err(|err| std::io::Error::new(std::io::ErrorKind::StorageFull, err.to_string()))?;
+         if let Some(live_thread) = self.live_thread() {
+-            live_thread.persist().await.map_err(std::io::Error::other)?;
++            if let Err(err) = live_thread.persist().await {
++                if err.is_storage_full() {
++                    self.services.persistence_health.trip();
++                }
++                return Err(std::io::Error::other(err));
++            }
+         }
+         Ok(())
+     }
+@@ -2003,7 +2028,7 @@ impl Session {
+         self.deliver_event_raw(event).await;
+     }
+ 
+-    async fn deliver_event_raw(&self, event: Event) {
++    pub(crate) async fn deliver_event_raw(&self, event: Event) {
+         // Record the last known agent status.
+         if let Some(status) = agent_status_from_event(&event.msg) {
+             self.agent_status.send_replace(status);
+@@ -3641,10 +3666,17 @@ impl Session {
+ 
+     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
+     pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) {
++        if self.services.persistence_health.is_failed() {
++            return;
++        }
+         if let Some(live_thread) = self.live_thread()
+             && let Err(e) = live_thread.append_items(items).await
+         {
+-            error!("failed to record rollout items: {e:#}");
++            if e.is_storage_full() {
++                self.services.persistence_health.trip();
++            } else {
++                error!("failed to record rollout items: {e:#}");
++            }
+         }
+     }
+ 
+diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
+index a610ae5976..db27a9c21b 100644
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -498,6 +498,7 @@ impl Session {
+         inherited_environments: Option<TurnEnvironmentSnapshot>,
+         analytics_events_client: Option<AnalyticsEventsClient>,
+         thread_store: Arc<dyn ThreadStore>,
++        persistence_health: Arc<crate::persistence_health::PersistenceHealth>,
+         parent_rollout_thread_trace: ThreadTraceContext,
+         attestation_provider: Option<Arc<dyn AttestationProvider>>,
+         external_time_provider: Option<Arc<dyn TimeProvider>>,
+@@ -1090,6 +1091,7 @@ impl Session {
+                 state_db: state_db_ctx.clone(),
+                 live_thread: live_thread_init.as_ref().cloned(),
+                 thread_store: Arc::clone(&thread_store),
++                persistence_health: Arc::clone(&persistence_health),
+                 attestation_provider: attestation_provider.clone(),
+                 time_provider,
+                 model_client: ModelClient::new(
+@@ -1147,6 +1149,7 @@ impl Session {
+                 services,
+                 next_internal_sub_id: AtomicU64::new(0),
+             });
++            persistence_health.register(&sess);
+             if let Some(network_policy_decider_session) = network_policy_decider_session {
+                 let mut guard = network_policy_decider_session.write().await;
+                 *guard = Arc::downgrade(&sess);
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index 604c6eb008..21ce32bc04 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -5460,6 +5460,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
+             codex_thread_store::LocalThreadStoreConfig::from_config(config.as_ref()),
+             /*state_db*/ None,
+         )),
++        crate::persistence_health::PersistenceHealth::new(),
+         codex_rollout_trace::ThreadTraceContext::disabled(),
+         /*attestation_provider*/ None,
+         /*external_time_provider*/ None,
+@@ -5649,6 +5650,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+             codex_thread_store::LocalThreadStoreConfig::from_config(config.as_ref()),
+             /*state_db*/ None,
+         )),
++        persistence_health: crate::persistence_health::PersistenceHealth::new(),
+         attestation_provider: None,
+         time_provider: Arc::new(crate::current_time::SystemTimeProvider),
+         model_client: ModelClient::new(
+@@ -5848,6 +5850,7 @@ async fn make_session_with_config_and_rx(
+             codex_thread_store::LocalThreadStoreConfig::from_config(config.as_ref()),
+             /*state_db*/ None,
+         )),
++        crate::persistence_health::PersistenceHealth::new(),
+         codex_rollout_trace::ThreadTraceContext::disabled(),
+         /*attestation_provider*/ None,
+         /*external_time_provider*/ None,
+@@ -5963,6 +5966,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
+                 .expect("state db should initialize"),
+             ),
+         )),
++        crate::persistence_health::PersistenceHealth::new(),
+         codex_rollout_trace::ThreadTraceContext::disabled(),
+         /*attestation_provider*/ None,
+         /*external_time_provider*/ None,
+@@ -7801,6 +7805,7 @@ where
+             codex_thread_store::LocalThreadStoreConfig::from_config(config.as_ref()),
+             state_db,
+         )),
++        persistence_health: crate::persistence_health::PersistenceHealth::new(),
+         attestation_provider: None,
+         time_provider: Arc::new(crate::current_time::SystemTimeProvider),
+         model_client: ModelClient::new(
+@@ -9507,6 +9512,165 @@ async fn attach_in_memory_thread_store(
+     store
+ }
+ 
++async fn wait_for_persistence_incident(session: &Session) {
++    timeout(Duration::from_secs(2), async {
++        while session.active_turn.lock().await.is_some() {
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .expect("persistence incident should reach the session");
++}
++
++fn drain_persistence_failure_events(rx: &async_channel::Receiver<Event>) -> usize {
++    let mut count = 0;
++    while let Ok(event) = rx.try_recv() {
++        if matches!(
++            &event.msg,
++            EventMsg::Error(error)
++                if error.message == crate::persistence_health::persistence_unavailable_message()
++        ) {
++            count += 1;
++        }
++    }
++    count
++}
++
++#[tokio::test]
++async fn storage_full_append_stops_all_registered_sessions_once_without_restarting_pending_work() {
++    let health = crate::persistence_health::PersistenceHealth::new();
++
++    let (mut first, first_context) = make_session_and_context().await;
++    let first_store = attach_in_memory_thread_store(&mut first).await;
++    let (first_tx, first_rx) = async_channel::unbounded();
++    first.tx_event = first_tx;
++    first.services.persistence_health = Arc::clone(&health);
++    let first = Arc::new(first);
++    health.register(&first);
++
++    let (mut second, second_context) = make_session_and_context().await;
++    let second_store = attach_in_memory_thread_store(&mut second).await;
++    let (second_tx, second_rx) = async_channel::unbounded();
++    second.tx_event = second_tx;
++    second.services.persistence_health = Arc::clone(&health);
++    let second = Arc::new(second);
++    health.register(&second);
++
++    first
++        .spawn_task(
++            Arc::new(first_context),
++            Vec::new(),
++            NeverEndingTask {
++                kind: TaskKind::Regular,
++                listen_to_cancellation_token: true,
++            },
++        )
++        .await;
++    second
++        .spawn_task(
++            Arc::new(second_context),
++            Vec::new(),
++            NeverEndingTask {
++                kind: TaskKind::Regular,
++                listen_to_cancellation_token: true,
++            },
++        )
++        .await;
++    first
++        .input_queue
++        .enqueue_mailbox_communication(InterAgentCommunication::new(
++            AgentPath::root(),
++            AgentPath::root(),
++            Vec::new(),
++            "pending trigger".to_string(),
++            /*trigger_turn*/ true,
++        ))
++        .await;
++
++    first_store.fail_appends_with_storage_full().await;
++    second_store.fail_appends_with_storage_full().await;
++    let item = RolloutItem::EventMsg(EventMsg::Warning(WarningEvent {
++        message: "persist me".to_string(),
++    }));
++    tokio::join!(
++        first.persist_rollout_items(std::slice::from_ref(&item)),
++        second.persist_rollout_items(std::slice::from_ref(&item)),
++    );
++
++    wait_for_persistence_incident(&first).await;
++    wait_for_persistence_incident(&second).await;
++    assert!(health.is_failed());
++    assert!(first.active_turn.lock().await.is_none());
++    assert!(second.active_turn.lock().await.is_none());
++    assert!(first.input_queue.has_trigger_turn_mailbox_items().await);
++
++    let first_append_calls = first_store.calls().await.append_items;
++    let second_append_calls = second_store.calls().await.append_items;
++    assert_eq!(first_append_calls + second_append_calls, 1);
++
++    health.trip();
++    first
++        .persist_rollout_items(std::slice::from_ref(&item))
++        .await;
++    second
++        .persist_rollout_items(std::slice::from_ref(&item))
++        .await;
++    tokio::task::yield_now().await;
++
++    assert_eq!(first_store.calls().await.append_items, first_append_calls);
++    assert_eq!(second_store.calls().await.append_items, second_append_calls);
++    let first_fatal_count = drain_persistence_failure_events(&first_rx);
++    let second_fatal_count = drain_persistence_failure_events(&second_rx);
++    assert_eq!(first_fatal_count, 1);
++    assert_eq!(second_fatal_count, 1);
++
++    let rejected_context = first.new_default_turn().await;
++    first
++        .start_task(
++            rejected_context,
++            Vec::new(),
++            NeverEndingTask {
++                kind: TaskKind::Regular,
++                listen_to_cancellation_token: true,
++            },
++        )
++        .await;
++    assert!(first.active_turn.lock().await.is_none());
++    assert_eq!(drain_persistence_failure_events(&first_rx), 1);
++}
++
++#[tokio::test]
++async fn unrelated_thread_store_error_does_not_trip_global_persistence_health() {
++    let health = crate::persistence_health::PersistenceHealth::new();
++    let (mut session, context) = make_session_and_context().await;
++    let store = attach_in_memory_thread_store(&mut session).await;
++    session.services.persistence_health = Arc::clone(&health);
++    let session = Arc::new(session);
++    health.register(&session);
++    session
++        .spawn_task(
++            Arc::new(context),
++            Vec::new(),
++            NeverEndingTask {
++                kind: TaskKind::Regular,
++                listen_to_cancellation_token: true,
++            },
++        )
++        .await;
++
++    store.fail_appends_with_internal_error().await;
++    session
++        .persist_rollout_items(&[RolloutItem::EventMsg(EventMsg::Warning(WarningEvent {
++            message: "ordinary failure".to_string(),
++        }))])
++        .await;
++
++    assert!(!health.is_failed());
++    assert!(session.active_turn.lock().await.is_some());
++    assert_eq!(store.calls().await.append_items, 1);
++    session.abort_all_tasks(TurnAbortReason::Replaced).await;
++}
++
+ async fn wait_for_flush_count(
+     store: &codex_thread_store::InMemoryThreadStore,
+     expected_flushes: usize,
+diff --git a/codex-rs/core/src/session/tests/guardian_tests.rs b/codex-rs/core/src/session/tests/guardian_tests.rs
+index 9677156186..2c6138083c 100644
+--- a/codex-rs/core/src/session/tests/guardian_tests.rs
++++ b/codex-rs/core/src/session/tests/guardian_tests.rs
+@@ -769,6 +769,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
+         supports_openai_form_elicitation: false,
+         analytics_events_client: None,
+         thread_store,
++        persistence_health: crate::persistence_health::PersistenceHealth::new(),
+         attestation_provider: None,
+         external_time_provider: None,
+         inherited_multi_agent_version: None,
+diff --git a/codex-rs/core/src/state/service.rs b/codex-rs/core/src/state/service.rs
+index 43f411e31b..6dfc8e1a92 100644
+--- a/codex-rs/core/src/state/service.rs
++++ b/codex-rs/core/src/state/service.rs
+@@ -94,6 +94,7 @@ pub(crate) struct SessionServices {
+     pub(crate) state_db: Option<StateDbHandle>,
+     pub(crate) live_thread: Option<LiveThread>,
+     pub(crate) thread_store: Arc<dyn ThreadStore>,
++    pub(crate) persistence_health: Arc<crate::persistence_health::PersistenceHealth>,
+     pub(crate) attestation_provider: Option<Arc<dyn AttestationProvider>>,
+     pub(crate) time_provider: Arc<dyn TimeProvider>,
+     /// Session-scoped model client shared across turns.
+diff --git a/codex-rs/core/src/tasks/mod.rs b/codex-rs/core/src/tasks/mod.rs
+index 3faf104364..e18afe09aa 100644
+--- a/codex-rs/core/src/tasks/mod.rs
++++ b/codex-rs/core/src/tasks/mod.rs
+@@ -45,6 +45,7 @@ use codex_otel::TURN_NETWORK_PROXY_METRIC;
+ use codex_otel::TURN_TOKEN_USAGE_METRIC;
+ use codex_otel::TURN_TOOL_CALL_METRIC;
+ use codex_protocol::models::ResponseItem;
++use codex_protocol::protocol::Event;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::MultiAgentVersion;
+ use codex_protocol::protocol::TokenUsage;
+@@ -328,6 +329,11 @@ impl Session {
+         input: Vec<TurnInput>,
+         task: T,
+     ) {
++        if self.services.persistence_health.is_failed() {
++            self.send_persistence_unavailable_event(turn_context.sub_id.clone())
++                .await;
++            return;
++        }
+         let task: Arc<dyn AnySessionTask> = Arc::new(task);
+         let task_kind = task.kind();
+         let span_name = task.span_name();
+@@ -470,6 +476,9 @@ impl Session {
+         self: &Arc<Self>,
+         sub_id: String,
+     ) {
++        if self.services.persistence_health.is_failed() {
++            return;
++        }
+         if !self.input_queue.has_trigger_turn_mailbox_items().await {
+             return;
+         }
+@@ -490,6 +499,15 @@ impl Session {
+     }
+ 
+     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
++        self.abort_all_tasks_inner(reason, /*restart_pending_work*/ true)
++            .await;
++    }
++
++    async fn abort_all_tasks_inner(
++        self: &Arc<Self>,
++        reason: TurnAbortReason,
++        restart_pending_work: bool,
++    ) {
+         let mut aborted_turn = false;
+         let mut active_turn_to_clear = None;
+         let mut turn_context = None;
+@@ -514,11 +532,32 @@ impl Session {
+             // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
+             self.input_queue.clear_pending(&active_turn).await;
+         }
+-        if reason == TurnAbortReason::Interrupted && aborted_turn {
++        if restart_pending_work && reason == TurnAbortReason::Interrupted && aborted_turn {
+             self.maybe_start_turn_for_pending_work().await;
+         }
+     }
+ 
++    pub(crate) async fn handle_persistence_failure(self: &Arc<Self>) {
++        self.send_persistence_unavailable_event("persistence-failure".to_string())
++            .await;
++        self.abort_all_tasks_inner(
++            TurnAbortReason::Interrupted,
++            /*restart_pending_work*/ false,
++        )
++        .await;
++    }
++
++    async fn send_persistence_unavailable_event(&self, sub_id: String) {
++        self.deliver_event_raw(Event {
++            id: sub_id,
++            msg: EventMsg::Error(codex_protocol::protocol::ErrorEvent {
++                message: crate::persistence_health::persistence_unavailable_message().to_string(),
++                codex_error_info: None,
++            }),
++        })
++        .await;
++    }
++
+     pub(crate) async fn abort_turn_if_active(
+         self: &Arc<Self>,
+         turn_id: &str,
+@@ -863,6 +902,7 @@ impl Session {
+             .await;
+ 
+         if reason == TurnAbortReason::Interrupted
++            && !self.services.persistence_health.is_failed()
+             && let Some(marker) = interrupted_turn_history_marker(
+                 InterruptedTurnHistoryMarker::from_config_and_version(
+                     task.turn_context.config.as_ref(),
+diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
+index 98d5c660c9..363d8f7629 100644
+--- a/codex-rs/core/src/thread_manager.rs
++++ b/codex-rs/core/src/thread_manager.rs
+@@ -9,6 +9,7 @@ use crate::current_time::TimeProvider;
+ use crate::environment_selection::TurnEnvironmentSnapshot;
+ use crate::environment_selection::default_thread_environment_selections;
+ use crate::mcp::McpManager;
++use crate::persistence_health::PersistenceHealth;
+ use crate::rollout::truncation;
+ use crate::session::INITIAL_SUBMIT_ID;
+ use crate::session::SessionIo;
+@@ -250,6 +251,7 @@ pub(crate) struct ThreadManagerState {
+     extensions: Arc<ExtensionRegistry<Config>>,
+     user_instructions_provider: Arc<dyn UserInstructionsProvider>,
+     thread_store: Arc<dyn ThreadStore>,
++    persistence_health: Arc<PersistenceHealth>,
+     agent_graph_store: Option<Arc<dyn AgentGraphStore>>,
+     attestation_provider: Option<Arc<dyn AttestationProvider>>,
+     external_time_provider: Option<Arc<dyn TimeProvider>>,
+@@ -337,6 +339,7 @@ impl ThreadManager {
+             config.bundled_skills_enabled(),
+             restriction_product,
+         ));
++        let persistence_health = PersistenceHealth::new();
+         Self {
+             state: Arc::new(ThreadManagerState {
+                 threads: Arc::new(RwLock::new(HashMap::new())),
+@@ -354,6 +357,7 @@ impl ThreadManager {
+                 extensions,
+                 user_instructions_provider,
+                 thread_store,
++                persistence_health,
+                 agent_graph_store,
+                 attestation_provider,
+                 external_time_provider,
+@@ -456,6 +460,7 @@ impl ThreadManager {
+             state_db.clone(),
+         ));
+         let agent_graph_store = local_agent_graph_store_from_state_db(state_db.as_ref());
++        let persistence_health = PersistenceHealth::new();
+         Self {
+             state: Arc::new(ThreadManagerState {
+                 threads: Arc::new(RwLock::new(HashMap::new())),
+@@ -472,6 +477,7 @@ impl ThreadManager {
+                     crate::test_support::EmptyUserInstructionsProvider,
+                 ),
+                 thread_store,
++                persistence_health,
+                 agent_graph_store,
+                 attestation_provider: None,
+                 external_time_provider: None,
+@@ -1571,6 +1577,7 @@ impl ThreadManagerState {
+         supports_openai_form_elicitation: bool,
+         user_shell_override: Option<crate::shell::Shell>,
+     ) -> CodexResult<NewThread> {
++        self.persistence_health.ensure_healthy()?;
+         let is_resumed_thread = matches!(&initial_history, InitialHistory::Resumed(_));
+         if let InitialHistory::Resumed(resumed) = &initial_history {
+             let mut threads = self.threads.write().await;
+@@ -1653,6 +1660,7 @@ impl ThreadManagerState {
+             supports_openai_form_elicitation,
+             analytics_events_client: self.analytics_events_client.clone(),
+             thread_store: Arc::clone(&self.thread_store),
++            persistence_health: Arc::clone(&self.persistence_health),
+             attestation_provider: self.attestation_provider.clone(),
+             external_time_provider: self.external_time_provider.clone(),
+             inherited_multi_agent_version: multi_agent_version,
+diff --git a/codex-rs/thread-store/src/error.rs b/codex-rs/thread-store/src/error.rs
+index bc5e8ed7c4..ea2520f3c6 100644
+--- a/codex-rs/thread-store/src/error.rs
++++ b/codex-rs/thread-store/src/error.rs
+@@ -18,6 +18,13 @@ pub(crate) fn reject_paginated_history_mode(
+ /// Error type shared by thread-store implementations.
+ #[derive(Debug, thiserror::Error)]
+ pub enum ThreadStoreError {
++    /// The durable store cannot accept more data because its backing storage is full.
++    #[error("thread-store storage is full: {message}")]
++    StorageFull {
++        /// Underlying I/O error text retained for diagnostics.
++        message: String,
++    },
++
+     /// The requested thread does not exist in this store.
+     #[error("thread {thread_id} not found")]
+     ThreadNotFound {
+@@ -53,3 +60,10 @@ pub enum ThreadStoreError {
+         message: String,
+     },
+ }
++
++impl ThreadStoreError {
++    /// Returns whether the operation failed because durable storage is full.
++    pub fn is_storage_full(&self) -> bool {
++        matches!(self, Self::StorageFull { .. })
++    }
++}
+diff --git a/codex-rs/thread-store/src/in_memory.rs b/codex-rs/thread-store/src/in_memory.rs
+index cbaccceb36..00cdf22c78 100644
+--- a/codex-rs/thread-store/src/in_memory.rs
++++ b/codex-rs/thread-store/src/in_memory.rs
+@@ -398,6 +398,13 @@ struct InMemoryThreadStoreState {
+     metadata_updates: HashMap<ThreadId, ThreadMetadataPatch>,
+     names: HashMap<ThreadId, Option<String>>,
+     rollout_paths: HashMap<PathBuf, ThreadId>,
++    append_failure: Option<InMemoryAppendFailure>,
++}
++
++#[derive(Clone, Copy)]
++enum InMemoryAppendFailure {
++    StorageFull,
++    Internal,
+ }
+ 
+ impl InMemoryThreadStore {
+@@ -421,6 +428,16 @@ impl InMemoryThreadStore {
+         self.state.lock().await.calls.clone()
+     }
+ 
++    /// Makes subsequent append calls fail as if durable storage were full.
++    pub async fn fail_appends_with_storage_full(&self) {
++        self.state.lock().await.append_failure = Some(InMemoryAppendFailure::StorageFull);
++    }
++
++    /// Makes subsequent append calls fail with an unrelated internal error.
++    pub async fn fail_appends_with_internal_error(&self) {
++        self.state.lock().await.append_failure = Some(InMemoryAppendFailure::Internal);
++    }
++
+     async fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreResult<()> {
+         reject_paginated_history_mode(params.history_mode)?;
+         let mut state = self.state.lock().await;
+@@ -488,12 +505,25 @@ impl InMemoryThreadStore {
+             return Ok(());
+         }
+         let mut state = self.state.lock().await;
++        state.calls.append_items += 1;
++        match state.append_failure {
++            Some(InMemoryAppendFailure::StorageFull) => {
++                return Err(ThreadStoreError::StorageFull {
++                    message: "injected storage-full failure".to_string(),
++                });
++            }
++            Some(InMemoryAppendFailure::Internal) => {
++                return Err(ThreadStoreError::Internal {
++                    message: "injected internal failure".to_string(),
++                });
++            }
++            None => {}
++        }
+         let history_mode = history_mode_from_state(&state, params.thread_id);
+         let persisted_items = persisted_rollout_items(params.items.as_slice(), history_mode);
+         if persisted_items.is_empty() {
+             return Ok(());
+         }
+-        state.calls.append_items += 1;
+         state
+             .histories
+             .entry(params.thread_id)
+diff --git a/codex-rs/thread-store/src/local/live_writer.rs b/codex-rs/thread-store/src/local/live_writer.rs
+index 3c62abf7b5..3ab90502f1 100644
+--- a/codex-rs/thread-store/src/local/live_writer.rs
++++ b/codex-rs/thread-store/src/local/live_writer.rs
+@@ -250,8 +250,37 @@ async fn sync_materialized_rollout_path(
+ }
+ 
+ fn thread_store_io_error(err: std::io::Error) -> ThreadStoreError {
+-    ThreadStoreError::Internal {
+-        message: err.to_string(),
++    let message = err.to_string();
++    if err.kind() == std::io::ErrorKind::StorageFull {
++        ThreadStoreError::StorageFull { message }
++    } else {
++        ThreadStoreError::Internal { message }
++    }
++}
++
++#[cfg(test)]
++mod error_tests {
++    use super::thread_store_io_error;
++    use crate::ThreadStoreError;
++
++    #[test]
++    fn storage_full_io_error_keeps_a_typed_classification() {
++        let err = std::io::Error::from(std::io::ErrorKind::StorageFull);
++
++        assert!(matches!(
++            thread_store_io_error(err),
++            ThreadStoreError::StorageFull { .. }
++        ));
++    }
++
++    #[test]
++    fn unrelated_io_error_stays_internal() {
++        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
++
++        assert!(matches!(
++            thread_store_io_error(err),
++            ThreadStoreError::Internal { .. }
++        ));
+     }
+ }
+ 

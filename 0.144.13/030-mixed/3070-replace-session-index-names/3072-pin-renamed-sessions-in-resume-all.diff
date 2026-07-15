@@ -1,0 +1,1169 @@
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index b574771a32..58ac620b18 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -139,7 +139,13 @@ impl App {
+                 tui.frame_requester().schedule_frame();
+             }
+             AppEvent::ResumeSessionByIdOrName(id_or_name) => {
+-                match crate::lookup_session_target_with_app_server(app_server, &id_or_name).await? {
++                match crate::lookup_session_target_with_app_server(
++                    app_server,
++                    self.config.codex_home.as_path(),
++                    &id_or_name,
++                )
++                .await?
++                {
+                     Some(target_session) => {
+                         return self
+                             .resume_target_session(tui, app_server, target_session)
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index 9400f24660..e368a545c4 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -64,10 +64,12 @@ use codex_utils_oss::ensure_oss_provider_ready;
+ use codex_utils_oss::get_default_model_for_oss_provider;
+ use color_eyre::eyre::WrapErr;
+ use cwd_prompt::CwdPromptAction;
++use serde::Deserialize;
+ pub use session_archive_commands::DeleteConfirmation;
+ pub use session_archive_commands::SessionArchiveAction;
+ pub use session_archive_commands::SessionArchiveCommandOptions;
+ pub use session_archive_commands::run_session_archive_command;
++use std::collections::HashSet;
+ use std::fs::OpenOptions;
+ use std::path::Path;
+ use std::path::PathBuf;
+@@ -659,12 +661,51 @@ async fn lookup_session_target_by_name_with_app_server(
+     }
+ }
+ 
++#[derive(Deserialize)]
++struct SessionIndexAliasEntry {
++    id: ThreadId,
++    thread_name: String,
++}
++
++async fn resolve_resume_alias_from_session_index(
++    codex_home: &Path,
++    alias: &str,
++) -> std::io::Result<Option<ThreadId>> {
++    if alias.trim().is_empty() {
++        return Ok(None);
++    }
++    let path = codex_home.join("session_index.jsonl");
++    let contents = match tokio::fs::read_to_string(path).await {
++        Ok(contents) => contents,
++        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
++        Err(err) => return Err(err),
++    };
++    let mut seen = HashSet::new();
++    for line in contents.lines().rev() {
++        let trimmed = line.trim();
++        if trimmed.is_empty() {
++            continue;
++        }
++        let Ok(entry) = serde_json::from_str::<SessionIndexAliasEntry>(trimmed) else {
++            continue;
++        };
++        if !seen.insert(entry.id) {
++            continue;
++        }
++        if entry.thread_name == alias {
++            return Ok(Some(entry.id));
++        }
++    }
++    Ok(None)
++}
++
+ async fn lookup_session_target_with_app_server(
+     app_server: &mut AppServerSession,
++    codex_home: &Path,
+     id_or_name: &str,
+ ) -> color_eyre::Result<Option<resume_picker::SessionTarget>> {
+-    if Uuid::parse_str(id_or_name).is_ok() {
+-        let thread_id = match ThreadId::from_string(id_or_name) {
++    let thread_id = if Uuid::parse_str(id_or_name).is_ok() {
++        match ThreadId::from_string(id_or_name) {
+             Ok(thread_id) => thread_id,
+             Err(err) => {
+                 warn!(
+@@ -674,24 +715,31 @@ async fn lookup_session_target_with_app_server(
+                 );
+                 return Ok(None);
+             }
+-        };
+-        return match app_server
+-            .thread_read(thread_id, /*include_turns*/ false)
++        }
++    } else {
++        let Some(thread_id) = resolve_resume_alias_from_session_index(codex_home, id_or_name)
+             .await
+-        {
+-            Ok(thread) => Ok(session_target_from_app_server_thread(thread)),
+-            Err(err) => {
+-                warn!(
+-                    session = id_or_name,
+-                    %err,
+-                    "thread/read failed during TUI session lookup"
+-                );
+-                Ok(None)
+-            }
++            .map_err(color_eyre::Report::from)?
++        else {
++            return lookup_session_target_by_name_with_app_server(app_server, id_or_name).await;
+         };
+-    }
++        thread_id
++    };
+ 
+-    lookup_session_target_by_name_with_app_server(app_server, id_or_name).await
++    match app_server
++        .thread_read(thread_id, /*include_turns*/ false)
++        .await
++    {
++        Ok(thread) => Ok(session_target_from_app_server_thread(thread)),
++        Err(err) => {
++            warn!(
++                session = id_or_name,
++                %err,
++                "thread/read failed during TUI session lookup"
++            );
++            Ok(None)
++        }
++    }
+ }
+ 
+ async fn lookup_latest_session_target_with_app_server(
+@@ -1480,7 +1528,13 @@ async fn run_ratatui_app(
+             let Some(startup_app_server) = app_server.as_mut() else {
+                 unreachable!("app server should be initialized for --fork <id>");
+             };
+-            match lookup_session_target_with_app_server(startup_app_server, id_str).await? {
++            match lookup_session_target_with_app_server(
++                startup_app_server,
++                config.codex_home.as_path(),
++                id_str,
++            )
++            .await?
++            {
+                 Some(target_session) => resume_picker::SessionSelection::Fork(target_session),
+                 None => {
+                     shutdown_app_server_if_present(app_server.take()).await;
+@@ -1537,7 +1591,13 @@ async fn run_ratatui_app(
+         let Some(startup_app_server) = app_server.as_mut() else {
+             unreachable!("app server should be initialized for --resume <id>");
+         };
+-        match lookup_session_target_with_app_server(startup_app_server, id_str).await? {
++        match lookup_session_target_with_app_server(
++            startup_app_server,
++            config.codex_home.as_path(),
++            id_str,
++        )
++        .await?
++        {
+             Some(target_session) => resume_picker::SessionSelection::Resume(target_session),
+             None => {
+                 shutdown_app_server_if_present(app_server.take()).await;
+@@ -2019,6 +2079,73 @@ mod tests {
+             .await
+     }
+ 
++    fn session_index_line(thread_id: ThreadId, thread_name: &str) -> String {
++        serde_json::json!({
++            "id": thread_id,
++            "thread_name": thread_name,
++            "updated_at": "2026-06-23T00:00:00Z",
++        })
++        .to_string()
++    }
++
++    #[tokio::test]
++    async fn resume_alias_resolves_latest_session_index_name() {
++        let home = TempDir::new().expect("temp dir");
++        let thread_id = ThreadId::new();
++        let other_id = ThreadId::new();
++        std::fs::write(
++            home.path().join("session_index.jsonl"),
++            format!(
++                "{}\n{}\n",
++                session_index_line(other_id, "other"),
++                session_index_line(thread_id, "skills"),
++            ),
++        )
++        .expect("write session index");
++
++        let resolved = resolve_resume_alias_from_session_index(home.path(), "skills")
++            .await
++            .expect("resolve alias");
++
++        assert_eq!(resolved, Some(thread_id));
++    }
++
++    #[tokio::test]
++    async fn resume_alias_ignores_old_names_for_same_thread() {
++        let home = TempDir::new().expect("temp dir");
++        let thread_id = ThreadId::new();
++        std::fs::write(
++            home.path().join("session_index.jsonl"),
++            format!(
++                "{}\n{}\n",
++                session_index_line(thread_id, "workflow"),
++                session_index_line(thread_id, "skills"),
++            ),
++        )
++        .expect("write session index");
++
++        let old = resolve_resume_alias_from_session_index(home.path(), "workflow")
++            .await
++            .expect("resolve old alias");
++        let current = resolve_resume_alias_from_session_index(home.path(), "skills")
++            .await
++            .expect("resolve current alias");
++
++        assert_eq!(old, None);
++        assert_eq!(current, Some(thread_id));
++    }
++
++    #[tokio::test]
++    async fn resume_alias_missing_index_returns_none() {
++        let home = TempDir::new().expect("temp dir");
++
++        let resolved = resolve_resume_alias_from_session_index(home.path(), "skills")
++            .await
++            .expect("resolve missing index");
++
++        assert_eq!(resolved, None);
++    }
++
+     fn write_session_rollout(
+         codex_home: &Path,
+         filename_ts: &str,
+@@ -2799,50 +2926,25 @@ mod tests {
+     }
+ 
+     #[tokio::test]
+-    async fn lookup_session_target_by_name_uses_backend_title_search() -> color_eyre::Result<()> {
++    async fn lookup_session_target_by_name_uses_session_index_alias() -> color_eyre::Result<()> {
+         Box::pin(async {
+             let temp_dir = TempDir::new()?;
+             let config = build_config(&temp_dir).await?;
+-            let thread_id = ThreadId::new();
+-            let rollout_path = temp_dir
+-                .path()
+-                .join("sessions/2025/02/01")
+-                .join(format!("rollout-2025-02-01T10-00-00-{thread_id}.jsonl"));
+-            let rollout_dir = rollout_path.parent().expect("rollout parent");
+-            std::fs::create_dir_all(rollout_dir)?;
+-            std::fs::write(&rollout_path, "")?;
+-
+-            let state_runtime = codex_state::StateRuntime::init(
+-                config.codex_home.to_path_buf(),
+-                config.model_provider_id.clone(),
+-            )
+-            .await
+-            .map_err(std::io::Error::other)?;
+-            state_runtime
+-                .mark_backfill_complete(/*last_watermark*/ None)
+-                .await
+-                .map_err(std::io::Error::other)?;
+-
+             let session_cwd = temp_dir.path().join("project");
+             std::fs::create_dir_all(&session_cwd)?;
+-            let created_at = chrono::DateTime::parse_from_rfc3339("2025-02-01T10:00:00Z")
+-                .expect("timestamp should parse")
+-                .with_timezone(&chrono::Utc);
+-            let mut builder = codex_state::ThreadMetadataBuilder::new(
+-                thread_id,
+-                rollout_path.clone(),
+-                created_at,
+-                serde_json::from_value(serde_json::json!("cli"))
+-                    .expect("cli session source should deserialize"),
++            let thread_id = write_session_rollout(
++                config.codex_home.as_path(),
++                "2025-02-01T10-00-00",
++                "2025-02-01T10:00:00Z",
++                "preview text",
++                config.model_provider_id.as_str(),
++                &session_cwd,
+             );
+-            builder.cwd = session_cwd;
+-            let mut metadata = builder.build(config.model_provider_id.as_str());
+-            metadata.title = "saved-session".to_string();
+-            metadata.first_user_message = Some("preview text".to_string());
+-            state_runtime
+-                .upsert_thread(&metadata)
+-                .await
+-                .map_err(std::io::Error::other)?;
++            let thread_id = thread_id?;
++            std::fs::write(
++                config.codex_home.join("session_index.jsonl"),
++                format!("{}\n", session_index_line(thread_id, "saved-session")),
++            )?;
+ 
+             let mut app_server = AppServerSession::new(
+                 codex_app_server_client::AppServerClient::InProcess(
+@@ -2850,11 +2952,13 @@ mod tests {
+                 ),
+                 ThreadParamsMode::Embedded,
+             );
+-            let target =
+-                lookup_session_target_by_name_with_app_server(&mut app_server, "saved-session")
+-                    .await?;
++            let target = lookup_session_target_with_app_server(
++                &mut app_server,
++                temp_dir.path(),
++                "saved-session",
++            )
++            .await?;
+             let target = target.expect("name lookup should find the saved thread");
+-            assert_eq!(target.path, Some(rollout_path));
+             assert_eq!(target.thread_id, thread_id);
+ 
+             app_server.shutdown().await?;
+diff --git a/codex-rs/tui/src/resume_picker.rs b/codex-rs/tui/src/resume_picker.rs
+index cdce09cde3..54f1cc82dd 100644
+--- a/codex-rs/tui/src/resume_picker.rs
++++ b/codex-rs/tui/src/resume_picker.rs
+@@ -33,11 +33,13 @@ use crate::wrapping::RtOptions;
+ use crate::wrapping::adaptive_wrap_lines;
+ use chrono::DateTime;
+ use chrono::Utc;
++use codex_app_server_protocol::SessionSource;
+ use codex_app_server_protocol::Thread;
+ use codex_app_server_protocol::ThreadItem;
+ use codex_app_server_protocol::ThreadListCwdFilter;
+ use codex_app_server_protocol::ThreadListParams;
+ use codex_app_server_protocol::ThreadSortKey;
++use codex_app_server_protocol::ThreadSourceKind;
+ use codex_config::types::SessionPickerViewMode;
+ use codex_protocol::ThreadId;
+ use codex_utils_path as path_utils;
+@@ -57,6 +59,7 @@ use ratatui::text::Line;
+ use ratatui::text::Span;
+ use ratatui::widgets::Clear;
+ use ratatui::widgets::Widget;
++use serde::Deserialize;
+ use tokio::sync::mpsc;
+ use tokio_stream::StreamExt;
+ use tokio_stream::wrappers::UnboundedReceiverStream;
+@@ -77,6 +80,8 @@ const FOOTER_HINT_LEFT_PADDING: usize = 1;
+ const FOOTER_HINT_GAP: usize = 3;
+ const PICKER_CHROME_HEIGHT: u16 = 8;
+ const PICKER_LIST_HORIZONTAL_INSET: u16 = 4;
++const PINNED_RENAMED_SESSION_LIMIT: usize = PAGE_SIZE;
++const SESSION_INDEX_FILE: &str = "session_index.jsonl";
+ 
+ #[derive(Debug, Clone)]
+ pub struct SessionTarget {
+@@ -145,6 +150,7 @@ struct PageLoadRequest {
+     cwd_filter: Option<PathBuf>,
+     provider_filter: ProviderFilter,
+     sort_key: ThreadSortKey,
++    pinned_renamed_codex_home: Option<PathBuf>,
+ }
+ 
+ enum PickerLoadRequest {
+@@ -568,6 +574,7 @@ fn spawn_app_server_page_loader(
+                         request.provider_filter,
+                         request.sort_key,
+                         include_non_interactive,
++                        request.pinned_renamed_codex_home.as_deref(),
+                     )
+                     .await;
+                     let _ = bg_tx.send(BackgroundEvent::Page {
+@@ -649,6 +656,7 @@ struct PickerState {
+     view_rows: Option<usize>,
+     view_width: Option<u16>,
+     provider_filter: ProviderFilter,
++    show_all: bool,
+     filter_mode: SessionFilterMode,
+     filter_cwd: Option<PathBuf>,
+     local_filter_cwd: Option<PathBuf>,
+@@ -737,31 +745,152 @@ async fn load_app_server_page(
+     provider_filter: ProviderFilter,
+     sort_key: ThreadSortKey,
+     include_non_interactive: bool,
++    pinned_renamed_codex_home: Option<&Path>,
+ ) -> std::io::Result<PickerPage> {
++    let mut rows = if cursor.is_none()
++        && cwd_filter.is_none()
++        && let Some(codex_home) = pinned_renamed_codex_home
++    {
++        load_pinned_renamed_rows(
++            app_server,
++            codex_home,
++            &provider_filter,
++            include_non_interactive,
++        )
++        .await
++    } else {
++        Vec::new()
++    };
++
+     let response = app_server
+         .thread_list(thread_list_params(
+             cursor,
+             cwd_filter,
+-            provider_filter,
++            provider_filter.clone(),
+             sort_key,
+             include_non_interactive,
+         ))
+         .await
+         .map_err(std::io::Error::other)?;
+     let num_scanned_files = response.data.len();
+-
+-    Ok(PickerPage {
+-        rows: response
++    rows.extend(
++        response
+             .data
+             .into_iter()
+-            .filter_map(row_from_app_server_thread)
+-            .collect(),
++            .filter_map(row_from_app_server_thread),
++    );
++
++    Ok(PickerPage {
++        rows,
+         next_cursor: response.next_cursor.map(PageCursor::AppServer),
+         num_scanned_files,
+         reached_scan_cap: false,
+     })
+ }
+ 
++#[derive(Deserialize)]
++struct PinnedRenamedSessionEntry {
++    id: ThreadId,
++    thread_name: String,
++    updated_at: String,
++}
++
++async fn load_pinned_renamed_rows(
++    app_server: &mut AppServerSession,
++    codex_home: &Path,
++    provider_filter: &ProviderFilter,
++    include_non_interactive: bool,
++) -> Vec<Row> {
++    let entries = load_pinned_renamed_entries(codex_home).await;
++    let mut rows = Vec::with_capacity(entries.len());
++    for (thread_id, _) in entries {
++        let Ok(thread) = app_server
++            .thread_read(thread_id, /*include_turns*/ false)
++            .await
++        else {
++            continue;
++        };
++        if !thread_matches_provider_filter(&thread, provider_filter)
++            || !thread_matches_resume_source_filter(&thread, include_non_interactive)
++        {
++            continue;
++        }
++        if let Some(row) = row_from_app_server_thread(thread) {
++            let mut row = row;
++            row.pinned = true;
++            rows.push(row);
++        }
++    }
++    rows
++}
++
++async fn load_pinned_renamed_entries(codex_home: &Path) -> Vec<(ThreadId, DateTime<Utc>)> {
++    let path = codex_home.join(SESSION_INDEX_FILE);
++    let Ok(contents) = tokio::fs::read_to_string(path).await else {
++        return Vec::new();
++    };
++    let mut latest_by_id: HashMap<ThreadId, DateTime<Utc>> = HashMap::new();
++    for line in contents.lines() {
++        let trimmed = line.trim();
++        if trimmed.is_empty() {
++            continue;
++        }
++        let Ok(entry) = serde_json::from_str::<PinnedRenamedSessionEntry>(trimmed) else {
++            continue;
++        };
++        if entry.thread_name.trim().is_empty() {
++            continue;
++        }
++        let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(&entry.updated_at) else {
++            continue;
++        };
++        let updated_at = updated_at.with_timezone(&Utc);
++        latest_by_id
++            .entry(entry.id)
++            .and_modify(|current| {
++                if updated_at > *current {
++                    *current = updated_at;
++                }
++            })
++            .or_insert(updated_at);
++    }
++
++    let mut entries = latest_by_id.into_iter().collect::<Vec<_>>();
++    entries.sort_by(|(_, left), (_, right)| right.cmp(left));
++    entries.truncate(PINNED_RENAMED_SESSION_LIMIT);
++    entries
++}
++
++fn thread_matches_provider_filter(thread: &Thread, provider_filter: &ProviderFilter) -> bool {
++    match provider_filter {
++        ProviderFilter::Any => true,
++        ProviderFilter::MatchDefault(default_provider) => {
++            thread.model_provider == *default_provider
++        }
++    }
++}
++
++fn thread_matches_resume_source_filter(thread: &Thread, include_non_interactive: bool) -> bool {
++    crate::resume_source_kinds(include_non_interactive)
++        .iter()
++        .any(|kind| thread_source_matches_kind(&thread.source, *kind))
++}
++
++fn thread_source_matches_kind(source: &SessionSource, kind: ThreadSourceKind) -> bool {
++    match kind {
++        ThreadSourceKind::Cli => matches!(source, SessionSource::Cli),
++        ThreadSourceKind::VsCode => matches!(source, SessionSource::VsCode),
++        ThreadSourceKind::Exec => matches!(source, SessionSource::Exec),
++        ThreadSourceKind::AppServer => matches!(source, SessionSource::AppServer),
++        ThreadSourceKind::SubAgent => matches!(source, SessionSource::SubAgent(_)),
++        ThreadSourceKind::SubAgentReview
++        | ThreadSourceKind::SubAgentCompact
++        | ThreadSourceKind::SubAgentThreadSpawn
++        | ThreadSourceKind::SubAgentOther => false,
++        ThreadSourceKind::Unknown => matches!(source, SessionSource::Unknown),
++    }
++}
++
+ async fn load_transcript_preview(
+     app_server: &mut AppServerSession,
+     thread_id: ThreadId,
+@@ -833,6 +962,7 @@ struct Row {
+     preview: String,
+     thread_id: Option<ThreadId>,
+     thread_name: Option<String>,
++    pinned: bool,
+     created_at: Option<DateTime<Utc>>,
+     updated_at: Option<DateTime<Utc>>,
+     cwd: Option<PathBuf>,
+@@ -923,6 +1053,7 @@ impl PickerState {
+             view_rows: None,
+             view_width: None,
+             provider_filter,
++            show_all,
+             filter_mode: SessionFilterMode::from_show_all(show_all, filter_cwd.as_deref()),
+             local_filter_cwd: filter_cwd.clone(),
+             filter_cwd,
+@@ -1276,9 +1407,20 @@ impl PickerState {
+             cwd_filter: self.active_cwd_filter(),
+             provider_filter: self.provider_filter.clone(),
+             sort_key: self.sort_key,
++            pinned_renamed_codex_home: self.pinned_renamed_codex_home_for_initial_load(),
+         }));
+     }
+ 
++    fn pinned_renamed_codex_home_for_initial_load(&self) -> Option<PathBuf> {
++        if self.show_all && matches!(self.action, SessionPickerAction::Resume) {
++            return self
++                .view_persistence
++                .as_ref()
++                .map(|persistence| persistence.codex_home.clone());
++        }
++        None
++    }
++
+     async fn handle_background_event(&mut self, event: BackgroundEvent) -> Result<()> {
+         match event {
+             BackgroundEvent::Page {
+@@ -1586,6 +1728,7 @@ impl PickerState {
+             cwd_filter: self.active_cwd_filter(),
+             provider_filter: self.provider_filter.clone(),
+             sort_key: self.sort_key,
++            pinned_renamed_codex_home: None,
+         }));
+     }
+ 
+@@ -1720,6 +1863,7 @@ impl PickerState {
+             })
+             .sum::<usize>()
+             + self.row_separator_height() * end_inclusive.saturating_sub(start)
++            + pinned_group_boundaries_between(&self.filtered_rows, start, end_inclusive)
+     }
+ 
+     fn has_more_above(&self) -> bool {
+@@ -1749,7 +1893,8 @@ impl PickerState {
+                 self.view_width.unwrap_or(u16::MAX),
+             )
+             .len();
+-            let separator_height = usize::from(offset > 0) * self.row_separator_height();
++            let separator_height = usize::from(offset > 0) * self.row_separator_height()
++                + usize::from(offset > 0 && is_pinned_group_boundary(&self.filtered_rows, row_idx));
+             if used + separator_height + row_height > capacity {
+                 return true;
+             }
+@@ -1794,6 +1939,7 @@ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
+         },
+         thread_id: Some(thread_id),
+         thread_name: thread.name,
++        pinned: false,
+         created_at: chrono::DateTime::from_timestamp(thread.created_at, 0)
+             .map(|dt| dt.with_timezone(&Utc)),
+         updated_at: chrono::DateTime::from_timestamp(thread.updated_at, 0)
+@@ -2453,10 +2599,20 @@ fn render_list(frame: &mut crate::custom_terminal::Frame, area: Rect, state: &Pi
+             break;
+         }
+         let row_idx = start + idx;
++        let pinned_separator_before = idx > 0 && is_pinned_group_boundary(rows, row_idx);
++        if pinned_separator_before {
++            let separator_idx = visual_row_idx(rows, row_idx).saturating_sub(1);
++            let line = pinned_group_separator_line(separator_idx.is_multiple_of(2), area.width);
++            frame.render_widget_ref(line, Rect::new(area.x, y, area.width, 1));
++            y = y.saturating_add(1);
++            if y >= content_area.y.saturating_add(content_area.height) {
++                break;
++            }
++        }
+         let is_selected = row_idx == state.selected;
+         let is_expanded =
+             is_selected && row.thread_id.is_some() && state.expanded_thread_id == row.thread_id;
+-        let is_zebra = row_idx.is_multiple_of(2);
++        let is_zebra = visual_row_idx(rows, row_idx).is_multiple_of(2);
+         for line in render_session_lines(row, state, is_selected, is_expanded, is_zebra, area.width)
+         {
+             if y >= content_area.y.saturating_add(content_area.height) {
+@@ -2498,6 +2654,44 @@ fn render_list(frame: &mut crate::custom_terminal::Frame, area: Rect, state: &Pi
+     }
+ }
+ 
++fn visual_row_idx(rows: &[Row], row_idx: usize) -> usize {
++    row_idx + pinned_group_boundaries_before(rows, row_idx)
++}
++
++fn pinned_group_boundaries_before(rows: &[Row], row_idx: usize) -> usize {
++    if row_idx == 0 {
++        return 0;
++    }
++    (1..=row_idx)
++        .filter(|&idx| is_pinned_group_boundary(rows, idx))
++        .count()
++}
++
++fn pinned_group_boundaries_between(rows: &[Row], start: usize, end_inclusive: usize) -> usize {
++    if start >= end_inclusive {
++        return 0;
++    }
++    (start.saturating_add(1)..=end_inclusive)
++        .filter(|&idx| is_pinned_group_boundary(rows, idx))
++        .count()
++}
++
++fn is_pinned_group_boundary(rows: &[Row], row_idx: usize) -> bool {
++    row_idx > 0
++        && rows
++            .get(row_idx - 1)
++            .zip(rows.get(row_idx))
++            .is_some_and(|(previous, current)| previous.pinned && !current.pinned)
++}
++
++fn pinned_group_separator_line(is_zebra: bool, width: u16) -> Line<'static> {
++    if is_zebra {
++        apply_line_background(Line::default(), dense_zebra_style(), width)
++    } else {
++        Line::default()
++    }
++}
++
+ fn more_line(label: &'static str) -> Line<'static> {
+     vec![label.dim()].into()
+ }
+@@ -2529,13 +2723,23 @@ fn render_comfortable_session_lines(
+     width: u16,
+ ) -> Vec<Line<'static>> {
+     let marker = selection_marker(is_selected, is_expanded);
+-    let title = truncate_text(row.display_preview(), width.saturating_sub(2) as usize);
++    let pinned_label = row.pinned.then(pinned_session_label_span);
++    let label_width = pinned_label.as_ref().map_or(0, Span::width);
++    let title_width = (width as usize)
++        .saturating_sub(marker.width())
++        .saturating_sub(label_width);
++    let title = truncate_text(row.display_preview(), title_width);
+     let title = if is_selected {
+         selected_session_title_span(title)
+     } else {
+         title.into()
+     };
+-    let title_line = Line::from(vec![marker, title]);
++    let mut title_spans = vec![marker];
++    if let Some(label) = pinned_label {
++        title_spans.push(label);
++    }
++    title_spans.push(title);
++    let title_line = Line::from(title_spans);
+     let mut lines = vec![title_line];
+     let row_style = if is_selected {
+         Some(dense_selected_style())
+@@ -2620,6 +2824,7 @@ fn render_dense_session_lines(
+         marker,
+         date: &date,
+         title: row.display_preview(),
++        pinned: row.pinned,
+         is_selected,
+         is_zebra,
+         width,
+@@ -2634,6 +2839,7 @@ struct DenseSummaryInput<'a> {
+     marker: Span<'static>,
+     date: &'a str,
+     title: &'a str,
++    pinned: bool,
+     is_selected: bool,
+     is_zebra: bool,
+     width: u16,
+@@ -2643,17 +2849,25 @@ fn dense_summary_line(input: DenseSummaryInput<'_>) -> Line<'static> {
+     let marker_width = input.marker.width();
+     let available = (input.width as usize).saturating_sub(marker_width);
+     let columns = dense_columns(available);
++    let pinned_label = input.pinned.then(pinned_session_label_span);
++    let label_width = pinned_label.as_ref().map_or(0, Span::width);
+     let title = if input.is_selected {
+-        selected_session_title_span(dense_column_text(input.title, columns.title_width))
++        selected_session_title_span(dense_column_text(
++            input.title,
++            columns.title_width.saturating_sub(label_width),
++        ))
+     } else {
+-        dense_column_text(input.title, columns.title_width).into()
++        dense_column_text(input.title, columns.title_width.saturating_sub(label_width)).into()
+     };
+ 
+-    let spans = vec![
++    let mut spans = vec![
+         input.marker,
+         dense_column_text(input.date, columns.date_width).dim(),
+-        title,
+     ];
++    if let Some(label) = pinned_label {
++        spans.push(label);
++    }
++    spans.push(title);
+     let mut line = Line::from(spans);
+     if input.is_selected {
+         let padding = (input.width as usize).saturating_sub(line.width());
+@@ -2732,6 +2946,18 @@ fn selected_session_title_span(title: String) -> Span<'static> {
+     title.set_style(selected_session_style())
+ }
+ 
++fn pinned_session_label_span() -> Span<'static> {
++    "Pinned ".set_style(pinned_session_label_style().bold())
++}
++
++fn pinned_session_label_style() -> Style {
++    if default_bg().is_some_and(is_light) {
++        Style::default().fg(best_color((0, 100, 0)))
++    } else {
++        Style::default().fg(Color::Cyan)
++    }
++}
++
+ fn render_footer_lines(
+     sort_key: ThreadSortKey,
+     created: &str,
+@@ -3237,6 +3463,15 @@ mod tests {
+         })
+     }
+ 
++    fn recorded_page_loader() -> (PickerLoader, Arc<Mutex<Vec<PageLoadRequest>>>) {
++        let recorded_requests: Arc<Mutex<Vec<PageLoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
++        let request_sink = recorded_requests.clone();
++        let loader = page_only_loader(move |req: PageLoadRequest| {
++            request_sink.lock().unwrap().push(req);
++        });
++        (loader, recorded_requests)
++    }
++
+     fn make_row(path: &str, ts: &str, preview: &str) -> Row {
+         let timestamp = parse_timestamp_str(ts).expect("timestamp should parse");
+         Row {
+@@ -3244,6 +3479,7 @@ mod tests {
+             preview: preview.to_string(),
+             thread_id: None,
+             thread_name: None,
++            pinned: false,
+             created_at: Some(timestamp),
+             updated_at: Some(timestamp),
+             cwd: None,
+@@ -3251,6 +3487,85 @@ mod tests {
+         }
+     }
+ 
++    fn test_thread_id(suffix: u128) -> ThreadId {
++        ThreadId::from_string(&format!("00000000-0000-4000-8000-{suffix:012x}"))
++            .expect("valid thread id")
++    }
++
++    #[test]
++    fn initial_resume_all_load_requests_pinned_renamed_sessions() {
++        let codex_home = PathBuf::from("/tmp/codex-home");
++        let (loader, recorded_requests) = recorded_page_loader();
++        let mut state = PickerState::new(
++            FrameRequester::test_dummy(),
++            loader,
++            ProviderFilter::MatchDefault(String::from("openai")),
++            /*show_all*/ true,
++            /*filter_cwd*/ None,
++            SessionPickerAction::Resume,
++        );
++        state.view_persistence = Some(SessionPickerViewPersistence {
++            codex_home: codex_home.clone(),
++        });
++
++        state.start_initial_load();
++
++        let requests = recorded_requests.lock().unwrap();
++        assert_eq!(requests.len(), 1);
++        assert_eq!(
++            requests[0].pinned_renamed_codex_home.as_deref(),
++            Some(codex_home.as_path())
++        );
++    }
++
++    #[test]
++    fn initial_cwd_scoped_resume_does_not_request_pinned_renamed_sessions() {
++        let (loader, recorded_requests) = recorded_page_loader();
++        let mut state = PickerState::new(
++            FrameRequester::test_dummy(),
++            loader,
++            ProviderFilter::MatchDefault(String::from("openai")),
++            /*show_all*/ false,
++            Some(PathBuf::from("/tmp/project")),
++            SessionPickerAction::Resume,
++        );
++        state.view_persistence = Some(SessionPickerViewPersistence {
++            codex_home: PathBuf::from("/tmp/codex-home"),
++        });
++
++        state.start_initial_load();
++
++        let requests = recorded_requests.lock().unwrap();
++        assert_eq!(requests.len(), 1);
++        assert_eq!(requests[0].pinned_renamed_codex_home, None);
++    }
++
++    #[tokio::test]
++    async fn pinned_renamed_entries_keep_latest_name_per_thread() {
++        let home = tempdir().expect("tempdir");
++        let oldest = test_thread_id(1);
++        let renamed = test_thread_id(2);
++        let newest = test_thread_id(3);
++        std::fs::write(
++            home.path().join(SESSION_INDEX_FILE),
++            format!(
++                "{{\"id\":\"{renamed}\",\"thread_name\":\"old\",\"updated_at\":\"2026-06-21T00:00:00Z\"}}\n\
++                 {{\"id\":\"{oldest}\",\"thread_name\":\"oldest\",\"updated_at\":\"2026-06-20T00:00:00Z\"}}\n\
++                 {{\"id\":\"{newest}\",\"thread_name\":\"newest\",\"updated_at\":\"2026-06-23T00:00:00Z\"}}\n\
++                 {{\"id\":\"{renamed}\",\"thread_name\":\"renamed\",\"updated_at\":\"2026-06-22T00:00:00Z\"}}\n"
++            ),
++        )
++        .expect("write index");
++
++        let entries = load_pinned_renamed_entries(home.path()).await;
++        let ids = entries
++            .into_iter()
++            .map(|(thread_id, _)| thread_id)
++            .collect::<Vec<_>>();
++
++        assert_eq!(ids, vec![newest, renamed, oldest]);
++    }
++
+     fn footer_lines_text(state: &PickerState, width: u16) -> String {
+         footer_hint_lines(state, width)
+             .into_iter()
+@@ -3290,6 +3605,7 @@ mod tests {
+             preview: String::from("first message"),
+             thread_id: None,
+             thread_name: Some(String::from("My session")),
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: None,
+@@ -3330,6 +3646,7 @@ mod tests {
+             preview: String::from("first message"),
+             thread_id: Some(thread_id),
+             thread_name: Some(String::from("My session")),
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: Some(PathBuf::from("/tmp/codex-session-picker")),
+@@ -3390,6 +3707,7 @@ mod tests {
+             preview: String::from("first message"),
+             thread_id: Some(thread_id),
+             thread_name: Some(String::from("feat(tui): add raw scrollback mode")),
++            pinned: false,
+             created_at: parse_timestamp_str("2026-05-02T14:31:08Z"),
+             updated_at: parse_timestamp_str("2026-05-02T14:48:19Z"),
+             cwd: Some(PathBuf::from("/Users/felipe.coury/code/codex")),
+@@ -3600,6 +3918,7 @@ mod tests {
+             preview: String::from("remote session"),
+             thread_id: Some(ThreadId::new()),
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: Some(PathBuf::from("/srv/real-project")),
+@@ -3625,6 +3944,7 @@ mod tests {
+             preview: String::from("remote session"),
+             thread_id: Some(ThreadId::new()),
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: Some(PathBuf::from("/srv/remote-project")),
+@@ -3656,6 +3976,7 @@ mod tests {
+                 preview: String::from("Fix resume picker timestamps"),
+                 thread_id: None,
+                 thread_name: None,
++                pinned: false,
+                 created_at: Some(now - Duration::minutes(16)),
+                 updated_at: Some(now - Duration::seconds(42)),
+                 cwd: None,
+@@ -3666,6 +3987,7 @@ mod tests {
+                 preview: String::from("Investigate lazy pagination cap"),
+                 thread_id: None,
+                 thread_name: None,
++                pinned: false,
+                 created_at: Some(now - Duration::hours(1)),
+                 updated_at: Some(now - Duration::minutes(35)),
+                 cwd: None,
+@@ -3676,6 +3998,7 @@ mod tests {
+                 preview: String::from("Explain the codebase"),
+                 thread_id: None,
+                 thread_name: None,
++                pinned: false,
+                 created_at: Some(now - Duration::hours(2)),
+                 updated_at: Some(now - Duration::hours(2)),
+                 cwd: None,
+@@ -4104,6 +4427,7 @@ mod tests {
+             preview: String::from("preview"),
+             thread_id: Some(thread_id),
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: None,
+@@ -4142,6 +4466,7 @@ mod tests {
+                 preview: String::from("one"),
+                 thread_id: Some(ThreadId::new()),
+                 thread_name: None,
++                pinned: false,
+                 created_at: None,
+                 updated_at: None,
+                 cwd: None,
+@@ -4152,6 +4477,7 @@ mod tests {
+                 preview: String::from("two"),
+                 thread_id: Some(ThreadId::new()),
+                 thread_name: None,
++                pinned: false,
+                 created_at: None,
+                 updated_at: None,
+                 cwd: None,
+@@ -4221,6 +4547,7 @@ mod tests {
+                 preview: String::from("Find pending threads and emails"),
+                 thread_id: Some(thread_id),
+                 thread_name: None,
++                pinned: false,
+                 created_at: None,
+                 updated_at: None,
+                 cwd: None,
+@@ -4231,6 +4558,7 @@ mod tests {
+                 preview: String::from("Plan raw scrollback mode"),
+                 thread_id: Some(ThreadId::new()),
+                 thread_name: None,
++                pinned: false,
+                 created_at: None,
+                 updated_at: None,
+                 cwd: None,
+@@ -4286,6 +4614,7 @@ mod tests {
+             preview: String::from("preview"),
+             thread_id: Some(thread_id),
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: None,
+@@ -4316,6 +4645,7 @@ mod tests {
+             preview: String::from("preview"),
+             thread_id: None,
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: None,
+@@ -4392,6 +4722,7 @@ mod tests {
+             preview: String::from("preview"),
+             thread_id: Some(thread_id),
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: None,
+@@ -4556,6 +4887,7 @@ session_picker_view = "dense"
+             preview: String::from("preview"),
+             thread_id: Some(thread_id),
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: None,
+@@ -4595,6 +4927,7 @@ session_picker_view = "dense"
+             preview: String::from("preview"),
+             thread_id: Some(thread_id),
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: None,
+@@ -4671,6 +5004,7 @@ session_picker_view = "dense"
+                 ThreadId::from_string("019dabc1-0ef5-7431-b81c-03037f51f62c").expect("thread id"),
+             ),
+             thread_name: None,
++            pinned: false,
+             created_at: parse_timestamp_str("2026-04-28T16:30:00Z"),
+             updated_at: parse_timestamp_str("2026-04-28T17:45:00Z"),
+             cwd: Some(PathBuf::from(
+@@ -4803,12 +5137,80 @@ session_picker_view = "dense"
+         assert!(!rendered.contains("Raw conversation preview"));
+     }
+ 
++    #[test]
++    fn comfortable_pinned_session_line_marks_row() {
++        let loader = page_only_loader(|_| {});
++        let state = PickerState::new(
++            FrameRequester::test_dummy(),
++            loader,
++            ProviderFilter::MatchDefault(String::from("openai")),
++            /*show_all*/ true,
++            /*filter_cwd*/ None,
++            SessionPickerAction::Resume,
++        );
++        let mut row = make_row(
++            "/tmp/a.jsonl",
++            "2026-05-02T11:45:00Z",
++            "Pinned renamed session",
++        );
++        row.pinned = true;
++
++        let rendered = render_comfortable_session_lines(
++            &row, &state, /*is_selected*/ false, /*is_expanded*/ false,
++            /*is_zebra*/ false, /*width*/ 80,
++        )[0]
++        .to_string();
++
++        assert!(rendered.contains("Pinned"));
++        assert!(rendered.contains("Pinned renamed session"));
++    }
++
++    #[test]
++    fn dense_pinned_session_line_marks_row() {
++        let mut row = dense_snapshot_row();
++        row.preview = String::from("Pinned dense session");
++        row.pinned = true;
++
++        let loader = page_only_loader(|_| {});
++        let state = PickerState::new(
++            FrameRequester::test_dummy(),
++            loader,
++            ProviderFilter::MatchDefault(String::from("openai")),
++            /*show_all*/ true,
++            /*filter_cwd*/ None,
++            SessionPickerAction::Resume,
++        );
++
++        let rendered = render_dense_session_lines(
++            &row, &state, /*is_selected*/ false, /*is_expanded*/ false,
++            /*is_zebra*/ false, /*width*/ 100,
++        )[0]
++        .to_string();
++
++        assert!(rendered.contains("Pinned"));
++        assert!(rendered.contains("Pinned dense session"));
++    }
++
++    #[test]
++    fn pinned_group_separator_counts_as_visual_row() {
++        let mut pinned = make_row("/tmp/a.jsonl", "2026-05-02T11:45:00Z", "Pinned");
++        pinned.pinned = true;
++        let regular = make_row("/tmp/b.jsonl", "2026-05-02T11:44:00Z", "Regular");
++        let rows = vec![pinned, regular];
++
++        assert!(is_pinned_group_boundary(&rows, 1));
++        assert_eq!(pinned_group_boundaries_between(&rows, 0, 1), 1);
++        assert_eq!(visual_row_idx(&rows, 0), 0);
++        assert_eq!(visual_row_idx(&rows, 1), 2);
++    }
++
+     #[test]
+     fn dense_selected_summary_line_uses_full_width_selection_style() {
+         let line = dense_summary_line(DenseSummaryInput {
+             marker: selection_marker(/*is_selected*/ true, /*is_expanded*/ false),
+             date: "15m ago",
+             title: "Selected dense row",
++            pinned: false,
+             is_selected: true,
+             is_zebra: false,
+             width: 80,
+@@ -4825,6 +5227,7 @@ session_picker_view = "dense"
+             marker: selection_marker(/*is_selected*/ false, /*is_expanded*/ false),
+             date: "15m ago",
+             title: "Zebra dense row",
++            pinned: false,
+             is_selected: false,
+             is_zebra: true,
+             width: 80,
+@@ -4925,6 +5328,7 @@ session_picker_view = "dense"
+             preview: String::from("Investigate picker expansion"),
+             thread_id: Some(thread_id),
+             thread_name: None,
++            pinned: false,
+             created_at: parse_timestamp_str("2026-04-28T16:30:00Z"),
+             updated_at: parse_timestamp_str("2026-04-28T17:45:00Z"),
+             cwd: Some(PathBuf::from("/tmp/codex")),
+@@ -4994,6 +5398,7 @@ session_picker_view = "dense"
+                 ThreadId::from_string("019dabc1-0ef5-7431-b81c-03037f51f62c").expect("thread id"),
+             ),
+             thread_name: None,
++            pinned: false,
+             created_at: parse_timestamp_str("2026-04-28T16:30:00Z"),
+             updated_at: parse_timestamp_str("2026-04-28T17:45:00Z"),
+             cwd: Some(PathBuf::from("/tmp/codex")),
+@@ -5052,6 +5457,7 @@ session_picker_view = "dense"
+                 preview: format!("item-{idx}"),
+                 thread_id: None,
+                 thread_name: None,
++                pinned: false,
+                 created_at: Some(now - Duration::hours(idx)),
+                 updated_at: Some(now - Duration::minutes(idx * 5)),
+                 cwd: None,
+@@ -5104,6 +5510,7 @@ session_picker_view = "dense"
+                 preview: format!("item-{idx}"),
+                 thread_id: None,
+                 thread_name: None,
++                pinned: false,
+                 created_at: Some(now - Duration::hours(idx)),
+                 updated_at: Some(now - Duration::minutes(idx * 5)),
+                 cwd: None,
+@@ -5655,6 +6062,7 @@ session_picker_view = "dense"
+             preview: String::from("missing metadata"),
+             thread_id: None,
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: None,
+@@ -5694,6 +6102,7 @@ session_picker_view = "dense"
+             preview: String::from("pathless thread"),
+             thread_id: Some(thread_id),
+             thread_name: None,
++            pinned: false,
+             created_at: None,
+             updated_at: None,
+             cwd: None,

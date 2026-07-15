@@ -1,0 +1,286 @@
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+index 4c89a9ae53..abed0143e4 100644
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -689,9 +689,7 @@ impl App {
+                 Ok(true)
+             }
+             AppCommand::SetThreadName { name } => {
+-                app_server
+-                    .thread_set_name(thread_id, name.to_string())
+-                    .await?;
++                app_server.thread_set_name(thread_id, name.clone()).await?;
+                 Ok(true)
+             }
+             AppCommand::Review { target } => {
+diff --git a/codex-rs/tui/src/app_command.rs b/codex-rs/tui/src/app_command.rs
+index c49c620d30..373891f3ee 100644
+--- a/codex-rs/tui/src/app_command.rs
++++ b/codex-rs/tui/src/app_command.rs
+@@ -90,7 +90,7 @@ pub(crate) enum AppCommand {
+     },
+     Compact,
+     SetThreadName {
+-        name: String,
++        name: Option<String>,
+     },
+     Shutdown,
+     Review {
+@@ -236,7 +236,7 @@ impl AppCommand {
+         Self::Compact
+     }
+ 
+-    pub(crate) fn set_thread_name(name: String) -> Self {
++    pub(crate) fn set_thread_name(name: Option<String>) -> Self {
+         Self::SetThreadName { name }
+     }
+ 
+diff --git a/codex-rs/tui/src/app_event_sender.rs b/codex-rs/tui/src/app_event_sender.rs
+index 6c1606761d..f89d6b401f 100644
+--- a/codex-rs/tui/src/app_event_sender.rs
++++ b/codex-rs/tui/src/app_event_sender.rs
+@@ -50,7 +50,7 @@ impl AppEventSender {
+         self.send(AppEvent::CodexOp(AppCommand::compact()));
+     }
+ 
+-    pub(crate) fn set_thread_name(&self, name: String) {
++    pub(crate) fn set_thread_name(&self, name: Option<String>) {
+         self.send(AppEvent::CodexOp(AppCommand::set_thread_name(name)));
+     }
+ 
+diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+index 7da015b21f..2238d271e5 100644
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -943,7 +943,7 @@ impl AppServerSession {
+     pub(crate) async fn thread_set_name(
+         &mut self,
+         thread_id: ThreadId,
+-        name: String,
++        name: Option<String>,
+     ) -> Result<()> {
+         let request_id = self.next_request_id();
+         let _: ThreadSetNameResponse = self
+@@ -952,7 +952,7 @@ impl AppServerSession {
+                 request_id,
+                 params: ThreadSetNameParams {
+                     thread_id: thread_id.to_string(),
+-                    name,
++                    name: Some(name),
+                 },
+             })
+             .await
+diff --git a/codex-rs/tui/src/bottom_pane/custom_prompt_view.rs b/codex-rs/tui/src/bottom_pane/custom_prompt_view.rs
+index bb81af7478..726d834cfa 100644
+--- a/codex-rs/tui/src/bottom_pane/custom_prompt_view.rs
++++ b/codex-rs/tui/src/bottom_pane/custom_prompt_view.rs
+@@ -31,8 +31,10 @@ pub(crate) type PromptSubmitted = Box<dyn Fn(String) + Send + Sync>;
+ /// Minimal multi-line text input view to collect custom review instructions.
+ pub(crate) struct CustomPromptView {
+     title: String,
++    title_hint: Option<String>,
+     placeholder: String,
+     context_label: Option<String>,
++    allow_empty_submit: bool,
+     on_submit: PromptSubmitted,
+ 
+     // UI state
+@@ -49,6 +51,46 @@ impl CustomPromptView {
+         initial_text: String,
+         context_label: Option<String>,
+         on_submit: PromptSubmitted,
++    ) -> Self {
++        Self::new_with_options(
++            title,
++            /*title_hint*/ None,
++            placeholder,
++            initial_text,
++            context_label,
++            /*allow_empty_submit*/ false,
++            on_submit,
++        )
++    }
++
++    pub(crate) fn new_with_title_hint_and_empty_submit(
++        title: String,
++        title_hint: Option<String>,
++        placeholder: String,
++        initial_text: String,
++        context_label: Option<String>,
++        allow_empty_submit: bool,
++        on_submit: PromptSubmitted,
++    ) -> Self {
++        Self::new_with_options(
++            title,
++            title_hint,
++            placeholder,
++            initial_text,
++            context_label,
++            allow_empty_submit,
++            on_submit,
++        )
++    }
++
++    fn new_with_options(
++        title: String,
++        title_hint: Option<String>,
++        placeholder: String,
++        initial_text: String,
++        context_label: Option<String>,
++        allow_empty_submit: bool,
++        on_submit: PromptSubmitted,
+     ) -> Self {
+         let mut textarea = TextArea::new();
+         if !initial_text.is_empty() {
+@@ -58,8 +100,10 @@ impl CustomPromptView {
+ 
+         Self {
+             title,
++            title_hint,
+             placeholder,
+             context_label,
++            allow_empty_submit,
+             on_submit,
+             textarea,
+             textarea_state: RefCell::new(TextAreaState::default()),
+@@ -87,7 +131,7 @@ impl CustomPromptView {
+                 }
+                 if modifiers == KeyModifiers::NONE {
+                     let text = self.textarea.text().trim().to_string();
+-                    if !text.is_empty() {
++                    if self.allow_empty_submit || !text.is_empty() {
+                         (self.on_submit)(text);
+                         self.completion = Some(ViewCompletion::Accepted);
+                     }
+@@ -177,7 +221,11 @@ impl Renderable for CustomPromptView {
+             width: area.width,
+             height: 1,
+         };
+-        let title_spans: Vec<Span<'static>> = vec![gutter(), self.title.clone().bold()];
++        let mut title_spans: Vec<Span<'static>> = vec![gutter(), self.title.clone().bold()];
++        if let Some(title_hint) = &self.title_hint {
++            title_spans.push(" ".into());
++            title_spans.push(title_hint.clone().yellow());
++        }
+         Paragraph::new(Line::from(title_spans)).render(title_area, buf);
+ 
+         // Optional context line
+diff --git a/codex-rs/tui/src/chatwidget/interaction.rs b/codex-rs/tui/src/chatwidget/interaction.rs
+index dc55356044..2312c6af9b 100644
+--- a/codex-rs/tui/src/chatwidget/interaction.rs
++++ b/codex-rs/tui/src/chatwidget/interaction.rs
+@@ -312,19 +312,28 @@ impl ChatWidget {
+         } else {
+             "Name thread"
+         };
+-        let view = CustomPromptView::new(
++        let title_hint = existing_name
++            .is_some()
++            .then(|| "clear to remove name".to_string());
++        let view = CustomPromptView::new_with_title_hint_and_empty_submit(
+             title.to_string(),
++            title_hint,
+             "Type a name and press Enter".to_string(),
+             /*initial_text*/ existing_name.unwrap_or_default().to_string(),
+             /*context_label*/ None,
++            /*allow_empty_submit*/ existing_name.is_some(),
+             Box::new(move |name: String| {
++                if name.trim().is_empty() {
++                    tx.set_thread_name(None);
++                    return;
++                }
+                 let Some(name) = normalize_thread_name(&name) else {
+                     tx.send(AppEvent::InsertHistoryCell(Box::new(
+                         history_cell::new_error_event("Thread name cannot be empty.".to_string()),
+                     )));
+                     return;
+                 };
+-                tx.set_thread_name(name);
++                tx.set_thread_name(Some(name));
+             }),
+         );
+ 
+diff --git a/codex-rs/tui/src/chatwidget/slash_dispatch.rs b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+index 2a1f9635bf..7d0fd59331 100644
+--- a/codex-rs/tui/src/chatwidget/slash_dispatch.rs
++++ b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+@@ -713,7 +713,7 @@ impl ChatWidget {
+                     self.add_error_message("Thread name cannot be empty.".to_string());
+                     return;
+                 };
+-                self.app_event_tx.set_thread_name(name);
++                self.app_event_tx.set_thread_name(Some(name));
+             }
+             SlashCommand::Plan if !trimmed.is_empty() => {
+                 if !self.apply_plan_slash_command() {
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__slash_rename_prefilled_prompt.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__slash_rename_prefilled_prompt.snap
+index f1eb0d223b..d26821cda3 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__slash_rename_prefilled_prompt.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__slash_rename_prefilled_prompt.snap
+@@ -1,9 +1,8 @@
+ ---
+ source: tui/src/chatwidget/tests/slash_commands.rs
+-assertion_line: 135
+ expression: popup
+ ---
+-▌ Rename thread
++▌ Rename thread clear to remove name
+ ▌
+ ▌ Current project title
+ 
+diff --git a/codex-rs/tui/src/chatwidget/tests/slash_commands.rs b/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
+index d8211a0cde..24c21e0765 100644
+--- a/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
++++ b/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
+@@ -469,7 +469,7 @@ async fn queued_bare_rename_drains_next_input_after_name_update() {
+     assert!(
+         events.iter().any(|event| matches!(
+             event,
+-            AppEvent::CodexOp(Op::SetThreadName { name }) if name == "Queued rename"
++            AppEvent::CodexOp(Op::SetThreadName { name }) if name.as_deref() == Some("Queued rename")
+         )),
+         "expected rename prompt to submit thread name; events: {events:?}"
+     );
+@@ -514,7 +514,7 @@ async fn queued_inline_rename_does_not_drain_again_before_turn_started() {
+     assert!(
+         events.iter().any(|event| matches!(
+             event,
+-            AppEvent::CodexOp(Op::SetThreadName { name }) if name == "Queued rename"
++            AppEvent::CodexOp(Op::SetThreadName { name }) if name.as_deref() == Some("Queued rename")
+         )),
+         "expected queued /rename to submit thread name; events: {events:?}"
+     );
+@@ -1197,7 +1197,7 @@ async fn slash_rename_prefills_existing_thread_name() {
+ 
+     assert_matches!(
+         rx.try_recv(),
+-        Ok(AppEvent::CodexOp(Op::SetThreadName { name })) if name == "Current project title"
++        Ok(AppEvent::CodexOp(Op::SetThreadName { name })) if name.as_deref() == Some("Current project title")
+     );
+ }
+ 
+@@ -1216,6 +1216,24 @@ async fn slash_rename_without_existing_thread_name_starts_empty() {
+     assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
+ }
+ 
++#[tokio::test]
++async fn slash_rename_existing_thread_name_can_be_cleared() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.thread_name = Some("Current project title".to_string());
++
++    chat.dispatch_command(SlashCommand::Rename);
++
++    for _ in 0.."Current project title".len() {
++        chat.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
++    }
++    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++
++    assert_matches!(
++        rx.try_recv(),
++        Ok(AppEvent::CodexOp(Op::SetThreadName { name })) if name.is_none()
++    );
++}
++
+ #[tokio::test]
+ async fn usage_error_slash_command_is_available_from_local_recall() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;

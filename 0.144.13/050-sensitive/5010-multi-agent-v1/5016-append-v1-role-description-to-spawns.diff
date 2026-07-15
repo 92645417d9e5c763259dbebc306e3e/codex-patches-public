@@ -1,0 +1,393 @@
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 6a1afa4922..89c4226603 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -968,21 +968,61 @@ impl ChatWidget {
+         agent_nickname: Option<String>,
+         agent_role: Option<String>,
+     ) {
++        let agent_description = self.v1_agent_description(agent_role.as_deref());
+         self.collab_agent_metadata.insert(
+             thread_id,
+             AgentMetadata {
+                 agent_nickname,
+                 agent_role,
++                agent_description,
+             },
+         );
+     }
+ 
+     /// Returns the cached metadata for a thread, defaulting to empty if none has been registered.
+     fn collab_agent_metadata(&self, thread_id: ThreadId) -> AgentMetadata {
+-        self.collab_agent_metadata
++        let mut metadata = self
++            .collab_agent_metadata
+             .get(&thread_id)
+             .cloned()
+-            .unwrap_or_default()
++            .unwrap_or_default();
++        if !self.v1_agent_descriptions_enabled() {
++            metadata.agent_description = None;
++        }
++        metadata
++    }
++
++    fn collab_agent_metadata_for_item(
++        &self,
++        thread_id: ThreadId,
++        item: &ThreadItem,
++    ) -> AgentMetadata {
++        let mut metadata = self.collab_agent_metadata(thread_id);
++        if metadata.agent_description.is_some() {
++            return metadata;
++        }
++        let item_role = match item {
++            ThreadItem::CollabAgentToolCall { agents_states, .. } => agents_states
++                .get(&thread_id.to_string())
++                .and_then(|state| state.agent_role.as_deref()),
++            _ => None,
++        };
++        metadata.agent_description =
++            self.v1_agent_description(metadata.agent_role.as_deref().or(item_role));
++        metadata
++    }
++
++    fn v1_agent_description(&self, role: Option<&str>) -> Option<String> {
++        if !self.v1_agent_descriptions_enabled() {
++            return None;
++        }
++        role.and_then(|role| self.config.agent_roles.get(role))
++            .and_then(|role| role.description.clone())
++    }
++
++    fn v1_agent_descriptions_enabled(&self) -> bool {
++        self.config.features.enabled(Feature::Collab)
++            && !self.config.features.enabled(Feature::MultiAgentV2)
+     }
+ 
+     fn restore_retry_status_header_if_present(&mut self) {
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index 7970c8fd8c..12ce3c5905 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -474,6 +474,15 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
+     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+     let sender_thread_id = ThreadId::new();
+     let spawned_thread_id = ThreadId::new();
++    let _ = chat.config.features.enable(Feature::Collab);
++    let _ = chat.config.features.disable(Feature::MultiAgentV2);
++    chat.config.agent_roles.insert(
++        "explorer".to_string(),
++        crate::legacy_core::config::AgentRoleConfig {
++            description: Some("Explore the codebase.".to_string()),
++            ..Default::default()
++        },
++    );
+     chat.set_collab_agent_metadata(
+         spawned_thread_id,
+         Some("Robie".to_string()),
+@@ -535,11 +544,97 @@ async fn collab_spawn_end_shows_requested_model_and_effort() {
+         .join("\n");
+ 
+     assert!(
+-        rendered.contains("Spawned Robie [explorer] (gpt-5 high)"),
++        rendered.contains("Spawned Robie [explorer] (gpt-5 high) Explore the codebase."),
+         "expected spawn line to include agent metadata and requested model, got {rendered:?}"
+     );
+ }
+ 
++#[tokio::test]
++async fn v1_collab_spawn_uses_item_role_description_without_cached_metadata() {
++    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    let sender_thread_id = ThreadId::new();
++    let spawned_thread_id = ThreadId::new();
++    let _ = chat.config.features.enable(Feature::Collab);
++    let _ = chat.config.features.disable(Feature::MultiAgentV2);
++    chat.config.agent_roles.insert(
++        "explorer".to_string(),
++        crate::legacy_core::config::AgentRoleConfig {
++            description: Some("Explore the codebase.".to_string()),
++            ..Default::default()
++        },
++    );
++
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            completed_at_ms: 0,
++            item: AppServerThreadItem::CollabAgentToolCall {
++                id: "call-spawn".to_string(),
++                tool: AppServerCollabAgentTool::SpawnAgent,
++                status: AppServerCollabAgentToolCallStatus::Completed,
++                sender_thread_id: sender_thread_id.to_string(),
++                receiver_thread_ids: vec![spawned_thread_id.to_string()],
++                prompt: None,
++                model: None,
++                reasoning_effort: None,
++                agents_states: HashMap::from([(
++                    spawned_thread_id.to_string(),
++                    AppServerCollabAgentState {
++                        status: AppServerCollabAgentStatus::PendingInit,
++                        message: None,
++                        agent_nickname: Some("Robie".to_string()),
++                        agent_role: Some("explorer".to_string()),
++                    },
++                )]),
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++
++    let rendered = drain_insert_history(&mut rx)
++        .iter()
++        .map(|lines| lines_to_single_string(lines))
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert!(rendered.contains("Spawned Robie [explorer] Explore the codebase."));
++}
++
++#[tokio::test]
++async fn v2_collab_metadata_does_not_resolve_role_description() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    let spawned_thread_id = ThreadId::new();
++    let _ = chat.config.features.enable(Feature::Collab);
++    let _ = chat.config.features.disable(Feature::MultiAgentV2);
++    chat.config.agent_roles.insert(
++        "explorer".to_string(),
++        crate::legacy_core::config::AgentRoleConfig {
++            description: Some("Explore the codebase.".to_string()),
++            ..Default::default()
++        },
++    );
++
++    chat.set_collab_agent_metadata(
++        spawned_thread_id,
++        Some("Robie".to_string()),
++        Some("explorer".to_string()),
++    );
++    assert_eq!(
++        chat.collab_agent_metadata(spawned_thread_id)
++            .agent_description
++            .as_deref(),
++        Some("Explore the codebase.")
++    );
++
++    let _ = chat.config.features.enable(Feature::MultiAgentV2);
++
++    assert_eq!(
++        chat.collab_agent_metadata(spawned_thread_id)
++            .agent_description,
++        None
++    );
++}
++
+ #[tokio::test]
+ async fn live_app_server_user_message_item_completed_does_not_duplicate_rendered_prompt() {
+     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+index 5141e11990..cf6de68417 100644
+--- a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
++++ b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+@@ -139,7 +139,7 @@ impl ChatWidget {
+         if let Some(cell) = multi_agents::tool_call_history_cell(
+             &item,
+             cached_spawn_request.as_ref(),
+-            |thread_id| self.collab_agent_metadata(thread_id),
++            |thread_id| self.collab_agent_metadata_for_item(thread_id, &item),
+         ) {
+             self.on_collab_event(cell);
+         }
+diff --git a/codex-rs/tui/src/multi_agents.rs b/codex-rs/tui/src/multi_agents.rs
+index 83b4cb00fb..d25f94bddd 100644
+--- a/codex-rs/tui/src/multi_agents.rs
++++ b/codex-rs/tui/src/multi_agents.rs
+@@ -59,6 +59,8 @@ pub(crate) struct AgentMetadata {
+     pub(crate) agent_nickname: Option<String>,
+     /// Agent type shown in brackets when present, for example `worker`.
+     pub(crate) agent_role: Option<String>,
++    /// Human-facing description for the agent role.
++    pub(crate) agent_description: Option<String>,
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -66,6 +68,7 @@ struct AgentLabel<'a> {
+     thread_id: Option<ThreadId>,
+     nickname: Option<&'a str>,
+     role: Option<&'a str>,
++    description: Option<&'a str>,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -368,6 +371,7 @@ fn spawn_end(
+             "Spawned",
+             agent_label(thread_id, &agent_metadata(thread_id)),
+             spawn_request,
++            /*show_agent_description*/ true,
+         ),
+         None => title_text("Agent spawn failed"),
+     };
+@@ -388,6 +392,7 @@ fn interaction_end(
+         "Sent input to",
+         agent_label(receiver_thread_id, &agent_metadata(receiver_thread_id)),
+         /*spawn_request*/ None,
++        /*show_agent_description*/ false,
+     );
+ 
+     let mut details = Vec::new();
+@@ -412,6 +417,7 @@ fn waiting_begin(
+             "Waiting for",
+             agent_label(*thread_id, metadata),
+             /*spawn_request*/ None,
++            /*show_agent_description*/ false,
+         ),
+         [] => title_text("Waiting for agents"),
+         _ => title_text(format!("Waiting for {} agents", receiver_agents.len())),
+@@ -447,6 +453,7 @@ fn close_end(
+             "Closed",
+             agent_label(receiver_thread_id, &agent_metadata(receiver_thread_id)),
+             /*spawn_request*/ None,
++            /*show_agent_description*/ false,
+         ),
+         Vec::new(),
+     )
+@@ -461,6 +468,7 @@ fn resume_begin(
+             "Resuming",
+             agent_label(receiver_thread_id, &agent_metadata(receiver_thread_id)),
+             /*spawn_request*/ None,
++            /*show_agent_description*/ false,
+         ),
+         Vec::new(),
+     )
+@@ -481,6 +489,7 @@ fn resume_end(
+             "Resumed",
+             agent_label(receiver_thread_id, &metadata),
+             /*spawn_request*/ None,
++            /*show_agent_description*/ false,
+         ),
+         vec![status_summary_line(status, fallback_error)],
+     )
+@@ -502,10 +511,14 @@ fn title_with_agent(
+     prefix: &str,
+     agent: AgentLabel<'_>,
+     spawn_request: Option<&SpawnRequestSummary>,
++    show_agent_description: bool,
+ ) -> Line<'static> {
+     let mut spans = vec![Span::from(format!("{prefix} ")).bold()];
+     spans.extend(agent_label_spans(agent));
+     spans.extend(spawn_request_spans(spawn_request));
++    if show_agent_description {
++        spans.extend(agent_description_spans(agent.description));
++    }
+     title_spans_line(spans)
+ }
+ 
+@@ -525,6 +538,7 @@ fn agent_label(thread_id: ThreadId, metadata: &AgentMetadata) -> AgentLabel<'_>
+         thread_id: Some(thread_id),
+         nickname: metadata.agent_nickname.as_deref(),
+         role: metadata.agent_role.as_deref(),
++        description: metadata.agent_description.as_deref(),
+     }
+ }
+ 
+@@ -580,6 +594,20 @@ fn spawn_request_spans(spawn_request: Option<&SpawnRequestSummary>) -> Vec<Span<
+     spans
+ }
+ 
++fn agent_description_spans(description: Option<&str>) -> Vec<Span<'static>> {
++    let Some(description) = description
++        .map(str::trim)
++        .filter(|description| !description.is_empty())
++    else {
++        return Vec::new();
++    };
++
++    vec![
++        Span::from(" ").dim(),
++        Span::from(description.to_string()).dim(),
++    ]
++}
++
+ fn reasoning_effort_spans(effort: ReasoningEffortConfig) -> Vec<Span<'static>> {
+     let label = effort.to_string();
+     vec![Span::styled(label, reasoning_effort_style(&effort))]
+@@ -828,6 +856,26 @@ mod tests {
+         )
+         .expect("wait end item renders");
+ 
++        let resume = tool_call_history_cell(
++            &ThreadItem::CollabAgentToolCall {
++                id: "call-resume".to_string(),
++                tool: CollabAgentTool::ResumeAgent,
++                status: CollabAgentToolCallStatus::Completed,
++                sender_thread_id: sender_thread_id.to_string(),
++                receiver_thread_ids: vec![robie_id.to_string()],
++                prompt: None,
++                model: None,
++                reasoning_effort: None,
++                agents_states: HashMap::from([(
++                    robie_id.to_string(),
++                    agent_state(CollabAgentStatus::Running, /*message*/ None),
++                )]),
++            },
++            /*cached_spawn_request*/ None,
++            |thread_id| metadata_for(thread_id, robie_id, bob_id),
++        )
++        .expect("resume item renders");
++
+         let close = tool_call_history_cell(
+             &ThreadItem::CollabAgentToolCall {
+                 id: "call-close".to_string(),
+@@ -848,7 +896,7 @@ mod tests {
+         )
+         .expect("close item renders");
+ 
+-        let snapshot = [spawn, send, waiting, finished, close]
++        let snapshot = [spawn, send, waiting, finished, resume, close]
+             .iter()
+             .map(cell_to_text)
+             .collect::<Vec<_>>()
+@@ -950,6 +998,8 @@ mod tests {
+         assert!(!title.spans[9].style.sub_modifier.contains(Modifier::DIM));
+         assert_eq!(title.spans[10].content.as_ref(), ")");
+         assert_eq!(title.spans[10].style.fg, Some(Color::Magenta));
++        assert_eq!(title.spans[12].content.as_ref(), "Explore the codebase.");
++        assert!(title.spans[12].style.add_modifier.contains(Modifier::DIM));
+     }
+ 
+     #[test]
+@@ -1078,11 +1128,13 @@ mod tests {
+             AgentMetadata {
+                 agent_nickname: Some("Robie".to_string()),
+                 agent_role: Some("explorer".to_string()),
++                agent_description: Some("Explore the codebase.".to_string()),
+             }
+         } else if thread_id == bob_id {
+             AgentMetadata {
+                 agent_nickname: Some("Bob".to_string()),
+                 agent_role: Some("worker".to_string()),
++                agent_description: Some("Make the change.".to_string()),
+             }
+         } else {
+             AgentMetadata::default()
+diff --git a/codex-rs/tui/src/snapshots/codex_tui__multi_agents__tests__collab_agent_transcript.snap b/codex-rs/tui/src/snapshots/codex_tui__multi_agents__tests__collab_agent_transcript.snap
+index f38e9ba2ee..888f18f3d2 100644
+--- a/codex-rs/tui/src/snapshots/codex_tui__multi_agents__tests__collab_agent_transcript.snap
++++ b/codex-rs/tui/src/snapshots/codex_tui__multi_agents__tests__collab_agent_transcript.snap
+@@ -2,7 +2,7 @@
+ source: tui/src/multi_agents.rs
+ expression: snapshot
+ ---
+-▪ Spawned Robie [explorer] (gpt-5 high)
++▪ Spawned Robie [explorer] (gpt-5 high) Explore the codebase.
+   └ Compute 11! and reply with just the integer result.
+ 
+ ▪ Sent input to Robie [explorer]
+@@ -14,4 +14,7 @@ expression: snapshot
+   └ Robie [explorer]: Completed - 39916800
+     Bob [worker]: Error - tool timeout
+ 
++▪ Resumed Robie [explorer]
++  └ Running
++
+ ▪ Closed Robie [explorer]

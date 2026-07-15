@@ -1,0 +1,1267 @@
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index 517f652feb..2f88a953de 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -4015,6 +4015,8 @@ dependencies = [
+  "clap",
+  "codex-git-utils",
+  "codex-protocol",
++ "codex-utils-home-dir",
++ "codex-utils-path",
+  "dirs",
+  "libsqlite3-sys",
+  "log",
+@@ -4024,6 +4026,7 @@ dependencies = [
+  "serde_json",
+  "sqlx",
+  "strum 0.27.2",
++ "tempfile",
+  "tokio",
+  "tracing",
+  "tracing-subscriber",
+diff --git a/codex-rs/app-server/tests/common/json_logging.rs b/codex-rs/app-server/tests/common/json_logging.rs
+index 8683d1bdaf..6a08ed1c4d 100644
+--- a/codex-rs/app-server/tests/common/json_logging.rs
++++ b/codex-rs/app-server/tests/common/json_logging.rs
+@@ -87,6 +87,7 @@ pub fn app_server_json_shutdown_event(
+     let output = Command::new(codex_utils_cargo_bin::cargo_bin(binary)?)
+         .stdin(Stdio::null())
+         .env("CODEX_HOME", codex_home)
++        .env("CODEX_SQLITE_HOME", codex_home)
+         .env(
+             "CODEX_APP_SERVER_MANAGED_CONFIG_PATH",
+             codex_home.join("managed_config.toml"),
+diff --git a/codex-rs/app-server/tests/common/test_app_server.rs b/codex-rs/app-server/tests/common/test_app_server.rs
+index 3214c9ef44..4350725d54 100644
+--- a/codex-rs/app-server/tests/common/test_app_server.rs
++++ b/codex-rs/app-server/tests/common/test_app_server.rs
+@@ -236,6 +236,7 @@ impl TestAppServer {
+         cmd.stderr(Stdio::piped());
+         cmd.current_dir(codex_home);
+         cmd.env("CODEX_HOME", codex_home);
++        cmd.env("CODEX_SQLITE_HOME", codex_home);
+         cmd.env("RUST_LOG", "warn");
+         // Keep integration tests isolated from host managed configuration.
+         cmd.env(
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+index 04d59c24ab..3ae8bf7d60 100644
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -2026,16 +2026,36 @@ async fn run_debug_clear_memories_command(
+         .build()
+         .await?;
+ 
+-    let memories_path = memories_db_path(config.sqlite_home.as_path());
+-    let cleared_memories_db =
+-        StateRuntime::clear_memory_data_in_sqlite_home(config.sqlite_home.as_path()).await?;
++    let mut sqlite_homes = vec![config.sqlite_home.as_path()];
++    if config.sqlite_home.as_path() != config.codex_home.as_path() {
++        sqlite_homes.push(config.codex_home.as_path());
++    }
++    let mut searched_memories_paths = Vec::with_capacity(sqlite_homes.len());
++    let mut cleared_memories_paths = Vec::with_capacity(sqlite_homes.len());
++    for sqlite_home in sqlite_homes {
++        let memories_path = memories_db_path(sqlite_home);
++        if StateRuntime::clear_memory_data_in_sqlite_home(sqlite_home).await? {
++            cleared_memories_paths.push(memories_path.clone());
++        }
++        searched_memories_paths.push(memories_path);
++    }
+ 
+     clear_memory_roots_contents(&config.codex_home).await?;
+ 
+-    let mut message = if cleared_memories_db {
+-        format!("Cleared memory state from {}.", memories_path.display())
++    let mut message = if cleared_memories_paths.is_empty() {
++        let paths = searched_memories_paths
++            .iter()
++            .map(|path| path.display().to_string())
++            .collect::<Vec<_>>()
++            .join(", ");
++        format!("No memories db found at {paths}.")
+     } else {
+-        format!("No memories db found at {}.", memories_path.display())
++        let paths = cleared_memories_paths
++            .iter()
++            .map(|path| path.display().to_string())
++            .collect::<Vec<_>>()
++            .join(", ");
++        format!("Cleared memory state from {paths}.")
+     };
+     message.push_str(&format!(
+         " Cleared memory directories under {}.",
+diff --git a/codex-rs/cli/tests/debug_clear_memories.rs b/codex-rs/cli/tests/debug_clear_memories.rs
+index be1c30da8a..d05c0d3f1f 100644
+--- a/codex-rs/cli/tests/debug_clear_memories.rs
++++ b/codex-rs/cli/tests/debug_clear_memories.rs
+@@ -8,9 +8,10 @@ use predicates::str::contains;
+ use sqlx::SqlitePool;
+ use tempfile::TempDir;
+ 
+-fn codex_command(codex_home: &Path) -> Result<assert_cmd::Command> {
++fn codex_command(codex_home: &Path, sqlite_home: &Path) -> Result<assert_cmd::Command> {
+     let mut cmd = assert_cmd::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?);
+     cmd.env("CODEX_HOME", codex_home);
++    cmd.env(codex_state::SQLITE_HOME_ENV, sqlite_home);
+     Ok(cmd)
+ }
+ 
+@@ -112,7 +113,7 @@ INSERT INTO jobs (
+     pool.close().await;
+     memories_pool.close().await;
+ 
+-    let mut cmd = codex_command(codex_home.path())?;
++    let mut cmd = codex_command(codex_home.path(), codex_home.path())?;
+     cmd.args(["debug", "clear-memories"])
+         .assert()
+         .success()
+@@ -171,7 +172,7 @@ INSERT INTO stage1_outputs (
+     memories_pool.close().await;
+     std::fs::remove_file(&db_path)?;
+ 
+-    let mut cmd = codex_command(codex_home.path())?;
++    let mut cmd = codex_command(codex_home.path(), codex_home.path())?;
+     cmd.args(["debug", "clear-memories"])
+         .assert()
+         .success()
+@@ -187,3 +188,33 @@ INSERT INTO stage1_outputs (
+ 
+     Ok(())
+ }
++
++#[tokio::test]
++async fn debug_clear_memories_clears_legacy_home_without_creating_current_db() -> Result<()> {
++    let legacy_home = TempDir::new()?;
++    let current_home = TempDir::new()?;
++    let runtime = StateRuntime::init(
++        legacy_home.path().to_path_buf(),
++        "test-provider".to_string(),
++    )
++    .await?;
++    runtime.close().await;
++
++    let legacy_memories_path = memories_db_path(legacy_home.path());
++    let current_memories_path = memories_db_path(current_home.path());
++    assert!(legacy_memories_path.exists());
++    assert!(!current_memories_path.exists());
++
++    let mut cmd = codex_command(legacy_home.path(), current_home.path())?;
++    cmd.args(["debug", "clear-memories"])
++        .assert()
++        .success()
++        .stdout(contains(format!(
++            "Cleared memory state from {}.",
++            legacy_memories_path.display()
++        )));
++
++    assert!(!current_memories_path.exists());
++
++    Ok(())
++}
+diff --git a/codex-rs/cli/tests/delete.rs b/codex-rs/cli/tests/delete.rs
+index 854b87b56e..8baabee10b 100644
+--- a/codex-rs/cli/tests/delete.rs
++++ b/codex-rs/cli/tests/delete.rs
+@@ -5,6 +5,7 @@ fn missing_session_fails_before_delete_confirmation() -> anyhow::Result<()> {
+     let codex_home = tempfile::tempdir()?;
+     let mut cmd = assert_cmd::Command::new(codex_utils_cargo_bin::cargo_bin("codex")?);
+     cmd.env("CODEX_HOME", codex_home.path())
++        .env("CODEX_SQLITE_HOME", codex_home.path())
+         .args(["delete", "123e4567-e89b-12d3-a456-426614174000"]);
+ 
+     cmd.assert()
+diff --git a/codex-rs/config/src/config_toml.rs b/codex-rs/config/src/config_toml.rs
+index 492caa1b34..3a74b697ea 100644
+--- a/codex-rs/config/src/config_toml.rs
++++ b/codex-rs/config/src/config_toml.rs
+@@ -322,7 +322,7 @@ pub struct ConfigToml {
+     pub history: Option<History>,
+ 
+     /// Directory where Codex stores the SQLite state DB.
+-    /// Defaults to `$CODEX_SQLITE_HOME` when set. Otherwise uses `$CODEX_HOME`.
++    /// Defaults to `$CODEX_SQLITE_HOME` when set. Otherwise uses the Codex system temp root.
+     pub sqlite_home: Option<AbsolutePathBuf>,
+ 
+     /// Directory where Codex writes log files. Setting this value explicitly
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+index b55512b169..eb245bbc6c 100644
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -5496,7 +5496,7 @@
+           "$ref": "#/definitions/AbsolutePathBuf"
+         }
+       ],
+-      "description": "Directory where Codex stores the SQLite state DB. Defaults to `$CODEX_SQLITE_HOME` when set. Otherwise uses `$CODEX_HOME`."
++      "description": "Directory where Codex stores the SQLite state DB. Defaults to `$CODEX_SQLITE_HOME` when set. Otherwise uses the Codex system temp root."
+     },
+     "suppress_unstable_features_warning": {
+       "description": "Suppress warnings about unstable (under development) features.",
+@@ -5552,4 +5552,4 @@
+   },
+   "title": "ConfigToml",
+   "type": "object"
+-}
+\ No newline at end of file
++}
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index 11ec23fc52..d8c23852d5 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -202,6 +202,25 @@ use std::path::Path;
+ use std::time::Duration;
+ use tempfile::TempDir;
+ 
++const SQLITE_DEFAULT_SUBPROCESS_ENV: &str = "CODEX_SQLITE_DEFAULT_SUBPROCESS";
++const SQLITE_DEFAULT_TEST: &str =
++    "config::tests::sqlite_home_defaults_to_codex_tmp_root_for_workspace_write";
++
++fn directory_entry_names_if_exists(
++    path: &Path,
++) -> std::io::Result<Option<Vec<std::ffi::OsString>>> {
++    let entries = match std::fs::read_dir(path) {
++        Ok(entries) => entries,
++        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
++        Err(err) => return Err(err),
++    };
++    let mut names = entries
++        .map(|entry| entry.map(|entry| entry.file_name()))
++        .collect::<std::io::Result<Vec<_>>>()?;
++    names.sort();
++    Ok(Some(names))
++}
++
+ fn stdio_mcp(command: &str) -> McpServerConfig {
+     stdio_mcp_with_args(command, &[])
+ }
+@@ -5307,19 +5326,86 @@ async fn default_zsh_path_sets_runtime_zsh_path() -> std::io::Result<()> {
+ }
+ 
+ #[tokio::test]
+-async fn sqlite_home_defaults_to_codex_home_for_workspace_write() -> std::io::Result<()> {
+-    let codex_home = TempDir::new()?;
++async fn sqlite_home_defaults_to_codex_tmp_root_for_workspace_write() -> std::io::Result<()> {
++    if std::env::var_os(SQLITE_DEFAULT_SUBPROCESS_ENV).is_none() {
++        let root = TempDir::new()?;
++        let codex_home = root.path().join("codex-home");
++        let system_tmp = root.path().join("runtime-tmp");
++        std::fs::create_dir(&codex_home)?;
++        std::fs::create_dir(&system_tmp)?;
++
++        let output = std::process::Command::new(std::env::current_exe()?)
++            .arg("--exact")
++            .arg(SQLITE_DEFAULT_TEST)
++            .env(SQLITE_DEFAULT_SUBPROCESS_ENV, "1")
++            .env("CODEX_HOME", &codex_home)
++            .env("TMPDIR", &system_tmp)
++            .env_remove("TMP")
++            .env_remove("TEMP")
++            .env_remove(codex_state::SQLITE_HOME_ENV)
++            .output()?;
++        assert!(
++            output.status.success(),
++            "SQLite default subprocess failed\nstdout:\n{}\nstderr:\n{}",
++            String::from_utf8_lossy(&output.stdout),
++            String::from_utf8_lossy(&output.stderr)
++        );
++        return Ok(());
++    }
++
++    let codex_home = codex_utils_home_dir::find_codex_home()?;
++    let expected_sqlite_home = codex_utils_home_dir::find_codex_tmp_root()?.into_path_buf();
++    let entries_before = directory_entry_names_if_exists(&expected_sqlite_home)?;
+     let config = Config::load_from_base_config_with_overrides(
+         ConfigToml::default(),
+         ConfigOverrides {
+             sandbox_mode: Some(SandboxMode::WorkspaceWrite),
+             ..Default::default()
+         },
+-        codex_home.abs(),
++        codex_home,
+     )
+     .await?;
+ 
+-    assert_eq!(config.sqlite_home, codex_home.path().to_path_buf());
++    assert_eq!(config.sqlite_home, expected_sqlite_home);
++    assert_eq!(
++        directory_entry_names_if_exists(&config.sqlite_home)?,
++        entries_before,
++        "loading Config must not add entries to the default SQLite home"
++    );
++    let runtime_db_paths = codex_state::runtime_db_paths(&config.sqlite_home);
++    assert_eq!(runtime_db_paths.len(), 5);
++    assert!(runtime_db_paths.iter().any(|db| {
++        db.path == codex_state::thread_history_db_path(config.sqlite_home.as_path())
++    }));
++    assert!(
++        runtime_db_paths
++            .iter()
++            .all(|db| db.path.parent() == Some(config.sqlite_home.as_path()))
++    );
++    for db in runtime_db_paths {
++        assert!(
++            !db.path.exists(),
++            "loading Config must not create {} at {}",
++            db.label,
++            db.path.display()
++        );
++    }
++
++    Ok(())
++}
++
++#[test]
++fn default_sqlite_home_resolution_is_pure_and_propagates_errors() -> std::io::Result<()> {
++    let root = TempDir::new()?;
++    let expected = root.path().join("sqlite-home");
++    let resolved = AbsolutePathBuf::from_absolute_path(&expected)?;
++
++    assert_eq!(default_sqlite_home_from(Ok(resolved))?, expected);
++    assert!(!expected.exists());
++
++    let error = default_sqlite_home_from(Err(std::io::Error::other("resolver failed")))
++        .expect_err("resolver errors must not fall back to CODEX_HOME");
++    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+ 
+     Ok(())
+ }
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index ce2868f417..1936e1d599 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -287,6 +287,16 @@ fn resolve_sqlite_home_env(resolved_cwd: &Path) -> Option<PathBuf> {
+     }
+ }
+ 
++fn default_sqlite_home() -> std::io::Result<PathBuf> {
++    default_sqlite_home_from(codex_utils_home_dir::find_codex_tmp_root())
++}
++
++fn default_sqlite_home_from(
++    resolved: std::io::Result<AbsolutePathBuf>,
++) -> std::io::Result<PathBuf> {
++    resolved.map(AbsolutePathBuf::into_path_buf)
++}
++
+ fn resolve_cli_auth_credentials_store_mode(
+     configured: AuthCredentialsStoreMode,
+     package_version: &str,
+@@ -3820,12 +3830,15 @@ impl Config {
+             .as_ref()
+             .map(AbsolutePathBuf::to_path_buf)
+             .unwrap_or_else(|| codex_home.join("log").to_path_buf());
+-        let sqlite_home = cfg
++        let sqlite_home = match cfg
+             .sqlite_home
+             .as_ref()
+             .map(AbsolutePathBuf::to_path_buf)
+             .or_else(|| resolve_sqlite_home_env(&resolved_cwd))
+-            .unwrap_or_else(|| codex_home.to_path_buf());
++        {
++            Some(sqlite_home) => sqlite_home,
++            None => default_sqlite_home()?,
++        };
+         let original_permission_profile = permission_profile.clone();
+         apply_requirement_constrained_value(
+             "approval_policy",
+diff --git a/codex-rs/core/tests/common/lib.rs b/codex-rs/core/tests/common/lib.rs
+index 47c4a6042f..98aa65e7a9 100644
+--- a/codex-rs/core/tests/common/lib.rs
++++ b/codex-rs/core/tests/common/lib.rs
+@@ -207,14 +207,16 @@ pub async fn load_default_config_for_test_with_cloud_config_bundle(
+     codex_home: &TempDir,
+     cloud_config_bundle: CloudConfigBundleLoader,
+ ) -> Config {
+-    ConfigBuilder::default()
++    let mut config = ConfigBuilder::default()
+         .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+         .codex_home(codex_home.path().to_path_buf())
+         .harness_overrides(default_test_overrides())
+         .cloud_config_bundle(cloud_config_bundle)
+         .build()
+         .await
+-        .expect("defaults for test should always succeed")
++        .expect("defaults for test should always succeed");
++    config.sqlite_home = codex_home.path().to_path_buf();
++    config
+ }
+ 
+ pub fn managed_network_requirements_loader() -> CloudConfigBundleLoader {
+diff --git a/codex-rs/state/Cargo.toml b/codex-rs/state/Cargo.toml
+index cbcec171ee..a2f0948683 100644
+--- a/codex-rs/state/Cargo.toml
++++ b/codex-rs/state/Cargo.toml
+@@ -9,6 +9,8 @@ anyhow = { workspace = true }
+ chrono = { workspace = true }
+ clap = { workspace = true, features = ["derive", "env"] }
+ codex-protocol = { workspace = true }
++codex-utils-home-dir = { workspace = true }
++codex-utils-path = { workspace = true }
+ dirs = { workspace = true }
+ libsqlite3-sys = { workspace = true }
+ log = { workspace = true }
+@@ -25,6 +27,7 @@ uuid = { workspace = true }
+ [dev-dependencies]
+ codex-git-utils = { workspace = true }
+ pretty_assertions = { workspace = true }
++tempfile = { workspace = true }
+ 
+ [lints]
+ workspace = true
+diff --git a/codex-rs/state/src/audit.rs b/codex-rs/state/src/audit.rs
+index 0ac4aadfaf..5a03e2844f 100644
+--- a/codex-rs/state/src/audit.rs
++++ b/codex-rs/state/src/audit.rs
+@@ -1,5 +1,6 @@
+ //! Read-only state database queries for diagnostics.
+ 
++use crate::runtime::SqliteHomeGuard;
+ use anyhow::Result;
+ use log::LevelFilter;
+ use sqlx::ConnectOptions;
+@@ -21,24 +22,38 @@ pub struct ThreadStateAuditRow {
+ 
+ /// Read persisted thread rows from a state DB without creating, migrating, or repairing it.
+ pub async fn read_thread_state_audit_rows(path: &Path) -> Result<Vec<ThreadStateAuditRow>> {
++    if !tokio::fs::try_exists(path).await? {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::NotFound,
++            format!("SQLite database does not exist: {}", path.display()),
++        )
++        .into());
++    }
++    let sqlite_home_guard = SqliteHomeGuard::for_db_path(path)?;
+     let options = SqliteConnectOptions::new()
+         .filename(path)
+         .create_if_missing(false)
+         .read_only(true)
+         .log_statements(LevelFilter::Off);
+-    let pool = SqlitePoolOptions::new()
+-        .max_connections(1)
+-        .connect_with(options)
+-        .await?;
+-    let rows = sqlx::query(
+-        r#"
++    let pool = sqlite_home_guard
++        .run(
++            SqlitePoolOptions::new()
++                .max_connections(1)
++                .connect_with(options),
++        )
++        .await??;
++    let rows = sqlite_home_guard
++        .run(
++            sqlx::query(
++                r#"
+ SELECT id, rollout_path, archived, source, model_provider
+ FROM threads
+         "#,
+-    )
+-    .fetch_all(&pool)
+-    .await?;
+-    pool.close().await;
++            )
++            .fetch_all(&pool),
++        )
++        .await??;
++    sqlite_home_guard.run(pool.close()).await?;
+ 
+     rows.into_iter()
+         .map(|row| {
+diff --git a/codex-rs/state/src/runtime.rs b/codex-rs/state/src/runtime.rs
+index 0055d262da..1bc991e0d7 100644
+--- a/codex-rs/state/src/runtime.rs
++++ b/codex-rs/state/src/runtime.rs
+@@ -37,6 +37,8 @@ use chrono::DateTime;
+ use chrono::Utc;
+ use codex_protocol::ThreadId;
+ use codex_protocol::protocol::RolloutItem;
++#[cfg(unix)]
++use codex_utils_path::resolve_symlink_write_paths;
+ use log::LevelFilter;
+ use serde_json::Value;
+ use sqlx::ConnectOptions;
+@@ -52,6 +54,7 @@ use sqlx::sqlite::SqliteJournalMode;
+ use sqlx::sqlite::SqlitePoolOptions;
+ use sqlx::sqlite::SqliteSynchronous;
+ use std::collections::BTreeSet;
++use std::future::Future;
+ use std::path::Path;
+ use std::path::PathBuf;
+ use std::sync::Arc;
+@@ -157,6 +160,189 @@ const THREAD_HISTORY_DB: RuntimeDbSpec = RuntimeDbSpec {
+ const RUNTIME_DBS: [RuntimeDbSpec; 5] =
+     [STATE_DB, LOGS_DB, GOALS_DB, MEMORIES_DB, THREAD_HISTORY_DB];
+ 
++#[derive(Debug)]
++pub(crate) struct SqliteHomeGuard {
++    #[cfg(unix)]
++    private_root: Option<codex_utils_home_dir::PrivateCodexTmpDir>,
++}
++
++impl SqliteHomeGuard {
++    pub(crate) fn prepare(sqlite_home: &Path) -> std::io::Result<Self> {
++        #[cfg(unix)]
++        {
++            let private_root = match codex_utils_home_dir::find_codex_tmp_root() {
++                Ok(default_root) => {
++                    if !sqlite_homes_alias(default_root.as_path(), sqlite_home)? {
++                        None
++                    } else {
++                        if default_root.as_path() != sqlite_home {
++                            return Err(std::io::Error::new(
++                                std::io::ErrorKind::PermissionDenied,
++                                format!(
++                                    "SQLite temp root must use its resolved path {}; alias {} is not allowed",
++                                    default_root.as_path().display(),
++                                    sqlite_home.display()
++                                ),
++                            ));
++                        }
++                        let private_root = codex_utils_home_dir::prepare_private_codex_tmp_root()?;
++                        if private_root.as_path() != sqlite_home {
++                            return Err(std::io::Error::new(
++                                std::io::ErrorKind::PermissionDenied,
++                                "SQLite temp root changed while its private guard was prepared",
++                            ));
++                        }
++                        Some(private_root)
++                    }
++                }
++                Err(_) => None,
++            };
++            let guard = Self { private_root };
++            guard.validate()?;
++            Ok(guard)
++        }
++        #[cfg(not(unix))]
++        {
++            let _ = sqlite_home;
++            Ok(Self {})
++        }
++    }
++
++    pub(crate) fn for_db_path(db_path: &Path) -> std::io::Result<Self> {
++        let sqlite_home = db_path.parent().ok_or_else(|| {
++            std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                format!(
++                    "database path does not have a parent directory: {}",
++                    db_path.display()
++                ),
++            )
++        })?;
++        Self::prepare(sqlite_home)
++    }
++
++    pub(crate) fn validate(&self) -> std::io::Result<()> {
++        #[cfg(unix)]
++        if let Some(private_root) = self.private_root.as_ref() {
++            private_root.validate()?;
++        }
++        Ok(())
++    }
++
++    pub(crate) async fn run<T>(&self, operation: impl Future<Output = T>) -> std::io::Result<T> {
++        self.validate()?;
++        let output = operation.await;
++        self.validate()?;
++        Ok(output)
++    }
++}
++
++#[cfg(unix)]
++fn sqlite_homes_alias(left: &Path, right: &Path) -> std::io::Result<bool> {
++    if left == right {
++        return Ok(true);
++    }
++    if let (Some(left), Some(right)) = (
++        lexically_normalize_absolute(left),
++        lexically_normalize_absolute(right),
++    ) && left == right
++    {
++        return Ok(true);
++    }
++
++    let resolved_left = resolve_sqlite_home_symlinks(left)?;
++    let resolved_right = resolve_sqlite_home_symlinks(right)?;
++    if resolved_left == resolved_right {
++        return Ok(true);
++    }
++    if let (Some(left), Some(right)) = (
++        lexically_normalize_absolute(&resolved_left),
++        lexically_normalize_absolute(&resolved_right),
++    ) && left == right
++    {
++        return Ok(true);
++    }
++
++    match (
++        normalize_sqlite_home_for_comparison(left),
++        normalize_sqlite_home_for_comparison(right),
++    ) {
++        (Ok(left), Ok(right)) => Ok(left == right),
++        (Err(left_err), Err(right_err)) => {
++            if left_err.kind() != std::io::ErrorKind::NotFound {
++                Err(left_err)
++            } else if right_err.kind() != std::io::ErrorKind::NotFound {
++                Err(right_err)
++            } else {
++                Ok(false)
++            }
++        }
++        (Err(err), _) | (_, Err(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
++        (Err(err), _) | (_, Err(err)) => Err(err),
++    }
++}
++
++#[cfg(unix)]
++fn resolve_sqlite_home_symlinks(path: &Path) -> std::io::Result<PathBuf> {
++    resolve_symlink_write_paths(path)?.read_path.ok_or_else(|| {
++        std::io::Error::new(
++            std::io::ErrorKind::PermissionDenied,
++            format!(
++                "SQLite home symbolic link chain could not be resolved safely: {}",
++                path.display()
++            ),
++        )
++    })
++}
++
++#[cfg(unix)]
++fn lexically_normalize_absolute(path: &Path) -> Option<PathBuf> {
++    use std::path::Component;
++
++    if !path.is_absolute() {
++        return None;
++    }
++    let mut normalized = PathBuf::new();
++    for component in path.components() {
++        match component {
++            Component::CurDir => {}
++            Component::ParentDir => {
++                normalized.pop();
++            }
++            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
++                normalized.push(component.as_os_str());
++            }
++        }
++    }
++    Some(normalized)
++}
++
++#[cfg(unix)]
++fn normalize_sqlite_home_for_comparison(path: &Path) -> std::io::Result<PathBuf> {
++    match std::fs::canonicalize(path) {
++        Ok(path) => Ok(path),
++        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
++            let parent = path.parent().ok_or_else(|| {
++                std::io::Error::new(
++                    std::io::ErrorKind::InvalidInput,
++                    format!("SQLite home has no parent directory: {}", path.display()),
++                )
++            })?;
++            let file_name = path.file_name().ok_or_else(|| {
++                std::io::Error::new(
++                    std::io::ErrorKind::InvalidInput,
++                    format!(
++                        "SQLite home has no final path component: {}",
++                        path.display()
++                    ),
++                )
++            })?;
++            Ok(std::fs::canonicalize(parent)?.join(file_name))
++        }
++        Err(err) => Err(err),
++    }
++}
++
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ pub struct RuntimeDbPath {
+     pub label: &'static str,
+@@ -204,7 +390,10 @@ impl StateRuntime {
+         default_provider: String,
+         telemetry_override: Option<&dyn DbTelemetry>,
+     ) -> anyhow::Result<Arc<Self>> {
+-        tokio::fs::create_dir_all(&codex_home).await?;
++        let sqlite_home_guard = SqliteHomeGuard::prepare(&codex_home)?;
++        sqlite_home_guard
++            .run(tokio::fs::create_dir_all(&codex_home))
++            .await??;
+         let state_migrator = runtime_state_migrator();
+         let logs_migrator = runtime_logs_migrator();
+         let goals_migrator = runtime_goals_migrator();
+@@ -213,15 +402,28 @@ impl StateRuntime {
+         let logs_path = LOGS_DB.path(codex_home.as_path());
+         let goals_path = GOALS_DB.path(codex_home.as_path());
+         let memories_path = MEMORIES_DB.path(codex_home.as_path());
+-        let pool = match open_state_sqlite(&state_path, &state_migrator, telemetry_override).await {
++        let pool_result = sqlite_home_guard
++            .run(open_state_sqlite(
++                &state_path,
++                &state_migrator,
++                telemetry_override,
++            ))
++            .await?;
++        let pool = match pool_result {
+             Ok(db) => Arc::new(db),
+             Err(err) => {
+                 warn!("failed to open state db at {}: {err}", state_path.display());
+                 return Err(err);
+             }
+         };
+-        let logs_pool = match open_logs_sqlite(&logs_path, &logs_migrator, telemetry_override).await
+-        {
++        let logs_pool_result = sqlite_home_guard
++            .run(open_logs_sqlite(
++                &logs_path,
++                &logs_migrator,
++                telemetry_override,
++            ))
++            .await?;
++        let logs_pool = match logs_pool_result {
+             Ok(db) => Arc::new(db),
+             Err(err) => {
+                 warn!("failed to open logs db at {}: {err}", logs_path.display());
+@@ -229,22 +431,29 @@ impl StateRuntime {
+                 return Err(err);
+             }
+         };
+-        let goals_pool =
+-            match open_goals_sqlite(&goals_path, &goals_migrator, telemetry_override).await {
+-                Ok(db) => Arc::new(db),
+-                Err(err) => {
+-                    warn!("failed to open goals db at {}: {err}", goals_path.display());
+-                    close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref()]).await;
+-                    return Err(err);
+-                }
+-            };
+-        let memories_pool = match open_memories_sqlite(
+-            &memories_path,
+-            &memories_migrator,
+-            telemetry_override,
+-        )
+-        .await
+-        {
++        let goals_pool_result = sqlite_home_guard
++            .run(open_goals_sqlite(
++                &goals_path,
++                &goals_migrator,
++                telemetry_override,
++            ))
++            .await?;
++        let goals_pool = match goals_pool_result {
++            Ok(db) => Arc::new(db),
++            Err(err) => {
++                warn!("failed to open goals db at {}: {err}", goals_path.display());
++                close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref()]).await;
++                return Err(err);
++            }
++        };
++        let memories_pool_result = sqlite_home_guard
++            .run(open_memories_sqlite(
++                &memories_path,
++                &memories_migrator,
++                telemetry_override,
++            ))
++            .await?;
++        let memories_pool = match memories_pool_result {
+             Ok(db) => Arc::new(db),
+             Err(err) => {
+                 warn!(
+@@ -351,15 +560,19 @@ impl StateRuntime {
+             return Ok(false);
+         }
+ 
++        let sqlite_home_guard = SqliteHomeGuard::prepare(sqlite_home)?;
+         let memories_migrator = runtime_memories_migrator();
+-        let pool = open_memories_sqlite(
+-            &memories_path,
+-            &memories_migrator,
+-            /*telemetry_override*/ None,
+-        )
+-        .await?;
+-        memories::clear_memory_data_in_pool(&pool).await?;
+-        pool.close().await;
++        let pool = sqlite_home_guard
++            .run(open_memories_sqlite(
++                &memories_path,
++                &memories_migrator,
++                /*telemetry_override*/ None,
++            ))
++            .await??;
++        sqlite_home_guard
++            .run(memories::clear_memory_data_in_pool(&pool))
++            .await??;
++        sqlite_home_guard.run(pool.close()).await?;
+         Ok(true)
+     }
+ }
+@@ -551,25 +764,39 @@ pub fn runtime_db_paths(codex_home: &Path) -> Vec<RuntimeDbPath> {
+ 
+ /// Run SQLite's built-in integrity check against an existing database file.
+ pub async fn sqlite_integrity_check(path: &Path) -> anyhow::Result<Vec<String>> {
++    if !tokio::fs::try_exists(path).await? {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::NotFound,
++            format!("SQLite database does not exist: {}", path.display()),
++        )
++        .into());
++    }
++    let sqlite_home_guard = SqliteHomeGuard::for_db_path(path)?;
+     let options = SqliteConnectOptions::new()
+         .filename(path)
+         .create_if_missing(false)
+         .read_only(true)
+         .log_statements(LevelFilter::Off);
+-    let pool = SqlitePoolOptions::new()
+-        .max_connections(1)
+-        .connect_with(options)
+-        .await?;
+-    let rows = sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
+-        .fetch_all(&pool)
+-        .await?;
+-    pool.close().await;
++    let pool = sqlite_home_guard
++        .run(
++            SqlitePoolOptions::new()
++                .max_connections(1)
++                .connect_with(options),
++        )
++        .await??;
++    let rows = sqlite_home_guard
++        .run(sqlx::query_scalar::<_, String>("PRAGMA integrity_check").fetch_all(&pool))
++        .await??;
++    sqlite_home_guard.run(pool.close()).await?;
+     Ok(rows)
+ }
+ 
+ #[cfg(test)]
+ mod tests {
++    #[cfg(unix)]
++    use super::SqliteHomeGuard;
+     use super::StateRuntime;
++    use super::backup_runtime_db_for_fresh_start;
+     use super::open_state_sqlite;
+     use super::runtime_state_migrator;
+     use super::sqlite_integrity_check;
+@@ -578,6 +805,7 @@ mod tests {
+     use crate::DB_INIT_METRIC;
+     use crate::DbTelemetry;
+     use crate::migrations::STATE_MIGRATOR;
++    use crate::read_thread_state_audit_rows;
+     use pretty_assertions::assert_eq;
+     use sqlx::SqlitePool;
+     use sqlx::migrate::MigrateError;
+@@ -585,7 +813,17 @@ mod tests {
+     use std::collections::BTreeMap;
+     use std::collections::BTreeSet;
+     use std::path::Path;
++    use std::path::PathBuf;
+     use std::sync::Mutex;
++    #[cfg(unix)]
++    use tempfile::TempDir;
++
++    #[cfg(unix)]
++    const SQLITE_GUARD_CASE_ENV: &str = "CODEX_STATE_SQLITE_GUARD_CASE";
++    #[cfg(unix)]
++    const SQLITE_GUARD_CUSTOM_HOME_ENV: &str = "CODEX_STATE_SQLITE_GUARD_CUSTOM_HOME";
++    #[cfg(unix)]
++    const SQLITE_GUARD_TEST: &str = "runtime::tests::default_sqlite_home_guard_contract";
+ 
+     #[derive(Default)]
+     struct TestTelemetry {
+@@ -648,6 +886,244 @@ mod tests {
+         .expect("open sqlite pool")
+     }
+ 
++    #[cfg(unix)]
++    async fn assert_state_init_fails(sqlite_home: PathBuf) {
++        if let Ok(runtime) = StateRuntime::init(sqlite_home, "test-provider".to_string()).await {
++            runtime.close().await;
++            panic!("state runtime unexpectedly initialized");
++        }
++    }
++
++    #[cfg(unix)]
++    fn assert_sqlite_guard_rejects(path: &Path, expected_message: &str) {
++        let error = SqliteHomeGuard::prepare(path).expect_err("SQLite home must be rejected");
++        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
++        assert!(
++            error.to_string().contains(expected_message),
++            "unexpected SQLite guard error: {error}"
++        );
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn default_sqlite_home_guard_contract() -> anyhow::Result<()> {
++        use std::os::unix::fs::MetadataExt;
++        use std::os::unix::fs::PermissionsExt;
++        use std::os::unix::fs::symlink;
++
++        if let Ok(case) = std::env::var(SQLITE_GUARD_CASE_ENV) {
++            let custom_home = PathBuf::from(
++                std::env::var_os(SQLITE_GUARD_CUSTOM_HOME_ENV).ok_or_else(|| {
++                    std::io::Error::new(std::io::ErrorKind::NotFound, "missing custom home")
++                })?,
++            );
++            match case.as_str() {
++                "normal" => {
++                    let sqlite_home = codex_utils_home_dir::find_codex_tmp_root()?.into_path_buf();
++                    let runtime =
++                        StateRuntime::init(sqlite_home.clone(), "test-provider".to_string())
++                            .await?;
++                    runtime.close().await;
++                    let metadata = std::fs::symlink_metadata(&sqlite_home)?;
++                    assert_eq!(metadata.mode() & 0o7777, 0o700);
++                    assert!(state_db_path(&sqlite_home).is_file());
++                }
++                "unsafe-custom" => {
++                    let sqlite_home = codex_utils_home_dir::find_codex_tmp_root()?.into_path_buf();
++                    assert_state_init_fails(sqlite_home.clone()).await;
++                    assert!(!sqlite_home.exists());
++                    let runtime =
++                        StateRuntime::init(custom_home.clone(), "test-provider".to_string())
++                            .await?;
++                    runtime.close().await;
++                    assert!(state_db_path(&custom_home).is_file());
++                }
++                "missing-reads" => {
++                    let sqlite_home = codex_utils_home_dir::find_codex_tmp_root()?.into_path_buf();
++                    assert!(!StateRuntime::clear_memory_data_in_sqlite_home(&sqlite_home).await?);
++                    assert!(
++                        read_thread_state_audit_rows(&state_db_path(&sqlite_home))
++                            .await
++                            .is_err()
++                    );
++                    assert!(
++                        sqlite_integrity_check(&state_db_path(&sqlite_home))
++                            .await
++                            .is_err()
++                    );
++                    assert!(!sqlite_home.exists());
++                }
++                "blocking-root" => {
++                    let sqlite_home = codex_utils_home_dir::find_codex_tmp_root()?.into_path_buf();
++                    assert!(sqlite_home.is_file());
++                    assert!(
++                        backup_runtime_db_for_fresh_start(&state_db_path(&sqlite_home))
++                            .await
++                            .is_err()
++                    );
++                    assert!(sqlite_home.is_file());
++                }
++                "aliases" => {
++                    let sqlite_home = codex_utils_home_dir::find_codex_tmp_root()?.into_path_buf();
++                    let runtime =
++                        StateRuntime::init(sqlite_home.clone(), "test-provider".to_string())
++                            .await?;
++                    runtime.close().await;
++                    let parent = sqlite_home.parent().expect("SQLite home parent");
++                    let symlink_home = parent.join("sqlite-alias");
++                    symlink(&sqlite_home, &symlink_home)?;
++                    assert_sqlite_guard_rejects(&symlink_home, "must use its resolved path");
++                    assert!(
++                        std::fs::symlink_metadata(&symlink_home)?
++                            .file_type()
++                            .is_symlink()
++                    );
++                    let nested = parent.join("nested");
++                    assert_sqlite_guard_rejects(
++                        &nested.join("..").join("codex"),
++                        "must use its resolved path",
++                    );
++                    assert!(!nested.exists());
++                }
++                "dangling-aliases" => {
++                    let sqlite_home = codex_utils_home_dir::find_codex_tmp_root()?.into_path_buf();
++                    assert!(!sqlite_home.exists());
++                    let parent = sqlite_home.parent().expect("SQLite home parent");
++                    let absolute_alias = parent.join("sqlite-absolute-alias");
++                    symlink(&sqlite_home, &absolute_alias)?;
++                    let relative_alias = parent.join("sqlite-relative-alias");
++                    symlink(Path::new("codex"), &relative_alias)?;
++                    let chained_alias = parent.join("sqlite-chained-alias");
++                    symlink(Path::new("sqlite-relative-alias"), &chained_alias)?;
++
++                    for alias in [&absolute_alias, &relative_alias, &chained_alias] {
++                        assert_sqlite_guard_rejects(alias, "must use its resolved path");
++                        assert!(std::fs::symlink_metadata(alias)?.file_type().is_symlink());
++                    }
++
++                    let parent_alias = custom_home
++                        .parent()
++                        .expect("custom SQLite home parent")
++                        .join("runtime-tmp-alias");
++                    symlink(parent, &parent_alias)?;
++                    assert_sqlite_guard_rejects(
++                        &parent_alias.join("codex"),
++                        "must use its resolved path",
++                    );
++                    assert!(
++                        std::fs::symlink_metadata(&parent_alias)?
++                            .file_type()
++                            .is_symlink()
++                    );
++
++                    let cycle_a = parent.join("sqlite-cycle-a");
++                    let cycle_b = parent.join("sqlite-cycle-b");
++                    symlink(Path::new("sqlite-cycle-b"), &cycle_a)?;
++                    symlink(Path::new("sqlite-cycle-a"), &cycle_b)?;
++                    assert_sqlite_guard_rejects(
++                        &cycle_a,
++                        "symbolic link chain could not be resolved safely",
++                    );
++                    assert!(
++                        std::fs::symlink_metadata(&cycle_a)?
++                            .file_type()
++                            .is_symlink()
++                    );
++                    assert!(
++                        std::fs::symlink_metadata(&cycle_b)?
++                            .file_type()
++                            .is_symlink()
++                    );
++                    assert!(!sqlite_home.exists());
++                }
++                "custom-paths" => {
++                    let sqlite_home = codex_utils_home_dir::find_codex_tmp_root()?.into_path_buf();
++                    let custom_target = custom_home.join("existing-target");
++                    std::fs::create_dir_all(&custom_target)?;
++                    let custom_alias = custom_home.join("existing-alias");
++                    symlink(&custom_target, &custom_alias)?;
++                    let runtime =
++                        StateRuntime::init(custom_alias, "test-provider".to_string()).await?;
++                    runtime.close().await;
++                    assert!(state_db_path(&custom_target).is_file());
++
++                    let deep_custom_home = custom_home.join("missing").join("deep");
++                    let runtime =
++                        StateRuntime::init(deep_custom_home.clone(), "test-provider".to_string())
++                            .await?;
++                    runtime.close().await;
++                    assert!(state_db_path(&deep_custom_home).is_file());
++                    assert!(!sqlite_home.exists());
++                }
++                "invalid-resolver-custom" => {
++                    let removed_cwd = custom_home
++                        .parent()
++                        .expect("custom home parent")
++                        .join("removed-cwd");
++                    std::fs::create_dir(&removed_cwd)?;
++                    std::env::set_current_dir(&removed_cwd)?;
++                    std::fs::remove_dir(&removed_cwd)?;
++                    assert!(codex_utils_home_dir::find_codex_tmp_root().is_err());
++                    let runtime =
++                        StateRuntime::init(custom_home.clone(), "test-provider".to_string())
++                            .await?;
++                    runtime.close().await;
++                    assert!(state_db_path(&custom_home).is_file());
++                }
++                _ => panic!("unknown SQLite guard case: {case}"),
++            }
++            return Ok(());
++        }
++
++        for case in [
++            "normal",
++            "unsafe-custom",
++            "missing-reads",
++            "blocking-root",
++            "aliases",
++            "dangling-aliases",
++            "custom-paths",
++            "invalid-resolver-custom",
++        ] {
++            let root = TempDir::new_in(std::env::current_dir()?)?;
++            let system_tmp = root.path().join("runtime-tmp");
++            std::fs::create_dir(&system_tmp)?;
++            if case == "unsafe-custom" {
++                std::fs::set_permissions(&system_tmp, std::fs::Permissions::from_mode(0o777))?;
++            }
++            if case == "blocking-root" {
++                std::fs::write(system_tmp.join("codex"), b"blocking file")?;
++            }
++            let custom_home = if case == "unsafe-custom" {
++                system_tmp.join("custom-sqlite")
++            } else {
++                root.path().join("custom-sqlite")
++            };
++            let tmpdir = if case == "invalid-resolver-custom" {
++                Path::new("relative-tmp")
++            } else {
++                system_tmp.as_path()
++            };
++            let output = std::process::Command::new(std::env::current_exe()?)
++                .arg("--exact")
++                .arg(SQLITE_GUARD_TEST)
++                .env(SQLITE_GUARD_CASE_ENV, case)
++                .env(SQLITE_GUARD_CUSTOM_HOME_ENV, &custom_home)
++                .env("TMPDIR", tmpdir)
++                .env_remove("TMP")
++                .env_remove("TEMP")
++                .output()?;
++            assert!(
++                output.status.success(),
++                "SQLite guard case {case} failed\nstdout:\n{}\nstderr:\n{}",
++                String::from_utf8_lossy(&output.stdout),
++                String::from_utf8_lossy(&output.stderr)
++            );
++        }
++
++        Ok(())
++    }
++
+     #[tokio::test]
+     async fn sqlite_integrity_check_reports_ok_for_valid_db() {
+         let codex_home = unique_temp_dir();
+diff --git a/codex-rs/state/src/runtime/recovery.rs b/codex-rs/state/src/runtime/recovery.rs
+index d9cf0bcdc9..c55dd59a3b 100644
+--- a/codex-rs/state/src/runtime/recovery.rs
++++ b/codex-rs/state/src/runtime/recovery.rs
+@@ -5,6 +5,7 @@
+ //! moves only that database file and its sidecars into a backup folder so the
+ //! other databases keep their data.
+ 
++use super::SqliteHomeGuard;
+ use std::borrow::Cow;
+ use std::path::Path;
+ use std::path::PathBuf;
+@@ -77,11 +78,19 @@ pub async fn backup_runtime_db_for_fresh_start(
+             db_path.display()
+         ))
+     })?;
+-    match tokio::fs::metadata(sqlite_home).await {
+-        Ok(metadata) if metadata.is_dir() => backup_runtime_db_files(db_path).await,
+-        Ok(_) => backup_blocking_sqlite_home(sqlite_home).await,
++    let sqlite_home_guard = SqliteHomeGuard::prepare(sqlite_home)?;
++    let metadata = sqlite_home_guard
++        .run(tokio::fs::metadata(sqlite_home))
++        .await?;
++    match metadata {
++        Ok(metadata) if metadata.is_dir() => {
++            backup_runtime_db_files(db_path, &sqlite_home_guard).await
++        }
++        Ok(_) => backup_blocking_sqlite_home(sqlite_home, &sqlite_home_guard).await,
+         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+-            tokio::fs::create_dir_all(sqlite_home).await?;
++            sqlite_home_guard
++                .run(tokio::fs::create_dir_all(sqlite_home))
++                .await??;
+             Err(std::io::Error::other(format!(
+                 "no Codex runtime database files were found to back up for {}",
+                 db_path.display()
+@@ -141,27 +150,40 @@ pub fn sqlite_error_detail_is_lock(detail: &str) -> bool {
+     detail.contains("database is locked") || detail.contains("database is busy")
+ }
+ 
+-async fn backup_runtime_db_files(db_path: &Path) -> std::io::Result<Vec<RuntimeDbBackup>> {
++async fn backup_runtime_db_files(
++    db_path: &Path,
++    sqlite_home_guard: &SqliteHomeGuard,
++) -> std::io::Result<Vec<RuntimeDbBackup>> {
+     let sqlite_home = db_path.parent().ok_or_else(|| {
+         std::io::Error::other(format!(
+             "database path does not have a parent directory: {}",
+             db_path.display()
+         ))
+     })?;
+-    backup_sqlite_paths(sqlite_home, sqlite_paths(db_path)).await
++    backup_sqlite_paths(sqlite_home, sqlite_paths(db_path), sqlite_home_guard).await
+ }
+ 
+ async fn backup_sqlite_paths(
+     sqlite_home: &Path,
+     paths: impl IntoIterator<Item = PathBuf>,
++    sqlite_home_guard: &SqliteHomeGuard,
+ ) -> std::io::Result<Vec<RuntimeDbBackup>> {
+-    let backup_dir = create_unique_backup_dir(sqlite_home.join(BACKUP_DIR_NAME).as_path()).await?;
++    let backup_dir = create_unique_backup_dir(
++        sqlite_home.join(BACKUP_DIR_NAME).as_path(),
++        sqlite_home_guard,
++    )
++    .await?;
+     let mut backups = Vec::new();
+ 
+     for path in paths {
+-        if tokio::fs::try_exists(path.as_path()).await? {
++        if sqlite_home_guard
++            .run(tokio::fs::try_exists(path.as_path()))
++            .await??
++        {
+             let backup_path = backup_dir.join(file_name(path.as_path())?);
+-            tokio::fs::rename(path.as_path(), backup_path.as_path()).await?;
++            sqlite_home_guard
++                .run(tokio::fs::rename(path.as_path(), backup_path.as_path()))
++                .await??;
+             backups.push(RuntimeDbBackup {
+                 original_path: path,
+                 backup_path,
+@@ -170,7 +192,9 @@ async fn backup_sqlite_paths(
+     }
+ 
+     if backups.is_empty() {
+-        let _ = tokio::fs::remove_dir(backup_dir).await;
++        let _ = sqlite_home_guard
++            .run(tokio::fs::remove_dir(backup_dir))
++            .await?;
+         return Err(std::io::Error::other(
+             "no Codex runtime database files were found to back up",
+         ));
+@@ -179,7 +203,10 @@ async fn backup_sqlite_paths(
+     Ok(backups)
+ }
+ 
+-async fn backup_blocking_sqlite_home(sqlite_home: &Path) -> std::io::Result<Vec<RuntimeDbBackup>> {
++async fn backup_blocking_sqlite_home(
++    sqlite_home: &Path,
++    sqlite_home_guard: &SqliteHomeGuard,
++) -> std::io::Result<Vec<RuntimeDbBackup>> {
+     let parent = sqlite_home.parent().ok_or_else(|| {
+         std::io::Error::other(format!(
+             "cannot create a backup folder for {}",
+@@ -189,10 +216,14 @@ async fn backup_blocking_sqlite_home(sqlite_home: &Path) -> std::io::Result<Vec<
+     let mut backup_dir_name = file_name(sqlite_home)?.to_os_string();
+     backup_dir_name.push(format!(".{BACKUP_DIR_NAME}"));
+     let backup_parent = parent.join(backup_dir_name);
+-    let backup_dir = create_unique_backup_dir(backup_parent.as_path()).await?;
++    let backup_dir = create_unique_backup_dir(backup_parent.as_path(), sqlite_home_guard).await?;
+     let backup_path = backup_dir.join(file_name(sqlite_home)?);
+-    tokio::fs::rename(sqlite_home, backup_path.as_path()).await?;
+-    tokio::fs::create_dir_all(sqlite_home).await?;
++    sqlite_home_guard
++        .run(tokio::fs::rename(sqlite_home, backup_path.as_path()))
++        .await??;
++    sqlite_home_guard
++        .run(tokio::fs::create_dir_all(sqlite_home))
++        .await??;
+     Ok(vec![RuntimeDbBackup {
+         original_path: sqlite_home.to_path_buf(),
+         backup_path,
+@@ -211,15 +242,23 @@ fn sqlite_paths(db_path: &Path) -> Vec<PathBuf> {
+     ]
+ }
+ 
+-async fn create_unique_backup_dir(backup_parent: &Path) -> std::io::Result<PathBuf> {
+-    tokio::fs::create_dir_all(backup_parent).await?;
++async fn create_unique_backup_dir(
++    backup_parent: &Path,
++    sqlite_home_guard: &SqliteHomeGuard,
++) -> std::io::Result<PathBuf> {
++    sqlite_home_guard
++        .run(tokio::fs::create_dir_all(backup_parent))
++        .await??;
+     let timestamp = std::time::SystemTime::now()
+         .duration_since(std::time::UNIX_EPOCH)
+         .map_or(0, |duration| duration.as_secs());
+     let mut sequence = 0_u32;
+     loop {
+         let backup_dir = backup_parent.join(format!("sqlite-{timestamp}-{sequence}"));
+-        match tokio::fs::create_dir(backup_dir.as_path()).await {
++        match sqlite_home_guard
++            .run(tokio::fs::create_dir(backup_dir.as_path()))
++            .await?
++        {
+             Ok(()) => return Ok(backup_dir),
+             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                 sequence += 1;
