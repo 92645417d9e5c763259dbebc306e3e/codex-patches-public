@@ -5,23 +5,41 @@ import unicodedata
 
 TUI_SOURCE = Path("codex-rs/tui/src")
 
-# Static product chrome converges on one visible square. Named Powerline
-# replacements remain reviewable here instead of hiding in numeric escapes.
+
+def codepoint(value: str) -> str:
+    return chr(int(value, 16))
+
+
+PRIMARY_HEAD_INPUT = codepoint("2022")
+SECONDARY_HEAD_INPUT = codepoint("25E6")
+SECONDARY_SEPARATOR_INPUT = codepoint("00B7")
+VERTICAL_ELLIPSIS_INPUT = codepoint("22EE")
+LEGACY_PRIMARY_HEAD_INPUT = codepoint("25A0")
+
+# Replaced input glyphs use hexadecimal codepoints. Chosen output glyphs stay literal.
+ROUNDED_BORDER_TRANSLATION = str.maketrans(
+    {
+        codepoint("256D"): "┌",
+        codepoint("256E"): "┐",
+        codepoint("2570"): "└",
+        codepoint("256F"): "┘",
+    }
+)
+
 NAMED_VISIBLE_REPLACEMENTS = {
-    "success": ("✔", "+"),
-    "failure": ("✗", "x"),
-    "heavy_failure": ("✘", "x"),
-    "warning": ("⚠", "!"),
-    "primary_head": ("•", "▪"),
-    "secondary_head": ("◦", "▪"),
-    "secondary_separator": ("·", "▪"),
-    "legacy_primary_head": ("■", "▪"),
-    "continuation": ("↳", ">"),
-    "cwd": ("⌁", "~"),
-    "option_key": ("⌥", "-"),
-    "expanded": ("⌄", "v"),
-    "info": ("ⓘ", "i"),
-    "powerline_branch": ("", ">"),
+    "success": (codepoint("2714"), "+"),
+    "failure": (codepoint("2717"), "x"),
+    "heavy_failure": (codepoint("2718"), "x"),
+    "warning": (codepoint("26A0"), "!"),
+    "primary_head": (PRIMARY_HEAD_INPUT, "▪"),
+    "secondary_head": (SECONDARY_HEAD_INPUT, "▪"),
+    "secondary_separator": (SECONDARY_SEPARATOR_INPUT, "▪"),
+    "legacy_primary_head": (LEGACY_PRIMARY_HEAD_INPUT, "▪"),
+    "continuation": (codepoint("21B3"), ">"),
+    "cwd": (codepoint("2301"), "~"),
+    "expanded": (codepoint("2304"), "v"),
+    "info": (codepoint("24D8"), "i"),
+    "powerline_branch": (codepoint("E0A0"), ">"),
 }
 
 VISIBLE_TRANSLATION = str.maketrans(
@@ -62,7 +80,7 @@ ASTERISK_CODEPOINTS = (
     "1F50C",  # ELECTRIC PLUG
 )
 OWNED_WIDE_GLYPHS = {
-    chr(int(codepoint, 16)): "* " for codepoint in ASTERISK_CODEPOINTS
+    codepoint(value): "* " for value in ASTERISK_CODEPOINTS
 }
 
 
@@ -87,8 +105,8 @@ def replace_owned_wide_glyphs(text: str) -> str:
 def normalize_diff_chrome(path: str, text: str) -> str:
     if path == DIFF_RENDER_SOURCE:
         candidates = (
-            'let mut header_spans: Vec<RtSpan<\'static>> = vec!["• ".dim()];',
-            'let mut header_spans: Vec<RtSpan<\'static>> = vec!["■ ".dim()];',
+            f'let mut header_spans: Vec<RtSpan<\'static>> = vec!["{PRIMARY_HEAD_INPUT} ".dim()];',
+            f'let mut header_spans: Vec<RtSpan<\'static>> = vec!["{LEGACY_PRIMARY_HEAD_INPUT} ".dim()];',
             'let mut header_spans: Vec<RtSpan<\'static>> = vec!["▪ ".dim()];',
         )
         matches = sum(text.count(candidate) for candidate in candidates)
@@ -96,16 +114,24 @@ def normalize_diff_chrome(path: str, text: str) -> str:
             raise ValueError(f"expected one diff header producer in {path}")
         for candidate in candidates[:-1]:
             text = text.replace(candidate, candidates[-1])
-        return text.replace('"⋮".dim()', '"...".dim()')
+        return text.replace(f'"{VERTICAL_ELLIPSIS_INPUT}".dim()', '"...".dim()')
 
     if path.startswith(DIFF_RENDER_SNAPSHOT_PREFIX) and path.endswith(".snap"):
         lines = text.splitlines(keepends=True)
         for index, line in enumerate(lines):
-            for prefix in ('"• ', '"■ ', '"▪ '):
+            for prefix in (
+                f'"{PRIMARY_HEAD_INPUT} ',
+                f'"{LEGACY_PRIMARY_HEAD_INPUT} ',
+                '"▪ ',
+            ):
                 if line.startswith(prefix):
                     lines[index] = '"▪ ' + line[len(prefix):]
                     return "".join(lines)
-            for prefix in ("• ", "■ ", "▪ "):
+            for prefix in (
+                f"{PRIMARY_HEAD_INPUT} ",
+                f"{LEGACY_PRIMARY_HEAD_INPUT} ",
+                "▪ ",
+            ):
                 if line.startswith(prefix):
                     lines[index] = "▪ " + line[len(prefix):]
                     return "".join(lines)
@@ -116,25 +142,25 @@ def normalize_diff_chrome(path: str, text: str) -> str:
 
 def normalize_secondary_separators(path: str, text: str) -> str:
     if path == "codex-rs/tui/src/history_cell/separators.rs":
-        return text.replace('join(" • ")', 'join(" ▪ ")')
+        return text.replace(f'join(" {PRIMARY_HEAD_INPUT} ")', 'join(" ▪ ")')
     return text
 
 
 def normalize_owned_chrome_in_semantics_files(path: str, text: str) -> str:
     if path == "codex-rs/tui/src/bottom_pane/chat_composer.rs":
-        return text.replace(" · ", " ▪ ")
+        return text.replace(f" {SECONDARY_SEPARATOR_INPUT} ", " ▪ ")
     if path == "codex-rs/tui/src/streaming/controller.rs":
         return text.replace(
-            'vec!["• ".dim(), "Proposed Plan".bold()]',
+            f'vec!["{PRIMARY_HEAD_INPUT} ".dim(), "Proposed Plan".bold()]',
             'vec!["▪ ".dim(), "Proposed Plan".bold()]',
         ).replace(
-            'vec!["■ ".dim(), "Proposed Plan".bold()]',
+            f'vec!["{LEGACY_PRIMARY_HEAD_INPUT} ".dim(), "Proposed Plan".bold()]',
             'vec!["▪ ".dim(), "Proposed Plan".bold()]',
         ).replace(
-            'vec!["• tail without newline".to_string()]',
+            f'vec!["{PRIMARY_HEAD_INPUT} tail without newline".to_string()]',
             'vec!["▪ tail without newline".to_string()]',
         ).replace(
-            'vec!["■ tail without newline".to_string()]',
+            f'vec!["{LEGACY_PRIMARY_HEAD_INPUT} tail without newline".to_string()]',
             'vec!["▪ tail without newline".to_string()]',
         )
     return text
@@ -171,7 +197,9 @@ for path in TUI_SOURCE.rglob("*"):
     posix = path.as_posix()
 
     old = path.read_text(encoding="utf-8")
-    new = normalize_diff_chrome(posix, old)
+    new = old.translate(ROUNDED_BORDER_TRANSLATION)
+    new = new.replace("BorderType::Rounded", "BorderType::Plain")
+    new = normalize_diff_chrome(posix, new)
     is_diff_snapshot = posix.startswith(DIFF_RENDER_SNAPSHOT_PREFIX)
     if not is_diff_snapshot and posix != DIFF_RENDER_SOURCE:
         new = normalize_secondary_separators(posix, new)
@@ -187,18 +215,19 @@ for path in TUI_SOURCE.rglob("*"):
         path.write_text(new, encoding="utf-8")
 
 
-legacy_square_survivors = []
+primary_head_survivors = []
 for path in TUI_SOURCE.rglob("*"):
     if path.suffix not in {".rs", ".snap"}:
         continue
     posix = path.as_posix()
     if posix in UNICODE_SEMANTICS_FILES:
         continue
-    if "■" in path.read_text(encoding="utf-8"):
-        legacy_square_survivors.append(posix)
+    text = path.read_text(encoding="utf-8")
+    if PRIMARY_HEAD_INPUT in text or LEGACY_PRIMARY_HEAD_INPUT in text:
+        primary_head_survivors.append(posix)
 
-if legacy_square_survivors:
+if primary_head_survivors:
     raise ValueError(
-        "legacy product-chrome square survived normalization: "
-        + ", ".join(legacy_square_survivors)
+        "primary product-chrome bullet survived normalization: "
+        + ", ".join(primary_head_survivors)
     )
