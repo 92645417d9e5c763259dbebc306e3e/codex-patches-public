@@ -229,10 +229,10 @@ index 097237ec44..36cdf84ea9 100644
          support_verbosity: false,
          default_verbosity: None,
 diff --git a/codex-rs/models-manager/src/instructions_overlay.rs b/codex-rs/models-manager/src/instructions_overlay.rs
-index 160485c7d7..5d2f841a69 100644
+index a0f368cbfe..9c6db54379 100644
 --- a/codex-rs/models-manager/src/instructions_overlay.rs
 +++ b/codex-rs/models-manager/src/instructions_overlay.rs
-@@ -327,7 +327,6 @@ mod tests {
+@@ -459,7 +459,6 @@ mod tests {
              .instructions_template = Some("second".to_string());
          let first_catalog = vec![first];
          let second_catalog = vec![second];
@@ -373,7 +373,7 @@ index 797cff5181..6289a08632 100644
  }
  
 diff --git a/codex-rs/models-manager/src/manager_tests.rs b/codex-rs/models-manager/src/manager_tests.rs
-index 4a397f2eb2..3c36316ee8 100644
+index 4a397f2eb2..e4983887c5 100644
 --- a/codex-rs/models-manager/src/manager_tests.rs
 +++ b/codex-rs/models-manager/src/manager_tests.rs
 @@ -46,6 +46,7 @@ fn remote_model_with_prompt(slug: &str, prompt: &str) -> ModelInfo {
@@ -402,7 +402,7 @@ index 4a397f2eb2..3c36316ee8 100644
  fn remote_model_with_visibility(
      slug: &str,
      display: &str,
-@@ -817,6 +829,145 @@ async fn instructions_overlay_reloads_and_config_keeps_final_precedence() {
+@@ -817,6 +829,190 @@ async fn instructions_overlay_reloads_and_config_keeps_final_precedence() {
      assert_eq!(overridden.model_messages, None);
  }
  
@@ -495,6 +495,51 @@ index 4a397f2eb2..3c36316ee8 100644
 +}
 +
 +#[tokio::test]
++async fn disabled_models_overlay_hides_official_model_from_catalog_picker_and_instruction_seed() {
++    let codex_home = tempdir().expect("temp dir");
++    write_models_overlay(
++        codex_home.path(),
++        json!({"models": [{"slug": "disabled-official", "enabled": false}]}),
++    );
++    let endpoint = TestModelsEndpoint::new(vec![vec![
++        remote_model_with_prompt("disabled-official", "disabled prompt must not be seeded"),
++        remote_model_with_prompt("visible-official", "visible prompt"),
++    ]]);
++    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint);
++
++    let catalog = manager
++        .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
++        .await;
++    assert!(
++        catalog
++            .models
++            .iter()
++            .all(|model| model.slug != "disabled-official")
++    );
++    let picker = manager
++        .list_models(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY)
++        .await;
++    assert!(
++        picker
++            .iter()
++            .all(|model| model.model != "disabled-official")
++    );
++    assert!(picker.iter().any(|model| model.model == "visible-official"));
++    assert!(
++        !instructions_overlay_path(codex_home.path(), "disabled-official").exists(),
++        "disabled catalog entries must be removed before instruction seeding"
++    );
++    assert_eq!(
++        std::fs::read_to_string(instructions_overlay_path(
++            codex_home.path(),
++            "visible-official"
++        ))
++        .expect("enabled catalog entry should seed its instruction file"),
++        "visible prompt"
++    );
++}
++
++#[tokio::test]
 +async fn hidden_models_overlay_retains_catalog_and_hides_picker_and_default() {
 +    let codex_home = tempdir().expect("temp dir");
 +    write_models_overlay(
@@ -548,7 +593,7 @@ index 4a397f2eb2..3c36316ee8 100644
  #[tokio::test]
  async fn instructions_overlay_uses_catalog_slug_without_mutating_catalog_views() {
      let codex_home = tempdir().expect("temp dir");
-@@ -1009,6 +1160,8 @@ async fn catalog_publication_seeds_no_clobber_and_losing_cache_does_not_seed() {
+@@ -1009,6 +1205,8 @@ async fn catalog_publication_seeds_no_clobber_and_losing_cache_does_not_seed() {
      );
      let cached = manager
          .cache_manager
@@ -571,10 +616,10 @@ index f8c2ee3ecc..a9911b4f06 100644
          default_verbosity: None,
 diff --git a/codex-rs/models-manager/src/models_overlay.rs b/codex-rs/models-manager/src/models_overlay.rs
 new file mode 100644
-index 0000000000..50403f7504
+index 0000000000..c623254a4c
 --- /dev/null
 +++ b/codex-rs/models-manager/src/models_overlay.rs
-@@ -0,0 +1,363 @@
+@@ -0,0 +1,391 @@
 +use codex_protocol::openai_models::ModelInfo;
 +use serde::Deserialize;
 +use serde_json::Map;
@@ -598,8 +643,14 @@ index 0000000000..50403f7504
 +#[derive(Debug, Deserialize)]
 +struct OfficialModelOverlay {
 +    slug: String,
++    #[serde(default = "default_enabled")]
++    enabled: bool,
 +    #[serde(flatten)]
 +    fields: Map<String, Value>,
++}
++
++const fn default_enabled() -> bool {
++    true
 +}
 +
 +pub(crate) fn path(codex_home: &Path) -> PathBuf {
@@ -661,6 +712,10 @@ index 0000000000..50403f7504
 +            );
 +            continue;
 +        };
++        if !overlay.enabled {
++            models.remove(index);
++            continue;
++        }
 +        if overlay.fields.is_empty() {
 +            continue;
 +        }
@@ -831,6 +886,24 @@ index 0000000000..50403f7504
 +    }
 +
 +    #[test]
++    fn disabled_overlay_removes_model_from_active_catalog() {
++        let codex_home = tempdir().expect("temp dir");
++        let overlay_path = path(codex_home.path());
++        write_overlay(
++            &overlay_path,
++            json!({"models": [{"slug": "gpt-5.4", "enabled": false}]}),
++        );
++
++        let models = apply_to_official_models(
++            &overlay_path,
++            vec![bundled_model("gpt-5.4"), bundled_model("gpt-5.6-sol")],
++        );
++
++        assert_eq!(models.len(), 1);
++        assert_eq!(models[0].slug, "gpt-5.6-sol");
++    }
++
++    #[test]
 +    fn overlay_controls_automatic_limit_retry() {
 +        let codex_home = tempdir().expect("temp dir");
 +        let overlay_path = path(codex_home.path());
@@ -925,7 +998,7 @@ index 0000000000..50403f7504
 +            json!({
 +                "models": [
 +                    {"slug": "gpt-5.6-sol", "context_window": 372000},
-+                    {"slug": "gpt-5.6-sol", "visibility": "hide"}
++                    {"slug": "gpt-5.6-sol", "enabled": false}
 +                ]
 +            }),
 +        );

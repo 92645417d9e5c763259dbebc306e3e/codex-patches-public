@@ -1,5 +1,5 @@
 diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
-index ee7946cd7a..62d5807098 100644
+index e182952c4f..19c1c65420 100644
 --- a/codex-rs/core/src/session/tests.rs
 +++ b/codex-rs/core/src/session/tests.rs
 @@ -2434,6 +2434,71 @@ async fn context_boundary_stage_resolves_current_catalog_instructions_without_pu
@@ -76,11 +76,12 @@ index ee7946cd7a..62d5807098 100644
      let (session, mut turn_context) = make_session_and_context().await;
 diff --git a/codex-rs/models-manager/src/instructions_overlay.rs b/codex-rs/models-manager/src/instructions_overlay.rs
 new file mode 100644
-index 0000000000..160485c7d7
+index 0000000000..a0f368cbfe
 --- /dev/null
 +++ b/codex-rs/models-manager/src/instructions_overlay.rs
-@@ -0,0 +1,477 @@
+@@ -0,0 +1,609 @@
 +use codex_protocol::openai_models::ModelInfo;
++use std::collections::BTreeMap;
 +use std::fs as std_fs;
 +use std::fs::File;
 +use std::fs::OpenOptions;
@@ -148,6 +149,7 @@ index 0000000000..160485c7d7
 +        return;
 +    }
 +
++    let startup_snapshot = InstructionFileSnapshot::capture(dir).await;
 +    for model in models {
 +        let Some(template) = model
 +            .model_messages
@@ -163,7 +165,10 @@ index 0000000000..160485c7d7
 +            );
 +            continue;
 +        };
-+        if matching_overlay_path(dir, &model.slug).await.is_some() {
++        if startup_snapshot
++            .matching_overlay_path(&model.slug)
++            .is_some()
++        {
 +            continue;
 +        }
 +        if template.trim().is_empty() {
@@ -186,6 +191,67 @@ index 0000000000..160485c7d7
 +    }
 +}
 +
++#[derive(Default)]
++struct InstructionFileSnapshot {
++    paths_by_stem: BTreeMap<String, PathBuf>,
++}
++
++impl InstructionFileSnapshot {
++    async fn capture(dir: &Path) -> Self {
++        let mut entries = match fs::read_dir(dir).await {
++            Ok(entries) => entries,
++            Err(err) if err.kind() == ErrorKind::NotFound => return Self::default(),
++            Err(err) => {
++                warn!(
++                    path = %dir.display(),
++                    "failed to scan instructions overlay directory: {err}"
++                );
++                return Self::default();
++            }
++        };
++        let mut snapshot = Self::default();
++        loop {
++            let entry = match entries.next_entry().await {
++                Ok(Some(entry)) => entry,
++                Ok(None) => break,
++                Err(err) => {
++                    warn!(
++                        path = %dir.display(),
++                        "failed to scan instructions overlay directory entry: {err}"
++                    );
++                    break;
++                }
++            };
++            let path = entry.path();
++            let Some(stem) = path
++                .extension()
++                .filter(|extension| *extension == "md")
++                .and_then(|_| path.file_stem())
++                .and_then(|stem| stem.to_str())
++                .filter(|stem| is_safe_catalog_slug(stem))
++            else {
++                continue;
++            };
++            snapshot.paths_by_stem.insert(stem.to_string(), path);
++        }
++        snapshot
++    }
++
++    fn matching_overlay_path(&self, catalog_slug: &str) -> Option<&Path> {
++        if !is_safe_catalog_slug(catalog_slug) {
++            return None;
++        }
++        if let Some(exact) = self.paths_by_stem.get(catalog_slug) {
++            return Some(exact.as_path());
++        }
++        self.paths_by_stem
++            .iter()
++            .filter(|(stem, _)| catalog_slug.starts_with(stem.as_str()))
++            .max_by_key(|(stem, _)| stem.len())
++            .map(|(_, path)| path.as_path())
++    }
++}
++
 +fn model_path(dir: &Path, catalog_slug: &str) -> Option<PathBuf> {
 +    is_safe_catalog_slug(catalog_slug).then(|| dir.join(format!("{catalog_slug}.md")))
 +}
@@ -198,51 +264,10 @@ index 0000000000..160485c7d7
 +        Err(_) => return Some(exact),
 +    }
 +
-+    let mut entries = match fs::read_dir(dir).await {
-+        Ok(entries) => entries,
-+        Err(err) if err.kind() == ErrorKind::NotFound => return None,
-+        Err(err) => {
-+            warn!(
-+                path = %dir.display(),
-+                "failed to scan instructions overlay directory: {err}"
-+            );
-+            return None;
-+        }
-+    };
-+    let mut best: Option<(usize, PathBuf)> = None;
-+    loop {
-+        let entry = match entries.next_entry().await {
-+            Ok(Some(entry)) => entry,
-+            Ok(None) => break,
-+            Err(err) => {
-+                warn!(
-+                    path = %dir.display(),
-+                    "failed to scan instructions overlay directory entry: {err}"
-+                );
-+                break;
-+            }
-+        };
-+        let path = entry.path();
-+        let Some(stem) = path
-+            .extension()
-+            .filter(|extension| *extension == "md")
-+            .and_then(|_| path.file_stem())
-+            .and_then(|stem| stem.to_str())
-+        else {
-+            continue;
-+        };
-+        if !is_safe_catalog_slug(stem) || !catalog_slug.starts_with(stem) {
-+            continue;
-+        }
-+        let length = stem.len();
-+        if best
-+            .as_ref()
-+            .is_none_or(|(best_length, _)| length > *best_length)
-+        {
-+            best = Some((length, path));
-+        }
-+    }
-+    best.map(|(_, path)| path)
++    InstructionFileSnapshot::capture(dir)
++        .await
++        .matching_overlay_path(catalog_slug)
++        .map(Path::to_path_buf)
 +}
 +
 +fn is_safe_catalog_slug(catalog_slug: &str) -> bool {
@@ -355,6 +380,22 @@ index 0000000000..160485c7d7
 +mod tests {
 +    use super::*;
 +
++    fn model_with_prompt(slug: &str, prompt: &str) -> ModelInfo {
++        let mut model = crate::bundled_models_response()
++            .expect("bundled models should parse")
++            .models
++            .into_iter()
++            .find(|model| model.model_messages.is_some())
++            .expect("bundled catalog should include instruction messages");
++        model.slug = slug.to_string();
++        model
++            .model_messages
++            .as_mut()
++            .expect("test model should have messages")
++            .instructions_template = Some(prompt.to_string());
++        model
++    }
++
 +    #[test]
 +    fn catalog_slug_paths_use_a_positive_ascii_filename_policy() {
 +        let dir = Path::new("instructions");
@@ -383,6 +424,97 @@ index 0000000000..160485c7d7
 +        ] {
 +            assert_eq!(model_path(dir, slug), None, "accepted unsafe slug {slug:?}");
 +        }
++    }
++
++    #[tokio::test]
++    async fn empty_snapshot_seeds_family_members_in_any_order_and_restart_is_idempotent() {
++        for reverse in [false, true] {
++            let temp = tempfile::tempdir().expect("create temp dir");
++            let dir = dir_path(temp.path());
++            let base = model_with_prompt("gpt-5.4", "base prompt");
++            let mini = model_with_prompt("gpt-5.4-mini", "mini prompt");
++            let mut models = vec![base, mini];
++            if reverse {
++                models.reverse();
++            }
++
++            seed(&dir, &models).await;
++
++            assert_eq!(
++                std_fs::read_to_string(dir.join("gpt-5.4.md")).expect("read base seed"),
++                "base prompt"
++            );
++            assert_eq!(
++                std_fs::read_to_string(dir.join("gpt-5.4-mini.md")).expect("read mini seed"),
++                "mini prompt"
++            );
++
++            let mut restarted = vec![
++                model_with_prompt("gpt-5.4", "replacement base"),
++                model_with_prompt("gpt-5.4-mini", "replacement mini"),
++            ];
++            restarted.reverse();
++            seed(&dir, &restarted).await;
++
++            assert_eq!(
++                std_fs::read_to_string(dir.join("gpt-5.4.md")).expect("read base after restart"),
++                "base prompt"
++            );
++            assert_eq!(
++                std_fs::read_to_string(dir.join("gpt-5.4-mini.md"))
++                    .expect("read mini after restart"),
++                "mini prompt"
++            );
++        }
++    }
++
++    #[tokio::test]
++    async fn mixed_startup_snapshot_covers_only_matching_models() {
++        let temp = tempfile::tempdir().expect("create temp dir");
++        let dir = dir_path(temp.path());
++        fs::create_dir_all(&dir).await.expect("create overlay dir");
++        fs::write(dir.join("gpt-5.4.md"), "existing family")
++            .await
++            .expect("write family overlay");
++        fs::write(dir.join("o4-mini.md"), "existing exact")
++            .await
++            .expect("write exact overlay");
++        let mut family_member = model_with_prompt("gpt-5.4-mini", "cached family member");
++        let mut exact = model_with_prompt("o4-mini", "cached exact");
++        let new_model = model_with_prompt("gpt-6", "new exact");
++
++        seed(&dir, &[family_member.clone(), exact.clone(), new_model]).await;
++
++        assert!(!dir.join("gpt-5.4-mini.md").exists());
++        assert_eq!(
++            std_fs::read_to_string(dir.join("gpt-5.4.md")).expect("read family overlay"),
++            "existing family"
++        );
++        assert_eq!(
++            std_fs::read_to_string(dir.join("o4-mini.md")).expect("read exact overlay"),
++            "existing exact"
++        );
++        assert_eq!(
++            std_fs::read_to_string(dir.join("gpt-6.md")).expect("read new exact seed"),
++            "new exact"
++        );
++
++        apply(&dir, "gpt-5.4-mini", &mut family_member).await;
++        apply(&dir, "o4-mini", &mut exact).await;
++        assert_eq!(
++            family_member
++                .model_messages
++                .as_ref()
++                .and_then(|messages| messages.instructions_template.as_deref()),
++            Some("existing family")
++        );
++        assert_eq!(
++            exact
++                .model_messages
++                .as_ref()
++                .and_then(|messages| messages.instructions_template.as_deref()),
++            Some("existing exact")
++        );
 +    }
 +
 +    #[tokio::test]

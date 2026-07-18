@@ -1,12 +1,13 @@
 diff --git a/codex-rs/tui/src/app/app_server_event_targets.rs b/codex-rs/tui/src/app/app_server_event_targets.rs
-index 63223c0cf3..1cbecaae19 100644
+index 63223c0cf3..0a1afefd98 100644
 --- a/codex-rs/tui/src/app/app_server_event_targets.rs
 +++ b/codex-rs/tui/src/app/app_server_event_targets.rs
-@@ -299,6 +299,7 @@ mod tests {
+@@ -299,6 +299,8 @@ mod tests {
                  request_id: "request-1".to_string(),
                  byte_count: 10,
                  reset: false,
 +                ttfb: None,
++                output_tokens_per_second: None,
              });
  
          let target = server_notification_thread_target(&notification);
@@ -160,58 +161,66 @@ index 68fd038b04..7f3ddca3e4 100644
              Self::FastMode,
              Self::RawOutput,
 diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
-index b74b2e544c..10200bb655 100644
+index b74b2e544c..88dda6a441 100644
 --- a/codex-rs/tui/src/chatwidget.rs
 +++ b/codex-rs/tui/src/chatwidget.rs
-@@ -733,6 +733,7 @@ pub(crate) struct ChatWidget {
+@@ -554,6 +554,21 @@ pub(crate) enum ExternalEditorState {
+     Active,
+ }
+ 
++const REQUEST_PERFORMANCE_FRESH_DURATION: Duration = Duration::from_secs(5);
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++struct ObservedRequestPerformanceValue {
++    value: f64,
++    observed_at: Instant,
++}
++
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++struct RequestPerformanceState {
++    ttfb: Option<ObservedRequestPerformanceValue>,
++    output_tokens_per_second: Option<ObservedRequestPerformanceValue>,
++    next_freshness_refresh_at: Option<Instant>,
++}
++
+ /// Maintains the per-session UI state and interaction state machines for the chat screen.
+ ///
+ /// `ChatWidget` owns the state derived from the protocol event stream (history cells, streaming
+@@ -733,6 +748,7 @@ pub(crate) struct ChatWidget {
      quit_shortcut_key: Option<KeyBinding>,
      // Runtime metrics accumulated across delta snapshots for the active turn.
      turn_runtime_metrics: RuntimeMetricsSummary,
-+    request_performance_snapshot: Option<codex_app_server_protocol::RequestPerformanceSnapshot>,
++    request_performance: RequestPerformanceState,
      last_rendered_width: std::cell::Cell<Option<usize>>,
      // Feedback sink for /feedback
      feedback: codex_feedback::CodexFeedback,
+@@ -1288,6 +1304,9 @@ impl ChatWidget {
+     }
+ 
+     pub(crate) fn pre_draw_tick(&mut self) {
++        if self.request_performance_freshness_due_at(Instant::now()) {
++            self.refresh_status_line();
++        }
+         self.update_due_hook_visibility();
+         self.schedule_hook_timer_if_needed();
+         self.refresh_retry_countdown_status_for_time_tick();
 diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
-index 0ea2e58667..32d84b9d52 100644
+index 0ea2e58667..41845c3115 100644
 --- a/codex-rs/tui/src/chatwidget/constructor.rs
 +++ b/codex-rs/tui/src/chatwidget/constructor.rs
 @@ -217,6 +217,7 @@ impl ChatWidget {
              quit_shortcut_expires_at: None,
              quit_shortcut_key: None,
              turn_runtime_metrics: RuntimeMetricsSummary::default(),
-+            request_performance_snapshot: None,
++            request_performance: RequestPerformanceState::default(),
              last_rendered_width: std::cell::Cell::new(None),
              feedback,
              current_rollout_path: None,
 diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
-index 13039a570b..ff6a14cf0a 100644
+index 13039a570b..64dec1abba 100644
 --- a/codex-rs/tui/src/chatwidget/protocol.rs
 +++ b/codex-rs/tui/src/chatwidget/protocol.rs
-@@ -30,9 +30,15 @@ impl ChatWidget {
-         }
-         match notification {
-             ServerNotification::ThreadTokenUsageUpdated(notification) => {
-+                let request_performance_changed = notification
-+                    .request_performance
-+                    .is_some_and(|snapshot| self.merge_request_performance_snapshot(snapshot));
-                 self.set_token_info(Some(token_usage_info_from_app_server(
-                     notification.token_usage,
-                 )));
-+                if request_performance_changed {
-+                    self.refresh_status_line();
-+                }
-             }
-             ServerNotification::ThreadNameUpdated(notification) => {
-                 match ThreadId::from_string(&notification.thread_id) {
-@@ -58,6 +64,7 @@ impl ChatWidget {
-                 self.on_thread_settings_updated(notification);
-             }
-             ServerNotification::TurnStarted(notification) => {
-+                self.request_performance_snapshot = None;
-                 self.bottom_pane.clear_response_output_bytes();
-                 let started_at = notification
-                     .turn
-@@ -104,11 +111,28 @@ impl ChatWidget {
+@@ -104,11 +104,23 @@ impl ChatWidget {
                  }
              }
              ServerNotification::ResponseOutputBytesDelta(notification) => {
@@ -222,18 +231,13 @@ index 13039a570b..ff6a14cf0a 100644
                      notification.reset,
                  );
 +                if accepted {
-+                    let request_performance_changed = if notification.reset {
-+                        self.request_performance_snapshot.take().is_some()
-+                    } else {
-+                        notification.ttfb.is_some_and(|ttfb| {
-+                            self.merge_request_performance_snapshot(
-+                                codex_app_server_protocol::RequestPerformanceSnapshot {
-+                                    ttfb: Some(ttfb),
-+                                    output_tokens_per_second: None,
-+                                },
-+                            )
-+                        })
-+                    };
++                    let request_performance_changed = self.merge_request_performance_at(
++                        codex_app_server_protocol::RequestPerformanceSnapshot {
++                            ttfb: notification.ttfb,
++                            output_tokens_per_second: notification.output_tokens_per_second,
++                        },
++                        Instant::now(),
++                    );
 +                    if request_performance_changed {
 +                        self.refresh_status_line();
 +                    }
@@ -241,71 +245,153 @@ index 13039a570b..ff6a14cf0a 100644
              }
              ServerNotification::ReasoningSummaryPartAdded(_) => self.on_reasoning_section_break(),
              ServerNotification::TerminalInteraction(notification) => {
-@@ -147,6 +171,8 @@ impl ChatWidget {
-                 self.on_hook_completed(notification.run);
-             }
-             ServerNotification::Error(notification) => {
-+                self.request_performance_snapshot = None;
-+                self.refresh_status_line();
-                 if notification.will_retry {
-                     if !from_replay {
-                         self.on_stream_error(
-@@ -265,6 +291,34 @@ impl ChatWidget {
+@@ -265,6 +277,67 @@ impl ChatWidget {
          }
      }
  
-+    fn merge_request_performance_snapshot(
++    pub(super) fn merge_request_performance_at(
 +        &mut self,
 +        update: codex_app_server_protocol::RequestPerformanceSnapshot,
++        observed_at: Instant,
 +    ) -> bool {
 +        if update.ttfb.is_none() && update.output_tokens_per_second.is_none() {
 +            return false;
 +        }
 +
-+        let previous = self.request_performance_snapshot.unwrap_or(
-+            codex_app_server_protocol::RequestPerformanceSnapshot {
-+                ttfb: None,
-+                output_tokens_per_second: None,
-+            },
-+        );
-+        let merged = codex_app_server_protocol::RequestPerformanceSnapshot {
-+            ttfb: update.ttfb.or(previous.ttfb),
-+            output_tokens_per_second: update
-+                .output_tokens_per_second
-+                .or(previous.output_tokens_per_second),
++        if let Some(ttfb) = update.ttfb {
++            self.request_performance.ttfb = Some(ObservedRequestPerformanceValue {
++                value: ttfb,
++                observed_at,
++            });
++        }
++        if let Some(output_tokens_per_second) = update.output_tokens_per_second {
++            self.request_performance.output_tokens_per_second =
++                Some(ObservedRequestPerformanceValue {
++                    value: output_tokens_per_second,
++                    observed_at,
++                });
++        }
++        self.schedule_request_performance_freshness_refresh_at(observed_at);
++        true
++    }
++
++    fn schedule_request_performance_freshness_refresh_at(&mut self, now: Instant) {
++        let next_refresh_at = [
++            self.request_performance.ttfb,
++            self.request_performance.output_tokens_per_second,
++        ]
++        .into_iter()
++        .flatten()
++        .filter_map(|metric| {
++            metric
++                .observed_at
++                .checked_add(REQUEST_PERFORMANCE_FRESH_DURATION)
++        })
++        .filter(|deadline| *deadline > now)
++        .min();
++        self.request_performance.next_freshness_refresh_at = next_refresh_at;
++        if let Some(next_refresh_at) = next_refresh_at {
++            self.frame_requester
++                .schedule_frame_in(next_refresh_at.saturating_duration_since(now));
++        }
++    }
++
++    pub(super) fn request_performance_freshness_due_at(&mut self, now: Instant) -> bool {
++        let Some(next_refresh_at) = self.request_performance.next_freshness_refresh_at else {
++            return false;
 +        };
-+        if self.request_performance_snapshot == Some(merged) {
++        if now < next_refresh_at {
++            self.frame_requester
++                .schedule_frame_in(next_refresh_at.saturating_duration_since(now));
 +            return false;
 +        }
 +
-+        self.request_performance_snapshot = Some(merged);
++        self.schedule_request_performance_freshness_refresh_at(now);
 +        true
 +    }
 +
      pub(super) fn handle_turn_completed_notification(
          &mut self,
          notification: TurnCompletedNotification,
+diff --git a/codex-rs/tui/src/chatwidget/session_flow.rs b/codex-rs/tui/src/chatwidget/session_flow.rs
+index cc937c3165..7e8701427c 100644
+--- a/codex-rs/tui/src/chatwidget/session_flow.rs
++++ b/codex-rs/tui/src/chatwidget/session_flow.rs
+@@ -24,6 +24,7 @@ impl ChatWidget {
+             .set_queue_submissions(/*queue_submissions*/ false);
+         if previous_thread_id != self.thread_id {
+             self.review.recent_auto_review_denials = RecentAutoReviewDenials::default();
++            self.request_performance = RequestPerformanceState::default();
+         }
+         self.refresh_plan_mode_nudge();
+         self.turn_lifecycle.reset_thread();
 diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
-index 16b1a190cb..a0da0cef91 100644
+index 16b1a190cb..2b0a69b056 100644
 --- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
 +++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
-@@ -756,6 +756,15 @@ impl ChatWidget {
+@@ -669,10 +669,44 @@ impl ChatWidget {
+             StatusLineItem::WeeklyLimit => {
+                 self.status_line_limit_display_line(weekly_status_window)
+             }
++            StatusLineItem::RequestTtfb | StatusLineItem::RequestTps => {
++                self.request_performance_line_at(*item, Instant::now())
++            }
+             _ => self.status_line_value_for_item(*item).map(Line::from),
+         }
+     }
+ 
++    pub(super) fn request_performance_line_at(
++        &self,
++        item: StatusLineItem,
++        now: Instant,
++    ) -> Option<Line<'static>> {
++        let metric = match item {
++            StatusLineItem::RequestTtfb => self.request_performance.ttfb,
++            StatusLineItem::RequestTps => self.request_performance.output_tokens_per_second,
++            _ => return None,
++        }?;
++        let text = match item {
++            StatusLineItem::RequestTtfb => format!("TTFB {:.3}s", metric.value),
++            StatusLineItem::RequestTps if metric.value.is_finite() && metric.value > 0.0 => {
++                format!("TPS {:.1}", metric.value)
++            }
++            StatusLineItem::RequestTps => return None,
++            _ => unreachable!("only request performance items reach formatting"),
++        };
++        let stale =
++            now.saturating_duration_since(metric.observed_at) >= REQUEST_PERFORMANCE_FRESH_DURATION;
++        let style = if stale {
++            Style::default()
++                .fg(Color::DarkGray)
++                .add_modifier(Modifier::DIM)
++        } else {
++            // Leave fresh values unstyled so the status-line Usage accent owns their color.
++            Style::default()
++        };
++        Some(Line::from(Span::styled(text, style)))
++    }
++
+     pub(super) fn status_line_value_for_item(&mut self, item: StatusLineItem) -> Option<String> {
+         match item {
+             StatusLineItem::ModelName => Some(self.model_display_name().to_string()),
+@@ -756,6 +790,16 @@ impl ChatWidget {
                  .status_line_total_usage()
                  .cache_hit_rate_percent()
                  .map(|rate| format!("{rate:.1}% hit")),
 +            StatusLineItem::RequestTtfb => self
-+                .request_performance_snapshot
-+                .and_then(|snapshot| snapshot.ttfb)
-+                .map(|ttfb| format!("TTFB {ttfb:.3}s")),
++                .request_performance
++                .ttfb
++                .map(|metric| format!("TTFB {:.3}s", metric.value)),
 +            StatusLineItem::RequestTps => self
-+                .request_performance_snapshot
-+                .and_then(|snapshot| snapshot.output_tokens_per_second)
++                .request_performance
++                .output_tokens_per_second
++                .map(|metric| metric.value)
 +                .filter(|tps| tps.is_finite() && *tps > 0.0)
 +                .map(|tps| format!("TPS {tps:.1}")),
              StatusLineItem::SessionId => self.thread_id.map(|id| id.to_string()),
              StatusLineItem::FastMode => Some(
                  if self.current_service_tier() == Some(ServiceTier::Fast.request_value()) {
-@@ -868,6 +877,8 @@ impl ChatWidget {
+@@ -868,6 +912,8 @@ impl ChatWidget {
              StatusSurfacePreviewItem::TotalInputTokens => StatusLineItem::TotalInputTokens,
              StatusSurfacePreviewItem::TotalOutputTokens => StatusLineItem::TotalOutputTokens,
              StatusSurfacePreviewItem::CacheHitRate => StatusLineItem::CacheHitRate,
@@ -315,10 +401,10 @@ index 16b1a190cb..a0da0cef91 100644
              StatusSurfacePreviewItem::FastMode => StatusLineItem::FastMode,
              StatusSurfacePreviewItem::RawOutput => StatusLineItem::RawOutput,
 diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
-index d6e24313e6..9ef1610584 100644
+index d6e24313e6..8e309de131 100644
 --- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
 +++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
-@@ -5,6 +5,49 @@ use pretty_assertions::assert_eq;
+@@ -5,6 +5,75 @@ use pretty_assertions::assert_eq;
  const SAFETY_BUFFERING_HEADER_TEXT: &str =
      "Our systems are thinking a bit more about this request before responding.";
  
@@ -336,6 +422,25 @@ index d6e24313e6..9ef1610584 100644
 +            byte_count,
 +            reset,
 +            ttfb,
++            output_tokens_per_second: None,
++        },
++    )
++}
++
++fn response_request_performance(
++    request_id: &str,
++    ttfb: Option<f64>,
++    output_tokens_per_second: Option<f64>,
++) -> ServerNotification {
++    ServerNotification::ResponseOutputBytesDelta(
++        codex_app_server_protocol::ResponseOutputBytesDeltaNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            request_id: request_id.to_string(),
++            byte_count: 0,
++            reset: false,
++            ttfb,
++            output_tokens_per_second,
 +        },
 +    )
 +}
@@ -365,10 +470,17 @@ index d6e24313e6..9ef1610584 100644
 +    )
 +}
 +
++fn request_performance_texts(chat: &mut ChatWidget) -> (Option<String>, Option<String>) {
++    (
++        chat.status_line_value_for_item(StatusLineItem::RequestTtfb),
++        chat.status_line_value_for_item(StatusLineItem::RequestTps),
++    )
++}
++
  #[tokio::test]
  async fn response_output_bytes_follow_the_active_request_lifecycle_without_history() {
      let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
-@@ -27,27 +70,16 @@ async fn response_output_bytes_follow_the_active_request_lifecycle_without_histo
+@@ -27,27 +96,16 @@ async fn response_output_bytes_follow_the_active_request_lifecycle_without_histo
      drain_insert_history(&mut rx);
  
      chat.handle_server_notification(
@@ -402,7 +514,7 @@ index d6e24313e6..9ef1610584 100644
              ),
              /*replay_kind*/ None,
          );
-@@ -81,15 +113,7 @@ async fn response_output_bytes_follow_the_active_request_lifecycle_without_histo
+@@ -81,15 +139,7 @@ async fn response_output_bytes_follow_the_active_request_lifecycle_without_histo
      );
  
      chat.handle_server_notification(
@@ -419,7 +531,7 @@ index d6e24313e6..9ef1610584 100644
          /*replay_kind*/ None,
      );
      let status = chat
-@@ -100,14 +124,8 @@ async fn response_output_bytes_follow_the_active_request_lifecycle_without_histo
+@@ -100,14 +150,8 @@ async fn response_output_bytes_follow_the_active_request_lifecycle_without_histo
  
      for (request_id, byte_count) in [("request-1", 100), ("request-2", 7)] {
          chat.handle_server_notification(
@@ -436,7 +548,7 @@ index d6e24313e6..9ef1610584 100644
              ),
              /*replay_kind*/ None,
          );
-@@ -154,26 +172,236 @@ async fn response_output_bytes_follow_the_active_request_lifecycle_without_histo
+@@ -154,26 +198,467 @@ async fn response_output_bytes_follow_the_active_request_lifecycle_without_histo
          /*replay_kind*/ None,
      );
      chat.handle_server_notification(
@@ -493,7 +605,6 @@ index d6e24313e6..9ef1610584 100644
 +        ),
 +        /*replay_kind*/ None,
 +    );
-+
 +    assert_eq!(
 +        status_line_text(&chat),
 +        Some("TTFB 0.125s".to_string()),
@@ -554,10 +665,27 @@ index d6e24313e6..9ef1610584 100644
 +    assert_eq!(status_line_text(&chat), Some("TTFB 0.125s".to_string()));
 +
 +    chat.handle_server_notification(
++        response_request_performance(
++            "request-1",
++            /*ttfb*/ None,
++            /*output_tokens_per_second*/ Some(42.54),
++        ),
++        /*replay_kind*/ None,
++    );
++    assert_eq!(
++        status_line_text(&chat),
++        Some("TTFB 0.125s ▪ TPS 42.5".to_string())
++    );
++
++    chat.handle_server_notification(
 +        response_output_bytes_delta("request-2", 0, /*reset*/ true, /*ttfb*/ None),
 +        /*replay_kind*/ None,
 +    );
-+    assert_eq!(status_line_text(&chat), None);
++    assert_eq!(
++        status_line_text(&chat),
++        Some("TTFB 0.125s ▪ TPS 42.5".to_string()),
++        "starting the next request must retain the last observed performance"
++    );
 +    assert_eq!(
 +        chat.bottom_pane
 +            .status_widget()
@@ -566,7 +694,8 @@ index d6e24313e6..9ef1610584 100644
          None,
 -        "turn completion must clear the active request identity"
 +        "a new request must clear the previous byte count"
-+    );
+     );
+-    assert!(drain_insert_history(&mut rx).is_empty());
 +
 +    chat.handle_server_notification(
 +        response_output_bytes_delta(
@@ -586,7 +715,18 @@ index d6e24313e6..9ef1610584 100644
 +        ),
 +        /*replay_kind*/ None,
 +    );
-+    assert_eq!(status_line_text(&chat), Some("TTFB 0.250s".to_string()));
++    chat.handle_server_notification(
++        response_request_performance(
++            "request-1",
++            /*ttfb*/ None,
++            /*output_tokens_per_second*/ Some(999.0),
++        ),
++        /*replay_kind*/ None,
++    );
++    assert_eq!(
++        status_line_text(&chat),
++        Some("TTFB 0.250s ▪ TPS 42.5".to_string())
++    );
 +    assert_eq!(
 +        chat.bottom_pane
 +            .status_widget()
@@ -595,10 +735,23 @@ index d6e24313e6..9ef1610584 100644
 +        Some(7),
 +        "a stale request must not change bytes or TTFB"
 +    );
++
++    chat.handle_server_notification(
++        response_request_performance(
++            "request-2",
++            /*ttfb*/ None,
++            /*output_tokens_per_second*/ Some(50.04),
++        ),
++        /*replay_kind*/ None,
++    );
++    assert_eq!(
++        status_line_text(&chat),
++        Some("TTFB 0.250s ▪ TPS 50.0".to_string())
++    );
 +}
 +
 +#[tokio::test]
-+async fn completed_request_performance_merges_ttfb_and_tps_independently() {
++async fn request_correlated_performance_updates_merge_independently() {
 +    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
 +    chat.config.tui_status_line = Some(vec!["ttfb".to_string(), "tps".to_string()]);
 +    chat.refresh_status_line();
@@ -619,12 +772,11 @@ index d6e24313e6..9ef1610584 100644
 +    assert_eq!(status_line_text(&chat), Some("TTFB 0.125s".to_string()));
 +
 +    chat.handle_server_notification(
-+        thread_token_usage_updated(Some(
-+            codex_app_server_protocol::RequestPerformanceSnapshot {
-+                ttfb: None,
-+                output_tokens_per_second: Some(42.54),
-+            },
-+        )),
++        response_request_performance(
++            "request-1",
++            /*ttfb*/ None,
++            /*output_tokens_per_second*/ Some(42.54),
++        ),
 +        /*replay_kind*/ None,
 +    );
 +    assert_eq!(
@@ -633,12 +785,11 @@ index d6e24313e6..9ef1610584 100644
 +    );
 +
 +    chat.handle_server_notification(
-+        thread_token_usage_updated(Some(
-+            codex_app_server_protocol::RequestPerformanceSnapshot {
-+                ttfb: Some(0.2),
-+                output_tokens_per_second: None,
-+            },
-+        )),
++        response_request_performance(
++            "request-1",
++            /*ttfb*/ Some(0.2),
++            /*output_tokens_per_second*/ None,
++        ),
 +        /*replay_kind*/ None,
 +    );
 +    assert_eq!(
@@ -648,36 +799,228 @@ index d6e24313e6..9ef1610584 100644
 +    );
 +
 +    chat.handle_server_notification(
-+        thread_token_usage_updated(/*request_performance*/ None),
-+        /*replay_kind*/ None,
-+    );
-+    assert_eq!(
-+        status_line_text(&chat),
-+        Some("TTFB 0.200s ▪ TPS 42.5".to_string()),
-+        "a usage update without performance data must not erase either lifecycle"
-+    );
-+
-+    chat.handle_server_notification(
-+        response_output_bytes_delta("request-2", 0, /*reset*/ true, /*ttfb*/ None),
-+        /*replay_kind*/ None,
-+    );
-+    assert_eq!(status_line_text(&chat), None);
-+
-+    chat.handle_server_notification(
 +        thread_token_usage_updated(Some(
 +            codex_app_server_protocol::RequestPerformanceSnapshot {
-+                ttfb: Some(0.3),
-+                output_tokens_per_second: Some(50.04),
++                ttfb: Some(9.0),
++                output_tokens_per_second: Some(999.0),
 +            },
 +        )),
 +        /*replay_kind*/ None,
 +    );
 +    assert_eq!(
 +        status_line_text(&chat),
++        Some("TTFB 0.200s ▪ TPS 42.5".to_string()),
++        "an uncorrelated usage snapshot must not overwrite request performance"
++    );
++
++    chat.handle_server_notification(
++        response_output_bytes_delta("request-2", 0, /*reset*/ true, /*ttfb*/ None),
++        /*replay_kind*/ None,
++    );
++    assert_eq!(
++        status_line_text(&chat),
++        Some("TTFB 0.200s ▪ TPS 42.5".to_string())
++    );
++
++    chat.handle_server_notification(
++        response_request_performance(
++            "request-2",
++            /*ttfb*/ Some(0.3),
++            /*output_tokens_per_second*/ None,
++        ),
++        /*replay_kind*/ None,
++    );
++    chat.handle_server_notification(
++        response_request_performance(
++            "request-2",
++            /*ttfb*/ None,
++            /*output_tokens_per_second*/ Some(50.04),
++        ),
++        /*replay_kind*/ None,
++    );
++    chat.handle_server_notification(
++        response_request_performance(
++            "request-2",
++            /*ttfb*/ None,
++            /*output_tokens_per_second*/ None,
++        ),
++        /*replay_kind*/ None,
++    );
++    assert_eq!(
++        status_line_text(&chat),
 +        Some("TTFB 0.300s ▪ TPS 50.0".to_string()),
-+        "a complete performance snapshot must still publish both values"
-     );
--    assert!(drain_insert_history(&mut rx).is_empty());
++        "None fields must be no-ops for both independently observed values"
++    );
++}
++
++#[tokio::test]
++async fn request_performance_survives_request_and_turn_lifecycle_until_thread_switch() {
++    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.config.tui_status_line = Some(vec!["ttfb".to_string(), "tps".to_string()]);
++    let first_thread_id = ThreadId::new();
++    chat.handle_thread_session(configured_thread_session(first_thread_id));
++    drain_insert_history(&mut rx);
++
++    chat.handle_server_notification(
++        ServerNotification::TurnStarted(TurnStartedNotification {
++            thread_id: first_thread_id.to_string(),
++            turn: AppServerTurn {
++                id: "turn-preempted".to_string(),
++                items_view: codex_app_server_protocol::TurnItemsView::Full,
++                items: Vec::new(),
++                status: AppServerTurnStatus::InProgress,
++                error: None,
++                started_at: Some(0),
++                completed_at: None,
++                duration_ms: None,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++    chat.handle_server_notification(
++        response_output_bytes_delta("request-1", 0, /*reset*/ true, /*ttfb*/ None),
++        /*replay_kind*/ None,
++    );
++    chat.handle_server_notification(
++        response_request_performance(
++            "request-1",
++            /*ttfb*/ Some(0.125),
++            /*output_tokens_per_second*/ None,
++        ),
++        /*replay_kind*/ None,
++    );
++    chat.handle_server_notification(
++        response_request_performance(
++            "request-1",
++            /*ttfb*/ None,
++            /*output_tokens_per_second*/ Some(42.5),
++        ),
++        /*replay_kind*/ None,
++    );
++    let expected = (
++        Some("TTFB 0.125s".to_string()),
++        Some("TPS 42.5".to_string()),
++    );
++    assert_eq!(request_performance_texts(&mut chat), expected);
++
++    chat.handle_server_notification(
++        response_output_bytes_delta("request-2", 0, /*reset*/ true, /*ttfb*/ None),
++        /*replay_kind*/ None,
++    );
++    assert_eq!(request_performance_texts(&mut chat), expected);
++
++    handle_stream_error(&mut chat, "retrying", /*additional_details*/ None);
++    assert_eq!(request_performance_texts(&mut chat), expected);
++    handle_error(&mut chat, "request failed", /*codex_error_info*/ None);
++    assert_eq!(request_performance_texts(&mut chat), expected);
++
++    chat.handle_server_notification(
++        ServerNotification::TurnCompleted(TurnCompletedNotification {
++            thread_id: first_thread_id.to_string(),
++            turn: AppServerTurn {
++                id: "turn-preempted".to_string(),
++                items_view: codex_app_server_protocol::TurnItemsView::Full,
++                items: Vec::new(),
++                status: AppServerTurnStatus::Interrupted,
++                error: None,
++                started_at: None,
++                completed_at: Some(1),
++                duration_ms: None,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++    assert_eq!(request_performance_texts(&mut chat), expected);
++
++    chat.handle_server_notification(
++        ServerNotification::TurnStarted(TurnStartedNotification {
++            thread_id: first_thread_id.to_string(),
++            turn: AppServerTurn {
++                id: "turn-next".to_string(),
++                items_view: codex_app_server_protocol::TurnItemsView::Full,
++                items: Vec::new(),
++                status: AppServerTurnStatus::InProgress,
++                error: None,
++                started_at: Some(2),
++                completed_at: None,
++                duration_ms: None,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++    assert_eq!(request_performance_texts(&mut chat), expected);
++    handle_turn_completed(&mut chat, "turn-next", /*duration_ms*/ None);
++    assert_eq!(request_performance_texts(&mut chat), expected);
++
++    chat.handle_thread_session(configured_thread_session(ThreadId::new()));
++    assert_eq!(request_performance_texts(&mut chat), (None, None));
++}
++
++#[tokio::test]
++async fn request_performance_freshness_expires_independently_at_five_seconds() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    let observed_at = Instant::now();
++    assert!(chat.merge_request_performance_at(
++        codex_app_server_protocol::RequestPerformanceSnapshot {
++            ttfb: Some(0.125),
++            output_tokens_per_second: None,
++        },
++        observed_at,
++    ));
++    assert!(chat.merge_request_performance_at(
++        codex_app_server_protocol::RequestPerformanceSnapshot {
++            ttfb: None,
++            output_tokens_per_second: Some(42.5),
++        },
++        observed_at + Duration::from_secs(2),
++    ));
++
++    let just_before_ttfb_stale = observed_at + Duration::from_millis(4_999);
++    assert!(!chat.request_performance_freshness_due_at(just_before_ttfb_stale));
++    let fresh_ttfb = chat
++        .request_performance_line_at(StatusLineItem::RequestTtfb, just_before_ttfb_stale)
++        .expect("fresh TTFB line");
++    let fresh_tps = chat
++        .request_performance_line_at(StatusLineItem::RequestTps, just_before_ttfb_stale)
++        .expect("fresh TPS line");
++    assert_eq!(fresh_ttfb.spans[0].style, Style::default());
++    assert_eq!(fresh_tps.spans[0].style, Style::default());
++
++    let ttfb_stale_at = observed_at + Duration::from_secs(5);
++    assert!(chat.request_performance_freshness_due_at(ttfb_stale_at));
++    assert_eq!(
++        chat.request_performance.next_freshness_refresh_at,
++        Some(observed_at + Duration::from_secs(7))
++    );
++    let stale_ttfb = chat
++        .request_performance_line_at(StatusLineItem::RequestTtfb, ttfb_stale_at)
++        .expect("stale TTFB line");
++    let still_fresh_tps = chat
++        .request_performance_line_at(StatusLineItem::RequestTps, ttfb_stale_at)
++        .expect("still-fresh TPS line");
++    assert_eq!(stale_ttfb.spans[0].style.fg, Some(Color::DarkGray));
++    assert!(
++        stale_ttfb.spans[0]
++            .style
++            .add_modifier
++            .contains(Modifier::DIM)
++    );
++    assert_eq!(still_fresh_tps.spans[0].style, Style::default());
++
++    let tps_stale_at = observed_at + Duration::from_secs(7);
++    assert!(chat.request_performance_freshness_due_at(tps_stale_at));
++    assert_eq!(chat.request_performance.next_freshness_refresh_at, None);
++    let stale_tps = chat
++        .request_performance_line_at(StatusLineItem::RequestTps, tps_stale_at)
++        .expect("stale TPS line");
++    assert_eq!(stale_tps.spans[0].style.fg, Some(Color::DarkGray));
++    assert!(
++        stale_tps.spans[0]
++            .style
++            .add_modifier
++            .contains(Modifier::DIM)
++    );
++    assert!(!chat.request_performance_freshness_due_at(tps_stale_at + Duration::from_secs(1)));
  }
  
  fn thread_settings_for_test(

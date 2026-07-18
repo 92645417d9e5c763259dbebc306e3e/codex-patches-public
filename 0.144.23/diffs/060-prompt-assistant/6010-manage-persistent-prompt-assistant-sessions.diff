@@ -23,18 +23,6 @@ index ecef4e6fdc..b4e4bc076b 100644
          assert_eq!(
              source_category(
                  r#"{"subagent":{"thread_spawn":{"parent_thread_id":"00000000-0000-0000-0000-000000000001","depth":2}}}"#,
-diff --git a/codex-rs/codex-api/tests/models_integration.rs b/codex-rs/codex-api/tests/models_integration.rs
-index 7d5f284549..1fe834df1d 100644
---- a/codex-rs/codex-api/tests/models_integration.rs
-+++ b/codex-rs/codex-api/tests/models_integration.rs
-@@ -72,6 +72,7 @@ async fn models_client_hits_models_endpoint() {
-             ],
-             shell_type: ConfigShellToolType::ShellCommand,
-             visibility: ModelVisibility::List,
-+            enabled: true,
-             supported_in_api: true,
-             priority: 1,
-             additional_speed_tiers: Vec::new(),
 diff --git a/codex-rs/core/src/agent/control/spawn.rs b/codex-rs/core/src/agent/control/spawn.rs
 index 391058b34b..081a6d6c21 100644
 --- a/codex-rs/core/src/agent/control/spawn.rs
@@ -60,19 +48,13 @@ index b3ca496d75..e8ce69511b 100644
              | RolloutItem::Compacted(_)
              | RolloutItem::WorldState(_)
 diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
-index 1f6a8c4d8e..de69d8e6a4 100644
+index 1f6a8c4d8e..2d5445e294 100644
 --- a/codex-rs/core/src/client.rs
 +++ b/codex-rs/core/src/client.rs
-@@ -910,6 +910,20 @@ impl ModelClient {
+@@ -910,6 +910,14 @@ impl ModelClient {
          service_tier: Option<String>,
          responses_metadata: &CodexResponsesMetadata,
      ) -> Result<ResponsesApiRequest> {
-+        if !model_info.enabled {
-+            return Err(CodexErr::InvalidRequest(format!(
-+                "model `{}` is disabled by the effective model catalog",
-+                model_info.slug
-+            )));
-+        }
 +        if !crate::prompt_assistant::model_allowed_for_source(
 +            &model_info.slug,
 +            &self.state.session_source,
@@ -85,7 +67,7 @@ index 1f6a8c4d8e..de69d8e6a4 100644
          let is_openai = self.state.provider.info().is_openai();
          if !is_openai {
 diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.rs
-index bf1eab4c85..fa0e000a55 100644
+index c891f21dc4..2005dc95c3 100644
 --- a/codex-rs/core/src/client_tests.rs
 +++ b/codex-rs/core/src/client_tests.rs
 @@ -41,6 +41,7 @@ use codex_model_provider_info::create_oss_provider_with_base_url;
@@ -96,7 +78,7 @@ index bf1eab4c85..fa0e000a55 100644
  use codex_protocol::models::BaseInstructions;
  use codex_protocol::models::ContentItem;
  use codex_protocol::models::ResponseItem;
-@@ -558,6 +559,100 @@ fn build_subagent_headers_sets_internal_memory_consolidation_label() {
+@@ -558,6 +559,85 @@ fn build_subagent_headers_sets_internal_memory_consolidation_label() {
      );
  }
  
@@ -177,21 +159,6 @@ index bf1eab4c85..fa0e000a55 100644
 +            &metadata,
 +        )
 +        .expect("Prompt Assistant source should use the dedicated model");
-+
-+    model_info.enabled = false;
-+    assert!(
-+        client
-+            .build_responses_request(
-+                &setup.api_provider,
-+                &prompt,
-+                &model_info,
-+                /*effort*/ None,
-+                ReasoningSummaryConfig::None,
-+                /*service_tier*/ None,
-+                &metadata,
-+            )
-+            .is_err()
-+    );
 +}
 +
  #[test]
@@ -485,13 +452,14 @@ index 1239f28e28..f3dee80b2a 100644
  pub(crate) mod windows_sandbox_read_grants;
 diff --git a/codex-rs/core/src/prompt_assistant/child_config.rs b/codex-rs/core/src/prompt_assistant/child_config.rs
 new file mode 100644
-index 0000000000..765255c4b8
+index 0000000000..83e4cd41cb
 --- /dev/null
 +++ b/codex-rs/core/src/prompt_assistant/child_config.rs
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,225 @@
 +use std::collections::HashMap;
 +use std::fs;
 +use std::io::ErrorKind;
++use std::io::Write;
 +use std::path::Path;
 +
 +use anyhow::Context;
@@ -522,7 +490,13 @@ index 0000000000..765255c4b8
 +    let policy = match fs::read_to_string(&path) {
 +        Ok(policy) => policy,
 +        Err(err) if err.kind() == ErrorKind::NotFound => {
-+            super::prompt::FIXED_INSTRUCTIONS.to_string()
++            ensure_policy_file(codex_home)?;
++            fs::read_to_string(&path).with_context(|| {
++                format!(
++                    "failed to read seeded Prompt Assistant policy at {}",
++                    path.display()
++                )
++            })?
 +        }
 +        Err(err) => {
 +            return Err(err).with_context(|| {
@@ -539,6 +513,67 @@ index 0000000000..765255c4b8
 +        path.display()
 +    );
 +    Ok(policy)
++}
++
++pub(crate) fn ensure_policy_file(codex_home: &Path) -> Result<()> {
++    let path = codex_home.join(POLICY_RELATIVE_PATH);
++    match path.try_exists() {
++        Ok(true) => return Ok(()),
++        Ok(false) => {}
++        Err(err) => {
++            return Err(err).with_context(|| {
++                format!(
++                    "failed to inspect Prompt Assistant policy at {}",
++                    path.display()
++                )
++            });
++        }
++    }
++
++    let parent = path.parent().with_context(|| {
++        format!(
++            "Prompt Assistant policy path {} has no parent directory",
++            path.display()
++        )
++    })?;
++    fs::create_dir_all(parent).with_context(|| {
++        format!(
++            "failed to create Prompt Assistant policy directory at {}",
++            parent.display()
++        )
++    })?;
++
++    let mut temporary = tempfile::NamedTempFile::new_in(parent).with_context(|| {
++        format!(
++            "failed to create temporary Prompt Assistant policy beside {}",
++            path.display()
++        )
++    })?;
++    temporary
++        .write_all(super::prompt::FIXED_INSTRUCTIONS.as_bytes())
++        .with_context(|| {
++            format!(
++                "failed to write temporary Prompt Assistant policy beside {}",
++                path.display()
++            )
++        })?;
++    temporary.as_file().sync_all().with_context(|| {
++        format!(
++            "failed to sync temporary Prompt Assistant policy beside {}",
++            path.display()
++        )
++    })?;
++
++    match temporary.persist_noclobber(&path) {
++        Ok(_) => Ok(()),
++        Err(err) if err.error.kind() == ErrorKind::AlreadyExists => Ok(()),
++        Err(err) => Err(err.error).with_context(|| {
++            format!(
++                "failed to install Prompt Assistant policy at {}",
++                path.display()
++            )
++        }),
++    }
 +}
 +
 +pub(super) fn build_child_config(
@@ -648,10 +683,10 @@ index 0000000000..765255c4b8
 +mod tests;
 diff --git a/codex-rs/core/src/prompt_assistant/child_config_tests.rs b/codex-rs/core/src/prompt_assistant/child_config_tests.rs
 new file mode 100644
-index 0000000000..8465cb11bb
+index 0000000000..2e9240f79a
 --- /dev/null
 +++ b/codex-rs/core/src/prompt_assistant/child_config_tests.rs
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,187 @@
 +use codex_protocol::config_types::ReasoningSummary;
 +use codex_protocol::config_types::WebSearchMode;
 +use codex_protocol::models::PermissionProfile;
@@ -712,7 +747,7 @@ index 0000000000..8465cb11bb
 +}
 +
 +#[test]
-+fn policy_file_overrides_bundled_policy_without_replacing_model_instructions() {
++fn missing_policy_is_seeded_from_bundled_policy_without_replacing_model_instructions() {
 +    let codex_home = tempfile::tempdir().expect("codex home");
 +    assert_eq!(
 +        load_policy(codex_home.path()).expect("load bundled policy"),
@@ -720,12 +755,123 @@ index 0000000000..8465cb11bb
 +    );
 +
 +    let path = codex_home.path().join(POLICY_RELATIVE_PATH);
-+    std::fs::create_dir_all(path.parent().expect("policy parent")).expect("create policy dir");
++    assert_eq!(
++        std::fs::read_to_string(&path).expect("read seeded policy"),
++        super::super::prompt::FIXED_INSTRUCTIONS
++    );
++
 +    std::fs::write(&path, "local Prompt Assistant policy").expect("write policy");
 +
 +    assert_eq!(
 +        load_policy(codex_home.path()).expect("load local policy"),
 +        "local Prompt Assistant policy"
++    );
++    assert_eq!(
++        std::fs::read_to_string(&path).expect("read retained local policy"),
++        "local Prompt Assistant policy"
++    );
++}
++
++#[test]
++fn startup_seed_is_idempotent_and_does_not_validate_or_clobber_existing_policy() {
++    let codex_home = tempfile::tempdir().expect("codex home");
++    ensure_policy_file(codex_home.path()).expect("seed policy");
++    ensure_policy_file(codex_home.path()).expect("repeat seed");
++    let path = codex_home.path().join(POLICY_RELATIVE_PATH);
++    assert_eq!(
++        std::fs::read_to_string(&path).expect("read seeded policy"),
++        super::super::prompt::FIXED_INSTRUCTIONS
++    );
++
++    std::fs::write(&path, "").expect("replace with user-owned empty policy");
++    ensure_policy_file(codex_home.path()).expect("retain existing policy");
++    assert_eq!(
++        std::fs::read_to_string(&path).expect("read retained policy"),
++        ""
++    );
++    assert!(load_policy(codex_home.path()).is_err());
++}
++
++#[test]
++fn concurrent_startup_seed_is_atomic_and_byte_exact() {
++    let codex_home = tempfile::tempdir().expect("codex home");
++    let start = std::sync::Barrier::new(8);
++    std::thread::scope(|scope| {
++        for _ in 0..8 {
++            scope.spawn(|| {
++                start.wait();
++                ensure_policy_file(codex_home.path()).expect("seed policy concurrently");
++            });
++        }
++    });
++
++    let path = codex_home.path().join(POLICY_RELATIVE_PATH);
++    assert_eq!(
++        std::fs::read(&path).expect("read concurrently seeded policy"),
++        super::super::prompt::FIXED_INSTRUCTIONS.as_bytes()
++    );
++    assert_eq!(
++        std::fs::read_dir(path.parent().expect("policy parent"))
++            .expect("list policy directory")
++            .map(|entry| entry.expect("read policy entry").file_name())
++            .collect::<Vec<_>>(),
++        vec![path.file_name().expect("policy file name").to_os_string()]
++    );
++}
++
++#[test]
++fn existing_empty_policy_is_rejected_without_replacement() {
++    let codex_home = tempfile::tempdir().expect("codex home");
++    let path = codex_home.path().join(POLICY_RELATIVE_PATH);
++    std::fs::create_dir_all(path.parent().expect("policy parent")).expect("create policy dir");
++    std::fs::write(&path, "\n\t").expect("write empty policy");
++
++    let error = load_policy(codex_home.path()).expect_err("reject empty policy");
++
++    assert!(error.to_string().contains("must not be empty"));
++    assert_eq!(
++        std::fs::read_to_string(&path).expect("read unchanged empty policy"),
++        "\n\t"
++    );
++}
++
++#[test]
++fn existing_non_utf8_policy_is_reported_without_replacement() {
++    let codex_home = tempfile::tempdir().expect("codex home");
++    let path = codex_home.path().join(POLICY_RELATIVE_PATH);
++    std::fs::create_dir_all(path.parent().expect("policy parent")).expect("create policy dir");
++    std::fs::write(&path, [0xff, 0xfe]).expect("write non-UTF-8 policy");
++
++    let error = load_policy(codex_home.path()).expect_err("reject non-UTF-8 policy");
++
++    assert!(
++        error
++            .to_string()
++            .contains("failed to read Prompt Assistant policy")
++    );
++    assert_eq!(
++        std::fs::read(&path).expect("read unchanged non-UTF-8 policy"),
++        [0xff, 0xfe]
++    );
++}
++
++#[test]
++fn invalid_policy_parent_is_reported_without_replacement() {
++    let codex_home = tempfile::tempdir().expect("codex home");
++    std::fs::write(codex_home.path().join("instructions"), "not a directory")
++        .expect("block policy directory");
++
++    let error = load_policy(codex_home.path()).expect_err("report invalid policy parent");
++
++    assert!(
++        error
++            .to_string()
++            .contains("failed to read Prompt Assistant policy")
++    );
++    assert_eq!(
++        std::fs::read(codex_home.path().join("instructions"))
++            .expect("read unchanged invalid policy parent"),
++        b"not a directory"
 +    );
 +}
 diff --git a/codex-rs/core/src/prompt_assistant/lifecycle.rs b/codex-rs/core/src/prompt_assistant/lifecycle.rs
@@ -1888,10 +2034,10 @@ index 0000000000..bdafda4d6c
 +}
 diff --git a/codex-rs/core/src/prompt_assistant/mod.rs b/codex-rs/core/src/prompt_assistant/mod.rs
 new file mode 100644
-index 0000000000..9377dfdfa0
+index 0000000000..d88fa7771d
 --- /dev/null
 +++ b/codex-rs/core/src/prompt_assistant/mod.rs
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,132 @@
 +use codex_protocol::ThreadId;
 +use codex_protocol::protocol::InternalSessionSource;
 +use codex_protocol::protocol::SessionSource;
@@ -1910,6 +2056,7 @@ index 0000000000..9377dfdfa0
 +
 +pub use codex_protocol::prompt_assistant::PromptAssistantOperation;
 +
++pub(crate) use child_config::ensure_policy_file;
 +pub(crate) use manager::PromptAssistantSessionManager;
 +
 +pub(crate) const SOURCE_LABEL: &str = "prompt-assistant";
@@ -3214,10 +3361,10 @@ index 0000000000..3185091eab
 +mod tests;
 diff --git a/codex-rs/core/src/prompt_assistant/runtime_tests.rs b/codex-rs/core/src/prompt_assistant/runtime_tests.rs
 new file mode 100644
-index 0000000000..d6b3a6826e
+index 0000000000..ef995b3773
 --- /dev/null
 +++ b/codex-rs/core/src/prompt_assistant/runtime_tests.rs
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,43 @@
 +use pretty_assertions::assert_eq;
 +
 +use super::*;
@@ -3238,6 +3385,7 @@ index 0000000000..d6b3a6826e
 +                request_id: "request".to_string(),
 +                byte_count,
 +                ttfb: Some(0.25),
++                output_tokens_per_second: None,
 +                reset,
 +            },
 +        )
@@ -3330,7 +3478,7 @@ index b0a26f0aa6..ea5e685299 100644
      crate::hook_runtime::run_session_end_hooks(sess).await;
  }
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
-index 8a6000d848..515a16baf0 100644
+index 8a6000d848..2f5b3ff8bc 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
 @@ -311,6 +311,7 @@ use crate::exec_policy::ExecPolicyUpdateError;
@@ -3356,15 +3504,24 @@ index 8a6000d848..515a16baf0 100644
          let LoadedUserInstructions {
              instructions: user_instructions,
              warnings: user_instruction_provider_warnings,
-@@ -594,6 +603,16 @@ impl Session {
+@@ -555,6 +564,13 @@ impl Session {
+         config
+             .startup_warnings
+             .extend(user_instruction_provider_warnings);
++        if !session_source.is_non_root_agent()
++            && let Err(err) = crate::prompt_assistant::ensure_policy_file(&config.codex_home)
++        {
++            config
++                .startup_warnings
++                .push(format!("failed to seed Prompt Assistant policy: {err:#}"));
++        }
+         let exec_policy = if crate::guardian::is_guardian_reviewer_source(&session_source) {
+             // Guardian review should rely on the built-in shell safety checks,
+             // not on caller-provided exec-policy rules that could shape the
+@@ -594,6 +610,11 @@ impl Session {
                  config.http_client_factory(),
              )
              .await;
-+        if !models_manager.model_is_enabled(&model).await {
-+            return Err(CodexErr::InvalidRequest(format!(
-+                "model `{model}` is disabled by the effective model catalog"
-+            )));
-+        }
 +        if !crate::prompt_assistant::model_allowed_for_source(&model, &session_source) {
 +            return Err(CodexErr::InvalidRequest(
 +                crate::prompt_assistant::reserved_model_error(&model),
@@ -3373,7 +3530,7 @@ index 8a6000d848..515a16baf0 100644
          if allow_provider_model_fallback
              && let Some(requested_model) = config.model.as_ref()
              && model != *requested_model
-@@ -3208,6 +3227,13 @@ impl Session {
+@@ -3208,6 +3229,13 @@ impl Session {
          state.replace_history(items, reference_context_item);
      }
  
@@ -3550,7 +3707,7 @@ index 647a4c5781..30650499c8 100644
          next_internal_sub_id: AtomicU64::new(0),
      });
 diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
-index c32d2219b0..3ae66d71e8 100644
+index 616d79c92e..5c39e8d211 100644
 --- a/codex-rs/core/src/session/turn.rs
 +++ b/codex-rs/core/src/session/turn.rs
 @@ -736,7 +736,9 @@ async fn build_skills_and_plugins(
@@ -3699,18 +3856,6 @@ index e4cf827be7..d902738ca5 100644
      let ToolRouterParams {
          tool_runtimes,
          tool_suggest_candidates,
-diff --git a/codex-rs/core/tests/suite/auto_review.rs b/codex-rs/core/tests/suite/auto_review.rs
-index e2f0f00f91..c763743c5a 100644
---- a/codex-rs/core/tests/suite/auto_review.rs
-+++ b/codex-rs/core/tests/suite/auto_review.rs
-@@ -229,6 +229,7 @@ fn remote_model_with_auto_review_override(slug: &str, review_model: &str) -> Mod
-         }],
-         shell_type: ConfigShellToolType::ShellCommand,
-         visibility: ModelVisibility::List,
-+        enabled: true,
-         supported_in_api: true,
-         input_modalities: default_input_modalities(),
-         used_fallback_model_metadata: false,
 diff --git a/codex-rs/core/tests/suite/mod.rs b/codex-rs/core/tests/suite/mod.rs
 index df143e8962..4af118701b 100644
 --- a/codex-rs/core/tests/suite/mod.rs
@@ -3723,64 +3868,12 @@ index df143e8962..4af118701b 100644
  mod prompt_cache_key;
  mod prompt_caching;
  mod prompt_debug_tests;
-diff --git a/codex-rs/core/tests/suite/model_switching.rs b/codex-rs/core/tests/suite/model_switching.rs
-index 0daad133a9..a8e55e7e10 100644
---- a/codex-rs/core/tests/suite/model_switching.rs
-+++ b/codex-rs/core/tests/suite/model_switching.rs
-@@ -82,6 +82,7 @@ fn test_model_info(
-         }],
-         shell_type: ConfigShellToolType::ShellCommand,
-         visibility: ModelVisibility::List,
-+        enabled: true,
-         supported_in_api: true,
-         input_modalities,
-         used_fallback_model_metadata: false,
-@@ -911,6 +912,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
-         }],
-         shell_type: ConfigShellToolType::ShellCommand,
-         visibility: ModelVisibility::List,
-+        enabled: true,
-         supported_in_api: true,
-         input_modalities: default_input_modalities(),
-         used_fallback_model_metadata: false,
-diff --git a/codex-rs/core/tests/suite/models_cache_ttl.rs b/codex-rs/core/tests/suite/models_cache_ttl.rs
-index e07d8acb68..731b4dd014 100644
---- a/codex-rs/core/tests/suite/models_cache_ttl.rs
-+++ b/codex-rs/core/tests/suite/models_cache_ttl.rs
-@@ -375,6 +375,7 @@ fn test_remote_model(slug: &str, priority: i32) -> ModelInfo {
-         ],
-         shell_type: ConfigShellToolType::ShellCommand,
-         visibility: ModelVisibility::List,
-+        enabled: true,
-         supported_in_api: true,
-         priority,
-         additional_speed_tiers: Vec::new(),
-diff --git a/codex-rs/core/tests/suite/personality.rs b/codex-rs/core/tests/suite/personality.rs
-index 08bbe1d510..786abe87e3 100644
---- a/codex-rs/core/tests/suite/personality.rs
-+++ b/codex-rs/core/tests/suite/personality.rs
-@@ -625,6 +625,7 @@ async fn remote_model_friendly_personality_instructions_with_feature() -> anyhow
-         }],
-         shell_type: ConfigShellToolType::UnifiedExec,
-         visibility: ModelVisibility::List,
-+        enabled: true,
-         supported_in_api: true,
-         priority: 1,
-         additional_speed_tiers: Vec::new(),
-@@ -745,6 +746,7 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
-         }],
-         shell_type: ConfigShellToolType::UnifiedExec,
-         visibility: ModelVisibility::List,
-+        enabled: true,
-         supported_in_api: true,
-         priority: 1,
-         additional_speed_tiers: Vec::new(),
 diff --git a/codex-rs/core/tests/suite/prompt_assistant.rs b/codex-rs/core/tests/suite/prompt_assistant.rs
 new file mode 100644
-index 0000000000..0739086312
+index 0000000000..23dbabca41
 --- /dev/null
 +++ b/codex-rs/core/tests/suite/prompt_assistant.rs
-@@ -0,0 +1,410 @@
+@@ -0,0 +1,424 @@
 +use std::sync::Arc;
 +use std::time::Duration;
 +
@@ -3814,6 +3907,7 @@ index 0000000000..0739086312
 +const HIDDEN_MODEL: &str = "hidden-prompt-specialist";
 +const WORKSPACE_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 +const WORKSPACE_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
++const BUNDLED_POLICY: &str = include_str!("../../src/prompt_assistant/prompt.md");
 +
 +fn completed_with_usage(response_id: &str, usage: &TokenUsage) -> Value {
 +    serde_json::json!({
@@ -3853,7 +3947,6 @@ index 0000000000..0739086312
 +    let mut visible = codex_models_manager::model_info::model_info_from_slug("gpt-test");
 +    visible.priority = 0;
 +    visible.visibility = ModelVisibility::List;
-+    visible.enabled = true;
 +    let mut hidden = visible.clone();
 +    hidden.slug = HIDDEN_MODEL.to_string();
 +    hidden.display_name = "Prompt specialist".to_string();
@@ -3871,6 +3964,20 @@ index 0000000000..0739086312
 +        config.model_catalog = Some(prompt_catalog());
 +        config.model_provider.supports_websockets = false;
 +    })
++}
++
++#[tokio::test]
++async fn root_session_startup_seeds_prompt_assistant_policy() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = start_mock_server().await;
++    let test = configured_builder().build(&server).await?;
++    let policy_path = test
++        .codex_home_path()
++        .join("instructions/prompt-assistant.md");
++
++    assert_eq!(std::fs::read_to_string(policy_path)?, BUNDLED_POLICY);
++    Ok(())
 +}
 +
 +#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4191,70 +4298,6 @@ index 0000000000..0739086312
 +    apply_session.codex.shutdown_and_wait().await?;
 +    Ok(())
 +}
-diff --git a/codex-rs/core/tests/suite/remote_models.rs b/codex-rs/core/tests/suite/remote_models.rs
-index 7777761068..09033a8154 100644
---- a/codex-rs/core/tests/suite/remote_models.rs
-+++ b/codex-rs/core/tests/suite/remote_models.rs
-@@ -474,6 +474,7 @@ async fn remote_models_remote_model_uses_unified_exec() -> Result<()> {
-         }],
-         shell_type: ConfigShellToolType::UnifiedExec,
-         visibility: ModelVisibility::List,
-+        enabled: true,
-         supported_in_api: true,
-         input_modalities: default_input_modalities(),
-         used_fallback_model_metadata: false,
-@@ -729,6 +730,7 @@ async fn remote_models_apply_remote_base_instructions() -> Result<()> {
-         }],
-         shell_type: ConfigShellToolType::ShellCommand,
-         visibility: ModelVisibility::List,
-+        enabled: true,
-         supported_in_api: true,
-         input_modalities: default_input_modalities(),
-         used_fallback_model_metadata: false,
-@@ -1257,6 +1259,7 @@ fn test_remote_model_with_policy(
-         }],
-         shell_type: ConfigShellToolType::ShellCommand,
-         visibility,
-+        enabled: true,
-         supported_in_api: true,
-         input_modalities: default_input_modalities(),
-         used_fallback_model_metadata: false,
-diff --git a/codex-rs/core/tests/suite/rmcp_client.rs b/codex-rs/core/tests/suite/rmcp_client.rs
-index baa58a9273..58d5140af9 100644
---- a/codex-rs/core/tests/suite/rmcp_client.rs
-+++ b/codex-rs/core/tests/suite/rmcp_client.rs
-@@ -1733,6 +1733,7 @@ async fn stdio_image_responses_are_sanitized_for_text_only_model() -> anyhow::Re
-                 }],
-                 shell_type: ConfigShellToolType::Default,
-                 visibility: ModelVisibility::List,
-+                enabled: true,
-                 supported_in_api: true,
-                 priority: 1,
-                 additional_speed_tiers: Vec::new(),
-diff --git a/codex-rs/core/tests/suite/spawn_agent_description.rs b/codex-rs/core/tests/suite/spawn_agent_description.rs
-index d63ddd6a3d..8ff66ced1d 100644
---- a/codex-rs/core/tests/suite/spawn_agent_description.rs
-+++ b/codex-rs/core/tests/suite/spawn_agent_description.rs
-@@ -64,6 +64,7 @@ fn test_model_info(
-         supported_reasoning_levels,
-         shell_type: ConfigShellToolType::ShellCommand,
-         visibility,
-+        enabled: true,
-         supported_in_api: true,
-         input_modalities: default_input_modalities(),
-         used_fallback_model_metadata: false,
-diff --git a/codex-rs/core/tests/suite/view_image.rs b/codex-rs/core/tests/suite/view_image.rs
-index 36cdf84ea9..060c05d7ea 100644
---- a/codex-rs/core/tests/suite/view_image.rs
-+++ b/codex-rs/core/tests/suite/view_image.rs
-@@ -1360,6 +1360,7 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
-         }],
-         shell_type: ConfigShellToolType::ShellCommand,
-         visibility: ModelVisibility::List,
-+        enabled: true,
-         supported_in_api: true,
-         input_modalities: vec![InputModality::Text],
-         used_fallback_model_metadata: false,
 diff --git a/codex-rs/mcp-server/src/codex_tool_runner.rs b/codex-rs/mcp-server/src/codex_tool_runner.rs
 index 49d29d309b..2b27134cb9 100644
 --- a/codex-rs/mcp-server/src/codex_tool_runner.rs
@@ -4297,14 +4340,14 @@ index 93dbfe0aad..1ffd26deca 100644
  pub fn bundled_models_response()
  -> std::result::Result<codex_protocol::openai_models::ModelsResponse, serde_json::Error> {
 diff --git a/codex-rs/models-manager/src/manager.rs b/codex-rs/models-manager/src/manager.rs
-index 6289a08632..dfe9ec0f87 100644
+index 6289a08632..368296f73b 100644
 --- a/codex-rs/models-manager/src/manager.rs
 +++ b/codex-rs/models-manager/src/manager.rs
-@@ -89,6 +89,58 @@ type SharedModelsEndpointClient = Arc<dyn ModelsEndpointClient>;
+@@ -89,6 +89,48 @@ type SharedModelsEndpointClient = Arc<dyn ModelsEndpointClient>;
  
  /// Coordinates model discovery plus cached metadata on disk.
  pub trait ModelsManager: fmt::Debug + Send + Sync {
-+    /// Resolve an enabled hidden functional model from the full catalog, outside picker filtering.
++    /// Resolve a hidden functional model from the full catalog, outside picker filtering.
 +    fn resolve_prompt_assistant_model<'a>(
 +        &'a self,
 +        requested_model: Option<&'a str>,
@@ -4319,7 +4362,7 @@ index 6289a08632..dfe9ec0f87 100644
 +                    .map(|model| model.slug.clone())
 +                    .ok_or_else(|| {
 +                        format!(
-+                            "Prompt Assistant model `{requested_model}` is not an enabled hidden catalog model"
++                            "Prompt Assistant model `{requested_model}` is not a hidden catalog model"
 +                        )
 +                    });
 +            }
@@ -4342,47 +4385,29 @@ index 6289a08632..dfe9ec0f87 100644
 +                    .min_by_key(|model| model.priority)
 +                    .map(|model| model.slug.clone())
 +            })
-+            .ok_or_else(|| "no enabled hidden Prompt Assistant model is available".to_string())
-+        })
-+    }
-+
-+    /// Return whether the effective catalog allows a resolved model to be requested.
-+    fn model_is_enabled<'a>(&'a self, model: &'a str) -> ModelsManagerFuture<'a, bool> {
-+        Box::pin(async move {
-+            let remote_models = self.get_remote_models().await;
-+            find_model_by_longest_prefix(model, &remote_models)
-+                .or_else(|| find_model_by_namespaced_suffix(model, &remote_models))
-+                .is_none_or(|model| model.enabled)
++            .ok_or_else(|| "no hidden Prompt Assistant model is available".to_string())
 +        })
 +    }
 +
      /// List all available models, refreshing according to the specified strategy.
      ///
      /// Returns model presets sorted by priority and filtered by auth mode and visibility.
-@@ -131,6 +183,7 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
- 
-     /// Build picker-ready presets from the active catalog snapshot.
-     fn build_available_models(&self, mut remote_models: Vec<ModelInfo>) -> Vec<ModelPreset> {
-+        remote_models.retain(|model| model.enabled);
-         remote_models.sort_by_key(|model| model.priority);
- 
-         let mut presets: Vec<ModelPreset> = remote_models.into_iter().map(Into::into).collect();
-@@ -1073,6 +1126,10 @@ fn requested_model_is_available(
+@@ -1073,6 +1115,10 @@ fn requested_model_is_available(
      })
  }
  
 +fn prompt_assistant_model_is_eligible(model: &ModelInfo) -> bool {
-+    model.enabled && model.visibility == ModelVisibility::Hide
++    model.visibility == ModelVisibility::Hide
 +}
 +
  fn find_model_by_longest_prefix(model: &str, candidates: &[ModelInfo]) -> Option<ModelInfo> {
      let mut best: Option<ModelInfo> = None;
      for candidate in candidates {
 diff --git a/codex-rs/models-manager/src/manager_tests.rs b/codex-rs/models-manager/src/manager_tests.rs
-index 3c36316ee8..844b1565f4 100644
+index e4983887c5..af81ad7c2d 100644
 --- a/codex-rs/models-manager/src/manager_tests.rs
 +++ b/codex-rs/models-manager/src/manager_tests.rs
-@@ -2961,6 +2961,105 @@ fn build_available_models_picks_default_after_hiding_hidden_models() {
+@@ -3006,6 +3006,80 @@ fn build_available_models_picks_default_after_hiding_hidden_models() {
      let available = manager.build_available_models(vec![hidden_model, visible_model]);
  
      assert_eq!(available, vec![expected_hidden, expected_visible]);
@@ -4391,7 +4416,7 @@ index 3c36316ee8..844b1565f4 100644
 +}
 +
 +#[tokio::test]
-+async fn prompt_assistant_resolves_only_enabled_hidden_catalog_models() {
++async fn prompt_assistant_resolves_only_hidden_catalog_models() {
 +    let dedicated = remote_model_with_visibility(
 +        crate::PROMPT_ASSISTANT_MODEL_SLUG,
 +        "Prompt Assistant",
@@ -4411,16 +4436,12 @@ index 3c36316ee8..844b1565f4 100644
 +        /*priority*/ 3,
 +        "hide",
 +    );
-+    let mut disabled_hidden =
-+        remote_model_with_visibility("disabled-hidden", "Disabled", /*priority*/ 4, "hide");
-+    disabled_hidden.enabled = false;
 +    let manager = static_manager_for_tests(ModelsResponse {
 +        models: vec![
 +            dedicated.clone(),
 +            fallback.clone(),
 +            visible.clone(),
 +            arbitrary_hidden.clone(),
-+            disabled_hidden.clone(),
 +        ],
 +    });
 +
@@ -4444,27 +4465,6 @@ index 3c36316ee8..844b1565f4 100644
 +            .await
 +            .is_err()
 +    );
-+    assert!(
-+        manager
-+            .resolve_prompt_assistant_model(Some("disabled-hidden"))
-+            .await
-+            .is_err()
-+    );
-+    assert!(!manager.model_is_enabled("disabled-hidden").await);
-+    assert!(manager.model_is_enabled("visible").await);
-+    assert!(
-+        !manager
-+            .build_available_models(vec![
-+                dedicated,
-+                fallback.clone(),
-+                visible,
-+                arbitrary_hidden,
-+                disabled_hidden,
-+            ])
-+            .into_iter()
-+            .any(|model| model.model == "disabled-hidden")
-+    );
-+
 +    let manager = static_manager_for_tests(ModelsResponse {
 +        models: vec![fallback],
 +    });
@@ -4488,23 +4488,11 @@ index 3c36316ee8..844b1565f4 100644
  }
  
  #[tokio::test]
-diff --git a/codex-rs/models-manager/src/model_info.rs b/codex-rs/models-manager/src/model_info.rs
-index a9911b4f06..185acffa7e 100644
---- a/codex-rs/models-manager/src/model_info.rs
-+++ b/codex-rs/models-manager/src/model_info.rs
-@@ -132,6 +132,7 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
-         supported_reasoning_levels: Vec::new(),
-         shell_type: ConfigShellToolType::Default,
-         visibility: ModelVisibility::None,
-+        enabled: true,
-         supported_in_api: true,
-         priority: 99,
-         additional_speed_tiers: Vec::new(),
 diff --git a/codex-rs/models-manager/src/models_overlay.rs b/codex-rs/models-manager/src/models_overlay.rs
-index 50403f7504..2c4b9757fe 100644
+index c623254a4c..d6587a5b67 100644
 --- a/codex-rs/models-manager/src/models_overlay.rs
 +++ b/codex-rs/models-manager/src/models_overlay.rs
-@@ -221,7 +221,7 @@ mod tests {
+@@ -231,7 +231,7 @@ mod tests {
          official.max_context_window = Some(272_000);
          let display_name = official.display_name.clone();
  
@@ -4513,43 +4501,36 @@ index 50403f7504..2c4b9757fe 100644
  
          assert_eq!(models[0].context_window, Some(372_000));
          assert_eq!(models[0].max_context_window, Some(372_000));
-@@ -293,7 +293,7 @@ mod tests {
+@@ -320,29 +320,6 @@ mod tests {
+         assert_eq!(models[0].context_window, Some(272_000));
      }
  
-     #[test]
+-    #[test]
 -    fn enabled_is_rejected_as_an_unknown_model_overlay_field() {
-+    fn enabled_and_visibility_apply_as_independent_model_controls() {
-         let codex_home = tempdir().expect("temp dir");
-         let overlay_path = path(codex_home.path());
-         write_overlay(
-@@ -309,10 +309,25 @@ mod tests {
-         let mut official = bundled_model("gpt-5.6-sol");
-         official.context_window = Some(272_000);
- 
+-        let codex_home = tempdir().expect("temp dir");
+-        let overlay_path = path(codex_home.path());
+-        write_overlay(
+-            &overlay_path,
+-            json!({
+-                "models": [{
+-                    "slug": "gpt-5.6-sol",
+-                    "enabled": false,
+-                    "context_window": 372000
+-                }]
+-            }),
+-        );
+-        let mut official = bundled_model("gpt-5.6-sol");
+-        official.context_window = Some(272_000);
+-
 -        let models = apply_to_official_models(&overlay_path, vec![official]);
-+        let models = apply_to_official_models(&overlay_path, vec![official.clone()]);
- 
-         assert_eq!(models.len(), 1);
+-
+-        assert_eq!(models.len(), 1);
 -        assert_eq!(models[0].context_window, Some(272_000));
-+        assert!(!models[0].enabled);
-+        assert_eq!(models[0].visibility, official.visibility);
-+        assert_eq!(models[0].context_window, Some(372_000));
-+
-+        write_overlay(
-+            &overlay_path,
-+            json!({
-+                "models": [{
-+                    "slug": "gpt-5.6-sol",
-+                    "visibility": "hide"
-+                }]
-+            }),
-+        );
-+        let models = apply_to_official_models(&overlay_path, vec![official]);
-+        assert!(models[0].enabled);
-+        assert_eq!(models[0].visibility, ModelVisibility::Hide);
-     }
- 
+-    }
+-
      #[test]
+     fn instruction_content_is_owned_only_by_markdown_overlay() {
+         let codex_home = tempdir().expect("temp dir");
 diff --git a/codex-rs/protocol/src/lib.rs b/codex-rs/protocol/src/lib.rs
 index b2b04b17a8..460c03e021 100644
 --- a/codex-rs/protocol/src/lib.rs
@@ -4563,7 +4544,7 @@ index b2b04b17a8..460c03e021 100644
  pub mod request_permissions;
  pub mod request_user_input;
 diff --git a/codex-rs/protocol/src/openai_models.rs b/codex-rs/protocol/src/openai_models.rs
-index dd5d16e5db..c9f71047a2 100644
+index dd5d16e5db..c79b62fced 100644
 --- a/codex-rs/protocol/src/openai_models.rs
 +++ b/codex-rs/protocol/src/openai_models.rs
 @@ -230,6 +230,10 @@ pub struct ModelPreset {
@@ -4590,20 +4571,7 @@ index dd5d16e5db..c9f71047a2 100644
  /// Shell execution capability for a model.
  #[derive(
      Debug,
-@@ -374,6 +384,12 @@ pub struct ModelInfo {
-     pub supported_reasoning_levels: Vec<ReasoningEffortPreset>,
-     pub shell_type: ConfigShellToolType,
-     pub visibility: ModelVisibility,
-+    /// Whether this catalog entry may be resolved or requested.
-+    ///
-+    /// Disabled entries stay in the cached catalog so a local overlay can be reversed without
-+    /// losing the upstream metadata, but every effective model view filters them out.
-+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-+    pub enabled: bool,
-     pub supported_in_api: bool,
-     pub priority: i32,
-     #[serde(default)]
-@@ -629,6 +645,7 @@ impl From<ModelInfo> for ModelPreset {
+@@ -629,6 +639,7 @@ impl From<ModelInfo> for ModelPreset {
                  migration_markdown: Some(upgrade.migration_markdown.clone()),
              }),
              show_in_picker: info.visibility == ModelVisibility::List,
@@ -4611,41 +4579,6 @@ index dd5d16e5db..c9f71047a2 100644
              multi_agent_version: info.multi_agent_version,
              availability_nux: info.availability_nux,
              supported_in_api: info.supported_in_api,
-@@ -706,6 +723,7 @@ mod tests {
-             supported_reasoning_levels: vec![],
-             shell_type: ConfigShellToolType::ShellCommand,
-             visibility: ModelVisibility::List,
-+            enabled: true,
-             supported_in_api: true,
-             priority: 1,
-             additional_speed_tiers: Vec::new(),
-@@ -1175,6 +1193,26 @@ mod tests {
-         assert_eq!(model.multi_agent_version, None);
-     }
- 
-+    #[test]
-+    fn model_info_defaults_enabled_without_coupling_it_to_visibility() {
-+        let mut value =
-+            serde_json::to_value(test_model(/*spec*/ None)).expect("serialize test model");
-+        let object = value
-+            .as_object_mut()
-+            .expect("model info should be an object");
-+        assert!(!object.contains_key("enabled"));
-+        object.remove("enabled");
-+        object.insert(
-+            "visibility".to_string(),
-+            serde_json::Value::String("hide".to_string()),
-+        );
-+
-+        let model = serde_json::from_value::<ModelInfo>(value).expect("deserialize model info");
-+
-+        assert!(model.enabled);
-+        assert_eq!(model.visibility, ModelVisibility::Hide);
-+    }
-+
-     #[test]
-     fn resolved_context_window_prefers_context_window() {
-         let model = ModelInfo {
 diff --git a/codex-rs/protocol/src/prompt_assistant.rs b/codex-rs/protocol/src/prompt_assistant.rs
 new file mode 100644
 index 0000000000..bf3b85eed0
@@ -4702,7 +4635,7 @@ index 0000000000..bf3b85eed0
 +    pub error: Option<String>,
 +}
 diff --git a/codex-rs/protocol/src/protocol.rs b/codex-rs/protocol/src/protocol.rs
-index 24c419b433..384d360694 100644
+index 1ee3f1baab..ca6483acca 100644
 --- a/codex-rs/protocol/src/protocol.rs
 +++ b/codex-rs/protocol/src/protocol.rs
 @@ -1481,6 +1481,7 @@ pub enum EventMsg {
@@ -4713,7 +4646,7 @@ index 24c419b433..384d360694 100644
  
      /// Collab interaction: agent spawn begin.
      CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent),
-@@ -1932,6 +1933,18 @@ pub struct ResponseOutputBytesDeltaEvent {
+@@ -1941,6 +1942,18 @@ pub struct ResponseOutputBytesDeltaEvent {
      pub reset: bool,
  }
  
@@ -4732,7 +4665,7 @@ index 24c419b433..384d360694 100644
  #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
  pub struct ModelRequestStartedEvent {
      pub auth_revision: Option<u64>,
-@@ -2729,6 +2742,7 @@ impl InitialHistory {
+@@ -2738,6 +2751,7 @@ impl InitialHistory {
                  | RolloutItem::InterAgentCommunicationMetadata { .. }
                  | RolloutItem::Compacted(_)
                  | RolloutItem::WorldState(_)
@@ -4740,7 +4673,7 @@ index 24c419b433..384d360694 100644
                  | RolloutItem::EventMsg(_) => None,
              })
              .and_then(|turn_context| turn_context.multi_agent_mode.clone())
-@@ -2892,6 +2906,7 @@ impl FromStr for ThreadSource {
+@@ -2901,6 +2915,7 @@ impl FromStr for ThreadSource {
  #[ts(rename_all = "snake_case")]
  pub enum InternalSessionSource {
      MemoryConsolidation,
@@ -4748,7 +4681,7 @@ index 24c419b433..384d360694 100644
  }
  
  #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
-@@ -3064,6 +3079,7 @@ impl fmt::Display for InternalSessionSource {
+@@ -3073,6 +3088,7 @@ impl fmt::Display for InternalSessionSource {
      fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
          match self {
              InternalSessionSource::MemoryConsolidation => f.write_str("memory_consolidation"),
@@ -4756,7 +4689,7 @@ index 24c419b433..384d360694 100644
          }
      }
  }
-@@ -3090,6 +3106,7 @@ fn multi_agent_version_from_items(
+@@ -3099,6 +3115,7 @@ fn multi_agent_version_from_items(
              | RolloutItem::InterAgentCommunicationMetadata { .. }
              | RolloutItem::Compacted(_)
              | RolloutItem::WorldState(_)
@@ -4764,7 +4697,7 @@ index 24c419b433..384d360694 100644
              | RolloutItem::EventMsg(_) => None,
          })
      })
-@@ -3259,6 +3276,7 @@ pub enum RolloutItem {
+@@ -3268,6 +3285,7 @@ pub enum RolloutItem {
      Compacted(CompactedItem),
      TurnContext(TurnContextItem),
      WorldState(WorldStateItem),
@@ -4867,7 +4800,7 @@ index d2b4db188a..26b11c06ba 100644
          RolloutItem::TurnContext(_) => "turn_context".to_string(),
          RolloutItem::WorldState(_) => "world_state".to_string(),
 diff --git a/codex-rs/rollout/src/policy.rs b/codex-rs/rollout/src/policy.rs
-index 62e9ba5976..842f9e4cf9 100644
+index 848a1821c5..92e69c4781 100644
 --- a/codex-rs/rollout/src/policy.rs
 +++ b/codex-rs/rollout/src/policy.rs
 @@ -16,6 +16,7 @@ pub fn is_persisted_rollout_item(item: &RolloutItem, history_mode: ThreadHistory
@@ -4898,7 +4831,7 @@ index 62e9ba5976..842f9e4cf9 100644
      use codex_protocol::protocol::RawResponseCompletedEvent;
      use codex_protocol::protocol::RawResponseItemEvent;
      use codex_protocol::protocol::ResponseOutputBytesDeltaEvent;
-@@ -288,4 +294,45 @@ mod tests {
+@@ -289,4 +295,45 @@ mod tests {
              ThreadHistoryMode::Paginated
          ));
      }
@@ -5012,15 +4945,3 @@ index 15da35e20f..1cbed34938 100644
                  | RolloutItem::Compacted(_)
                  | RolloutItem::WorldState(_) => {}
              }
-diff --git a/codex-rs/tools/src/tool_config_tests.rs b/codex-rs/tools/src/tool_config_tests.rs
-index b4e6d75cd4..d720ce0c11 100644
---- a/codex-rs/tools/src/tool_config_tests.rs
-+++ b/codex-rs/tools/src/tool_config_tests.rs
-@@ -18,6 +18,7 @@ fn model_with_shell_type(shell_type: ConfigShellToolType) -> ModelInfo {
-         supported_reasoning_levels: Vec::new(),
-         shell_type,
-         visibility: ModelVisibility::List,
-+        enabled: true,
-         supported_in_api: true,
-         priority: 0,
-         additional_speed_tiers: Vec::new(),
