@@ -1,0 +1,893 @@
+diff --git a/codex-rs/app-server/src/bespoke_event_handling.rs b/codex-rs/app-server/src/bespoke_event_handling.rs
+index c2e2bc99a5..c74f64122e 100644
+--- a/codex-rs/app-server/src/bespoke_event_handling.rs
++++ b/codex-rs/app-server/src/bespoke_event_handling.rs
+@@ -893,6 +893,7 @@ pub(crate) async fn apply_bespoke_event_handling(
+         | EventMsg::ReasoningContentDelta(_)
+         | EventMsg::ReasoningRawContentDelta(_)
+         | EventMsg::ResponseOutputBytesDelta(_)
++        | EventMsg::PromptAssistantProgress(_)
+         | EventMsg::AgentReasoningSectionBreak(_)) => {
+             let notification = item_event_to_server_notification(
+                 msg,
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index d870cf2f4a..0410b95cd0 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -42,6 +42,7 @@ use crate::request_processors::MarketplaceRequestProcessor;
+ use crate::request_processors::McpRequestProcessor;
+ use crate::request_processors::PluginRequestProcessor;
+ use crate::request_processors::ProcessExecRequestProcessor;
++use crate::request_processors::PromptAssistantRequestProcessor;
+ use crate::request_processors::RemoteControlRequestProcessor;
+ use crate::request_processors::SearchRequestProcessor;
+ use crate::request_processors::ThreadGoalRequestProcessor;
+@@ -136,6 +137,7 @@ pub(crate) struct MessageProcessor {
+     marketplace_processor: MarketplaceRequestProcessor,
+     mcp_processor: McpRequestProcessor,
+     plugin_processor: PluginRequestProcessor,
++    prompt_assistant_processor: PromptAssistantRequestProcessor,
+     remote_control_processor: RemoteControlRequestProcessor,
+     search_processor: SearchRequestProcessor,
+     thread_goal_processor: ThreadGoalRequestProcessor,
+@@ -438,6 +440,8 @@ impl MessageProcessor {
+             workspace_settings_cache,
+             on_effective_plugins_changed,
+         );
++        let prompt_assistant_processor =
++            PromptAssistantRequestProcessor::new(Arc::clone(&thread_manager));
+         let remote_control_processor = RemoteControlRequestProcessor::new(remote_control_handle);
+         let search_processor = SearchRequestProcessor::new(outgoing.clone());
+         let thread_goal_processor = ThreadGoalRequestProcessor::new(
+@@ -535,6 +539,7 @@ impl MessageProcessor {
+             marketplace_processor,
+             mcp_processor,
+             plugin_processor,
++            prompt_assistant_processor,
+             remote_control_processor,
+             search_processor,
+             thread_goal_processor,
+@@ -1439,6 +1444,31 @@ impl MessageProcessor {
+             ClientRequest::ReviewStart { params, .. } => {
+                 self.turn_processor.review_start(&request_id, params).await
+             }
++            ClientRequest::PromptAssistantStart { params, .. } => self
++                .prompt_assistant_processor
++                .start(params)
++                .await
++                .map(|response| Some(response.into())),
++            ClientRequest::PromptAssistantRefine { params, .. } => self
++                .prompt_assistant_processor
++                .refine(params)
++                .await
++                .map(|response| Some(response.into())),
++            ClientRequest::PromptAssistantReview { params, .. } => self
++                .prompt_assistant_processor
++                .review(params)
++                .await
++                .map(|response| Some(response.into())),
++            ClientRequest::PromptAssistantApply { params, .. } => self
++                .prompt_assistant_processor
++                .apply(params)
++                .await
++                .map(|response| Some(response.into())),
++            ClientRequest::PromptAssistantCancel { params, .. } => self
++                .prompt_assistant_processor
++                .cancel(params)
++                .await
++                .map(|response| Some(response.into())),
+             ClientRequest::McpServerOauthLogin { params, .. } => {
+                 self.mcp_processor.mcp_server_oauth_login(params).await
+             }
+diff --git a/codex-rs/app-server/src/models.rs b/codex-rs/app-server/src/models.rs
+index 36219e886f..998ea55791 100644
+--- a/codex-rs/app-server/src/models.rs
++++ b/codex-rs/app-server/src/models.rs
+@@ -39,6 +39,7 @@ fn model_from_preset(preset: ModelPreset) -> Model {
+         display_name: preset.display_name.to_string(),
+         description: preset.description.to_string(),
+         hidden: !preset.show_in_picker,
++        visibility: preset.visibility,
+         supported_reasoning_efforts: reasoning_efforts_from_preset(
+             preset.supported_reasoning_efforts,
+         ),
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+index dbd410a272..217efbf0b2 100644
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -543,6 +543,7 @@ mod marketplace_processor;
+ mod mcp_processor;
+ mod plugins;
+ mod process_exec_processor;
++mod prompt_assistant_processor;
+ mod remote_control_processor;
+ mod search;
+ mod thread_fork_goal;
+@@ -565,6 +566,7 @@ pub(crate) use marketplace_processor::MarketplaceRequestProcessor;
+ pub(crate) use mcp_processor::McpRequestProcessor;
+ pub(crate) use plugins::PluginRequestProcessor;
+ pub(crate) use process_exec_processor::ProcessExecRequestProcessor;
++pub(crate) use prompt_assistant_processor::PromptAssistantRequestProcessor;
+ pub(crate) use remote_control_processor::RemoteControlRequestProcessor;
+ pub(crate) use search::SearchRequestProcessor;
+ pub(crate) use thread_goal_processor::ThreadGoalRequestProcessor;
+diff --git a/codex-rs/app-server/src/request_processors/prompt_assistant_processor.rs b/codex-rs/app-server/src/request_processors/prompt_assistant_processor.rs
+new file mode 100644
+index 0000000000..4de549f4e1
+--- /dev/null
++++ b/codex-rs/app-server/src/request_processors/prompt_assistant_processor.rs
+@@ -0,0 +1,227 @@
++use std::sync::Arc;
++
++use codex_app_server_protocol::JSONRPCErrorError;
++use codex_app_server_protocol::PromptAssistantApplyParams;
++use codex_app_server_protocol::PromptAssistantApplyResponse;
++use codex_app_server_protocol::PromptAssistantCancelParams;
++use codex_app_server_protocol::PromptAssistantCancelResponse;
++use codex_app_server_protocol::PromptAssistantOperation as ApiPromptAssistantOperation;
++use codex_app_server_protocol::PromptAssistantRefineParams;
++use codex_app_server_protocol::PromptAssistantRefineResponse;
++use codex_app_server_protocol::PromptAssistantReview as ApiPromptAssistantReview;
++use codex_app_server_protocol::PromptAssistantReviewDisposition;
++use codex_app_server_protocol::PromptAssistantReviewParams;
++use codex_app_server_protocol::PromptAssistantReviewResponse;
++use codex_app_server_protocol::PromptAssistantStartOperation;
++use codex_app_server_protocol::PromptAssistantStartParams;
++use codex_app_server_protocol::PromptAssistantStartResponse;
++use codex_app_server_protocol::PromptAssistantWorkspace;
++use codex_core::CodexThread;
++use codex_core::ThreadManager;
++use codex_core::prompt_assistant::PromptAssistantApplyRequest;
++use codex_core::prompt_assistant::PromptAssistantCancelRequest;
++use codex_core::prompt_assistant::PromptAssistantError;
++use codex_core::prompt_assistant::PromptAssistantOperation;
++use codex_core::prompt_assistant::PromptAssistantRefineRequest;
++use codex_core::prompt_assistant::PromptAssistantRequest;
++use codex_core::prompt_assistant::PromptAssistantResult;
++use codex_core::prompt_assistant::PromptAssistantReviewRequest;
++use codex_core::prompt_assistant::PromptAssistantReviewStatus;
++use codex_protocol::ThreadId;
++use uuid::Uuid;
++
++use crate::error_code::internal_error;
++use crate::error_code::invalid_request;
++
++#[derive(Clone)]
++pub(crate) struct PromptAssistantRequestProcessor {
++    thread_manager: Arc<ThreadManager>,
++}
++
++impl PromptAssistantRequestProcessor {
++    pub(crate) fn new(thread_manager: Arc<ThreadManager>) -> Self {
++        Self { thread_manager }
++    }
++
++    pub(crate) async fn start(
++        &self,
++        params: PromptAssistantStartParams,
++    ) -> Result<PromptAssistantStartResponse, JSONRPCErrorError> {
++        let (thread_id, thread) = self.loaded_thread(&params.thread_id).await?;
++        let result = thread
++            .start_prompt_assistant(PromptAssistantRequest {
++                workspace_id: params
++                    .workspace_id
++                    .unwrap_or_else(|| Uuid::now_v7().to_string()),
++                operation: operation_to_core(params.operation),
++                source: params.input,
++                model: params.model,
++            })
++            .await
++            .map_err(prompt_assistant_error)?;
++        Ok(PromptAssistantStartResponse {
++            workspace: workspace(thread_id, result),
++        })
++    }
++
++    pub(crate) async fn refine(
++        &self,
++        params: PromptAssistantRefineParams,
++    ) -> Result<PromptAssistantRefineResponse, JSONRPCErrorError> {
++        let (thread_id, thread) = self.loaded_thread(&params.thread_id).await?;
++        let result = thread
++            .refine_prompt_assistant(PromptAssistantRefineRequest {
++                workspace_id: params.workspace_id,
++                generation: params.generation,
++                instruction: params.instructions,
++            })
++            .await
++            .map_err(prompt_assistant_error)?;
++        Ok(PromptAssistantRefineResponse {
++            workspace: workspace(thread_id, result),
++        })
++    }
++
++    pub(crate) async fn review(
++        &self,
++        params: PromptAssistantReviewParams,
++    ) -> Result<PromptAssistantReviewResponse, JSONRPCErrorError> {
++        let (thread_id, thread) = self.loaded_thread(&params.thread_id).await?;
++        let result = thread
++            .review_prompt_assistant(PromptAssistantReviewRequest {
++                workspace_id: params.workspace_id,
++                generation: params.generation,
++                candidate_hash: params.candidate_hash,
++            })
++            .await
++            .map_err(prompt_assistant_error)?;
++        Ok(PromptAssistantReviewResponse {
++            workspace: workspace(thread_id, result),
++        })
++    }
++
++    pub(crate) async fn apply(
++        &self,
++        params: PromptAssistantApplyParams,
++    ) -> Result<PromptAssistantApplyResponse, JSONRPCErrorError> {
++        let (_, thread) = self.loaded_thread(&params.thread_id).await?;
++        let result = thread
++            .apply_prompt_assistant(PromptAssistantApplyRequest {
++                workspace_id: params.workspace_id,
++                generation: params.generation,
++                candidate_hash: params.candidate_hash,
++            })
++            .await
++            .map_err(prompt_assistant_error)?;
++        Ok(PromptAssistantApplyResponse {
++            workspace_id: result.workspace_id,
++            generation: result.generation,
++            candidate: result.candidate,
++            candidate_hash: result.candidate_hash,
++            applied: true,
++        })
++    }
++
++    pub(crate) async fn cancel(
++        &self,
++        params: PromptAssistantCancelParams,
++    ) -> Result<PromptAssistantCancelResponse, JSONRPCErrorError> {
++        let (_, thread) = self.loaded_thread(&params.thread_id).await?;
++        let workspace_id = params.workspace_id;
++        let generation = params.generation;
++        thread
++            .cancel_prompt_assistant(PromptAssistantCancelRequest {
++                workspace_id: workspace_id.clone(),
++                generation,
++            })
++            .await
++            .map_err(prompt_assistant_error)?;
++        Ok(PromptAssistantCancelResponse {
++            workspace_id,
++            generation,
++            cancelled: true,
++        })
++    }
++
++    async fn loaded_thread(
++        &self,
++        thread_id: &str,
++    ) -> Result<(ThreadId, Arc<CodexThread>), JSONRPCErrorError> {
++        let thread_id = ThreadId::from_string(thread_id)
++            .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
++        let thread = self
++            .thread_manager
++            .get_thread(thread_id)
++            .await
++            .map_err(|_| invalid_request(format!("thread not found: {thread_id}")))?;
++        Ok((thread_id, thread))
++    }
++}
++
++fn workspace(thread_id: ThreadId, result: PromptAssistantResult) -> PromptAssistantWorkspace {
++    PromptAssistantWorkspace {
++        thread_id: thread_id.to_string(),
++        workspace_id: result.workspace_id,
++        child_thread_id: result.child_thread_id.to_string(),
++        operation: operation_to_api(result.operation),
++        model: result.model,
++        reasoning_effort: result.reasoning_effort,
++        generation: result.generation,
++        candidate: result.candidate,
++        candidate_hash: result.candidate_hash,
++        usage: result.usage.map(Into::into),
++        review: Some(ApiPromptAssistantReview {
++            disposition: match result.review.status {
++                PromptAssistantReviewStatus::Pass => PromptAssistantReviewDisposition::Pass,
++                PromptAssistantReviewStatus::Revised => PromptAssistantReviewDisposition::Revised,
++                PromptAssistantReviewStatus::Blocked => PromptAssistantReviewDisposition::Blocked,
++            },
++            rationale: result.review.rationale,
++        }),
++    }
++}
++
++fn operation_to_core(operation: PromptAssistantStartOperation) -> PromptAssistantOperation {
++    match operation {
++        PromptAssistantStartOperation::Translate => PromptAssistantOperation::Translate,
++        PromptAssistantStartOperation::Generate => PromptAssistantOperation::Generate,
++    }
++}
++
++fn operation_to_api(operation: PromptAssistantOperation) -> ApiPromptAssistantOperation {
++    match operation {
++        PromptAssistantOperation::Translate => ApiPromptAssistantOperation::Translate,
++        PromptAssistantOperation::Generate => ApiPromptAssistantOperation::Generate,
++        PromptAssistantOperation::Refine => ApiPromptAssistantOperation::Refine,
++        PromptAssistantOperation::Review => ApiPromptAssistantOperation::Review,
++    }
++}
++
++fn prompt_assistant_error(error: PromptAssistantError) -> JSONRPCErrorError {
++    match error {
++        PromptAssistantError::InvalidInput(_)
++        | PromptAssistantError::WorkspaceNotFound(_)
++        | PromptAssistantError::Cancelled
++        | PromptAssistantError::Blocked => invalid_request(error.to_string()),
++        PromptAssistantError::Failed(_) => internal_error(error.to_string()),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use pretty_assertions::assert_eq;
++
++    use super::*;
++
++    #[test]
++    fn client_and_model_failures_use_distinct_json_rpc_error_classes() {
++        assert_eq!(
++            prompt_assistant_error(PromptAssistantError::InvalidInput("stale".into())).code,
++            crate::error_code::INVALID_REQUEST_ERROR_CODE
++        );
++        assert_eq!(
++            prompt_assistant_error(PromptAssistantError::Failed("upstream".into())).code,
++            crate::error_code::INTERNAL_ERROR_CODE
++        );
++    }
++}
+diff --git a/codex-rs/app-server/tests/common/models_cache.rs b/codex-rs/app-server/tests/common/models_cache.rs
+index 99b7251c1c..c8f2be2224 100644
+--- a/codex-rs/app-server/tests/common/models_cache.rs
++++ b/codex-rs/app-server/tests/common/models_cache.rs
+@@ -26,6 +26,7 @@ fn preset_to_info(preset: &ModelPreset, priority: i32) -> ModelInfo {
+         } else {
+             ModelVisibility::Hide
+         },
++        enabled: true,
+         supported_in_api: preset.supported_in_api,
+         priority,
+         additional_speed_tiers: preset.additional_speed_tiers.clone(),
+diff --git a/codex-rs/app-server/tests/common/test_app_server.rs b/codex-rs/app-server/tests/common/test_app_server.rs
+index ce821f8dc6..c172c5ec0c 100644
+--- a/codex-rs/app-server/tests/common/test_app_server.rs
++++ b/codex-rs/app-server/tests/common/test_app_server.rs
+@@ -74,6 +74,11 @@ use codex_app_server_protocol::ProcessKillParams;
+ use codex_app_server_protocol::ProcessResizePtyParams;
+ use codex_app_server_protocol::ProcessSpawnParams;
+ use codex_app_server_protocol::ProcessWriteStdinParams;
++use codex_app_server_protocol::PromptAssistantApplyParams;
++use codex_app_server_protocol::PromptAssistantCancelParams;
++use codex_app_server_protocol::PromptAssistantRefineParams;
++use codex_app_server_protocol::PromptAssistantReviewParams;
++use codex_app_server_protocol::PromptAssistantStartParams;
+ use codex_app_server_protocol::RemoteControlClientsListParams;
+ use codex_app_server_protocol::RemoteControlClientsRevokeParams;
+ use codex_app_server_protocol::RemoteControlPairingStartParams;
+@@ -1262,6 +1267,55 @@ impl TestAppServer {
+         self.send_request("review/start", params).await
+     }
+ 
++    pub async fn send_prompt_assistant_start_request(
++        &mut self,
++        params: PromptAssistantStartParams,
++    ) -> anyhow::Result<i64> {
++        self.send_request("promptAssistant/start", Some(serde_json::to_value(params)?))
++            .await
++    }
++
++    pub async fn send_prompt_assistant_refine_request(
++        &mut self,
++        params: PromptAssistantRefineParams,
++    ) -> anyhow::Result<i64> {
++        self.send_request(
++            "promptAssistant/refine",
++            Some(serde_json::to_value(params)?),
++        )
++        .await
++    }
++
++    pub async fn send_prompt_assistant_review_request(
++        &mut self,
++        params: PromptAssistantReviewParams,
++    ) -> anyhow::Result<i64> {
++        self.send_request(
++            "promptAssistant/review",
++            Some(serde_json::to_value(params)?),
++        )
++        .await
++    }
++
++    pub async fn send_prompt_assistant_apply_request(
++        &mut self,
++        params: PromptAssistantApplyParams,
++    ) -> anyhow::Result<i64> {
++        self.send_request("promptAssistant/apply", Some(serde_json::to_value(params)?))
++            .await
++    }
++
++    pub async fn send_prompt_assistant_cancel_request(
++        &mut self,
++        params: PromptAssistantCancelParams,
++    ) -> anyhow::Result<i64> {
++        self.send_request(
++            "promptAssistant/cancel",
++            Some(serde_json::to_value(params)?),
++        )
++        .await
++    }
++
+     pub async fn send_windows_sandbox_setup_start_request(
+         &mut self,
+         params: WindowsSandboxSetupStartParams,
+diff --git a/codex-rs/app-server/tests/suite/v2/mod.rs b/codex-rs/app-server/tests/suite/v2/mod.rs
+index 6566f0459e..631c5393c6 100644
+--- a/codex-rs/app-server/tests/suite/v2/mod.rs
++++ b/codex-rs/app-server/tests/suite/v2/mod.rs
+@@ -50,6 +50,7 @@ mod plugin_read;
+ mod plugin_share;
+ mod plugin_uninstall;
+ mod process_exec;
++mod prompt_assistant;
+ mod rate_limit_reset_credits;
+ mod rate_limits;
+ mod realtime_conversation;
+diff --git a/codex-rs/app-server/tests/suite/v2/model_list.rs b/codex-rs/app-server/tests/suite/v2/model_list.rs
+index e34662e5b4..56daf51554 100644
+--- a/codex-rs/app-server/tests/suite/v2/model_list.rs
++++ b/codex-rs/app-server/tests/suite/v2/model_list.rs
+@@ -49,6 +49,7 @@ fn model_from_preset(preset: &ModelPreset) -> Model {
+         display_name: preset.display_name.clone(),
+         description: preset.description.clone(),
+         hidden: !preset.show_in_picker,
++        visibility: preset.visibility,
+         supported_reasoning_efforts: preset
+             .supported_reasoning_efforts
+             .iter()
+diff --git a/codex-rs/app-server/tests/suite/v2/prompt_assistant.rs b/codex-rs/app-server/tests/suite/v2/prompt_assistant.rs
+new file mode 100644
+index 0000000000..526e7305ae
+--- /dev/null
++++ b/codex-rs/app-server/tests/suite/v2/prompt_assistant.rs
+@@ -0,0 +1,433 @@
++use std::path::Path;
++use std::time::Duration;
++
++use anyhow::Result;
++use app_test_support::TestAppServer;
++use app_test_support::to_response;
++use app_test_support::write_models_cache_with_models;
++use codex_app_server_protocol::JSONRPCError;
++use codex_app_server_protocol::JSONRPCResponse;
++use codex_app_server_protocol::PromptAssistantApplyParams;
++use codex_app_server_protocol::PromptAssistantApplyResponse;
++use codex_app_server_protocol::PromptAssistantCancelParams;
++use codex_app_server_protocol::PromptAssistantCancelResponse;
++use codex_app_server_protocol::PromptAssistantOperation;
++use codex_app_server_protocol::PromptAssistantProgressNotification;
++use codex_app_server_protocol::PromptAssistantRefineParams;
++use codex_app_server_protocol::PromptAssistantRefineResponse;
++use codex_app_server_protocol::PromptAssistantReviewDisposition;
++use codex_app_server_protocol::PromptAssistantReviewParams;
++use codex_app_server_protocol::PromptAssistantReviewResponse;
++use codex_app_server_protocol::PromptAssistantStartOperation;
++use codex_app_server_protocol::PromptAssistantStartParams;
++use codex_app_server_protocol::PromptAssistantStartResponse;
++use codex_app_server_protocol::RequestId;
++use codex_app_server_protocol::ThreadStartParams;
++use codex_app_server_protocol::ThreadStartResponse;
++use codex_protocol::ThreadId;
++use codex_protocol::openai_models::ModelVisibility;
++use codex_protocol::openai_models::ModelsResponse;
++use codex_protocol::protocol::TokenUsage;
++use core_test_support::responses::ev_assistant_message;
++use core_test_support::responses::ev_response_created;
++use core_test_support::responses::mount_models_once;
++use core_test_support::responses::mount_response_once;
++use core_test_support::responses::mount_sse_sequence;
++use core_test_support::responses::sse;
++use core_test_support::responses::sse_response;
++use core_test_support::responses::start_mock_server;
++use pretty_assertions::assert_eq;
++use serde_json::Value;
++use tempfile::TempDir;
++use tokio::time::timeout;
++
++const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
++const HIDDEN_MODEL: &str = "hidden-prompt-specialist";
++const WORKSPACE_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
++const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
++
++fn completed_with_usage(response_id: &str, usage: &TokenUsage) -> Value {
++    serde_json::json!({
++        "type": "response.completed",
++        "response": {
++            "id": response_id,
++            "usage": {
++                "input_tokens": usage.input_tokens,
++                "input_tokens_details": {
++                    "cached_tokens": usage.cached_input_tokens,
++                    "cache_write_tokens": usage.cache_write_input_tokens
++                },
++                "output_tokens": usage.output_tokens,
++                "output_tokens_details": {
++                    "reasoning_tokens": usage.reasoning_output_tokens
++                },
++                "total_tokens": usage.total_tokens
++            }
++        }
++    })
++}
++
++fn successful_response(
++    response_id: &str,
++    candidate: &str,
++    disposition: &str,
++    usage: &TokenUsage,
++) -> String {
++    let output = serde_json::json!({
++        "candidate": candidate,
++        "review": {"status": disposition, "rationale": "Intent preserved."}
++    })
++    .to_string();
++    sse(vec![
++        ev_response_created(response_id),
++        ev_assistant_message(&format!("message-{response_id}"), &output),
++        completed_with_usage(response_id, usage),
++    ])
++}
++
++fn prompt_catalog() -> ModelsResponse {
++    let mut visible = codex_models_manager::model_info::model_info_from_slug("mock-model");
++    visible.priority = 0;
++    visible.visibility = ModelVisibility::List;
++    visible.enabled = true;
++    let mut hidden = visible.clone();
++    hidden.slug = HIDDEN_MODEL.to_string();
++    hidden.display_name = "Prompt specialist".to_string();
++    hidden.priority = 1;
++    hidden.visibility = ModelVisibility::Hide;
++    hidden.enabled = true;
++    hidden.base_instructions = "selected hidden model instructions".to_string();
++    ModelsResponse {
++        models: vec![visible, hidden],
++    }
++}
++
++fn write_config(codex_home: &Path, server_uri: &str) -> std::io::Result<()> {
++    std::fs::write(
++        codex_home.join("config.toml"),
++        format!(
++            r#"
++model = "mock-model"
++approval_policy = "never"
++sandbox_mode = "read-only"
++model_provider = "mock_provider"
++
++[model_providers.mock_provider]
++name = "Mock provider"
++base_url = "{server_uri}/v1"
++wire_api = "responses"
++request_max_retries = 0
++stream_max_retries = 0
++supports_websockets = false
++"#
++        ),
++    )
++}
++
++async fn start_parent_thread(mcp: &mut TestAppServer) -> Result<String> {
++    let request_id = mcp
++        .send_thread_start_request(ThreadStartParams {
++            model: Some("mock-model".to_string()),
++            ..Default::default()
++        })
++        .await?;
++    let response = timeout(
++        DEFAULT_TIMEOUT,
++        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
++    )
++    .await??;
++    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(response)?;
++    Ok(thread.id)
++}
++
++async fn read_prompt_progress(
++    mcp: &mut TestAppServer,
++    thread_id: &str,
++    workspace_id: &str,
++    require_nonzero: bool,
++) -> Result<PromptAssistantProgressNotification> {
++    let notification = timeout(
++        DEFAULT_TIMEOUT,
++        mcp.read_stream_until_matching_notification("Prompt Assistant progress", |notification| {
++            if notification.method != "promptAssistant/progress" {
++                return false;
++            }
++            let Some(params) = notification.params.as_ref() else {
++                return false;
++            };
++            params["threadId"] == thread_id
++                && params["workspaceId"] == workspace_id
++                && (!require_nonzero || params["byteCount"].as_u64().is_some_and(|bytes| bytes > 0))
++        }),
++    )
++    .await??;
++    Ok(serde_json::from_value(
++        notification.params.expect("progress params"),
++    )?)
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn prompt_assistant_rpc_chain_preserves_progress_usage_and_validated_apply() -> Result<()> {
++    let server = start_mock_server().await;
++    let catalog = prompt_catalog();
++    mount_models_once(&server, catalog.clone()).await;
++    let usages = [
++        TokenUsage {
++            input_tokens: 100,
++            cached_input_tokens: 60,
++            cache_write_input_tokens: 7,
++            output_tokens: 20,
++            reasoning_output_tokens: 12,
++            total_tokens: 120,
++        },
++        TokenUsage {
++            input_tokens: 90,
++            cached_input_tokens: 70,
++            cache_write_input_tokens: 3,
++            output_tokens: 18,
++            reasoning_output_tokens: 9,
++            total_tokens: 108,
++        },
++        TokenUsage {
++            input_tokens: 95,
++            cached_input_tokens: 75,
++            cache_write_input_tokens: 2,
++            output_tokens: 17,
++            reasoning_output_tokens: 10,
++            total_tokens: 112,
++        },
++    ];
++    let responses = mount_sse_sequence(
++        &server,
++        vec![
++            successful_response("response-start", "candidate one", "pass", &usages[0]),
++            successful_response("response-refine", "candidate two", "revised", &usages[1]),
++            successful_response("response-review", "candidate two", "pass", &usages[2]),
++        ],
++    )
++    .await;
++
++    let codex_home = TempDir::new()?;
++    write_models_cache_with_models(codex_home.path(), catalog.models)?;
++    write_config(codex_home.path(), &server.uri())?;
++    let mut mcp = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .without_auto_env()
++        .build()
++        .await?;
++    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
++
++    let missing_thread = ThreadId::new().to_string();
++    let missing_id = mcp
++        .send_prompt_assistant_start_request(PromptAssistantStartParams {
++            thread_id: missing_thread,
++            operation: PromptAssistantStartOperation::Generate,
++            input: "intent".to_string(),
++            model: Some(HIDDEN_MODEL.to_string()),
++            workspace_id: Some(WORKSPACE_ID.to_string()),
++        })
++        .await?;
++    let missing: JSONRPCError = timeout(
++        DEFAULT_TIMEOUT,
++        mcp.read_stream_until_error_message(RequestId::Integer(missing_id)),
++    )
++    .await??;
++    assert_eq!(missing.error.code, INVALID_REQUEST_ERROR_CODE);
++    assert!(missing.error.message.contains("thread not found"));
++    assert!(responses.requests().is_empty());
++
++    let thread_id = start_parent_thread(&mut mcp).await?;
++    let start_id = mcp
++        .send_prompt_assistant_start_request(PromptAssistantStartParams {
++            thread_id: thread_id.clone(),
++            operation: PromptAssistantStartOperation::Generate,
++            input: "initial intent".to_string(),
++            model: Some(HIDDEN_MODEL.to_string()),
++            workspace_id: Some(WORKSPACE_ID.to_string()),
++        })
++        .await?;
++    let progress = read_prompt_progress(&mut mcp, &thread_id, WORKSPACE_ID, true).await?;
++    assert_eq!(progress.generation, 1);
++    assert!(!progress.reset);
++    let start_response: JSONRPCResponse = timeout(
++        DEFAULT_TIMEOUT,
++        mcp.read_stream_until_response_message(RequestId::Integer(start_id)),
++    )
++    .await??;
++    let start = to_response::<PromptAssistantStartResponse>(start_response)?.workspace;
++    assert_eq!(start.operation, PromptAssistantOperation::Generate);
++    assert_eq!(start.usage, Some(usages[0].clone().into()));
++
++    let refine_id = mcp
++        .send_prompt_assistant_refine_request(PromptAssistantRefineParams {
++            thread_id: thread_id.clone(),
++            workspace_id: WORKSPACE_ID.to_string(),
++            generation: start.generation,
++            instructions: "make it more precise".to_string(),
++        })
++        .await?;
++    let refine_response: JSONRPCResponse = timeout(
++        DEFAULT_TIMEOUT,
++        mcp.read_stream_until_response_message(RequestId::Integer(refine_id)),
++    )
++    .await??;
++    let refine = to_response::<PromptAssistantRefineResponse>(refine_response)?.workspace;
++    assert_eq!(refine.operation, PromptAssistantOperation::Refine);
++    assert_eq!(refine.usage, Some(usages[1].clone().into()));
++
++    let review_id = mcp
++        .send_prompt_assistant_review_request(PromptAssistantReviewParams {
++            thread_id: thread_id.clone(),
++            workspace_id: WORKSPACE_ID.to_string(),
++            generation: refine.generation,
++            candidate_hash: refine.candidate_hash.clone(),
++        })
++        .await?;
++    let review_response: JSONRPCResponse = timeout(
++        DEFAULT_TIMEOUT,
++        mcp.read_stream_until_response_message(RequestId::Integer(review_id)),
++    )
++    .await??;
++    let review = to_response::<PromptAssistantReviewResponse>(review_response)?.workspace;
++    assert_eq!(review.operation, PromptAssistantOperation::Review);
++    assert_eq!(review.usage, Some(usages[2].clone().into()));
++    assert_eq!(
++        review.review.as_ref().map(|review| review.disposition),
++        Some(PromptAssistantReviewDisposition::Pass)
++    );
++
++    assert_eq!(start.workspace_id, refine.workspace_id);
++    assert_eq!(start.workspace_id, review.workspace_id);
++    assert_eq!(start.child_thread_id, refine.child_thread_id);
++    assert_eq!(start.child_thread_id, review.child_thread_id);
++    assert_eq!(start.model, HIDDEN_MODEL);
++    assert_eq!(start.model, refine.model);
++    assert_eq!(start.model, review.model);
++    assert_eq!(
++        [start.generation, refine.generation, review.generation],
++        [1, 2, 3]
++    );
++
++    let stale_apply_id = mcp
++        .send_prompt_assistant_apply_request(PromptAssistantApplyParams {
++            thread_id: thread_id.clone(),
++            workspace_id: WORKSPACE_ID.to_string(),
++            generation: refine.generation,
++            candidate_hash: refine.candidate_hash,
++        })
++        .await?;
++    let stale_apply: JSONRPCError = timeout(
++        DEFAULT_TIMEOUT,
++        mcp.read_stream_until_error_message(RequestId::Integer(stale_apply_id)),
++    )
++    .await??;
++    assert_eq!(stale_apply.error.code, INVALID_REQUEST_ERROR_CODE);
++    assert!(stale_apply.error.message.contains("generation or hash"));
++
++    let apply_id = mcp
++        .send_prompt_assistant_apply_request(PromptAssistantApplyParams {
++            thread_id,
++            workspace_id: WORKSPACE_ID.to_string(),
++            generation: review.generation,
++            candidate_hash: review.candidate_hash.clone(),
++        })
++        .await?;
++    let apply_response: JSONRPCResponse = timeout(
++        DEFAULT_TIMEOUT,
++        mcp.read_stream_until_response_message(RequestId::Integer(apply_id)),
++    )
++    .await??;
++    let applied = to_response::<PromptAssistantApplyResponse>(apply_response)?;
++    assert!(applied.applied);
++    assert_eq!(applied.generation, review.generation);
++    assert_eq!(applied.candidate, review.candidate);
++    assert_eq!(applied.candidate_hash, review.candidate_hash);
++    assert_eq!(responses.requests().len(), 3);
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn prompt_assistant_cancel_interrupts_an_inflight_start() -> Result<()> {
++    let server = start_mock_server().await;
++    let catalog = prompt_catalog();
++    mount_models_once(&server, catalog.clone()).await;
++    let delayed = mount_response_once(
++        &server,
++        sse_response(successful_response(
++            "delayed-response",
++            "candidate",
++            "pass",
++            &TokenUsage::default(),
++        ))
++        .set_delay(Duration::from_secs(30)),
++    )
++    .await;
++
++    let codex_home = TempDir::new()?;
++    write_models_cache_with_models(codex_home.path(), catalog.models)?;
++    write_config(codex_home.path(), &server.uri())?;
++    let mut mcp = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .without_auto_env()
++        .build()
++        .await?;
++    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
++    let thread_id = start_parent_thread(&mut mcp).await?;
++
++    let start_id = mcp
++        .send_prompt_assistant_start_request(PromptAssistantStartParams {
++            thread_id: thread_id.clone(),
++            operation: PromptAssistantStartOperation::Generate,
++            input: "delayed intent".to_string(),
++            model: Some(HIDDEN_MODEL.to_string()),
++            workspace_id: Some(WORKSPACE_ID.to_string()),
++        })
++        .await?;
++    let reset = read_prompt_progress(&mut mcp, &thread_id, WORKSPACE_ID, false).await?;
++    assert!(reset.reset);
++    timeout(DEFAULT_TIMEOUT, async {
++        while delayed.requests().is_empty() {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await?;
++
++    let stale_id = mcp
++        .send_prompt_assistant_cancel_request(PromptAssistantCancelParams {
++            thread_id: thread_id.clone(),
++            workspace_id: WORKSPACE_ID.to_string(),
++            generation: reset.generation.saturating_sub(1),
++        })
++        .await?;
++    let stale: JSONRPCError = timeout(
++        DEFAULT_TIMEOUT,
++        mcp.read_stream_until_error_message(RequestId::Integer(stale_id)),
++    )
++    .await??;
++    assert_eq!(stale.error.code, INVALID_REQUEST_ERROR_CODE);
++
++    let cancel_id = mcp
++        .send_prompt_assistant_cancel_request(PromptAssistantCancelParams {
++            thread_id,
++            workspace_id: WORKSPACE_ID.to_string(),
++            generation: reset.generation,
++        })
++        .await?;
++    let cancel_response: JSONRPCResponse = timeout(
++        DEFAULT_TIMEOUT,
++        mcp.read_stream_until_response_message(RequestId::Integer(cancel_id)),
++    )
++    .await??;
++    let cancelled = to_response::<PromptAssistantCancelResponse>(cancel_response)?;
++    assert!(cancelled.cancelled);
++    assert_eq!(cancelled.generation, reset.generation);
++
++    let start_error: JSONRPCError = timeout(
++        DEFAULT_TIMEOUT,
++        mcp.read_stream_until_error_message(RequestId::Integer(start_id)),
++    )
++    .await??;
++    assert_eq!(start_error.error.code, INVALID_REQUEST_ERROR_CODE);
++    assert!(start_error.error.message.contains("was cancelled"));
++    Ok(())
++}
