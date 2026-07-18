@@ -1,0 +1,294 @@
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index 58774d0c9f..8fe1ccf233 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -3588,6 +3588,7 @@ dependencies = [
+  "tokio",
+  "tokio-util",
+  "tracing",
++ "tracing-test",
+ ]
+ 
+ [[package]]
+diff --git a/codex-rs/models-manager/Cargo.toml b/codex-rs/models-manager/Cargo.toml
+index 0edb0ce453..66483c66ce 100644
+--- a/codex-rs/models-manager/Cargo.toml
++++ b/codex-rs/models-manager/Cargo.toml
+@@ -31,3 +31,4 @@ tracing = { workspace = true, features = ["log"] }
+ pretty_assertions = { workspace = true }
+ serde_json = { workspace = true }
+ tempfile = { workspace = true }
++tracing-test = { workspace = true, features = ["no-env-filter"] }
+diff --git a/codex-rs/models-manager/src/manager.rs b/codex-rs/models-manager/src/manager.rs
+index afe78e1523..2fbc91f3ad 100644
+--- a/codex-rs/models-manager/src/manager.rs
++++ b/codex-rs/models-manager/src/manager.rs
+@@ -25,6 +25,7 @@ use tokio::sync::Semaphore;
+ use tokio::sync::TryLockError;
+ use tokio_util::task::AbortOnDropHandle;
+ use tracing::Instrument as _;
++use tracing::debug;
+ use tracing::error;
+ use tracing::info;
+ 
+@@ -390,7 +391,11 @@ impl OpenAiModelsManager {
+             .refresh_available_models(refresh_strategy, &http_client_factory)
+             .await
+         {
+-            error!("failed to refresh available models: {err}");
++            debug!(
++                refresh_strategy = %refresh_strategy,
++                error = %err,
++                "models refresh: foreground refresh failed; using current catalog"
++            );
+         }
+         ModelsResponse {
+             models: self.get_remote_models().await,
+@@ -456,7 +461,11 @@ impl OpenAiModelsManager {
+             .fetch_and_update_models_locked(&http_client_factory, flight_auth_revision)
+             .await
+         {
+-            error!("failed to refresh available models: {err}");
++            debug!(
++                expected_etag = %etag,
++                error = %err,
++                "models refresh: ETag-triggered refresh failed; keeping current catalog"
++            );
+         }
+     }
+ 
+@@ -586,10 +595,20 @@ impl OpenAiModelsManager {
+             state.running = false;
+         }
+         if state.running {
+-            state.pending = Some(match state.pending.take() {
++            let incoming_revision = request.observed_revision;
++            let had_pending = state.pending.is_some();
++            let pending = match state.pending.take() {
+                 Some(pending) => pending.coalesce(request),
+                 None => request,
+-            });
++            };
++            let pending_revision = pending.observed_revision;
++            state.pending = Some(pending);
++            debug!(
++                incoming_revision,
++                pending_revision,
++                had_pending,
++                "models refresh: coalesced background refresh request"
++            );
+             return;
+         }
+         let request = match state.pending.take() {
+@@ -738,14 +757,26 @@ async fn run_background_model_refresh(
+     mut request: BackgroundRefreshRequest,
+ ) {
+     loop {
+-        if let Err(err) = refresh_context
++        debug!(
++            observed_revision = request.observed_revision,
++            "models refresh: background refresh started"
++        );
++        match refresh_context
+             .fetch_and_update_models_if_unchanged(
+                 request.observed_revision,
+                 &request.http_client_factory,
+             )
+             .await
+         {
+-            error!("failed to refresh available models: {err}");
++            Ok(()) => debug!(
++                observed_revision = request.observed_revision,
++                "models refresh: background refresh completed"
++            ),
++            Err(err) => debug!(
++                observed_revision = request.observed_revision,
++                error = %err,
++                "models refresh: background refresh failed"
++            ),
+         }
+ 
+         let Some(background_refresh) = background_refresh.upgrade() else {
+@@ -771,6 +802,7 @@ impl ModelsRefreshContext {
+         http_client_factory: &HttpClientFactory,
+     ) -> CoreResult<()> {
+         let _refresh_permit = self.refresh_gate.acquire().await.map_err(|err| {
++            error!(error = %err, "models refresh: refresh gate closed");
+             codex_protocol::error::CodexErr::Fatal(format!(
+                 "failed to acquire models refresh gate: {err}"
+             ))
+@@ -800,9 +832,15 @@ impl ModelsRefreshContext {
+             .endpoint_client
+             .list_models(&client_version, http_client_factory.clone())
+             .await?;
++        debug!(
++            models_count = models.len(),
++            etag = ?etag,
++            "models refresh: fetched remote models"
++        );
+         let merged_models = self.merge_remote_models(models.clone());
+         if let Some(cache_manager) = self.cache_manager.as_ref() {
+             let _cache_io_permit = self.cache_io_gate.acquire().await.map_err(|err| {
++                error!(error = %err, "models refresh: cache I/O gate closed");
+                 codex_protocol::error::CodexErr::Fatal(format!(
+                     "failed to acquire models cache I/O gate: {err}"
+                 ))
+diff --git a/codex-rs/models-manager/src/manager_tests.rs b/codex-rs/models-manager/src/manager_tests.rs
+index c0e7e87846..395316d0eb 100644
+--- a/codex-rs/models-manager/src/manager_tests.rs
++++ b/codex-rs/models-manager/src/manager_tests.rs
+@@ -23,6 +23,7 @@ use std::sync::atomic::AtomicUsize;
+ use std::sync::atomic::Ordering;
+ use tempfile::tempdir;
+ use tokio::sync::oneshot;
++use tracing_test::traced_test;
+ 
+ #[path = "model_info_overrides_tests.rs"]
+ mod model_info_overrides_tests;
+@@ -224,6 +225,13 @@ impl ControlledModelsFetch {
+             response: ControlledModelsResponse::Error(message),
+         }
+     }
++
++    fn error(message: &'static str) -> Self {
++        Self {
++            release: None,
++            response: ControlledModelsResponse::Error(message),
++        }
++    }
+ }
+ 
+ #[derive(Debug)]
+@@ -921,6 +929,65 @@ async fn completed_refresh_without_auth_revision_is_not_reusable() {
+     assert!(!manager.can_reuse_completed_refresh(0, None).await);
+ }
+ 
++#[tokio::test]
++#[traced_test]
++async fn foreground_model_refresh_failure_uses_debug_noise() {
++    let (endpoint, mut started_rx) = ControlledModelsEndpoint::new(vec![
++        ControlledModelsFetch::error("catalog refresh failed"),
++        ControlledModelsFetch::error("etag refresh failed"),
++    ]);
++    let codex_home = tempdir().expect("temp dir");
++    let manager = openai_manager_for_tests(codex_home.path().to_path_buf(), endpoint.clone());
++
++    let catalog = manager
++        .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
++        .await;
++
++    expect_fetch_started(&mut started_rx, 1).await;
++    manager
++        .refresh_if_new_etag("changed-etag".to_string(), DEFAULT_HTTP_CLIENT_FACTORY)
++        .await;
++    expect_fetch_started(&mut started_rx, 2).await;
++    assert_eq!(endpoint.fetch_count(), 2);
++    assert!(
++        !catalog.models.is_empty(),
++        "foreground refresh failure should preserve bundled models"
++    );
++    logs_assert(|lines: &[&str]| {
++        for (error, message) in [
++            (
++                "catalog refresh failed",
++                "models refresh: foreground refresh failed; using current catalog",
++            ),
++            (
++                "etag refresh failed",
++                "models refresh: ETag-triggered refresh failed; keeping current catalog",
++            ),
++        ] {
++            let Some(line) = lines
++                .iter()
++                .find(|line| line.contains(error) && line.contains(message))
++            else {
++                return Err(format!("missing refresh failure debug log: {message}"));
++            };
++            if !line.contains("DEBUG") || line.contains("ERROR") {
++                return Err(format!(
++                    "refresh failure used the wrong log level: {message}"
++                ));
++            }
++            if lines
++                .iter()
++                .any(|line| line.contains("ERROR") && line.contains(error))
++            {
++                return Err(format!(
++                    "refresh failure was also logged as error: {message}"
++                ));
++            }
++        }
++        Ok(())
++    });
++}
++
+ #[tokio::test]
+ async fn online_if_uncached_cache_hit_returns_while_background_joins_inflight_refresh() {
+     let cached_models = vec![remote_model("cache-hit", "Cache Hit", 0)];
+@@ -1010,6 +1077,7 @@ async fn online_if_uncached_cache_hit_returns_while_background_joins_inflight_re
+ }
+ 
+ #[tokio::test]
++#[traced_test]
+ async fn coalesced_background_refresh_refetches_for_unknown_auth_identity() {
+     let initial_models = vec![remote_model("unknown-initial", "Unknown Initial", 0)];
+     let first_refresh_models = vec![remote_model("unknown-first", "Unknown First", 0)];
+@@ -1067,6 +1135,22 @@ async fn coalesced_background_refresh_refetches_for_unknown_auth_identity() {
+         "trailing refresh should replace the prior remote response"
+     );
+     assert_eq!(endpoint.fetch_count(), 3);
++    logs_assert(|lines: &[&str]| {
++        for message in [
++            "models refresh: coalesced background refresh request",
++            "models refresh: background refresh started",
++            "models refresh: background refresh completed",
++            "models refresh: fetched remote models",
++        ] {
++            if !lines
++                .iter()
++                .any(|line| line.contains("DEBUG") && line.contains(message))
++            {
++                return Err(format!("missing model refresh lifecycle log: {message}"));
++            }
++        }
++        Ok(())
++    });
+ }
+ 
+ #[tokio::test]
+@@ -1886,6 +1970,7 @@ async fn refresh_available_models_uses_version_mismatched_cache_before_backgroun
+ }
+ 
+ #[tokio::test]
++#[traced_test]
+ async fn cache_hit_retries_background_refresh_after_error() {
+     let cached_models = vec![remote_model("cached-error", "Cached Error", 0)];
+     let recovered_models = vec![remote_model("recovered", "Recovered", 0)];
+@@ -1949,6 +2034,27 @@ async fn cache_hit_retries_background_refresh_after_error() {
+ 
+     assert_eq!(manager.get_remote_models().await, recovered_models);
+     assert_eq!(endpoint.fetch_count(), 3);
++    logs_assert(|lines: &[&str]| {
++        let failure_message = "models refresh: background refresh failed";
++        if !lines
++            .iter()
++            .any(|line| line.contains("DEBUG") && line.contains(failure_message))
++        {
++            return Err("missing background refresh failure debug log".to_string());
++        }
++        if lines
++            .iter()
++            .any(|line| line.contains("ERROR") && line.contains(failure_message))
++        {
++            return Err("background refresh failure was logged as error".to_string());
++        }
++        if !lines.iter().any(|line| {
++            line.contains("DEBUG") && line.contains("models refresh: background refresh completed")
++        }) {
++            return Err("missing recovered background refresh completion log".to_string());
++        }
++        Ok(())
++    });
+ }
+ 
+ #[tokio::test]

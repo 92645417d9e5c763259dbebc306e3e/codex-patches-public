@@ -1,0 +1,1463 @@
+diff --git a/codex-rs/tui/src/app/config_persistence.rs b/codex-rs/tui/src/app/config_persistence.rs
+index 6021a5e6a3..cd7d54bade 100644
+--- a/codex-rs/tui/src/app/config_persistence.rs
++++ b/codex-rs/tui/src/app/config_persistence.rs
+@@ -26,6 +26,28 @@ async fn build_config_on_runtime_worker(
+     }
+ }
+ 
++pub(super) fn permission_profile_selection_config_edits(
++    selection: &PermissionProfileSelection,
++) -> Vec<codex_app_server_protocol::ConfigEdit> {
++    let mut edits = vec![crate::config_update::replace_config_value(
++        "default_permissions",
++        serde_json::json!(selection.profile_id.clone()),
++    )];
++    if let Some(policy) = selection.approval_policy {
++        edits.push(crate::config_update::replace_config_value(
++            "approval_policy",
++            serde_json::to_value(policy).expect("approval policy should serialize"),
++        ));
++    }
++    if let Some(reviewer) = selection.approvals_reviewer {
++        edits.push(crate::config_update::replace_config_value(
++            "approvals_reviewer",
++            serde_json::json!(reviewer.to_string()),
++        ));
++    }
++    edits
++}
++
+ pub(super) fn resume_model_settings_for_overrides(
+     config: &Config,
+     harness_overrides: &ConfigOverrides,
+@@ -57,6 +79,41 @@ pub(super) fn resume_model_settings_for_overrides(
+ }
+ 
+ impl App {
++    pub(super) async fn persist_permission_profile_selection(
++        &mut self,
++        app_server: &AppServerSession,
++        selection: &PermissionProfileSelection,
++    ) -> bool {
++        let edits = permission_profile_selection_config_edits(selection);
++        let write_response = match crate::config_update::write_config_batch(
++            app_server.request_handle(),
++            edits,
++        )
++        .await
++        {
++            Ok(response) => response,
++            Err(err) => {
++                let error = crate::config_update::format_config_error(&err);
++                tracing::error!(error = %error, "failed to persist permission profile selection");
++                self.chat_widget
++                    .add_error_message(format!("Failed to save permission profile: {error}"));
++                return false;
++            }
++        };
++        if write_response.status == WriteStatus::OkOverridden {
++            let message = overridden_write_message(&write_response);
++            tracing::warn!(
++                message,
++                "permission profile config write was overridden by effective config"
++            );
++            self.chat_widget.add_error_message(format!(
++                "Permission profile was saved but not applied: {message}"
++            ));
++            return false;
++        }
++        true
++    }
++
+     pub(super) async fn rebuild_config_for_cwd(&self, cwd: PathBuf) -> Result<Config> {
+         let mut overrides = self.harness_overrides.clone();
+         overrides.cwd = Some(cwd.clone());
+@@ -444,7 +501,7 @@ impl App {
+                         serde_json::json!(auto_review_preset.approvals_reviewer.to_string()),
+                     ));
+                     if previous_approvals_reviewer != auto_review_preset.approvals_reviewer {
+-                        permissions_history_label = Some("Approve for me");
++                        permissions_history_label = Some(crate::status::APPROVE_FOR_ME_LABEL);
+                     }
+                 } else if !effective_enabled {
+                     feature_edits.push(crate::config_update::clear_config_value(
+@@ -1185,6 +1242,29 @@ mod tests {
+     use pretty_assertions::assert_eq;
+     use tempfile::tempdir;
+ 
++    #[test]
++    fn permission_profile_selection_persists_profile_policy_and_reviewer() {
++        let selection = PermissionProfileSelection {
++            profile_id: BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string(),
++            approval_policy: Some(AskForApproval::OnRequest),
++            approvals_reviewer: Some(ApprovalsReviewer::User),
++            display_label: "Ask For Approval".to_string(),
++        };
++
++        let edits = permission_profile_selection_config_edits(&selection);
++
++        assert_eq!(edits.len(), 3);
++        assert_eq!(edits[0].key_path, "default_permissions");
++        assert_eq!(
++            edits[0].value,
++            serde_json::json!(BUILT_IN_PERMISSION_PROFILE_WORKSPACE)
++        );
++        assert_eq!(edits[1].key_path, "approval_policy");
++        assert_eq!(edits[1].value, serde_json::json!("on-request"));
++        assert_eq!(edits[2].key_path, "approvals_reviewer");
++        assert_eq!(edits[2].value, serde_json::json!("user"));
++    }
++
+     #[tokio::test]
+     async fn update_reasoning_effort_updates_collaboration_mode() {
+         let mut app = make_test_app().await;
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index 8975c653c0..3573429eb9 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -1481,7 +1481,11 @@ impl App {
+                                         /*personality*/ None,
+                                     ),
+                                 ));
+-                                if self.apply_permission_profile_selection(selection).await {
++                                if self
++                                    .persist_permission_profile_selection(app_server, &selection)
++                                    .await
++                                    && self.apply_permission_profile_selection(selection).await
++                                {
+                                     self.chat_widget.submit_initial_user_message_if_pending();
+                                 }
+                                 self.chat_widget.add_plain_history_lines(vec![
+@@ -1751,7 +1755,11 @@ impl App {
+                 }
+             }
+             AppEvent::SelectPermissionProfile(selection) => {
+-                if self.apply_permission_profile_selection(selection).await {
++                if self
++                    .persist_permission_profile_selection(app_server, &selection)
++                    .await
++                    && self.apply_permission_profile_selection(selection).await
++                {
+                     self.chat_widget.submit_initial_user_message_if_pending();
+                 }
+             }
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index fea22e244e..ba6873c78c 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -98,6 +98,7 @@ use codex_protocol::config_types::SandboxMode;
+ use codex_protocol::config_types::ServiceTier;
+ use codex_protocol::config_types::Settings;
+ use codex_protocol::models::ActivePermissionProfile;
++use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
+ use codex_protocol::models::FileSystemPermissions;
+ use codex_protocol::models::NetworkPermissions;
+ use codex_protocol::models::PermissionProfile;
+@@ -1739,12 +1740,8 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
+             .start_thread(app.chat_widget.config_ref())
+             .await?;
+         let root_thread_id = root.session.thread_id;
+-        app.enqueue_primary_thread_session(
+-            root.session,
+-            root.turns,
+-            root.history_window_metadata,
+-        )
+-        .await?;
++        app.enqueue_primary_thread_session(root.session, root.turns, root.history_window_metadata)
++            .await?;
+ 
+         let rollout_dir = app
+             .config
+@@ -2240,6 +2237,63 @@ default_permissions = "locked-down"
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn composite_permission_selection_persists_before_runtime_application() -> Result<()> {
++    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
++    let codex_home = tempdir()?;
++    app.config.codex_home = codex_home.path().to_path_buf().abs();
++    let app_server = start_config_write_test_app_server(&app).await?;
++    let selection = PermissionProfileSelection {
++        profile_id: BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS.to_string(),
++        approval_policy: Some(AskForApproval::Never),
++        approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
++        display_label: "YOLO".to_string(),
++    };
++    let original_profile = app.config.permissions.permission_profile().clone();
++
++    assert!(
++        app.persist_permission_profile_selection(&app_server, &selection)
++            .await
++    );
++    assert_eq!(
++        app.config.permissions.permission_profile(),
++        &original_profile,
++        "persistence must complete before runtime state changes"
++    );
++    let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
++    assert!(config.contains("default_permissions = \":danger-full-access\""));
++    assert!(config.contains("approval_policy = \"never\""));
++    assert!(config.contains("approvals_reviewer = \"auto_review\""));
++
++    assert!(app.apply_permission_profile_selection(selection).await);
++    assert_eq!(
++        app.config.permissions.permission_profile(),
++        &PermissionProfile::Disabled
++    );
++    assert_eq!(
++        AskForApproval::from(app.config.permissions.approval_policy.value()),
++        AskForApproval::Never
++    );
++    assert_eq!(app.config.approvals_reviewer, ApprovalsReviewer::AutoReview);
++    let _override = app_event_rx
++        .try_recv()
++        .expect("runtime application should emit an override");
++    let history = app_event_rx
++        .try_recv()
++        .expect("runtime application should emit history after persistence");
++    let AppEvent::InsertHistoryCell(cell) = history else {
++        panic!("expected permission history after durable application: {history:?}");
++    };
++    assert!(
++        cell.display_lines(/*width*/ 120)
++            .iter()
++            .any(|line| line.to_string().contains("Permissions updated to YOLO"))
++    );
++
++    app_server.shutdown().await?;
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn update_feature_flags_enabling_guardian_selects_auto_review() -> Result<()> {
+     let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
+@@ -2330,7 +2384,7 @@ async fn update_feature_flags_enabling_guardian_selects_auto_review() -> Result<
+         .map(|line| line.to_string())
+         .collect::<Vec<_>>()
+         .join("\n");
+-    assert!(rendered.contains("Permissions updated to Approve for me"));
++    assert!(rendered.contains("Permissions updated to Approve For Me"));
+ 
+     let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+     assert!(config.contains("guardian_approval = true"));
+diff --git a/codex-rs/tui/src/app/thread_session_state.rs b/codex-rs/tui/src/app/thread_session_state.rs
+index b867b95354..b0717250cb 100644
+--- a/codex-rs/tui/src/app/thread_session_state.rs
++++ b/codex-rs/tui/src/app/thread_session_state.rs
+@@ -399,6 +399,10 @@ mod tests {
+     #[tokio::test]
+     async fn thread_read_fallback_uses_active_permission_settings() {
+         let mut app = make_test_app().await;
++        app.config
++            .permissions
++            .set_permission_profile(PermissionProfile::read_only())
++            .expect("set stale app permission profile");
+         let primary_thread_id =
+             ThreadId::from_string("00000000-0000-0000-0000-000000000404").expect("valid thread");
+         let read_thread_id =
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index f47893dd28..98b579fc38 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -455,6 +455,11 @@ use self::user_messages::user_message_preview_text;
+ mod warnings;
+ use self::warnings::WarningDisplayState;
+ pub(crate) use crate::branch_summary::StatusLineGitSummary;
++use crate::status::APPROVE_FOR_ME_LABEL;
++use crate::status::ASK_FOR_APPROVAL_LABEL;
++use crate::status::FULL_ACCESS_AGENT_REVIEW_LABEL;
++use crate::status::FULL_ACCESS_LABEL;
++use crate::status::YOLO_LABEL;
+ use crate::streaming::chunking::AdaptiveChunkingPolicy;
+ use crate::streaming::commit_tick::CommitTickScope;
+ use crate::streaming::commit_tick::run_commit_tick;
+@@ -479,10 +484,13 @@ use unicode_segmentation::UnicodeSegmentation;
+ 
+ const USER_SHELL_COMMAND_HELP_TITLE: &str = "Prefix a command with ! to run it locally";
+ const USER_SHELL_COMMAND_HELP_HINT: &str = "Example: !ls";
+-const ASK_FOR_APPROVAL_LABEL: &str = "Ask for approval";
+-const APPROVE_FOR_ME_LABEL: &str = "Approve for me";
+-const AUTO_REVIEW_DESCRIPTION: &str = "Only ask for actions detected as potentially unsafe.";
+ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
++const WORKSPACE_MANUAL_APPROVAL_DESCRIPTION: &str =
++    "Workspace write sandbox. Ask the user before internet access or edits outside the workspace.";
++const WORKSPACE_AUTO_REVIEW_DESCRIPTION: &str = "Workspace write sandbox. Ask the auto-review agent before internet access or edits outside the workspace.";
++const FULL_ACCESS_AUTO_REVIEW_DESCRIPTION: &str =
++    "Full filesystem and network access. Ask the auto-review agent before privileged actions.";
++const YOLO_DESCRIPTION: &str = "Full filesystem and network access without approval. Dangerous.";
+ const DEFAULT_STATUS_LINE_ITEMS: [&str; 4] = [
+     "model-with-reasoning",
+     "active-clients",
+diff --git a/codex-rs/tui/src/chatwidget/permission_popups.rs b/codex-rs/tui/src/chatwidget/permission_popups.rs
+index 6c667864d3..d5912814f1 100644
+--- a/codex-rs/tui/src/chatwidget/permission_popups.rs
++++ b/codex-rs/tui/src/chatwidget/permission_popups.rs
+@@ -74,11 +74,18 @@ impl ChatWidget {
+             let default_disabled_reason = approval_disabled_reason
+                 .clone()
+                 .or_else(|| guardian_disabled_reason(false));
++            let base_approval = AskForApproval::from(preset.approval);
++            let base_selection = PermissionProfileSelection {
++                profile_id: preset.active_permission_profile.id.clone(),
++                approval_policy: Some(base_approval),
++                approvals_reviewer: Some(ApprovalsReviewer::User),
++                display_label: base_name.clone(),
++            };
+             let default_actions = self.permission_mode_actions(
+                 &preset,
+                 base_name.clone(),
+                 ApprovalsReviewer::User,
+-                /*profile_selection*/ None,
++                Some(base_selection),
+                 /*return_to_permissions*/ !include_read_only,
+             );
+             if preset.id == "auto" {
+@@ -101,7 +108,7 @@ impl ChatWidget {
+                 if guardian_approval_enabled {
+                     items.push(SelectionItem {
+                         name: APPROVE_FOR_ME_LABEL.to_string(),
+-                        description: Some(AUTO_REVIEW_DESCRIPTION.to_string()),
++                        description: Some(WORKSPACE_AUTO_REVIEW_DESCRIPTION.to_string()),
+                         is_current: current_review_policy == ApprovalsReviewer::AutoReview
+                             && Self::preset_matches_current(
+                                 current_approval,
+@@ -113,7 +120,12 @@ impl ChatWidget {
+                             &preset,
+                             APPROVE_FOR_ME_LABEL.to_string(),
+                             ApprovalsReviewer::AutoReview,
+-                            /*profile_selection*/ None,
++                            Some(PermissionProfileSelection {
++                                profile_id: preset.active_permission_profile.id.clone(),
++                                approval_policy: Some(AskForApproval::OnRequest),
++                                approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
++                                display_label: APPROVE_FOR_ME_LABEL.to_string(),
++                            }),
+                             /*return_to_permissions*/ !include_read_only,
+                         ),
+                         dismiss_on_select: true,
+@@ -122,16 +134,87 @@ impl ChatWidget {
+                         ..Default::default()
+                     });
+                 }
++            } else if preset.id == "full-access" {
++                items.push(SelectionItem {
++                    name: FULL_ACCESS_LABEL.to_string(),
++                    description: base_description.clone(),
++                    is_current: current_review_policy == ApprovalsReviewer::User
++                        && Self::preset_matches_current(
++                            current_approval,
++                            &current_permission_profile,
++                            self.config.cwd.as_path(),
++                            &preset,
++                        ),
++                    actions: default_actions,
++                    dismiss_on_select: true,
++                    disabled_reason: default_disabled_reason.clone(),
++                    ..Default::default()
++                });
++                if guardian_approval_enabled {
++                    let approval = AskForApproval::OnRequest;
++                    items.push(SelectionItem {
++                        name: FULL_ACCESS_AGENT_REVIEW_LABEL.to_string(),
++                        description: Some(FULL_ACCESS_AUTO_REVIEW_DESCRIPTION.to_string()),
++                        is_current: current_review_policy == ApprovalsReviewer::AutoReview
++                            && current_approval == approval
++                            && matches!(current_permission_profile, PermissionProfile::Disabled),
++                        actions: self.permission_mode_actions(
++                            &preset,
++                            FULL_ACCESS_AGENT_REVIEW_LABEL.to_string(),
++                            ApprovalsReviewer::AutoReview,
++                            Some(PermissionProfileSelection {
++                                profile_id: preset.active_permission_profile.id.clone(),
++                                approval_policy: Some(approval),
++                                approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
++                                display_label: FULL_ACCESS_AGENT_REVIEW_LABEL.to_string(),
++                            }),
++                            /*return_to_permissions*/ !include_read_only,
++                        ),
++                        dismiss_on_select: true,
++                        disabled_reason: self
++                            .config
++                            .permissions
++                            .approval_policy
++                            .can_set(&approval.to_core())
++                            .err()
++                            .map(|err| err.to_string())
++                            .or_else(|| guardian_disabled_reason(true)),
++                        ..Default::default()
++                    });
++                }
++                items.push(SelectionItem {
++                    name: YOLO_LABEL.to_string(),
++                    description: Some(YOLO_DESCRIPTION.to_string()),
++                    is_current: current_review_policy == ApprovalsReviewer::AutoReview
++                        && current_approval == AskForApproval::Never
++                        && matches!(current_permission_profile, PermissionProfile::Disabled),
++                    actions: self.permission_mode_actions(
++                        &preset,
++                        YOLO_LABEL.to_string(),
++                        ApprovalsReviewer::AutoReview,
++                        Some(PermissionProfileSelection {
++                            profile_id: preset.active_permission_profile.id.clone(),
++                            approval_policy: Some(AskForApproval::Never),
++                            approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
++                            display_label: YOLO_LABEL.to_string(),
++                        }),
++                        /*return_to_permissions*/ !include_read_only,
++                    ),
++                    dismiss_on_select: true,
++                    disabled_reason: default_disabled_reason,
++                    ..Default::default()
++                });
+             } else {
+                 items.push(SelectionItem {
+                     name: base_name,
+                     description: base_description,
+-                    is_current: Self::preset_matches_current(
+-                        current_approval,
+-                        &current_permission_profile,
+-                        self.config.cwd.as_path(),
+-                        &preset,
+-                    ),
++                    is_current: current_review_policy == ApprovalsReviewer::User
++                        && Self::preset_matches_current(
++                            current_approval,
++                            &current_permission_profile,
++                            self.config.cwd.as_path(),
++                            &preset,
++                        ),
+                     actions: default_actions,
+                     dismiss_on_select: true,
+                     disabled_reason: default_disabled_reason,
+@@ -304,8 +387,7 @@ impl ChatWidget {
+                 Self::permission_profile_selection_actions,
+             )
+         };
+-        let requires_confirmation =
+-            approvals_reviewer == ApprovalsReviewer::User && preset.id == "full-access";
++        let requires_confirmation = preset.id == "full-access";
+         if requires_confirmation {
+             let preset = preset.clone();
+             return vec![Box::new(move |tx| {
+diff --git a/codex-rs/tui/src/chatwidget/permissions_menu.rs b/codex-rs/tui/src/chatwidget/permissions_menu.rs
+index c97721819e..1aa953de4b 100644
+--- a/codex-rs/tui/src/chatwidget/permissions_menu.rs
++++ b/codex-rs/tui/src/chatwidget/permissions_menu.rs
+@@ -42,7 +42,7 @@ impl ChatWidget {
+             items.push(self.builtin_permission_mode_selection_item(
+                 default,
+                 ":workspace",
+-                AUTO_REVIEW_DESCRIPTION.to_string(),
++                WORKSPACE_AUTO_REVIEW_DESCRIPTION.to_string(),
+                 AskForApproval::OnRequest,
+                 ApprovalsReviewer::AutoReview,
+             ));
+@@ -54,6 +54,23 @@ impl ChatWidget {
+             AskForApproval::from(full_access.approval),
+             ApprovalsReviewer::User,
+         ));
++        if self.config.features.enabled(Feature::GuardianApproval) {
++            items.push(self.builtin_permission_mode_selection_item(
++                full_access,
++                BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
++                FULL_ACCESS_AUTO_REVIEW_DESCRIPTION.to_string(),
++                AskForApproval::OnRequest,
++                ApprovalsReviewer::AutoReview,
++            ));
++        }
++        items.push(self.builtin_permission_mode_selection_item_with_label(
++            full_access,
++            BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
++            YOLO_LABEL,
++            YOLO_DESCRIPTION.to_string(),
++            AskForApproval::Never,
++            ApprovalsReviewer::AutoReview,
++        ));
+         items.push(self.builtin_permission_mode_selection_item(
+             read_only,
+             ":read-only",
+@@ -96,11 +113,28 @@ impl ChatWidget {
+         approval_policy: AskForApproval,
+         approvals_reviewer: ApprovalsReviewer,
+     ) -> SelectionItem {
+-        let label = match (preset.id, approvals_reviewer) {
+-            ("auto", ApprovalsReviewer::AutoReview) => APPROVE_FOR_ME_LABEL,
+-            ("auto", ApprovalsReviewer::User) => ASK_FOR_APPROVAL_LABEL,
+-            _ => preset.label,
+-        };
++        let label =
++            crate::status::builtin_permission_mode_label(id, approval_policy, approvals_reviewer)
++                .unwrap_or(preset.label);
++        self.builtin_permission_mode_selection_item_with_label(
++            preset,
++            id,
++            label,
++            description,
++            approval_policy,
++            approvals_reviewer,
++        )
++    }
++
++    fn builtin_permission_mode_selection_item_with_label(
++        &self,
++        preset: &ApprovalPreset,
++        id: &str,
++        label: &str,
++        description: String,
++        approval_policy: AskForApproval,
++        approvals_reviewer: ApprovalsReviewer,
++    ) -> SelectionItem {
+         let active_profile_id = self
+             .config
+             .permissions
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approvals_selection_popup.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approvals_selection_popup.snap
+index bfa5173474..6117262fb3 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approvals_selection_popup.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__approvals_selection_popup.snap
+@@ -10,5 +10,7 @@ expression: popup
+   2. Full Access       Codex can edit files outside this workspace and access
+                        the internet without asking for approval. Exercise
+                        caution when using.
++  3. YOLO              Full filesystem and network access without approval.
++                       Dangerous.
+ 
+   Press enter to confirm or esc to go back
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup.snap
+index 5ad5481590..3d88d07913 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup.snap
+@@ -4,16 +4,20 @@ expression: "render_bottom_popup(&chat, 80)"
+ ---
+   Update Model Permissions
+ 
+-› 1. Ask for approval (current)  Codex can read and edit files in the current
+-                                 workspace, and run commands. Approval is
+-                                 required to access the internet or edit other
+-                                 files.
+-  2. Approve for me              Only ask for actions detected as potentially
+-                                 unsafe.
++› 1. Ask For Approval (current)  Workspace write sandbox. Ask the user before
++                                 internet access or edits outside the
++                                 workspace.
++  2. Approve For Me              Workspace write sandbox. Ask the auto-review
++                                 agent before internet access or edits outside
++                                 the workspace.
+   3. Full Access                 Codex can edit files outside this workspace
+                                  and access the internet without asking for
+                                  approval. Exercise caution when using.
+-  4. Read Only                   Codex can read files in the current
++  4. Full Access + Agent Review  Full filesystem and network access. Ask the
++                                 auto-review agent before privileged actions.
++  5. YOLO                        Full filesystem and network access without
++                                 approval. Dangerous.
++  6. Read Only                   Codex can read files in the current
+                                  workspace. Approval is required to edit files
+                                  or access the internet.
+ 
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup_with_custom_profiles.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup_with_custom_profiles.snap
+index 008669d3d3..93eb6503b4 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup_with_custom_profiles.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup_with_custom_profiles.snap
+@@ -4,19 +4,25 @@ expression: "render_bottom_popup(&chat, 80)"
+ ---
+   Update Model Permissions
+ 
+-  1. Ask for approval        Codex can read and edit files in the current
+-                             workspace, and run commands. Approval is required
+-                             to access the internet or edit other files.
+-  2. Approve for me          Only ask for actions detected as potentially
+-                             unsafe.
+-  3. Full Access             Codex can edit files outside this workspace and
+-                             access the internet without asking for approval.
+-                             Exercise caution when using.
+-  4. Read Only               Codex can read files in the current workspace.
+-                             Approval is required to edit files or access the
+-                             internet.
+-› 5. locked-down (current)   Inspect and patch only approved workspace files.
+-     web-enabled (disabled)  Workspace profile with network access. (disabled:
+-                             Disabled by requirements.)
++  1. Ask For Approval            Workspace write sandbox. Ask the user before
++                                 internet access or edits outside the
++                                 workspace.
++  2. Approve For Me              Workspace write sandbox. Ask the auto-review
++                                 agent before internet access or edits outside
++                                 the workspace.
++  3. Full Access                 Codex can edit files outside this workspace
++                                 and access the internet without asking for
++                                 approval. Exercise caution when using.
++  4. Full Access + Agent Review  Full filesystem and network access. Ask the
++                                 auto-review agent before privileged actions.
++  5. YOLO                        Full filesystem and network access without
++                                 approval. Dangerous.
++  6. Read Only                   Codex can read files in the current
++                                 workspace. Approval is required to edit files
++                                 or access the internet.
++› 7. locked-down (current)       Inspect and patch only approved workspace
++                                 files.
++     web-enabled (disabled)      Workspace profile with network access.
++                                 (disabled: Disabled by requirements.)
+ 
+   Press enter to confirm or esc to go back
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup_with_disallowed_full_access.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup_with_disallowed_full_access.snap
+index 1d2a74e956..1bc176a33e 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup_with_disallowed_full_access.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__profile_permissions_selection_popup_with_disallowed_full_access.snap
+@@ -4,17 +4,31 @@ expression: "render_bottom_popup(&chat, 80)"
+ ---
+   Update Model Permissions
+ 
+-  1. Ask for approval        Codex can read and edit files in the current
+-                             workspace, and run commands. Approval is required
+-                             to access the internet or edit other files.
+-  2. Approve for me          Only ask for actions detected as potentially
+-                             unsafe.
+-     Full Access (disabled)  Codex can edit files outside this workspace and
+-                             access the internet without asking for approval.
+-                             Exercise caution when using. (disabled: Disabled
+-                             by requirements.)
+-› 3. Read Only (current)     Codex can read files in the current workspace.
+-                             Approval is required to edit files or access the
+-                             internet.
++  1. Ask For Approval                       Workspace write sandbox. Ask the
++                                            user before internet access or
++                                            edits outside the workspace.
++  2. Approve For Me                         Workspace write sandbox. Ask the
++                                            auto-review agent before internet
++                                            access or edits outside the
++                                            workspace.
++     Full Access (disabled)                 Codex can edit files outside this
++                                            workspace and access the internet
++                                            without asking for approval.
++                                            Exercise caution when using.
++                                            (disabled: Disabled by
++                                            requirements.)
++     Full Access + Agent Review (disabled)  Full filesystem and network
++                                            access. Ask the auto-review agent
++                                            before privileged actions.
++                                            (disabled: Disabled by
++                                            requirements.)
++     YOLO (disabled)                        Full filesystem and network access
++                                            without approval. Dangerous.
++                                            (disabled: Disabled by
++                                            requirements.)
++› 3. Read Only (current)                    Codex can read files in the
++                                            current workspace. Approval is
++                                            required to edit files or access
++                                            the internet.
+ 
+   Press enter to confirm or esc to go back
+diff --git a/codex-rs/tui/src/chatwidget/tests/permissions.rs b/codex-rs/tui/src/chatwidget/tests/permissions.rs
+index 0cdf5d67a5..9719879c42 100644
+--- a/codex-rs/tui/src/chatwidget/tests/permissions.rs
++++ b/codex-rs/tui/src/chatwidget/tests/permissions.rs
+@@ -2,6 +2,7 @@ use super::*;
+ use crate::legacy_core::config::PermissionProfileCatalogEntry;
+ use codex_protocol::models::ActivePermissionProfile;
+ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
++use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
+ use codex_protocol::models::ManagedFileSystemPermissions;
+ use codex_protocol::permissions::FileSystemAccessMode;
+ use codex_protocol::permissions::FileSystemPath;
+@@ -119,6 +120,13 @@ async fn profile_permissions_selection_popup_with_disallowed_full_access_snapsho
+         ]),
+         ..Default::default()
+     });
++    chat.config
++        .permissions
++        .set_permission_profile_from_session_snapshot(PermissionProfileSnapshot::active(
++            PermissionProfile::read_only(),
++            ActivePermissionProfile::new(BUILT_IN_PERMISSION_PROFILE_READ_ONLY),
++        ))
++        .expect("set current read-only profile");
+ 
+     chat.open_permissions_popup();
+ 
+@@ -254,7 +262,7 @@ async fn profile_permissions_selection_emits_auto_review_mode_event() {
+             approval_policy: Some(AskForApproval::OnRequest),
+             approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+             display_label,
+-        }) if profile_id == ":workspace" && display_label == "Approve for me"
++        }) if profile_id == ":workspace" && display_label == "Approve For Me"
+     ));
+ }
+ 
+@@ -266,7 +274,7 @@ async fn profile_permissions_full_access_always_opens_confirmation() {
+     chat.config.notices.hide_full_access_warning = Some(true);
+ 
+     chat.open_permissions_popup();
+-    chat.handle_key_event(KeyEvent::from(KeyCode::Up));
++    chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+ 
+     let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+@@ -288,6 +296,49 @@ async fn profile_permissions_full_access_always_opens_confirmation() {
+     ));
+ }
+ 
++#[tokio::test]
++async fn profile_permissions_preserve_agent_review_and_yolo_as_distinct_modes() {
++    for (down_count, expected_policy, expected_label) in [
++        (3, AskForApproval::OnRequest, "Full Access + Agent Review"),
++        (4, AskForApproval::Never, "YOLO"),
++    ] {
++        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++        chat.config.explicit_permission_profile_mode = true;
++        chat.set_feature_enabled(Feature::GuardianApproval, /*enabled*/ true);
++        chat.open_permissions_popup();
++        chat.handle_key_event(KeyEvent::from(KeyCode::Home));
++        for _ in 0..down_count {
++            chat.handle_key_event(KeyEvent::from(KeyCode::Down));
++        }
++        chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
++
++        let AppEvent::OpenFullAccessConfirmation {
++            preset,
++            return_to_permissions,
++            profile_selection,
++        } = rx
++            .try_recv()
++            .expect("full-access mode should require confirmation")
++        else {
++            panic!("expected full-access confirmation");
++        };
++        chat.open_full_access_confirmation(preset, return_to_permissions, profile_selection);
++        chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
++
++        assert!(matches!(
++            rx.try_recv(),
++            Ok(AppEvent::SelectPermissionProfile(PermissionProfileSelection {
++                profile_id,
++                approval_policy: Some(policy),
++                approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
++                display_label,
++            })) if profile_id == BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS
++                && policy == expected_policy
++                && display_label == expected_label
++        ));
++    }
++}
++
+ #[cfg(target_os = "windows")]
+ #[tokio::test]
+ #[serial]
+@@ -721,9 +772,8 @@ async fn approvals_popup_navigation_skips_disabled() {
+     assert!(
+         app_events.iter().any(|ev| matches!(
+             ev,
+-            AppEvent::CodexOp(Op::OverrideTurnContext {
++            AppEvent::SelectPermissionProfile(PermissionProfileSelection {
+                 approval_policy: Some(AskForApproval::OnRequest),
+-                personality: None,
+                 ..
+             })
+         )),
+@@ -732,9 +782,8 @@ async fn approvals_popup_navigation_skips_disabled() {
+     assert!(
+         !app_events.iter().any(|ev| matches!(
+             ev,
+-            AppEvent::CodexOp(Op::OverrideTurnContext {
++            AppEvent::SelectPermissionProfile(PermissionProfileSelection {
+                 approval_policy: Some(AskForApproval::Never),
+-                personality: None,
+                 ..
+             })
+         )),
+@@ -743,7 +792,7 @@ async fn approvals_popup_navigation_skips_disabled() {
+ }
+ 
+ #[tokio::test]
+-async fn permissions_selection_emits_history_cell_when_selection_changes() {
++async fn permissions_selection_emits_composite_selection_when_mode_changes() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+     #[cfg(target_os = "windows")]
+     {
+@@ -755,21 +804,20 @@ async fn permissions_selection_emits_history_cell_when_selection_changes() {
+     chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+ 
+-    let cells = drain_insert_history(&mut rx);
+-    assert_eq!(
+-        cells.len(),
+-        1,
+-        "expected one permissions selection history cell"
+-    );
+-    let rendered = lines_to_single_string(&cells[0]);
+-    assert!(
+-        rendered.contains("Permissions updated to"),
+-        "expected permissions selection history message, got: {rendered}"
+-    );
++    assert!(matches!(
++        rx.try_recv(),
++        Ok(AppEvent::SelectPermissionProfile(PermissionProfileSelection {
++            profile_id,
++            approval_policy: Some(AskForApproval::OnRequest),
++            approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
++            display_label,
++        })) if profile_id == BUILT_IN_PERMISSION_PROFILE_WORKSPACE
++            && display_label == "Approve For Me"
++    ));
+ }
+ 
+ #[tokio::test]
+-async fn permissions_selection_history_snapshot_after_mode_switch() {
++async fn full_access_selection_emits_only_after_confirmation() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+     #[cfg(target_os = "windows")]
+     {
+@@ -797,16 +845,20 @@ async fn permissions_selection_history_snapshot_after_mode_switch() {
+     chat.open_full_access_confirmation(preset, return_to_permissions, profile_selection);
+     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+ 
+-    let cells = drain_insert_history(&mut rx);
+-    assert_eq!(cells.len(), 1, "expected one mode-switch history cell");
+-    assert_chatwidget_snapshot!(
+-        "permissions_selection_history_after_mode_switch",
+-        lines_to_single_string(&cells[0])
+-    );
++    assert!(matches!(
++        rx.try_recv(),
++        Ok(AppEvent::SelectPermissionProfile(PermissionProfileSelection {
++            profile_id,
++            approval_policy: Some(AskForApproval::Never),
++            approvals_reviewer: Some(ApprovalsReviewer::User),
++            display_label,
++        })) if profile_id == BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS
++            && display_label == "Full Access"
++    ));
+ }
+ 
+ #[tokio::test]
+-async fn permissions_selection_history_snapshot_full_access_to_default() {
++async fn full_access_to_workspace_selection_preserves_reviewer_identity() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+     #[cfg(target_os = "windows")]
+     {
+@@ -824,31 +876,24 @@ async fn permissions_selection_history_snapshot_full_access_to_default() {
+         .expect("set permission profile");
+ 
+     chat.open_permissions_popup();
+-    let popup = render_bottom_popup(&chat, /*width*/ 120);
+-    chat.handle_key_event(KeyEvent::from(KeyCode::Up));
+-    if popup.contains("Approve for me") {
+-        chat.handle_key_event(KeyEvent::from(KeyCode::Up));
+-    }
++    chat.set_approvals_reviewer(ApprovalsReviewer::User);
++    chat.handle_key_event(KeyEvent::from(KeyCode::Home));
+     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+ 
+-    let cells = drain_insert_history(&mut rx);
+-    assert_eq!(cells.len(), 1, "expected one mode-switch history cell");
+-    #[cfg(target_os = "windows")]
+-    insta::with_settings!({ snapshot_suffix => "windows" }, {
+-        assert_chatwidget_snapshot!(
+-            "permissions_selection_history_full_access_to_default",
+-            lines_to_single_string(&cells[0])
+-        );
+-    });
+-    #[cfg(not(target_os = "windows"))]
+-    assert_chatwidget_snapshot!(
+-        "permissions_selection_history_full_access_to_default",
+-        lines_to_single_string(&cells[0])
+-    );
++    assert!(matches!(
++        rx.try_recv(),
++        Ok(AppEvent::SelectPermissionProfile(PermissionProfileSelection {
++            profile_id,
++            approval_policy: Some(AskForApproval::OnRequest),
++            approvals_reviewer: Some(ApprovalsReviewer::User),
++            display_label,
++        })) if profile_id == BUILT_IN_PERMISSION_PROFILE_WORKSPACE
++            && display_label.starts_with("Ask For Approval")
++    ));
+ }
+ 
+ #[tokio::test]
+-async fn permissions_selection_emits_history_cell_when_current_is_selected() {
++async fn current_permission_selection_still_emits_durable_selection() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+     #[cfg(target_os = "windows")]
+     {
+@@ -868,17 +913,15 @@ async fn permissions_selection_emits_history_cell_when_current_is_selected() {
+     chat.open_permissions_popup();
+     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+ 
+-    let cells = drain_insert_history(&mut rx);
+-    assert_eq!(
+-        cells.len(),
+-        1,
+-        "expected history cell even when selecting current permissions"
+-    );
+-    let rendered = lines_to_single_string(&cells[0]);
+-    assert!(
+-        rendered.contains("Permissions updated to"),
+-        "expected permissions update history message, got: {rendered}"
+-    );
++    assert!(matches!(
++        rx.try_recv(),
++        Ok(AppEvent::SelectPermissionProfile(PermissionProfileSelection {
++            profile_id,
++            approval_policy: Some(AskForApproval::OnRequest),
++            approvals_reviewer: Some(ApprovalsReviewer::User),
++            ..
++        })) if profile_id == BUILT_IN_PERMISSION_PROFILE_WORKSPACE
++    ));
+ }
+ 
+ #[tokio::test]
+@@ -894,8 +937,8 @@ async fn permissions_selection_hides_auto_review_when_feature_disabled() {
+     let popup = render_bottom_popup(&chat, /*width*/ 120);
+ 
+     assert!(
+-        !popup.contains("Approve for me"),
+-        "expected Approve for me to stay hidden until the feature is enabled: {popup}"
++        !popup.contains("Approve For Me"),
++        "expected Approve For Me to stay hidden until the feature is enabled: {popup}"
+     );
+ }
+ 
+@@ -924,8 +967,8 @@ async fn permissions_selection_hides_auto_review_when_feature_disabled_even_if_a
+     let popup = render_bottom_popup(&chat, /*width*/ 120);
+ 
+     assert!(
+-        !popup.contains("Approve for me"),
+-        "expected Approve for me to stay hidden when the feature is disabled: {popup}"
++        !popup.contains("Approve For Me"),
++        "expected Approve For Me to stay hidden when the feature is disabled: {popup}"
+     );
+ }
+ 
+@@ -969,8 +1012,8 @@ async fn permissions_selection_marks_auto_review_current_after_session_configure
+     let popup = render_bottom_popup(&chat, /*width*/ 120);
+ 
+     assert!(
+-        popup.contains("Approve for me (current)"),
+-        "expected Approve for me to be current after SessionConfigured sync: {popup}"
++        popup.contains("Approve For Me (current)"),
++        "expected Approve For Me to be current after SessionConfigured sync: {popup}"
+     );
+ }
+ 
+@@ -1018,8 +1061,8 @@ async fn permissions_selection_marks_auto_review_current_with_custom_workspace_w
+     let popup = render_bottom_popup(&chat, /*width*/ 120);
+ 
+     assert!(
+-        popup.contains("Approve for me (current)"),
+-        "expected Approve for me to be current even with custom workspace-write details: {popup}"
++        popup.contains("Approve For Me (current)"),
++        "expected Approve For Me to be current even with custom workspace-write details: {popup}"
+     );
+ }
+ 
+@@ -1051,9 +1094,13 @@ async fn permissions_selection_can_disable_auto_review() {
+     assert!(
+         events.iter().any(|event| matches!(
+             event,
+-            AppEvent::UpdateApprovalsReviewer(ApprovalsReviewer::User)
++            AppEvent::SelectPermissionProfile(PermissionProfileSelection {
++                approval_policy: Some(AskForApproval::OnRequest),
++                approvals_reviewer: Some(ApprovalsReviewer::User),
++                ..
++            })
+         )),
+-        "expected selecting Ask for approval from Approve for me to switch back to manual approval review: {events:?}"
++        "expected selecting Ask For Approval from Approve For Me to preserve the manual reviewer: {events:?}"
+     );
+     assert!(
+         !events
+@@ -1064,7 +1111,7 @@ async fn permissions_selection_can_disable_auto_review() {
+ }
+ 
+ #[tokio::test]
+-async fn permissions_selection_sends_approvals_reviewer_in_override_turn_context() {
++async fn permissions_selection_carries_reviewer_in_durable_selection() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+     #[cfg(target_os = "windows")]
+     {
+@@ -1097,55 +1144,32 @@ async fn permissions_selection_sends_approvals_reviewer_in_override_turn_context
+     assert!(
+         popup
+             .lines()
+-            .any(|line| line.contains("Approve for me") && line.contains('›')),
+-        "expected one Down from Ask for approval to select Approve for me: {popup}"
++            .any(|line| line.contains("Approve For Me") && line.contains('›')),
++        "expected one Down from Ask for approval to select Approve For Me: {popup}"
+     );
+     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+ 
+-    let op = std::iter::from_fn(|| rx.try_recv().ok())
++    let selection = std::iter::from_fn(|| rx.try_recv().ok())
+         .find_map(|event| match event {
+-            AppEvent::CodexOp(op @ Op::OverrideTurnContext { .. }) => Some(op),
++            AppEvent::SelectPermissionProfile(selection) => Some(selection),
+             _ => None,
+         })
+-        .expect("expected OverrideTurnContext op");
++        .expect("expected durable permission selection");
+ 
+-    assert_eq!(
+-        op,
+-        Op::OverrideTurnContext {
+-            cwd: None,
++    assert!(matches!(
++        selection,
++        PermissionProfileSelection {
++            profile_id,
+             approval_policy: Some(AskForApproval::OnRequest),
+             approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+-            permission_profile: Some(PermissionProfile::workspace_write()),
+-            active_permission_profile: Some(ActivePermissionProfile::new(
+-                BUILT_IN_PERMISSION_PROFILE_WORKSPACE,
+-            )),
+-            windows_sandbox_level: None,
+-            model: None,
+-            effort: None,
+-            summary: None,
+-            service_tier: None,
+-            collaboration_mode: None,
+-            personality: None,
+-        }
+-    );
+-
+-    let active_permission_profile_update = std::iter::from_fn(|| rx.try_recv().ok())
+-        .find_map(|event| match event {
+-            AppEvent::UpdateActivePermissionProfile(active_permission_profile) => {
+-                Some(active_permission_profile)
+-            }
+-            _ => None,
+-        })
+-        .expect("expected UpdateActivePermissionProfile event");
+-
+-    assert_eq!(
+-        active_permission_profile_update,
+-        ActivePermissionProfile::new(BUILT_IN_PERMISSION_PROFILE_WORKSPACE)
+-    );
++            display_label,
++        } if profile_id == BUILT_IN_PERMISSION_PROFILE_WORKSPACE
++            && display_label == "Approve For Me"
++    ));
+ }
+ 
+ #[tokio::test]
+-async fn permissions_full_access_history_cell_emitted_only_after_confirmation() {
++async fn permissions_full_access_selection_emitted_only_after_confirmation() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+     #[cfg(target_os = "windows")]
+     {
+@@ -1160,11 +1184,11 @@ async fn permissions_full_access_history_cell_emitted_only_after_confirmation()
+     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+ 
+     let mut open_confirmation_event = None;
+-    let mut cells_before_confirmation = Vec::new();
++    let mut selections_before_confirmation = Vec::new();
+     while let Ok(event) = rx.try_recv() {
+         match event {
+-            AppEvent::InsertHistoryCell(cell) => {
+-                cells_before_confirmation.push(cell.display_lines(/*width*/ 80));
++            AppEvent::SelectPermissionProfile(selection) => {
++                selections_before_confirmation.push(selection);
+             }
+             AppEvent::OpenFullAccessConfirmation {
+                 preset,
+@@ -1176,12 +1200,10 @@ async fn permissions_full_access_history_cell_emitted_only_after_confirmation()
+             _ => {}
+         }
+     }
+-    if cfg!(not(target_os = "windows")) {
+-        assert!(
+-            cells_before_confirmation.is_empty(),
+-            "did not expect history cell before confirming full access"
+-        );
+-    }
++    assert!(
++        selections_before_confirmation.is_empty(),
++        "did not expect a durable selection before confirming full access"
++    );
+     let (preset, return_to_permissions, profile_selection) =
+         open_confirmation_event.expect("expected full access confirmation event");
+     chat.open_full_access_confirmation(preset, return_to_permissions, profile_selection);
+@@ -1193,19 +1215,14 @@ async fn permissions_full_access_history_cell_emitted_only_after_confirmation()
+     );
+ 
+     chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+-    let cells_after_confirmation = drain_insert_history(&mut rx);
+-    let total_history_cells = cells_before_confirmation.len() + cells_after_confirmation.len();
+-    assert_eq!(
+-        total_history_cells, 1,
+-        "expected one full access history cell total"
+-    );
+-    let rendered = if !cells_before_confirmation.is_empty() {
+-        lines_to_single_string(&cells_before_confirmation[0])
+-    } else {
+-        lines_to_single_string(&cells_after_confirmation[0])
+-    };
+-    assert!(
+-        rendered.contains("Permissions updated to Full Access"),
+-        "expected full access update history message, got: {rendered}"
+-    );
++    assert!(matches!(
++        rx.try_recv(),
++        Ok(AppEvent::SelectPermissionProfile(PermissionProfileSelection {
++            profile_id,
++            approval_policy: Some(AskForApproval::Never),
++            approvals_reviewer: Some(ApprovalsReviewer::User),
++            display_label,
++        })) if profile_id == BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS
++            && display_label == "Full Access"
++    ));
+ }
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index f72e904636..52ca52ba77 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -249,11 +249,11 @@ async fn status_line_permissions_show_full_access_with_active_guardian_review()
+ 
+     assert_eq!(
+         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::Permissions),
+-        Some("Full Access + Guardian Review".to_string())
++        Some("Full Access + Agent Review".to_string())
+     );
+     assert_eq!(
+         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::ApprovalMode),
+-        Some("Guardian Review".to_string())
++        Some("Approve For Me".to_string())
+     );
+ }
+ 
+diff --git a/codex-rs/tui/src/status/mod.rs b/codex-rs/tui/src/status/mod.rs
+index b1b3b6b27f..dcd0d44ab5 100644
+--- a/codex-rs/tui/src/status/mod.rs
++++ b/codex-rs/tui/src/status/mod.rs
+@@ -24,7 +24,13 @@ pub(crate) use helpers::compose_agents_summary;
+ pub(crate) use helpers::format_directory_display;
+ pub(crate) use helpers::format_tokens_compact;
+ pub(crate) use helpers::plan_type_display_name;
++pub(crate) use permissions::APPROVE_FOR_ME_LABEL;
++pub(crate) use permissions::ASK_FOR_APPROVAL_LABEL;
++pub(crate) use permissions::FULL_ACCESS_AGENT_REVIEW_LABEL;
++pub(crate) use permissions::FULL_ACCESS_LABEL;
++pub(crate) use permissions::YOLO_LABEL;
+ pub(crate) use permissions::approval_mode_label;
++pub(crate) use permissions::builtin_permission_mode_label;
+ pub(crate) use permissions::effective_permissions_label;
+ pub(crate) use rate_limits::RateLimitSnapshotDisplay;
+ pub(crate) use rate_limits::RateLimitWindowDisplay;
+diff --git a/codex-rs/tui/src/status/permissions.rs b/codex-rs/tui/src/status/permissions.rs
+index e1a39818d4..c65a8130b4 100644
+--- a/codex-rs/tui/src/status/permissions.rs
++++ b/codex-rs/tui/src/status/permissions.rs
+@@ -5,19 +5,26 @@ use codex_protocol::models::ActivePermissionProfile;
+ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
+ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
+ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
++use codex_protocol::models::ManagedFileSystemPermissions;
+ use codex_protocol::models::PermissionProfile;
++use codex_protocol::permissions::FileSystemPath;
++use codex_protocol::permissions::FileSystemSpecialPath;
+ use codex_utils_absolute_path::AbsolutePathBuf;
+ use codex_utils_sandbox_summary::summarize_permission_profile;
+ 
+-const ASK_FOR_APPROVAL_LABEL: &str = "Ask For Approval";
+-const GUARDIAN_REVIEW_LABEL: &str = "Guardian Review";
++pub(crate) const ASK_FOR_APPROVAL_LABEL: &str = "Ask For Approval";
++pub(crate) const APPROVE_FOR_ME_LABEL: &str = "Approve For Me";
++pub(crate) const FULL_ACCESS_LABEL: &str = "Full Access";
++pub(crate) const FULL_ACCESS_AGENT_REVIEW_LABEL: &str = "Full Access + Agent Review";
++pub(crate) const YOLO_LABEL: &str = "YOLO";
+ 
+ pub(crate) fn effective_permissions_label(config: &Config) -> String {
+     let permission_profile = config.permissions.effective_permission_profile();
+     let approval_policy = AskForApproval::from(config.permissions.approval_policy.value());
+     let approval_fallback = config.permissions.approval_policy.value().to_string();
+     let workspace_roots = config.effective_workspace_roots();
+-    let sandbox = sandbox_label(&permission_profile, &config.cwd, workspace_roots.as_slice());
++    let permission_summary =
++        permission_summary(&permission_profile, &config.cwd, workspace_roots.as_slice());
+     let workspace_root_suffix = workspace_root_suffix(workspace_roots.as_slice(), &config.cwd);
+ 
+     effective_permissions_label_from_parts(
+@@ -25,8 +32,9 @@ pub(crate) fn effective_permissions_label(config: &Config) -> String {
+         &permission_profile,
+         approval_policy,
+         config.approvals_reviewer,
+-        &sandbox,
++        &permission_summary.sandbox,
+         &approval_fallback,
++        permission_summary.default_workspace,
+         workspace_root_suffix.as_deref(),
+     )
+ }
+@@ -46,6 +54,7 @@ fn effective_permissions_label_from_parts(
+     approvals_reviewer: ApprovalsReviewer,
+     sandbox: &str,
+     approval_fallback: &str,
++    default_workspace: bool,
+     workspace_root_suffix: Option<&str>,
+ ) -> String {
+     let approval = approval_label(approval_policy, approvals_reviewer, approval_fallback);
+@@ -67,7 +76,7 @@ fn effective_permissions_label_from_parts(
+             if approval_policy == AskForApproval::OnRequest {
+                 return match approvals_reviewer {
+                     ApprovalsReviewer::AutoReview => {
+-                        format!("{sandbox} + {GUARDIAN_REVIEW_LABEL}")
++                        format!("{sandbox} + {APPROVE_FOR_ME_LABEL}")
+                     }
+                     ApprovalsReviewer::User
+                         if sandbox == "Read Only"
+@@ -83,20 +92,15 @@ fn effective_permissions_label_from_parts(
+         Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE) if sandbox.starts_with("workspace") => {
+             let sandbox = decorate_workspace_sandbox_label(sandbox, workspace_root_suffix);
+             let sandbox = workspace_display_label(&sandbox);
+-            if approval_policy == AskForApproval::OnRequest {
+-                return match approvals_reviewer {
+-                    ApprovalsReviewer::AutoReview => {
+-                        format!("{sandbox} + {GUARDIAN_REVIEW_LABEL}")
+-                    }
+-                    ApprovalsReviewer::User
+-                        if sandbox == "Workspace"
+-                            && permission_profile == &PermissionProfile::workspace_write()
+-                            && workspace_root_suffix.is_none() =>
+-                    {
+-                        ASK_FOR_APPROVAL_LABEL.to_string()
+-                    }
+-                    ApprovalsReviewer::User => format!("{sandbox} ({approval})"),
+-                };
++            if let Some(label) = builtin_permission_mode_label(
++                BUILT_IN_PERMISSION_PROFILE_WORKSPACE,
++                approval_policy,
++                approvals_reviewer,
++            ) {
++                if sandbox == "Workspace" && default_workspace && workspace_root_suffix.is_none() {
++                    return label.to_string();
++                }
++                return format!("{sandbox} ({label})");
+             }
+             return format!("{sandbox} ({approval})");
+         }
+@@ -120,7 +124,7 @@ fn effective_permissions_label_from_parts(
+         let sandbox = workspace_display_label(&sandbox);
+         return match approvals_reviewer {
+             ApprovalsReviewer::AutoReview => {
+-                format!("{sandbox} + {GUARDIAN_REVIEW_LABEL}")
++                format!("{sandbox} + {APPROVE_FOR_ME_LABEL}")
+             }
+             ApprovalsReviewer::User => format!("{sandbox} ({approval})"),
+         };
+@@ -135,12 +139,47 @@ fn full_access_label(
+     approvals_reviewer: ApprovalsReviewer,
+     approval: &str,
+ ) -> String {
+-    match (approval_policy, approvals_reviewer) {
+-        (AskForApproval::Never, _) => "Full Access".to_string(),
+-        (AskForApproval::OnRequest, ApprovalsReviewer::AutoReview) => {
+-            "Full Access + Guardian Review".to_string()
+-        }
+-        _ => format!("No Sandbox ({approval})"),
++    builtin_permission_mode_label(
++        BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
++        approval_policy,
++        approvals_reviewer,
++    )
++    .map(str::to_string)
++    .unwrap_or_else(|| format!("No Sandbox ({approval})"))
++}
++
++pub(crate) fn builtin_permission_mode_label(
++    profile_id: &str,
++    approval_policy: AskForApproval,
++    approvals_reviewer: ApprovalsReviewer,
++) -> Option<&'static str> {
++    match (profile_id, approval_policy, approvals_reviewer) {
++        (
++            BUILT_IN_PERMISSION_PROFILE_WORKSPACE,
++            AskForApproval::OnRequest,
++            ApprovalsReviewer::User,
++        ) => Some(ASK_FOR_APPROVAL_LABEL),
++        (
++            BUILT_IN_PERMISSION_PROFILE_WORKSPACE,
++            AskForApproval::OnRequest,
++            ApprovalsReviewer::AutoReview,
++        ) => Some(APPROVE_FOR_ME_LABEL),
++        (
++            BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
++            AskForApproval::Never,
++            ApprovalsReviewer::User,
++        ) => Some(FULL_ACCESS_LABEL),
++        (
++            BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
++            AskForApproval::OnRequest,
++            ApprovalsReviewer::AutoReview,
++        ) => Some(FULL_ACCESS_AGENT_REVIEW_LABEL),
++        (
++            BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
++            AskForApproval::Never,
++            ApprovalsReviewer::AutoReview,
++        ) => Some(YOLO_LABEL),
++        _ => None,
+     }
+ }
+ 
+@@ -151,7 +190,7 @@ fn approval_label(
+ ) -> String {
+     if approval_policy == AskForApproval::OnRequest {
+         return match approvals_reviewer {
+-            ApprovalsReviewer::AutoReview => GUARDIAN_REVIEW_LABEL.to_string(),
++            ApprovalsReviewer::AutoReview => APPROVE_FOR_ME_LABEL.to_string(),
+             ApprovalsReviewer::User => ASK_FOR_APPROVAL_LABEL.to_string(),
+         };
+     }
+@@ -159,28 +198,79 @@ fn approval_label(
+     fallback.to_string()
+ }
+ 
+-fn sandbox_label(
++struct PermissionSummary {
++    sandbox: String,
++    default_workspace: bool,
++}
++
++fn permission_summary(
+     permission_profile: &PermissionProfile,
+     cwd: &AbsolutePathBuf,
+     workspace_roots: &[AbsolutePathBuf],
+-) -> String {
++) -> PermissionSummary {
+     let summary = summarize_permission_profile(permission_profile, cwd, workspace_roots);
++    let default_workspace = workspace_profile_has_only_default_writes(permission_profile, cwd);
+     if let Some(details) = summary.strip_prefix("read-only") {
+         if details.contains("(network access enabled)") {
+-            return "read-only with network access".to_string();
++            return PermissionSummary {
++                sandbox: "read-only with network access".to_string(),
++                default_workspace,
++            };
+         }
+-        return "read-only".to_string();
++        return PermissionSummary {
++            sandbox: "read-only".to_string(),
++            default_workspace,
++        };
+     }
+     if let Some(details) = summary.strip_prefix("workspace-write") {
+         if details.contains("(network access enabled)") {
+-            return "workspace with network access".to_string();
++            return PermissionSummary {
++                sandbox: "workspace with network access".to_string(),
++                default_workspace,
++            };
+         }
+-        return "workspace".to_string();
++        return PermissionSummary {
++            sandbox: "workspace".to_string(),
++            default_workspace,
++        };
+     }
+     if summary == "custom permissions (network access enabled)" {
+-        return "custom permissions with network access".to_string();
++        return PermissionSummary {
++            sandbox: "custom permissions with network access".to_string(),
++            default_workspace,
++        };
++    }
++    PermissionSummary {
++        sandbox: summary,
++        default_workspace,
+     }
+-    summary
++}
++
++fn workspace_profile_has_only_default_writes(
++    permission_profile: &PermissionProfile,
++    cwd: &AbsolutePathBuf,
++) -> bool {
++    let PermissionProfile::Managed { file_system, .. } = permission_profile else {
++        return false;
++    };
++    let ManagedFileSystemPermissions::Restricted { entries, .. } = file_system else {
++        return false;
++    };
++    entries.iter().all(|entry| {
++        if !entry.access.can_write() {
++            return true;
++        }
++        match &entry.path {
++            FileSystemPath::Special {
++                value:
++                    FileSystemSpecialPath::ProjectRoots { subpath: None }
++                    | FileSystemSpecialPath::Tmpdir
++                    | FileSystemSpecialPath::SlashTmp,
++            } => true,
++            FileSystemPath::Path { path } => path == cwd,
++            _ => false,
++        }
++    })
+ }
+ 
+ fn workspace_root_suffix(
+@@ -222,11 +312,7 @@ mod tests {
+                 ApprovalsReviewer::User,
+                 "Full Access",
+             ),
+-            (
+-                AskForApproval::Never,
+-                ApprovalsReviewer::AutoReview,
+-                "Full Access",
+-            ),
++            (AskForApproval::Never, ApprovalsReviewer::AutoReview, "YOLO"),
+             (
+                 AskForApproval::OnRequest,
+                 ApprovalsReviewer::User,
+@@ -235,7 +321,7 @@ mod tests {
+             (
+                 AskForApproval::OnRequest,
+                 ApprovalsReviewer::AutoReview,
+-                "Full Access + Guardian Review",
++                "Full Access + Agent Review",
+             ),
+         ];
+ 
+diff --git a/codex-rs/tui/src/status/snapshots/codex_tui__status__tests__status_snapshot_shows_auto_review_permissions.snap b/codex-rs/tui/src/status/snapshots/codex_tui__status__tests__status_snapshot_shows_auto_review_permissions.snap
+index 03c4c12851..95e6c08e38 100644
+--- a/codex-rs/tui/src/status/snapshots/codex_tui__status__tests__status_snapshot_shows_auto_review_permissions.snap
++++ b/codex-rs/tui/src/status/snapshots/codex_tui__status__tests__status_snapshot_shows_auto_review_permissions.snap
+@@ -12,7 +12,7 @@ expression: sanitized
+ │                                                                       │
+ │  Model:            gpt-5.1-codex-max (reasoning none, summaries auto) │
+ │  Directory: [[workspace]]                                             │
+-│  Permissions:      Workspace + Guardian Review                        │
++│  Permissions:      Approve For Me                                     │
+ │  Agents.md:        <none>                                             │
+ │                                                                       │
+ │  Token usage:      0 total  (0 input + 0 output)                      │
+diff --git a/codex-rs/tui/src/status/tests.rs b/codex-rs/tui/src/status/tests.rs
+index 01c8519c50..377ad9cc4c 100644
+--- a/codex-rs/tui/src/status/tests.rs
++++ b/codex-rs/tui/src/status/tests.rs
+@@ -482,7 +482,7 @@ async fn status_permissions_named_workspace_profile_shows_builtin_label() {
+ 
+     assert_eq!(
+         permissions_text_for(&config).as_deref(),
+-        Some("Workspace (Ask for approval)")
++        Some("Ask For Approval")
+     );
+ }
+ 
+@@ -506,7 +506,7 @@ async fn status_permissions_workspace_auto_review_shows_reviewer_label() {
+ 
+     assert_eq!(
+         permissions_text_for(&config).as_deref(),
+-        Some("Workspace + Guardian Review")
++        Some("Approve For Me")
+     );
+ }
+ 
+@@ -652,7 +652,7 @@ async fn status_permissions_full_access_auto_review_shows_active_guardian() {
+ 
+     assert_eq!(
+         permissions_text_for(&config).as_deref(),
+-        Some("Full Access + Guardian Review")
++        Some("Full Access + Agent Review")
+     );
+ }
+ 

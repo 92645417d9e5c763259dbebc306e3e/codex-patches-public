@@ -1,0 +1,75 @@
+diff --git a/codex-rs/core/src/responses_retry.rs b/codex-rs/core/src/responses_retry.rs
+index 4aab290f4c..111dc93f75 100644
+--- a/codex-rs/core/src/responses_retry.rs
++++ b/codex-rs/core/src/responses_retry.rs
+@@ -42,6 +42,18 @@ pub(crate) fn external_limit_retry_delay(err: &CodexErr) -> Option<Duration> {
+     external_limit_retry(err).map(|retry| retry.delay)
+ }
+ 
++pub(crate) fn sampling_error_is_retryable(
++    err: &CodexErr,
++    responses_websocket_enabled: bool,
++) -> bool {
++    match err {
++        CodexErr::UnexpectedStatus(response) if response.status.is_client_error() => {
++            responses_websocket_enabled
++        }
++        _ => err.is_retryable(),
++    }
++}
++
+ fn external_limit_retry(err: &CodexErr) -> Option<ExternalLimitRetry> {
+     external_limit_retry_at(err, SystemTime::now())
+ }
+@@ -205,7 +217,26 @@ fn log_retry(
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use codex_protocol::error::UnexpectedResponseError;
+     use codex_protocol::error::UsageLimitReachedError;
++    use http::StatusCode;
++
++    #[test]
++    fn sampling_client_errors_retry_only_for_websocket_transport() {
++        let error = CodexErr::UnexpectedStatus(UnexpectedResponseError {
++            status: StatusCode::BAD_REQUEST,
++            body: String::new(),
++            user_message: None,
++            url: None,
++            cf_ray: None,
++            request_id: None,
++            identity_authorization_error: None,
++            identity_error_code: None,
++        });
++
++        assert!(sampling_error_is_retryable(&error, true));
++        assert!(!sampling_error_is_retryable(&error, false));
++    }
+ 
+     #[test]
+     fn stream_retry_backoff_is_bounded_and_preserves_requested_delay() {
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index 8dad245aa4..08d57c6301 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -40,6 +40,7 @@ use crate::responses_metadata::CodexResponsesRequestKind;
+ use crate::responses_retry::ResponsesStreamRequest;
+ use crate::responses_retry::external_limit_retry_delay;
+ use crate::responses_retry::handle_retryable_response_stream_error;
++use crate::responses_retry::sampling_error_is_retryable;
+ use crate::session::PreviousTurnSettings;
+ use crate::session::TurnInput;
+ use crate::session::session::Session;
+@@ -1200,7 +1201,11 @@ async fn run_sampling_request(
+             original_input = Some(prompt.input);
+         }
+ 
+-        if !err.is_retryable() && external_limit_retry_delay(&err).is_none() {
++        if !sampling_error_is_retryable(
++            &err,
++            sess.services.model_client.responses_websocket_enabled(),
++        ) && external_limit_retry_delay(&err).is_none()
++        {
+             return Err(err);
+         }
+ 

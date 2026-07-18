@@ -1,0 +1,888 @@
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+index 56b1ec0076..2b3f07f43a 100644
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -673,7 +673,11 @@ pub async fn run_main_with_transport_options(
+ 
+     let feedback_layer = feedback.logger_layer();
+     let feedback_metadata_layer = feedback.metadata_layer();
+-    let log_db = state_db.clone().map(log_db::start);
++    let log_db = config
++        .feedback_enabled
++        .then(|| state_db.clone())
++        .flatten()
++        .map(log_db::start);
+     let log_db_layer = log_db
+         .clone()
+         .map(|layer| layer.with_filter(log_db::default_filter()));
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_list.rs b/codex-rs/app-server/tests/suite/v2/thread_list.rs
+index e17bb11865..b74d1376e3 100644
+--- a/codex-rs/app-server/tests/suite/v2/thread_list.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_list.rs
+@@ -737,6 +737,8 @@ sqlite = true
+         sqlite_home: codex_home.path().to_path_buf(),
+         cwd: codex_home.path().to_path_buf(),
+         model_provider_id: "mock_provider".to_string(),
++        use_goals: true,
++        persist_feedback_logs: true,
+         generate_memories: false,
+     };
+     let repaired_page = codex_core::RolloutRecorder::list_threads(
+@@ -1875,6 +1877,8 @@ async fn thread_list_sort_recency_at_uses_state_db_order_with_provider_filter()
+         sqlite_home: codex_home.path().to_path_buf(),
+         cwd: codex_home.path().to_path_buf(),
+         model_provider_id: "mock_provider".to_string(),
++        use_goals: true,
++        persist_feedback_logs: true,
+         generate_memories: false,
+     };
+     codex_core::RolloutRecorder::list_threads(
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index 00990d3f9c..0025b3c8ac 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -5604,6 +5604,78 @@ async fn memory_tool_makes_memories_root_readable_without_creating_or_widening_w
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn workspace_write_skips_memories_root_when_memory_feature_disabled() -> std::io::Result<()> {
++    let codex_home = TempDir::new()?;
++    let memories_root = codex_home.path().join("memories");
++    let config = Config::load_from_base_config_with_overrides(
++        ConfigToml {
++            features: Some(FeaturesToml::from(BTreeMap::from([(
++                "memories".to_string(),
++                false,
++            )]))),
++            sandbox_workspace_write: Some(SandboxWorkspaceWrite {
++                writable_roots: vec![codex_home.path().join("workspace").abs()],
++                ..Default::default()
++            }),
++            ..Default::default()
++        },
++        ConfigOverrides {
++            sandbox_mode: Some(SandboxMode::WorkspaceWrite),
++            ..Default::default()
++        },
++        codex_home.abs(),
++    )
++    .await?;
++
++    assert!(
++        !memories_root.exists(),
++        "expected disabled memories feature not to create {}",
++        memories_root.display()
++    );
++    let expected_memories_root = memories_root.abs();
++    if let SandboxPolicy::WorkspaceWrite { writable_roots, .. } = &config.legacy_sandbox_policy() {
++        assert!(
++            !writable_roots.contains(&expected_memories_root),
++            "expected disabled memories root not to be writable"
++        );
++    }
++
++    Ok(())
++}
++
++#[tokio::test]
++async fn rollout_config_snapshot_preserves_disabled_local_state_surfaces() -> std::io::Result<()> {
++    let codex_home = TempDir::new()?;
++    let config = Config::load_from_base_config_with_overrides(
++        ConfigToml {
++            feedback: Some(FeedbackConfigToml {
++                enabled: Some(false),
++            }),
++            features: Some(FeaturesToml::from(BTreeMap::from([
++                ("goals".to_string(), false),
++                ("memories".to_string(), false),
++            ]))),
++            memories: Some(MemoriesToml {
++                generate_memories: Some(false),
++                ..Default::default()
++            }),
++            ..Default::default()
++        },
++        ConfigOverrides::default(),
++        codex_home.abs(),
++    )
++    .await?;
++
++    let snapshot = codex_rollout::RolloutConfig::from_view(&config);
++
++    assert!(!snapshot.use_goals);
++    assert!(!snapshot.persist_feedback_logs);
++    assert!(!snapshot.generate_memories);
++
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn config_defaults_to_file_cli_auth_store_mode() -> std::io::Result<()> {
+     let codex_home = TempDir::new()?;
+diff --git a/codex-rs/core/src/rollout.rs b/codex-rs/core/src/rollout.rs
+index 73fbe5b5e4..a7ecee38b5 100644
+--- a/codex-rs/core/src/rollout.rs
++++ b/codex-rs/core/src/rollout.rs
+@@ -1,4 +1,5 @@
+ use crate::config::Config;
++use codex_features::Feature;
+ pub use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
+ pub use codex_rollout::Cursor;
+ pub use codex_rollout::INTERACTIVE_SESSION_SOURCES;
+@@ -40,6 +41,14 @@ impl codex_rollout::RolloutConfigView for Config {
+         self.model_provider_id.as_str()
+     }
+ 
++    fn use_goals(&self) -> bool {
++        self.features.enabled(Feature::Goals)
++    }
++
++    fn persist_feedback_logs(&self) -> bool {
++        self.feedback_enabled
++    }
++
+     fn generate_memories(&self) -> bool {
+         self.memories.generate_memories
+     }
+diff --git a/codex-rs/rollout/src/compression_tests.rs b/codex-rs/rollout/src/compression_tests.rs
+index 6b2f8d328f..7a65db0de0 100644
+--- a/codex-rs/rollout/src/compression_tests.rs
++++ b/codex-rs/rollout/src/compression_tests.rs
+@@ -314,6 +314,8 @@ async fn resume_materializes_compressed_rollout_path() -> anyhow::Result<()> {
+         sqlite_home: home.path().to_path_buf(),
+         cwd: home.path().to_path_buf(),
+         model_provider_id: "test-provider".to_string(),
++        use_goals: true,
++        persist_feedback_logs: true,
+         generate_memories: true,
+     };
+     let uuid = Uuid::from_u128(3);
+diff --git a/codex-rs/rollout/src/config.rs b/codex-rs/rollout/src/config.rs
+index 420949bfbd..e49eb4ca4a 100644
+--- a/codex-rs/rollout/src/config.rs
++++ b/codex-rs/rollout/src/config.rs
+@@ -7,6 +7,8 @@ pub trait RolloutConfigView {
+     fn sqlite_home(&self) -> &Path;
+     fn cwd(&self) -> &Path;
+     fn model_provider_id(&self) -> &str;
++    fn use_goals(&self) -> bool;
++    fn persist_feedback_logs(&self) -> bool;
+     fn generate_memories(&self) -> bool;
+ }
+ 
+@@ -16,6 +18,8 @@ pub struct RolloutConfig {
+     pub sqlite_home: PathBuf,
+     pub cwd: PathBuf,
+     pub model_provider_id: String,
++    pub use_goals: bool,
++    pub persist_feedback_logs: bool,
+     pub generate_memories: bool,
+ }
+ 
+@@ -28,6 +32,8 @@ impl RolloutConfig {
+             sqlite_home: view.sqlite_home().to_path_buf(),
+             cwd: view.cwd().to_path_buf(),
+             model_provider_id: view.model_provider_id().to_string(),
++            use_goals: view.use_goals(),
++            persist_feedback_logs: view.persist_feedback_logs(),
+             generate_memories: view.generate_memories(),
+         }
+     }
+@@ -50,6 +56,14 @@ impl RolloutConfigView for RolloutConfig {
+         self.model_provider_id.as_str()
+     }
+ 
++    fn use_goals(&self) -> bool {
++        self.use_goals
++    }
++
++    fn persist_feedback_logs(&self) -> bool {
++        self.persist_feedback_logs
++    }
++
+     fn generate_memories(&self) -> bool {
+         self.generate_memories
+     }
+@@ -72,6 +86,14 @@ impl<T: RolloutConfigView + ?Sized> RolloutConfigView for &T {
+         (*self).model_provider_id()
+     }
+ 
++    fn use_goals(&self) -> bool {
++        (*self).use_goals()
++    }
++
++    fn persist_feedback_logs(&self) -> bool {
++        (*self).persist_feedback_logs()
++    }
++
+     fn generate_memories(&self) -> bool {
+         (*self).generate_memories()
+     }
+@@ -94,6 +116,14 @@ impl<T: RolloutConfigView + ?Sized> RolloutConfigView for Arc<T> {
+         self.as_ref().model_provider_id()
+     }
+ 
++    fn use_goals(&self) -> bool {
++        self.as_ref().use_goals()
++    }
++
++    fn persist_feedback_logs(&self) -> bool {
++        self.as_ref().persist_feedback_logs()
++    }
++
+     fn generate_memories(&self) -> bool {
+         self.as_ref().generate_memories()
+     }
+diff --git a/codex-rs/rollout/src/recorder_tests.rs b/codex-rs/rollout/src/recorder_tests.rs
+index 2c8b2eb09b..8762a7345d 100644
+--- a/codex-rs/rollout/src/recorder_tests.rs
++++ b/codex-rs/rollout/src/recorder_tests.rs
+@@ -44,6 +44,8 @@ fn test_config(codex_home: &Path) -> RolloutConfig {
+         sqlite_home: codex_home.to_path_buf(),
+         cwd: codex_home.to_path_buf(),
+         model_provider_id: "test-provider".to_string(),
++        use_goals: true,
++        persist_feedback_logs: true,
+         generate_memories: true,
+     }
+ }
+diff --git a/codex-rs/rollout/src/state_db.rs b/codex-rs/rollout/src/state_db.rs
+index f22019af84..eb4b7f92a2 100644
+--- a/codex-rs/rollout/src/state_db.rs
++++ b/codex-rs/rollout/src/state_db.rs
+@@ -42,13 +42,7 @@ const STARTUP_BACKFILL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+ /// initialized handle.
+ pub async fn init(config: &impl RolloutConfigView) -> Option<StateDbHandle> {
+     let config = RolloutConfig::from_view(config);
+-    match try_init_with_roots(
+-        config.codex_home,
+-        config.sqlite_home,
+-        config.model_provider_id,
+-    )
+-    .await
+-    {
++    match try_init_with_config(config, /*backfill_lease_seconds*/ None).await {
+         Ok(runtime) => Some(runtime),
+         Err(err) => {
+             emit_startup_warning(&format!("failed to initialize state runtime: {err:#}"));
+@@ -63,26 +57,7 @@ pub async fn init(config: &impl RolloutConfigView) -> Option<StateDbHandle> {
+ /// tracing or UI setup has completed.
+ pub async fn try_init(config: &impl RolloutConfigView) -> anyhow::Result<StateDbHandle> {
+     let config = RolloutConfig::from_view(config);
+-    try_init_with_roots(
+-        config.codex_home,
+-        config.sqlite_home,
+-        config.model_provider_id,
+-    )
+-    .await
+-}
+-
+-async fn try_init_with_roots(
+-    codex_home: PathBuf,
+-    sqlite_home: PathBuf,
+-    default_model_provider_id: String,
+-) -> anyhow::Result<StateDbHandle> {
+-    try_init_with_roots_inner(
+-        codex_home,
+-        sqlite_home,
+-        default_model_provider_id,
+-        /*backfill_lease_seconds*/ None,
+-    )
+-    .await
++    try_init_with_config(config, /*backfill_lease_seconds*/ None).await
+ }
+ 
+ #[cfg(test)]
+@@ -92,35 +67,42 @@ async fn try_init_with_roots_and_backfill_lease(
+     default_model_provider_id: String,
+     backfill_lease_seconds: i64,
+ ) -> anyhow::Result<StateDbHandle> {
+-    try_init_with_roots_inner(
++    let config = RolloutConfig {
++        cwd: codex_home.clone(),
+         codex_home,
+         sqlite_home,
+-        default_model_provider_id,
+-        Some(backfill_lease_seconds),
+-    )
+-    .await
++        model_provider_id: default_model_provider_id,
++        use_goals: true,
++        persist_feedback_logs: true,
++        generate_memories: true,
++    };
++    try_init_with_config(config, Some(backfill_lease_seconds)).await
+ }
+ 
+-async fn try_init_with_roots_inner(
+-    codex_home: PathBuf,
+-    sqlite_home: PathBuf,
+-    default_model_provider_id: String,
++async fn try_init_with_config(
++    config: RolloutConfig,
+     backfill_lease_seconds: Option<i64>,
+ ) -> anyhow::Result<StateDbHandle> {
+-    let runtime =
+-        codex_state::StateRuntime::init(sqlite_home.clone(), default_model_provider_id.clone())
+-            .await
+-            .with_context(|| {
+-                format!(
+-                    "failed to initialize state runtime at {}",
+-                    sqlite_home.display()
+-                )
+-            })?;
++    let runtime = codex_state::StateRuntime::init_with_db_persistence(
++        config.sqlite_home.clone(),
++        config.model_provider_id.clone(),
++        config.persist_feedback_logs,
++        config.use_goals,
++        config.generate_memories,
++    )
++    .await
++    .with_context(|| {
++        format!(
++            "failed to initialize state runtime at {}",
++            config.sqlite_home.display()
++        )
++    })?;
+     let backfill_gate_started = Instant::now();
+     let backfill_gate_result = wait_for_backfill_gate(
+         runtime.as_ref(),
+-        codex_home.as_path(),
+-        default_model_provider_id.as_str(),
++        config.codex_home.as_path(),
++        config.sqlite_home.as_path(),
++        config.model_provider_id.as_str(),
+         backfill_lease_seconds,
+     )
+     .await;
+@@ -139,6 +121,7 @@ async fn try_init_with_roots_inner(
+ async fn wait_for_backfill_gate(
+     runtime: &codex_state::StateRuntime,
+     codex_home: &Path,
++    sqlite_home: &Path,
+     default_model_provider_id: &str,
+     backfill_lease_seconds: Option<i64>,
+ ) -> anyhow::Result<()> {
+@@ -148,7 +131,7 @@ async fn wait_for_backfill_gate(
+         let backfill_state = runtime.get_backfill_state().await.map_err(|err| {
+             anyhow::anyhow!(
+                 "failed to read backfill state at {}: {err}",
+-                codex_home.display()
++                sqlite_home.display()
+             )
+         })?;
+         if backfill_state.status == codex_state::BackfillStatus::Complete {
+@@ -169,7 +152,7 @@ async fn wait_for_backfill_gate(
+         let backfill_state = runtime.get_backfill_state().await.map_err(|err| {
+             anyhow::anyhow!(
+                 "failed to read backfill state at {} after startup backfill: {err}",
+-                codex_home.display()
++                sqlite_home.display()
+             )
+         })?;
+         if backfill_state.status == codex_state::BackfillStatus::Complete {
+@@ -178,7 +161,7 @@ async fn wait_for_backfill_gate(
+         if wait_started.elapsed() >= STARTUP_BACKFILL_WAIT_TIMEOUT {
+             return Err(anyhow::anyhow!(
+                 "timed out waiting for state db backfill at {} after {:?} (status: {})",
+-                codex_home.display(),
++                sqlite_home.display(),
+                 STARTUP_BACKFILL_WAIT_TIMEOUT,
+                 backfill_state.status.as_str()
+             ));
+@@ -187,7 +170,7 @@ async fn wait_for_backfill_gate(
+         let message = format!(
+             "state db backfill is {} at {}; waiting up to {:?} before retrying startup initialization",
+             backfill_state.status.as_str(),
+-            codex_home.display(),
++            sqlite_home.display(),
+             STARTUP_BACKFILL_WAIT_TIMEOUT,
+         );
+         if reported_wait {
+@@ -215,7 +198,8 @@ fn emit_startup_warning(message: &str) {
+ /// Unlike [`init`], this helper does not run rollout backfill. It is for
+ /// optional local reads from non-owning contexts such as remote app-server mode.
+ pub async fn get_state_db(config: &impl RolloutConfigView) -> Option<StateDbHandle> {
+-    let state_path = codex_state::state_db_path(config.sqlite_home());
++    let config = RolloutConfig::from_view(config);
++    let state_path = codex_state::state_db_path(config.sqlite_home.as_path());
+     if !tokio::fs::try_exists(&state_path).await.unwrap_or(false) {
+         codex_state::record_fallback(
+             "get_state_db",
+@@ -224,9 +208,12 @@ pub async fn get_state_db(config: &impl RolloutConfigView) -> Option<StateDbHand
+         );
+         return None;
+     }
+-    let runtime = match codex_state::StateRuntime::init(
+-        config.sqlite_home().to_path_buf(),
+-        config.model_provider_id().to_string(),
++    let runtime = match codex_state::StateRuntime::init_with_db_persistence(
++        config.sqlite_home.clone(),
++        config.model_provider_id,
++        config.persist_feedback_logs,
++        config.use_goals,
++        config.generate_memories,
+     )
+     .await
+     {
+@@ -240,7 +227,7 @@ pub async fn get_state_db(config: &impl RolloutConfigView) -> Option<StateDbHand
+             return None;
+         }
+     };
+-    require_backfill_complete(runtime, config.sqlite_home()).await
++    require_backfill_complete(runtime, config.sqlite_home.as_path()).await
+ }
+ 
+ /// Build a SQLite telemetry recorder backed by an OTEL metrics client.
+@@ -253,14 +240,14 @@ pub fn sqlite_telemetry_recorder(
+ 
+ async fn require_backfill_complete(
+     runtime: StateDbHandle,
+-    codex_home: &Path,
++    sqlite_home: &Path,
+ ) -> Option<StateDbHandle> {
+     match runtime.get_backfill_state().await {
+         Ok(state) if state.status == codex_state::BackfillStatus::Complete => Some(runtime),
+         Ok(state) => {
+             warn!(
+                 "state db backfill not complete at {} (status: {})",
+-                codex_home.display(),
++                sqlite_home.display(),
+                 state.status.as_str()
+             );
+             codex_state::record_fallback(
+@@ -273,7 +260,7 @@ async fn require_backfill_complete(
+         Err(err) => {
+             warn!(
+                 "failed to read backfill state at {}: {err}",
+-                codex_home.display()
++                sqlite_home.display()
+             );
+             codex_state::record_fallback(
+                 "get_state_db",
+diff --git a/codex-rs/rollout/src/state_db_tests.rs b/codex-rs/rollout/src/state_db_tests.rs
+index 60fbe45896..ce514cf8e2 100644
+--- a/codex-rs/rollout/src/state_db_tests.rs
++++ b/codex-rs/rollout/src/state_db_tests.rs
+@@ -107,6 +107,189 @@ async fn try_init_times_out_waiting_for_stuck_startup_backfill() -> anyhow::Resu
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn disabled_memories_state_db_does_not_create_placeholder_file() -> anyhow::Result<()> {
++    let home = TempDir::new().expect("temp dir");
++    let config = RolloutConfig {
++        codex_home: home.path().to_path_buf(),
++        sqlite_home: home.path().to_path_buf(),
++        cwd: home.path().to_path_buf(),
++        model_provider_id: "test-provider".to_string(),
++        use_goals: true,
++        persist_feedback_logs: true,
++        generate_memories: false,
++    };
++
++    let runtime = try_init(&config).await?;
++
++    assert!(codex_state::state_db_path(home.path()).is_file());
++    assert!(codex_state::logs_db_path(home.path()).is_file());
++    assert!(codex_state::goals_db_path(home.path()).is_file());
++    assert!(!codex_state::memories_db_path(home.path()).exists());
++    runtime.close().await;
++
++    Ok(())
++}
++
++#[tokio::test]
++async fn disabled_memories_state_db_ignores_existing_file() -> anyhow::Result<()> {
++    let home = TempDir::new().expect("temp dir");
++    let memories_path = codex_state::memories_db_path(home.path());
++    std::fs::write(&memories_path, b"not a sqlite database")?;
++    let config = RolloutConfig {
++        codex_home: home.path().to_path_buf(),
++        sqlite_home: home.path().to_path_buf(),
++        cwd: home.path().to_path_buf(),
++        model_provider_id: "test-provider".to_string(),
++        use_goals: true,
++        persist_feedback_logs: true,
++        generate_memories: false,
++    };
++
++    let runtime = try_init(&config).await?;
++
++    assert_eq!(std::fs::read(&memories_path)?, b"not a sqlite database");
++    runtime.close().await;
++
++    Ok(())
++}
++
++#[tokio::test]
++async fn disabled_goals_state_db_does_not_create_placeholder_file() -> anyhow::Result<()> {
++    let home = TempDir::new().expect("temp dir");
++    let config = RolloutConfig {
++        codex_home: home.path().to_path_buf(),
++        sqlite_home: home.path().to_path_buf(),
++        cwd: home.path().to_path_buf(),
++        model_provider_id: "test-provider".to_string(),
++        use_goals: false,
++        persist_feedback_logs: true,
++        generate_memories: true,
++    };
++
++    let runtime = try_init(&config).await?;
++    assert_eq!(
++        runtime
++            .thread_goals()
++            .get_thread_goal(ThreadId::new())
++            .await?,
++        None
++    );
++
++    assert!(codex_state::state_db_path(home.path()).is_file());
++    assert!(codex_state::logs_db_path(home.path()).is_file());
++    assert!(!codex_state::goals_db_path(home.path()).exists());
++    assert!(codex_state::memories_db_path(home.path()).is_file());
++    runtime.close().await;
++
++    Ok(())
++}
++
++#[tokio::test]
++async fn disabled_goals_state_db_ignores_existing_file() -> anyhow::Result<()> {
++    let home = TempDir::new().expect("temp dir");
++    let goals_path = codex_state::goals_db_path(home.path());
++    std::fs::write(&goals_path, b"not a sqlite database")?;
++    let config = RolloutConfig {
++        codex_home: home.path().to_path_buf(),
++        sqlite_home: home.path().to_path_buf(),
++        cwd: home.path().to_path_buf(),
++        model_provider_id: "test-provider".to_string(),
++        use_goals: false,
++        persist_feedback_logs: true,
++        generate_memories: true,
++    };
++
++    let runtime = try_init(&config).await?;
++    assert_eq!(
++        runtime
++            .thread_goals()
++            .get_thread_goal(ThreadId::new())
++            .await?,
++        None
++    );
++
++    assert_eq!(std::fs::read(&goals_path)?, b"not a sqlite database");
++    runtime.close().await;
++
++    Ok(())
++}
++
++#[tokio::test]
++async fn disabled_feedback_logs_state_db_uses_in_memory_logs() -> anyhow::Result<()> {
++    let home = TempDir::new().expect("temp dir");
++    let config = RolloutConfig {
++        codex_home: home.path().to_path_buf(),
++        sqlite_home: home.path().to_path_buf(),
++        cwd: home.path().to_path_buf(),
++        model_provider_id: "test-provider".to_string(),
++        use_goals: true,
++        persist_feedback_logs: false,
++        generate_memories: true,
++    };
++
++    let runtime = try_init(&config).await?;
++    runtime
++        .insert_log(&codex_state::LogEntry {
++            ts: 1,
++            ts_nanos: 0,
++            level: "INFO".to_string(),
++            target: "test".to_string(),
++            message: None,
++            feedback_log_body: Some("kept in memory".to_string()),
++            thread_id: Some("thread-1".to_string()),
++            process_uuid: Some("process-1".to_string()),
++            module_path: None,
++            file: None,
++            line: None,
++        })
++        .await?;
++    let logs = runtime
++        .query_logs(&codex_state::LogQuery {
++            thread_ids: vec!["thread-1".to_string()],
++            ..Default::default()
++        })
++        .await?;
++
++    assert_eq!(logs.len(), 1);
++    assert_eq!(logs[0].message.as_deref(), Some("kept in memory"));
++    assert!(codex_state::state_db_path(home.path()).is_file());
++    assert!(!codex_state::logs_db_path(home.path()).exists());
++    assert!(codex_state::goals_db_path(home.path()).is_file());
++    assert!(codex_state::memories_db_path(home.path()).is_file());
++    runtime.close().await;
++
++    Ok(())
++}
++
++#[tokio::test]
++async fn disabled_feedback_logs_state_db_ignores_existing_file() -> anyhow::Result<()> {
++    let home = TempDir::new().expect("temp dir");
++    let logs_path = codex_state::logs_db_path(home.path());
++    std::fs::write(&logs_path, b"not a sqlite database")?;
++    let config = RolloutConfig {
++        codex_home: home.path().to_path_buf(),
++        sqlite_home: home.path().to_path_buf(),
++        cwd: home.path().to_path_buf(),
++        model_provider_id: "test-provider".to_string(),
++        use_goals: true,
++        persist_feedback_logs: false,
++        generate_memories: true,
++    };
++
++    let runtime = try_init(&config).await?;
++    assert!(
++        runtime
++            .query_logs(&codex_state::LogQuery::default())
++            .await?
++            .is_empty()
++    );
++    assert_eq!(std::fs::read(&logs_path)?, b"not a sqlite database");
++    runtime.close().await;
++
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn reconcile_rollout_preserves_existing_explicit_title() -> anyhow::Result<()> {
+     let home = TempDir::new().expect("temp dir");
+diff --git a/codex-rs/state/src/runtime.rs b/codex-rs/state/src/runtime.rs
+index 1bc991e0d7..81ba2d0347 100644
+--- a/codex-rs/state/src/runtime.rs
++++ b/codex-rs/state/src/runtime.rs
+@@ -368,9 +368,35 @@ impl StateRuntime {
+     /// Logs and paginated thread history live in dedicated files to reduce
+     /// lock contention with the rest of the state store.
+     pub async fn init(codex_home: PathBuf, default_provider: String) -> anyhow::Result<Arc<Self>> {
++        Self::init_with_db_persistence(
++            codex_home,
++            default_provider,
++            /*persist_logs*/ true,
++            /*persist_goals*/ true,
++            /*persist_memories*/ true,
++        )
++        .await
++    }
++
++    /// Initialize the runtime while controlling logs, goals, and memories persistence.
++    ///
++    /// The primary state database is always persisted, and paginated thread-history storage is not
++    /// governed by these switches. A disabled logs, goals, or memories database uses a migrated
++    /// in-memory SQLite store, so its API remains usable without creating, opening, or modifying
++    /// its on-disk file.
++    pub async fn init_with_db_persistence(
++        codex_home: PathBuf,
++        default_provider: String,
++        persist_logs: bool,
++        persist_goals: bool,
++        persist_memories: bool,
++    ) -> anyhow::Result<Arc<Self>> {
+         Self::init_inner(
+             codex_home,
+             default_provider,
++            persist_logs,
++            persist_goals,
++            persist_memories,
+             /*telemetry_override*/ None,
+         )
+         .await
+@@ -382,12 +408,23 @@ impl StateRuntime {
+         default_provider: String,
+         telemetry_override: &dyn DbTelemetry,
+     ) -> anyhow::Result<Arc<Self>> {
+-        Self::init_inner(codex_home, default_provider, Some(telemetry_override)).await
++        Self::init_inner(
++            codex_home,
++            default_provider,
++            /*persist_logs*/ true,
++            /*persist_goals*/ true,
++            /*persist_memories*/ true,
++            Some(telemetry_override),
++        )
++        .await
+     }
+ 
+     async fn init_inner(
+         codex_home: PathBuf,
+         default_provider: String,
++        persist_logs: bool,
++        persist_goals: bool,
++        persist_memories: bool,
+         telemetry_override: Option<&dyn DbTelemetry>,
+     ) -> anyhow::Result<Arc<Self>> {
+         let sqlite_home_guard = SqliteHomeGuard::prepare(&codex_home)?;
+@@ -417,9 +454,11 @@ impl StateRuntime {
+             }
+         };
+         let logs_pool_result = sqlite_home_guard
+-            .run(open_logs_sqlite(
++            .run(open_configurable_sqlite(
+                 &logs_path,
+                 &logs_migrator,
++                LOGS_DB,
++                persist_logs,
+                 telemetry_override,
+             ))
+             .await?;
+@@ -432,9 +471,11 @@ impl StateRuntime {
+             }
+         };
+         let goals_pool_result = sqlite_home_guard
+-            .run(open_goals_sqlite(
++            .run(open_configurable_sqlite(
+                 &goals_path,
+                 &goals_migrator,
++                GOALS_DB,
++                persist_goals,
+                 telemetry_override,
+             ))
+             .await?;
+@@ -447,9 +488,11 @@ impl StateRuntime {
+             }
+         };
+         let memories_pool_result = sqlite_home_guard
+-            .run(open_memories_sqlite(
++            .run(open_configurable_sqlite(
+                 &memories_path,
+                 &memories_migrator,
++                MEMORIES_DB,
++                persist_memories,
+                 telemetry_override,
+             ))
+             .await?;
+@@ -604,20 +647,38 @@ async fn open_state_sqlite(
+     open_sqlite(path, migrator, STATE_DB, telemetry_override).await
+ }
+ 
+-async fn open_logs_sqlite(
++async fn open_configurable_sqlite(
+     path: &Path,
+     migrator: &Migrator,
++    spec: RuntimeDbSpec,
++    persist: bool,
+     telemetry_override: Option<&dyn DbTelemetry>,
+ ) -> anyhow::Result<SqlitePool> {
+-    open_sqlite(path, migrator, LOGS_DB, telemetry_override).await
++    if persist {
++        return open_sqlite(path, migrator, spec, telemetry_override).await;
++    }
++
++    open_in_memory_sqlite(migrator, spec, telemetry_override).await
+ }
+ 
+-async fn open_goals_sqlite(
+-    path: &Path,
++async fn open_in_memory_sqlite(
+     migrator: &Migrator,
++    spec: RuntimeDbSpec,
+     telemetry_override: Option<&dyn DbTelemetry>,
+ ) -> anyhow::Result<SqlitePool> {
+-    open_sqlite(path, migrator, GOALS_DB, telemetry_override).await
++    let options = SqliteConnectOptions::new()
++        .in_memory(true)
++        .create_if_missing(true)
++        .log_statements(LevelFilter::Off);
++    open_sqlite_with_options(
++        Path::new(":memory:"),
++        options,
++        /*max_connections*/ 1,
++        migrator,
++        spec,
++        telemetry_override,
++    )
++    .await
+ }
+ 
+ async fn open_memories_sqlite(
+@@ -647,9 +708,28 @@ async fn open_sqlite(
+     telemetry_override: Option<&dyn DbTelemetry>,
+ ) -> anyhow::Result<SqlitePool> {
+     let options = base_sqlite_options(path).auto_vacuum(SqliteAutoVacuum::Incremental);
++    open_sqlite_with_options(
++        path,
++        options,
++        /*max_connections*/ 5,
++        migrator,
++        spec,
++        telemetry_override,
++    )
++    .await
++}
++
++async fn open_sqlite_with_options(
++    path: &Path,
++    options: SqliteConnectOptions,
++    max_connections: u32,
++    migrator: &Migrator,
++    spec: RuntimeDbSpec,
++    telemetry_override: Option<&dyn DbTelemetry>,
++) -> anyhow::Result<SqlitePool> {
+     let started = Instant::now();
+     let pool_result = SqlitePoolOptions::new()
+-        .max_connections(5)
++        .max_connections(max_connections)
+         .connect_with(options)
+         .await
+         .map_err(anyhow::Error::from);
+diff --git a/codex-rs/thread-store/src/local/create_thread.rs b/codex-rs/thread-store/src/local/create_thread.rs
+index 0c4af760e7..3ce9d852b9 100644
+--- a/codex-rs/thread-store/src/local/create_thread.rs
++++ b/codex-rs/thread-store/src/local/create_thread.rs
+@@ -23,6 +23,8 @@ pub(super) async fn create_thread(
+         sqlite_home: store.config.sqlite_home.clone(),
+         cwd,
+         model_provider_id: params.metadata.model_provider.clone(),
++        use_goals: true,
++        persist_feedback_logs: true,
+         generate_memories: matches!(params.metadata.memory_mode, ThreadMemoryMode::Enabled),
+     };
+     RolloutRecorder::new(
+diff --git a/codex-rs/thread-store/src/local/list_threads.rs b/codex-rs/thread-store/src/local/list_threads.rs
+index f514231333..b76d70cc7f 100644
+--- a/codex-rs/thread-store/src/local/list_threads.rs
++++ b/codex-rs/thread-store/src/local/list_threads.rs
+@@ -47,6 +47,8 @@ pub(super) async fn list_threads(
+         sqlite_home: store.config.sqlite_home.clone(),
+         cwd: store.config.codex_home.clone(),
+         model_provider_id: store.config.default_model_provider_id.clone(),
++        use_goals: true,
++        persist_feedback_logs: true,
+         generate_memories: false,
+     };
+     let page = list_rollout_threads(
+diff --git a/codex-rs/thread-store/src/local/live_writer.rs b/codex-rs/thread-store/src/local/live_writer.rs
+index cbf53722c7..d1aad13eb3 100644
+--- a/codex-rs/thread-store/src/local/live_writer.rs
++++ b/codex-rs/thread-store/src/local/live_writer.rs
+@@ -98,6 +98,8 @@ pub(super) async fn resume_thread(
+         sqlite_home: store.config.sqlite_home.clone(),
+         cwd,
+         model_provider_id: params.metadata.model_provider.clone(),
++        use_goals: true,
++        persist_feedback_logs: true,
+         generate_memories: matches!(params.metadata.memory_mode, ThreadMemoryMode::Enabled),
+     };
+     let recorder = RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path))
+diff --git a/codex-rs/thread-store/src/local/search_threads.rs b/codex-rs/thread-store/src/local/search_threads.rs
+index e881dabd59..2efccd4119 100644
+--- a/codex-rs/thread-store/src/local/search_threads.rs
++++ b/codex-rs/thread-store/src/local/search_threads.rs
+@@ -66,6 +66,8 @@ pub(super) async fn search_threads(
+         sqlite_home: store.config.sqlite_home.clone(),
+         cwd: store.config.codex_home.clone(),
+         model_provider_id: store.config.default_model_provider_id.clone(),
++        use_goals: true,
++        persist_feedback_logs: true,
+         generate_memories: false,
+     };
+     let rg_command = InstallContext::current().rg_command();

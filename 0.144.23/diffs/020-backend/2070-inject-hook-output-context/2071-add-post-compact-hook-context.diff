@@ -1,0 +1,393 @@
+diff --git a/codex-rs/core/src/hook_runtime.rs b/codex-rs/core/src/hook_runtime.rs
+index 3adbea420c..5b1f5c6235 100644
+--- a/codex-rs/core/src/hook_runtime.rs
++++ b/codex-rs/core/src/hook_runtime.rs
+@@ -454,6 +454,7 @@ pub(crate) async fn run_post_compact_hooks(
+ 
+     let outcome = sess.hooks().run_post_compact(request).await;
+     emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
++    record_additional_contexts(sess, turn_context, outcome.additional_contexts).await;
+     if outcome.should_stop {
+         PostCompactHookOutcome::Stopped
+     } else {
+diff --git a/codex-rs/core/tests/suite/compact.rs b/codex-rs/core/tests/suite/compact.rs
+index 722c474d61..284c751743 100644
+--- a/codex-rs/core/tests/suite/compact.rs
++++ b/codex-rs/core/tests/suite/compact.rs
+@@ -18,6 +18,7 @@ use codex_protocol::openai_models::ModelsResponse;
+ use codex_protocol::protocol::AskForApproval;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::HookEventName;
++use codex_protocol::protocol::HookOutputEntryKind;
+ use codex_protocol::protocol::HookRunStatus;
+ use codex_protocol::protocol::ItemCompletedEvent;
+ use codex_protocol::protocol::ItemStartedEvent;
+@@ -97,6 +98,13 @@ const REMOTE_V2_SUMMARY: &str = "global-instructions-remote-v2-summary";
+ 
+ pub(super) const COMPACT_WARNING_MESSAGE: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
+ 
++fn post_compact_context() -> String {
++    format!(
++        "reload workflow execution surface:{}:complete",
++        "x".repeat(10_240)
++    )
++}
++
+ fn ev_shell_command_call(call_id: &str, command: &str) -> serde_json::Value {
+     ev_function_call(
+         call_id,
+@@ -234,6 +242,7 @@ with Path(r"{auto_log_path}").open("a", encoding="utf-8") as handle:
+ "#,
+         auto_log_path = auto_log_path.display(),
+     );
++    let post_compact_context = post_compact_context();
+     let manual_post_script = format!(
+         r#"import json
+ from pathlib import Path
+@@ -242,8 +251,10 @@ import sys
+ payload = json.load(sys.stdin)
+ with Path(r"{manual_post_log_path}").open("a", encoding="utf-8") as handle:
+     handle.write(json.dumps(payload) + "\n")
++print(json.dumps({{"hookSpecificOutput": {{"hookEventName": "PostCompact", "additionalContext": "{post_compact_context}"}}}}))
+ "#,
+         manual_post_log_path = manual_post_log_path.display(),
++        post_compact_context = post_compact_context,
+     );
+     let hooks = json!({
+         "hooks": {
+@@ -823,6 +834,8 @@ async fn manual_pre_compact_block_decision_does_not_block_compaction() {
+ async fn compact_hooks_respect_matchers_and_post_runs_after_compaction() {
+     skip_if_no_network!();
+ 
++    let post_compact_context = post_compact_context();
++    assert!(post_compact_context.len() > 10_000);
+     let server = start_mock_server().await;
+     let first_turn = sse(vec![
+         ev_assistant_message("m0", FIRST_REPLY),
+@@ -832,7 +845,12 @@ async fn compact_hooks_respect_matchers_and_post_runs_after_compaction() {
+         ev_assistant_message("m1", SUMMARY_TEXT),
+         ev_completed_with_tokens("r1", /*total_tokens*/ 100),
+     ]);
+-    let request_log = mount_sse_sequence(&server, vec![first_turn, compact_turn]).await;
++    let follow_up_turn = sse(vec![
++        ev_assistant_message("m2", FINAL_REPLY),
++        ev_completed_with_tokens("r2", /*total_tokens*/ 120),
++    ]);
++    let request_log =
++        mount_sse_sequence(&server, vec![first_turn, compact_turn, follow_up_turn]).await;
+ 
+     let model_provider = non_openai_model_provider(&server);
+     let mut builder = test_codex()
+@@ -862,9 +880,72 @@ async fn compact_hooks_respect_matchers_and_post_runs_after_compaction() {
+ 
+     codex.submit(Op::Compact).await.expect("trigger compact");
+     wait_for_event(&codex, |ev| matches!(ev, EventMsg::Warning(_))).await;
++    let completed = wait_for_event_match(&codex, |ev| match ev {
++        EventMsg::HookCompleted(completed)
++            if completed.run.event_name == HookEventName::PostCompact =>
++        {
++            Some(completed.clone())
++        }
++        _ => None,
++    })
++    .await;
++    assert_eq!(completed.run.status, HookRunStatus::Completed);
++    assert_eq!(completed.run.entries.len(), 1);
++    assert_eq!(completed.run.entries[0].kind, HookOutputEntryKind::Context);
++    assert!(
++        completed.run.entries[0].text.as_str() == post_compact_context.as_str(),
++        "PostCompact HookCompleted context must remain complete"
++    );
+     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+ 
+-    assert_eq!(request_log.requests().len(), 2);
++    let follow_up_submission_id = codex
++        .submit(Op::UserInput {
++            items: vec![UserInput::Text {
++                text: "continue after compact hook".to_string(),
++                text_elements: Vec::new(),
++            }],
++            final_output_json_schema: None,
++            responsesapi_client_metadata: None,
++            additional_context: Default::default(),
++            thread_settings: Default::default(),
++        })
++        .await
++        .expect("submit follow-up turn");
++    let follow_up_turn_id = loop {
++        let event = tokio::time::timeout(std::time::Duration::from_secs(10), codex.next_event())
++            .await
++            .expect("timeout waiting for follow-up turn start")
++            .expect("event stream ended before follow-up turn start");
++        if event.id != follow_up_submission_id {
++            continue;
++        }
++        match event.msg {
++            EventMsg::TurnStarted(event) => break event.turn_id,
++            EventMsg::Error(error) => panic!("follow-up turn failed to start: {error:?}"),
++            _ => {}
++        }
++    };
++    loop {
++        let event = tokio::time::timeout(std::time::Duration::from_secs(10), codex.next_event())
++            .await
++            .expect("timeout waiting for follow-up turn completion")
++            .expect("event stream ended before follow-up turn completion");
++        if event.id != follow_up_submission_id {
++            continue;
++        }
++        match event.msg {
++            EventMsg::TurnComplete(event) if event.turn_id == follow_up_turn_id => break,
++            EventMsg::Error(error) => panic!("follow-up turn failed: {error:?}"),
++            _ => {}
++        }
++    }
++
++    let requests = request_log.requests();
++    assert_eq!(requests.len(), 3);
++    assert!(body_contains_text(
++        &requests[2].body_json().to_string(),
++        &post_compact_context,
++    ));
+     assert!(
+         !test
+             .codex_home_path()
+diff --git a/codex-rs/hooks/schema/generated/post-compact.command.output.schema.json b/codex-rs/hooks/schema/generated/post-compact.command.output.schema.json
+index 0221ac29b4..3acdddc6d9 100644
+--- a/codex-rs/hooks/schema/generated/post-compact.command.output.schema.json
++++ b/codex-rs/hooks/schema/generated/post-compact.command.output.schema.json
+@@ -1,11 +1,38 @@
+ {
+   "$schema": "http://json-schema.org/draft-07/schema#",
+   "additionalProperties": false,
++  "definitions": {
++    "PostCompactHookSpecificOutputWire": {
++      "additionalProperties": false,
++      "properties": {
++        "additionalContext": {
++          "default": null,
++          "type": "string"
++        },
++        "hookEventName": {
++          "const": "PostCompact",
++          "type": "string"
++        }
++      },
++      "required": [
++        "hookEventName"
++      ],
++      "type": "object"
++    }
++  },
+   "properties": {
+     "continue": {
+       "default": true,
+       "type": "boolean"
+     },
++    "hookSpecificOutput": {
++      "allOf": [
++        {
++          "$ref": "#/definitions/PostCompactHookSpecificOutputWire"
++        }
++      ],
++      "default": null
++    },
+     "stopReason": {
+       "default": null,
+       "type": "string"
+diff --git a/codex-rs/hooks/src/engine/output_parser.rs b/codex-rs/hooks/src/engine/output_parser.rs
+index b4f214146a..038e26a7a6 100644
+--- a/codex-rs/hooks/src/engine/output_parser.rs
++++ b/codex-rs/hooks/src/engine/output_parser.rs
+@@ -70,6 +70,7 @@ pub(crate) struct PreCompactOutput {
+ #[derive(Debug, Clone)]
+ pub(crate) struct StatelessHookOutput {
+     pub universal: UniversalOutput,
++    pub additional_context: Option<String>,
+     pub invalid_reason: Option<String>,
+ }
+ 
+@@ -250,8 +251,12 @@ pub(crate) fn parse_pre_compact(stdout: &str) -> Option<PreCompactOutput> {
+ pub(crate) fn parse_post_compact(stdout: &str) -> Option<StatelessHookOutput> {
+     let wire: PostCompactCommandOutputWire = parse_json(stdout)?;
+     let universal = UniversalOutput::from(wire.universal);
++    let additional_context = wire
++        .hook_specific_output
++        .and_then(|output| output.additional_context);
+     Some(StatelessHookOutput {
+         universal,
++        additional_context,
+         invalid_reason: None,
+     })
+ }
+diff --git a/codex-rs/hooks/src/events/compact.rs b/codex-rs/hooks/src/events/compact.rs
+index cb3080219a..1bbd8e509b 100644
+--- a/codex-rs/hooks/src/events/compact.rs
++++ b/codex-rs/hooks/src/events/compact.rs
+@@ -44,6 +44,7 @@ pub struct PostCompactRequest {
+ #[derive(Debug)]
+ pub struct StatelessHookOutcome {
+     pub hook_events: Vec<HookCompletedEvent>,
++    pub additional_contexts: Vec<String>,
+     pub should_stop: bool,
+     pub stop_reason: Option<String>,
+ }
+@@ -164,6 +165,7 @@ pub(crate) async fn run_post(
+     if matched.is_empty() {
+         return StatelessHookOutcome {
+             hook_events: Vec::new(),
++            additional_contexts: Vec::new(),
+             should_stop: false,
+             stop_reason: None,
+         };
+@@ -178,6 +180,7 @@ pub(crate) async fn run_post(
+                     Some(request.turn_id),
+                     format!("failed to serialize post compact hook input: {error}"),
+                 ),
++                additional_contexts: Vec::new(),
+                 should_stop: false,
+                 stop_reason: None,
+             };
+@@ -197,8 +200,14 @@ pub(crate) async fn run_post(
+     let stop_reason = results
+         .iter()
+         .find_map(|result| result.data.stop_reason.clone());
++    let additional_contexts = common::flatten_additional_contexts(
++        results
++            .iter()
++            .map(|result| result.data.additional_contexts_for_model.as_slice()),
++    );
+     StatelessHookOutcome {
+         hook_events: results.into_iter().map(|result| result.completed).collect(),
++        additional_contexts,
+         should_stop,
+         stop_reason,
+     }
+@@ -223,6 +232,7 @@ fn post_command_input_json(request: &PostCompactRequest) -> Result<String, serde
+ struct CompactHandlerData {
+     should_stop: bool,
+     stop_reason: Option<String>,
++    additional_contexts_for_model: Vec<String>,
+ }
+ 
+ fn parse_pre_completed(
+@@ -307,6 +317,7 @@ fn parse_pre_completed(
+         data: CompactHandlerData {
+             should_stop,
+             stop_reason,
++            additional_contexts_for_model: Vec::new(),
+         },
+         completion_order: 0,
+     }
+@@ -337,6 +348,7 @@ fn parse_completed(
+     let mut status = HookRunStatus::Completed;
+     let mut should_stop = false;
+     let mut stop_reason = None;
++    let mut additional_contexts_for_model = Vec::new();
+ 
+     match run_result.error.as_deref() {
+         Some(error) => {
+@@ -358,6 +370,13 @@ fn parse_completed(
+                         });
+                     }
+                     let _ = parsed.universal.suppress_output;
++                    if let Some(additional_context) = parsed.additional_context {
++                        common::append_additional_context(
++                            &mut entries,
++                            &mut additional_contexts_for_model,
++                            additional_context,
++                        );
++                    }
+                     if !parsed.universal.continue_processing {
+                         status = HookRunStatus::Stopped;
+                         should_stop = true;
+@@ -410,6 +429,7 @@ fn parse_completed(
+         data: CompactHandlerData {
+             should_stop,
+             stop_reason,
++            additional_contexts_for_model,
+         },
+         completion_order: 0,
+     }
+@@ -567,6 +587,32 @@ mod tests {
+         assert_eq!(parsed.completed.run.entries, Vec::new());
+     }
+ 
++    #[test]
++    fn post_compact_adds_hook_specific_context() {
++        let parsed = parse_post_completed(
++            &handler(HookEventName::PostCompact),
++            run_result(
++                Some(0),
++                r#"{"hookSpecificOutput":{"hookEventName":"PostCompact","additionalContext":"reload workflow execution surface"}}"#,
++                "",
++            ),
++            Some("turn-1".to_string()),
++        );
++
++        assert_eq!(parsed.completed.run.status, HookRunStatus::Completed);
++        assert_eq!(
++            parsed.completed.run.entries,
++            vec![HookOutputEntry {
++                kind: HookOutputEntryKind::Context,
++                text: "reload workflow execution surface".to_string(),
++            }]
++        );
++        assert_eq!(
++            parsed.data.additional_contexts_for_model,
++            vec!["reload workflow execution surface".to_string()]
++        );
++    }
++
+     fn pre_request() -> super::PreCompactRequest {
+         super::PreCompactRequest {
+             session_id: ThreadId::from_string("00000000-0000-4000-8000-000000000001")
+diff --git a/codex-rs/hooks/src/schema.rs b/codex-rs/hooks/src/schema.rs
+index 3847cc9181..16aaf14239 100644
+--- a/codex-rs/hooks/src/schema.rs
++++ b/codex-rs/hooks/src/schema.rs
+@@ -177,6 +177,8 @@ pub(crate) struct PreCompactCommandOutputWire {
+ pub(crate) struct PostCompactCommandOutputWire {
+     #[serde(flatten)]
+     pub universal: HookUniversalOutputWire,
++    #[serde(default)]
++    pub hook_specific_output: Option<PostCompactHookSpecificOutputWire>,
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+@@ -213,6 +215,16 @@ pub(crate) struct PermissionRequestDecisionWire {
+     pub interrupt: bool,
+ }
+ 
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
++#[serde(rename_all = "camelCase")]
++#[serde(deny_unknown_fields)]
++pub(crate) struct PostCompactHookSpecificOutputWire {
++    #[schemars(schema_with = "post_compact_hook_event_name_schema")]
++    pub hook_event_name: HookEventNameWire,
++    #[serde(default)]
++    pub additional_context: Option<String>,
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+ pub(crate) enum PermissionRequestBehaviorWire {
+     #[serde(rename = "allow")]
+@@ -860,6 +872,7 @@ mod tests {
+     use super::PermissionRequestCommandInput;
+     use super::PermissionRequestCommandOutputWire;
+     use super::PostCompactCommandInput;
++    use super::PostCompactCommandOutputWire;
+     use super::PostToolUseCommandInput;
+     use super::PostToolUseCommandOutputWire;
+     use super::PreCompactCommandInput;
+@@ -1027,6 +1040,10 @@ mod tests {
+             "PostToolUseHookSpecificOutputWire",
+             "PostToolUse",
+         );
++        assert_output_hook_event_name_const::<PostCompactCommandOutputWire>(
++            "PostCompactHookSpecificOutputWire",
++            "PostCompact",
++        );
+         assert_output_hook_event_name_const::<PreToolUseCommandOutputWire>(
+             "PreToolUseHookSpecificOutputWire",
+             "PreToolUse",

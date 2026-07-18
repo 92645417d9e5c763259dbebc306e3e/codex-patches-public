@@ -1,0 +1,472 @@
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index dc5ed3f9ad..3f17c011a5 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -429,6 +429,7 @@ pub(crate) enum AppRunControl {
+ #[derive(Debug, Clone)]
+ pub enum ExitReason {
+     UserRequested,
++    Detached,
+     Fatal(String),
+ }
+ 
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index 8b42a9d69e..d06c8c53fd 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -389,7 +389,9 @@ impl App {
+                 self.chat_widget.on_commit_tick();
+             }
+             AppEvent::Exit(mode) => {
+-                if mode == ExitMode::ShutdownFirst {
++                if mode == ExitMode::ShutdownFirst
++                    || (mode == ExitMode::Detach && !self.app_server_target.supports_detach())
++                {
+                     self.show_shutdown_feedback(tui)?;
+                 }
+                 return Ok(self.handle_exit_mode(app_server, mode).await);
+@@ -2476,6 +2478,35 @@ impl App {
+                 self.pending_shutdown_exit_thread_id = None;
+                 AppRunControl::Exit(ExitReason::UserRequested)
+             }
++            ExitMode::Detach => {
++                if self.app_server_target.supports_detach() {
++                    if self.chat_widget.has_pending_steers() {
++                        let thread_id = self.active_thread_id.or(self.chat_widget.thread_id());
++                        let turn_id = match thread_id {
++                            Some(thread_id) => self.active_turn_id_for_thread(thread_id).await,
++                            None => None,
++                        };
++                        if let (Some(thread_id), Some(turn_id)) = (thread_id, turn_id) {
++                            if let Err(err) = app_server
++                                .turn_clear_pending_steers(thread_id, turn_id)
++                                .await
++                            {
++                                tracing::warn!(error = %err, "failed to clear pending steer before detach");
++                                self.chat_widget.add_error_message(
++                                    "Unable to detach before the pending steer is cleared."
++                                        .to_string(),
++                                );
++                                return AppRunControl::Continue;
++                            }
++                        }
++                        self.chat_widget.clear_pending_steers();
++                    }
++                    self.pending_shutdown_exit_thread_id = None;
++                    AppRunControl::Exit(ExitReason::Detached)
++                } else {
++                    Box::pin(self.handle_exit_mode(app_server, ExitMode::ShutdownFirst)).await
++                }
++            }
+             ExitMode::Immediate => {
+                 self.pending_shutdown_exit_thread_id = None;
+                 AppRunControl::Exit(ExitReason::UserRequested)
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index 5e51fc6e9c..5a2a74d13e 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -6142,6 +6142,116 @@ async fn shutdown_first_exit_uses_app_server_shutdown_without_submitting_op() {
+     );
+ }
+ 
++#[tokio::test]
++async fn detach_exit_falls_back_to_shutdown_first_for_embedded_app_server() {
++    let (mut app, _app_event_rx, mut op_rx) = Box::pin(make_test_app_with_channels()).await;
++    let thread_id = ThreadId::new();
++    app.active_thread_id = Some(thread_id);
++
++    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
++        app.chat_widget.config_ref(),
++    ))
++    .await
++    .expect("embedded app server");
++    let control = Box::pin(app.handle_exit_mode(&mut app_server, ExitMode::Detach)).await;
++
++    assert_eq!(app.pending_shutdown_exit_thread_id, None);
++    assert!(matches!(
++        control,
++        AppRunControl::Exit(ExitReason::UserRequested)
++    ));
++    assert!(
++        op_rx.try_recv().is_err(),
++        "embedded detach fallback should use app-server shutdown, not Op::Shutdown"
++    );
++}
++
++#[tokio::test]
++async fn detach_exit_leaves_local_daemon_thread_running() {
++    let (mut app, _app_event_rx, mut op_rx) = Box::pin(make_test_app_with_channels()).await;
++    let thread_id = ThreadId::new();
++    app.active_thread_id = Some(thread_id);
++    app.app_server_target = crate::AppServerTarget::LocalDaemon {
++        endpoint: crate::RemoteAppServerEndpoint::UnixSocket {
++            socket_path: test_absolute_path("/tmp/codex-test.sock"),
++        },
++    };
++
++    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
++        app.chat_widget.config_ref(),
++    ))
++    .await
++    .expect("embedded app server");
++    let control = Box::pin(app.handle_exit_mode(&mut app_server, ExitMode::Detach)).await;
++
++    assert_eq!(app.pending_shutdown_exit_thread_id, None);
++    assert!(matches!(control, AppRunControl::Exit(ExitReason::Detached)));
++    assert!(
++        op_rx.try_recv().is_err(),
++        "detaching from a separate app-server should not submit shutdown"
++    );
++}
++
++#[tokio::test]
++async fn detach_exit_discards_pending_local_steer_state() {
++    let (mut app, _app_event_rx, _op_rx) = Box::pin(make_test_app_with_channels()).await;
++    app.chat_widget
++        .queue_pending_steer_for_test("pending steer");
++    assert!(app.chat_widget.has_pending_steers());
++    app.app_server_target = crate::AppServerTarget::LocalDaemon {
++        endpoint: crate::RemoteAppServerEndpoint::UnixSocket {
++            socket_path: test_absolute_path("/tmp/codex-test.sock"),
++        },
++    };
++
++    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
++        app.chat_widget.config_ref(),
++    ))
++    .await
++    .expect("embedded app server");
++    let control = Box::pin(app.handle_exit_mode(&mut app_server, ExitMode::Detach)).await;
++
++    assert!(matches!(control, AppRunControl::Exit(ExitReason::Detached)));
++    assert!(!app.chat_widget.has_pending_steers());
++}
++
++#[tokio::test]
++async fn detach_exit_waits_for_remote_pending_steer_clear() {
++    Box::pin(async {
++        let (mut app, _app_event_rx, _op_rx) = Box::pin(make_test_app_with_channels()).await;
++        let thread_id = ThreadId::new();
++        app.active_thread_id = Some(thread_id);
++        app.thread_event_channels.insert(
++            thread_id,
++            ThreadEventChannel::new_with_session(
++                THREAD_EVENT_CHANNEL_CAPACITY,
++                test_thread_session(thread_id, test_path_buf("/tmp/project")),
++                vec![test_turn("turn-1", TurnStatus::InProgress, Vec::new())],
++            ),
++        );
++        app.chat_widget
++            .queue_pending_steer_for_test("pending steer");
++        app.app_server_target = crate::AppServerTarget::LocalDaemon {
++            endpoint: crate::RemoteAppServerEndpoint::UnixSocket {
++                socket_path: test_absolute_path("/tmp/codex-test.sock"),
++            },
++        };
++
++        // The in-process app-server does not own the synthetic active thread, so
++        // its clear request fails. Detach must fail closed without hiding the steer.
++        let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
++            app.chat_widget.config_ref(),
++        ))
++        .await
++        .expect("embedded app server");
++        let control = Box::pin(app.handle_exit_mode(&mut app_server, ExitMode::Detach)).await;
++
++        assert!(matches!(control, AppRunControl::Continue));
++        assert!(app.chat_widget.has_pending_steers());
++    })
++    .await;
++}
++
+ #[tokio::test]
+ async fn interrupt_without_active_turn_is_treated_as_handled() {
+     Box::pin(async {
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+index dcfebfb42d..bfda9bf40f 100644
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -1138,6 +1138,11 @@ pub(crate) struct PermissionProfileSelection {
+ pub(crate) enum ExitMode {
+     /// Shutdown core and exit after completion.
+     ShutdownFirst,
++    /// Detach from a thread owned by a separate app-server process.
++    ///
++    /// Embedded sessions fall back to `ShutdownFirst` because there is no
++    /// independent process to keep the thread alive after the TUI exits.
++    Detach,
+     /// Exit the UI loop immediately without waiting for shutdown.
+     ///
+     /// This skips `Op::Shutdown`, so any in-flight work may be dropped and
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 37dcdf983e..91a192923f 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -1329,12 +1329,20 @@ impl ChatWidget {
+     /// Request a shutdown-first quit.
+     ///
+     /// This is used for explicit quit commands (`/quit`, `/exit`, `/logout`) and for
+-    /// the double-press Ctrl+C/Ctrl+D quit shortcut.
++    /// the double-press Ctrl+C quit shortcut.
+     fn request_quit_without_confirmation(&self) {
+         self.app_event_tx
+             .send(AppEvent::Exit(ExitMode::ShutdownFirst));
+     }
+ 
++    /// Request a detach-or-quit exit.
++    ///
++    /// The app layer decides whether the active app-server target can keep the
++    /// thread alive outside this TUI process.
++    fn request_detach_without_confirmation(&self) {
++        self.app_event_tx.send(AppEvent::Exit(ExitMode::Detach));
++    }
++
+     pub(crate) fn show_shutdown_in_progress(&mut self) {
+         self.bottom_pane.show_shutdown_in_progress();
+     }
+@@ -1724,6 +1732,23 @@ impl ChatWidget {
+         self.request_redraw();
+     }
+ 
++    pub(crate) fn has_pending_steers(&self) -> bool {
++        !self.input_queue.pending_steers.is_empty()
++    }
++
++    #[cfg(test)]
++    pub(crate) fn queue_pending_steer_for_test(&mut self, text: &str) {
++        self.input_queue.pending_steers.push_back(PendingSteer {
++            user_message: UserMessage::from(text),
++            history_record: UserMessageHistoryRecord::UserMessageText,
++            compare_key: PendingSteerCompareKey {
++                message: text.to_string(),
++                image_count: 0,
++            },
++        });
++        self.refresh_pending_input_preview();
++    }
++
+     fn refresh_skills_for_current_cwd(&mut self, force_reload: bool) {
+         self.submit_op(AppCommand::list_skills(
+             vec![self.config.cwd.to_path_buf()],
+diff --git a/codex-rs/tui/src/chatwidget/interaction.rs b/codex-rs/tui/src/chatwidget/interaction.rs
+index 80f5aea58d..810d2d4ad2 100644
+--- a/codex-rs/tui/src/chatwidget/interaction.rs
++++ b/codex-rs/tui/src/chatwidget/interaction.rs
+@@ -428,8 +428,9 @@ impl ChatWidget {
+ 
+     /// Handles a Ctrl+D press at the chat-widget layer.
+     ///
+-    /// Ctrl-D only participates in quit when the composer is empty and no modal/popup is active.
+-    /// Otherwise it should be routed to the active view and not attempt to quit.
++    /// Ctrl-D only participates in detach/quit when the composer is empty and no
++    /// modal/popup is active. Otherwise it should be routed to the active view
++    /// and not attempt to exit.
+     fn on_ctrl_d(&mut self) -> bool {
+         let key = key_hint::ctrl(KeyCode::Char('d'));
+         if !DOUBLE_PRESS_QUIT_SHORTCUT_ENABLED {
+@@ -438,14 +439,14 @@ impl ChatWidget {
+                 return false;
+             }
+ 
+-            self.request_quit_without_confirmation();
++            self.request_detach_without_confirmation();
+             return true;
+         }
+ 
+         if self.quit_shortcut_active_for(key) {
+             self.quit_shortcut_expires_at = None;
+             self.quit_shortcut_key = None;
+-            self.request_quit_without_confirmation();
++            self.request_detach_without_confirmation();
+             return true;
+         }
+ 
+diff --git a/codex-rs/tui/src/chatwidget/slash_dispatch.rs b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+index 0f725d6999..8153891eb5 100644
+--- a/codex-rs/tui/src/chatwidget/slash_dispatch.rs
++++ b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+@@ -236,6 +236,12 @@ impl ChatWidget {
+             SlashCommand::Resume => {
+                 self.app_event_tx.send(AppEvent::OpenResumePicker);
+             }
++            SlashCommand::Detach => {
++                self.add_error_message(
++                    "'/detach' is not exposed by this build; use Ctrl+D to detach when supported."
++                        .to_string(),
++                );
++            }
+             SlashCommand::Fork => {
+                 self.app_event_tx.send(AppEvent::ForkCurrentSession);
+             }
+@@ -1069,6 +1075,7 @@ impl ChatWidget {
+             | SlashCommand::Delete
+             | SlashCommand::Clear
+             | SlashCommand::Resume
++            | SlashCommand::Detach
+             | SlashCommand::Fork
+             | SlashCommand::Init
+             | SlashCommand::Compact
+diff --git a/codex-rs/tui/src/chatwidget/tests/slash_commands.rs b/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
+index 35930f8d24..d8211a0cde 100644
+--- a/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
++++ b/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
+@@ -616,11 +616,11 @@ async fn queued_unknown_slash_reports_error_when_dequeued() {
+ }
+ 
+ #[tokio::test]
+-async fn ctrl_d_quits_without_prompt() {
++async fn ctrl_d_requests_detach_without_prompt() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+ 
+     chat.handle_key_event(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+-    assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::ShutdownFirst)));
++    assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::Detach)));
+ }
+ 
+ #[tokio::test]
+@@ -1690,6 +1690,24 @@ async fn slash_quit_requests_exit() {
+     assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::ShutdownFirst)));
+ }
+ 
++#[tokio::test]
++async fn slash_detach_is_hidden_shortcut_anchor_only() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++
++    chat.dispatch_command(SlashCommand::Detach);
++
++    let cells = drain_insert_history(&mut rx);
++    let rendered = cells
++        .iter()
++        .map(|lines| lines_to_single_string(lines))
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert!(
++        rendered.contains("use Ctrl+D to detach"),
++        "expected hidden /detach guidance, got {rendered:?}"
++    );
++}
++
+ #[tokio::test]
+ async fn slash_logout_requests_app_server_logout() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index f1c2c635d1..d4e6aa7e96 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -266,6 +266,10 @@ impl AppServerTarget {
+         matches!(self, Self::Remote { .. })
+     }
+ 
++    pub(crate) fn supports_detach(&self) -> bool {
++        !matches!(self, Self::Embedded)
++    }
++
+     fn thread_params_mode(&self) -> ThreadParamsMode {
+         if self.uses_remote_workspace() {
+             ThreadParamsMode::Remote
+diff --git a/codex-rs/tui/src/main.rs b/codex-rs/tui/src/main.rs
+index 814683e331..d20139b42a 100644
+--- a/codex-rs/tui/src/main.rs
++++ b/codex-rs/tui/src/main.rs
+@@ -16,6 +16,7 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
+         token_usage,
+         thread_id,
+         resume_hint,
++        exit_reason,
+         ..
+     } = exit_info;
+ 
+@@ -30,7 +31,14 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
+         } else {
+             resume_cmd
+         };
+-        lines.push(format!("To continue this session, run {command}"));
++        if matches!(exit_reason, ExitReason::Detached) {
++            if let Some(thread_id) = thread_id {
++                lines.push(format!("Detached session: {thread_id}"));
++            }
++            lines.push(format!("Reattach with: {command}"));
++        } else {
++            lines.push(format!("To continue this session, run {command}"));
++        }
+     } else if is_fatal && let Some(thread_id) = thread_id {
+         lines.push(format!("Session ID: {thread_id}"));
+     }
+@@ -68,7 +76,7 @@ fn main() -> anyhow::Result<()> {
+                 eprintln!("ERROR: {message}");
+                 true
+             }
+-            ExitReason::UserRequested => false,
++            ExitReason::UserRequested | ExitReason::Detached => false,
+         };
+ 
+         let color_enabled = supports_color::on(Stream::Stdout).is_some();
+diff --git a/codex-rs/tui/src/slash_command.rs b/codex-rs/tui/src/slash_command.rs
+index b3a2ddc519..eddeb2b630 100644
+--- a/codex-rs/tui/src/slash_command.rs
++++ b/codex-rs/tui/src/slash_command.rs
+@@ -34,6 +34,7 @@ pub enum SlashCommand {
+     Archive,
+     Delete,
+     Resume,
++    Detach,
+     Fork,
+     App,
+     Init,
+@@ -91,6 +92,7 @@ impl SlashCommand {
+             SlashCommand::Resume => "resume a saved chat",
+             SlashCommand::Archive => "archive this session and exit",
+             SlashCommand::Delete => "permanently delete this session and exit",
++            SlashCommand::Detach => "detach from the current chat",
+             SlashCommand::Clear => "clear the terminal and start a new chat",
+             SlashCommand::Fork => "fork the current chat",
+             SlashCommand::App => "continue this session in the Desktop app",
+@@ -190,9 +192,13 @@ impl SlashCommand {
+             SlashCommand::New
+             | SlashCommand::Archive
+             | SlashCommand::Delete
++            | SlashCommand::Detach
+             | SlashCommand::Fork
+             | SlashCommand::Init
+             | SlashCommand::Compact
++            | SlashCommand::Model
++            | SlashCommand::Personality
++            | SlashCommand::Permissions
+             | SlashCommand::Keymap
+             | SlashCommand::Vim
+             | SlashCommand::ElevateSandbox
+@@ -207,10 +213,6 @@ impl SlashCommand {
+             | SlashCommand::MemoryDrop
+             | SlashCommand::MemoryUpdate => false,
+             SlashCommand::Diff
+-            | SlashCommand::Resume
+-            | SlashCommand::Model
+-            | SlashCommand::Personality
+-            | SlashCommand::Permissions
+             | SlashCommand::Copy
+             | SlashCommand::Raw
+             | SlashCommand::Rename
+@@ -232,6 +234,7 @@ impl SlashCommand {
+             | SlashCommand::AutoReview
+             | SlashCommand::Feedback
+             | SlashCommand::Ide
++            | SlashCommand::Resume
+             | SlashCommand::Quit
+             | SlashCommand::Exit
+             | SlashCommand::Side
+@@ -249,6 +252,7 @@ impl SlashCommand {
+             SlashCommand::Copy => !cfg!(target_os = "android"),
+             SlashCommand::App => cfg!(any(target_os = "macos", target_os = "windows")),
+             SlashCommand::Rollout | SlashCommand::TestApproval => cfg!(debug_assertions),
++            SlashCommand::Detach => false,
+             _ => true,
+         }
+     }
+@@ -292,6 +296,7 @@ mod tests {
+         assert!(SlashCommand::Title.available_during_task());
+         assert!(SlashCommand::Statusline.available_during_task());
+         assert!(SlashCommand::Raw.available_during_task());
++        assert!(SlashCommand::Resume.available_during_task());
+         assert!(SlashCommand::Raw.available_in_side_conversation());
+         assert!(SlashCommand::Raw.supports_inline_args());
+         assert!(SlashCommand::App.available_during_task());

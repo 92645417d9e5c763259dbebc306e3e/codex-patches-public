@@ -1,0 +1,307 @@
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index e9879eda0a..707ad807cc 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -5622,6 +5622,7 @@ fn token_usage_notification(
+             },
+             model_context_window,
+         },
++        request_performance: None,
+     })
+ }
+ 
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+index 8876bab180..0e9c5e68c9 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -138,6 +138,14 @@ pub(crate) enum StatusLineItem {
+ 
+     /// Prompt cache hit rate for input tokens.
+     CacheHitRate,
++
++    /// Latest completed model request time to first byte.
++    #[strum(to_string = "ttfb")]
++    RequestTtfb,
++
++    /// Latest completed model request billed output throughput.
++    #[strum(to_string = "tps")]
++    RequestTps,
+     /// Full thread UUID.
+     #[strum(to_string = "thread-id", serialize = "session-id")]
+     SessionId,
+@@ -205,6 +213,12 @@ impl StatusLineItem {
+             StatusLineItem::CacheHitRate => {
+                 "Prompt cache hit rate for input tokens (omitted when unavailable)"
+             }
++            StatusLineItem::RequestTtfb => {
++                "Latest model request time to first byte (omitted when unavailable)"
++            }
++            StatusLineItem::RequestTps => {
++                "Latest model request billed output throughput (omitted when unavailable)"
++            }
+             StatusLineItem::SessionId => "Current thread identifier (omitted until thread starts)",
+             StatusLineItem::FastMode => "Whether Fast mode is currently active",
+             StatusLineItem::RawOutput => "Whether raw scrollback mode is active",
+@@ -247,6 +261,8 @@ impl StatusLineItem {
+             StatusLineItem::TotalInputTokens => StatusSurfacePreviewItem::TotalInputTokens,
+             StatusLineItem::TotalOutputTokens => StatusSurfacePreviewItem::TotalOutputTokens,
+             StatusLineItem::CacheHitRate => StatusSurfacePreviewItem::CacheHitRate,
++            StatusLineItem::RequestTtfb => StatusSurfacePreviewItem::RequestTtfb,
++            StatusLineItem::RequestTps => StatusSurfacePreviewItem::RequestTps,
+             StatusLineItem::SessionId => StatusSurfacePreviewItem::SessionId,
+             StatusLineItem::FastMode => StatusSurfacePreviewItem::FastMode,
+             StatusLineItem::RawOutput => StatusSurfacePreviewItem::RawOutput,
+@@ -470,6 +486,20 @@ mod tests {
+         assert_eq!(StatusLineItem::ActiveClients.to_string(), "active-clients");
+     }
+ 
++    #[test]
++    fn request_performance_items_are_selectable_ids() {
++        assert_eq!(
++            "ttfb".parse::<StatusLineItem>(),
++            Ok(StatusLineItem::RequestTtfb)
++        );
++        assert_eq!(
++            "tps".parse::<StatusLineItem>(),
++            Ok(StatusLineItem::RequestTps)
++        );
++        assert_eq!(StatusLineItem::RequestTtfb.to_string(), "ttfb");
++        assert_eq!(StatusLineItem::RequestTps.to_string(), "tps");
++    }
++
+     #[test]
+     fn project_name_is_canonical_and_accepts_legacy_ids() {
+         assert_eq!(StatusLineItem::ProjectRoot.to_string(), "project-name");
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+index 6ff0eeb5a3..dee6c9e774 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -45,7 +45,9 @@ impl StatusLineAccent {
+             | StatusLineItem::UsedTokens
+             | StatusLineItem::TotalInputTokens
+             | StatusLineItem::TotalOutputTokens
+-            | StatusLineItem::CacheHitRate => Self::Usage,
++            | StatusLineItem::CacheHitRate
++            | StatusLineItem::RequestTtfb
++            | StatusLineItem::RequestTps => Self::Usage,
+             StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit => Self::Limit,
+             StatusLineItem::CodexVersion
+             | StatusLineItem::SessionId
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+index 68fd038b04..ac2541220f 100644
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -30,6 +30,8 @@ pub(crate) enum StatusSurfacePreviewItem {
+     TotalInputTokens,
+     TotalOutputTokens,
+     CacheHitRate,
++    RequestTtfb,
++    RequestTps,
+     SessionId,
+     FastMode,
+     RawOutput,
+@@ -66,6 +68,8 @@ impl StatusSurfacePreviewItem {
+             StatusSurfacePreviewItem::TotalInputTokens => "0 in",
+             StatusSurfacePreviewItem::TotalOutputTokens => "0 out",
+             StatusSurfacePreviewItem::CacheHitRate => "Cache 0.0% hit",
++            StatusSurfacePreviewItem::RequestTtfb => "TTFB 125ms",
++            StatusSurfacePreviewItem::RequestTps => "TPS 42.5",
+             StatusSurfacePreviewItem::SessionId => "550e8400-e29b-41d4",
+             StatusSurfacePreviewItem::FastMode => "Fast on",
+             StatusSurfacePreviewItem::RawOutput => "raw output",
+@@ -102,6 +106,8 @@ impl StatusSurfacePreviewItem {
+             Self::TotalInputTokens,
+             Self::TotalOutputTokens,
+             Self::CacheHitRate,
++            Self::RequestTtfb,
++            Self::RequestTps,
+             Self::SessionId,
+             Self::FastMode,
+             Self::RawOutput,
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index f1d05e04f1..9aab2f3421 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -732,6 +732,7 @@ pub(crate) struct ChatWidget {
+     quit_shortcut_key: Option<KeyBinding>,
+     // Runtime metrics accumulated across delta snapshots for the active turn.
+     turn_runtime_metrics: RuntimeMetricsSummary,
++    request_performance_snapshot: Option<codex_app_server_protocol::RequestPerformanceSnapshot>,
+     last_rendered_width: std::cell::Cell<Option<usize>>,
+     // Feedback sink for /feedback
+     feedback: codex_feedback::CodexFeedback,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 0ea2e58667..32d84b9d52 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -217,6 +217,7 @@ impl ChatWidget {
+             quit_shortcut_expires_at: None,
+             quit_shortcut_key: None,
+             turn_runtime_metrics: RuntimeMetricsSummary::default(),
++            request_performance_snapshot: None,
+             last_rendered_width: std::cell::Cell::new(None),
+             feedback,
+             current_rollout_path: None,
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index 8503831fa2..128e626200 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -30,6 +30,7 @@ impl ChatWidget {
+         }
+         match notification {
+             ServerNotification::ThreadTokenUsageUpdated(notification) => {
++                self.request_performance_snapshot = notification.request_performance;
+                 self.set_token_info(Some(token_usage_info_from_app_server(
+                     notification.token_usage,
+                 )));
+@@ -58,6 +59,7 @@ impl ChatWidget {
+                 self.on_thread_settings_updated(notification);
+             }
+             ServerNotification::TurnStarted(notification) => {
++                self.request_performance_snapshot = None;
+                 self.bottom_pane
+                     .update_response_output_bytes(0, /*reset*/ true);
+                 let started_at = notification
+@@ -146,6 +148,8 @@ impl ChatWidget {
+                 self.on_hook_completed(notification.run);
+             }
+             ServerNotification::Error(notification) => {
++                self.request_performance_snapshot = None;
++                self.refresh_status_line();
+                 if notification.will_retry {
+                     if !from_replay {
+                         self.on_stream_error(
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 16b1a190cb..8658c9838f 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -756,6 +756,15 @@ impl ChatWidget {
+                 .status_line_total_usage()
+                 .cache_hit_rate_percent()
+                 .map(|rate| format!("{rate:.1}% hit")),
++            StatusLineItem::RequestTtfb => self
++                .request_performance_snapshot
++                .and_then(|snapshot| snapshot.ttfb_ms)
++                .map(|ttfb_ms| format!("TTFB {ttfb_ms}ms")),
++            StatusLineItem::RequestTps => self
++                .request_performance_snapshot
++                .and_then(|snapshot| snapshot.output_tokens_per_second)
++                .filter(|tps| tps.is_finite() && *tps > 0.0)
++                .map(|tps| format!("TPS {tps:.1}")),
+             StatusLineItem::SessionId => self.thread_id.map(|id| id.to_string()),
+             StatusLineItem::FastMode => Some(
+                 if self.current_service_tier() == Some(ServiceTier::Fast.request_value()) {
+@@ -868,6 +877,8 @@ impl ChatWidget {
+             StatusSurfacePreviewItem::TotalInputTokens => StatusLineItem::TotalInputTokens,
+             StatusSurfacePreviewItem::TotalOutputTokens => StatusLineItem::TotalOutputTokens,
+             StatusSurfacePreviewItem::CacheHitRate => StatusLineItem::CacheHitRate,
++            StatusSurfacePreviewItem::RequestTtfb => StatusLineItem::RequestTtfb,
++            StatusSurfacePreviewItem::RequestTps => StatusLineItem::RequestTps,
+             StatusSurfacePreviewItem::SessionId => StatusLineItem::SessionId,
+             StatusSurfacePreviewItem::FastMode => StatusLineItem::FastMode,
+             StatusSurfacePreviewItem::RawOutput => StatusLineItem::RawOutput,
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index 300d356e7b..f33d74ddb1 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -65,6 +65,88 @@ async fn response_output_bytes_accumulate_live_and_reset_without_history() {
+     assert!(drain_insert_history(&mut rx).is_empty());
+ }
+ 
++#[tokio::test]
++async fn request_performance_snapshot_drives_ttfb_and_tps_status_items() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    let usage = codex_app_server_protocol::TokenUsageBreakdown {
++        total_tokens: 15,
++        input_tokens: 10,
++        cached_input_tokens: 4,
++        cache_write_input_tokens: 0,
++        output_tokens: 5,
++        reasoning_output_tokens: 2,
++    };
++    chat.handle_server_notification(
++        ServerNotification::ThreadTokenUsageUpdated(
++            codex_app_server_protocol::ThreadTokenUsageUpdatedNotification {
++                thread_id: "thread-1".to_string(),
++                turn_id: "turn-1".to_string(),
++                token_usage: codex_app_server_protocol::ThreadTokenUsage {
++                    total: usage.clone(),
++                    last: usage,
++                    model_context_window: Some(128_000),
++                },
++                request_performance: Some(codex_app_server_protocol::RequestPerformanceSnapshot {
++                    ttfb_ms: Some(125),
++                    output_tokens_per_second: Some(42.54),
++                }),
++            },
++        ),
++        /*replay_kind*/ None,
++    );
++
++    assert_eq!(
++        chat.status_line_value_for_item(StatusLineItem::RequestTtfb),
++        Some("TTFB 125ms".to_string())
++    );
++    assert_eq!(
++        chat.status_line_value_for_item(StatusLineItem::RequestTps),
++        Some("TPS 42.5".to_string())
++    );
++
++    chat.handle_server_notification(
++        ServerNotification::ThreadTokenUsageUpdated(
++            codex_app_server_protocol::ThreadTokenUsageUpdatedNotification {
++                thread_id: "thread-1".to_string(),
++                turn_id: "turn-2".to_string(),
++                token_usage: codex_app_server_protocol::ThreadTokenUsage {
++                    total: codex_app_server_protocol::TokenUsageBreakdown {
++                        total_tokens: 0,
++                        input_tokens: 0,
++                        cached_input_tokens: 0,
++                        cache_write_input_tokens: 0,
++                        output_tokens: 0,
++                        reasoning_output_tokens: 0,
++                    },
++                    last: codex_app_server_protocol::TokenUsageBreakdown {
++                        total_tokens: 0,
++                        input_tokens: 0,
++                        cached_input_tokens: 0,
++                        cache_write_input_tokens: 0,
++                        output_tokens: 0,
++                        reasoning_output_tokens: 0,
++                    },
++                    model_context_window: Some(128_000),
++                },
++                request_performance: Some(codex_app_server_protocol::RequestPerformanceSnapshot {
++                    ttfb_ms: Some(200),
++                    output_tokens_per_second: None,
++                }),
++            },
++        ),
++        /*replay_kind*/ None,
++    );
++
++    assert_eq!(
++        chat.status_line_value_for_item(StatusLineItem::RequestTtfb),
++        Some("TTFB 200ms".to_string())
++    );
++    assert_eq!(
++        chat.status_line_value_for_item(StatusLineItem::RequestTps),
++        None
++    );
++}
++
+ fn thread_settings_for_test(
+     model: &str,
+     thread_id: ThreadId,
+diff --git a/codex-rs/tui/src/chatwidget/tests/helpers.rs b/codex-rs/tui/src/chatwidget/tests/helpers.rs
+index 2ff6a34971..baf46e27ee 100644
+--- a/codex-rs/tui/src/chatwidget/tests/helpers.rs
++++ b/codex-rs/tui/src/chatwidget/tests/helpers.rs
+@@ -471,6 +471,7 @@ pub(super) fn handle_token_count(chat: &mut ChatWidget, info: Option<TokenUsageI
+                             last: token_usage_breakdown(info.last_token_usage),
+                             model_context_window: info.model_context_window,
+                         },
++                        request_performance: None,
+                     },
+                 ),
+                 /*replay_kind*/ None,

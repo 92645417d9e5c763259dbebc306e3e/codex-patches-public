@@ -1,0 +1,1394 @@
+diff --git a/codex-rs/core/src/guardian/mod.rs b/codex-rs/core/src/guardian/mod.rs
+index 5402afeaf9..353f56d936 100644
+--- a/codex-rs/core/src/guardian/mod.rs
++++ b/codex-rs/core/src/guardian/mod.rs
+@@ -38,6 +38,8 @@ pub(crate) use review::record_guardian_denial_for_test;
+ pub(crate) use review::review_approval_request;
+ #[cfg(test)]
+ pub(crate) use review::review_approval_request_with_cancel;
++#[cfg(test)]
++pub(crate) use review::review_approval_request_with_timeout_for_test;
+ pub(crate) use review::routes_approval_to_guardian;
+ pub(crate) use review::routes_approval_to_guardian_with_reviewer;
+ pub(crate) use review::spawn_approval_request_review;
+diff --git a/codex-rs/core/src/guardian/review.rs b/codex-rs/core/src/guardian/review.rs
+index 0aee36ca88..40c46c75c9 100644
+--- a/codex-rs/core/src/guardian/review.rs
++++ b/codex-rs/core/src/guardian/review.rs
+@@ -15,11 +15,13 @@ use codex_protocol::protocol::GuardianAssessmentEvent;
+ use codex_protocol::protocol::GuardianAssessmentStatus;
+ use codex_protocol::protocol::GuardianRiskLevel;
+ use codex_protocol::protocol::GuardianUserAuthorization;
++use codex_protocol::protocol::NetworkApprovalContext;
+ use codex_protocol::protocol::ReviewDecision;
+ use codex_protocol::protocol::SubAgentSource;
+ use codex_protocol::protocol::TurnAbortReason;
+ use codex_protocol::protocol::WarningEvent;
+ use std::sync::Arc;
++use std::time::Duration;
+ use tokio::sync::oneshot;
+ use tokio::time::Instant;
+ use tokio::time::sleep_until;
+@@ -266,6 +268,165 @@ async fn record_guardian_denial(session: &Arc<Session>, turn: &Arc<TurnContext>,
+     });
+ }
+ 
++async fn request_user_review_after_guardian_block(
++    session: &Arc<Session>,
++    turn: &TurnContext,
++    request: &GuardianApprovalRequest,
++    rationale: &str,
++) -> ReviewDecision {
++    let (call_id, command, cwd, network_context, additional_permissions, detail) = match request {
++        GuardianApprovalRequest::Shell {
++            id,
++            command,
++            cwd,
++            additional_permissions,
++            ..
++        }
++        | GuardianApprovalRequest::ExecCommand {
++            id,
++            command,
++            cwd,
++            additional_permissions,
++            ..
++        } => (
++            id.clone(),
++            command.clone(),
++            cwd.clone(),
++            None,
++            additional_permissions.clone(),
++            None,
++        ),
++        #[cfg(unix)]
++        GuardianApprovalRequest::Execve {
++            id,
++            program,
++            argv,
++            cwd,
++            additional_permissions,
++            ..
++        } => (
++            id.clone(),
++            if argv.is_empty() {
++                vec![program.clone()]
++            } else {
++                argv.clone()
++            },
++            cwd.clone(),
++            None,
++            additional_permissions.clone(),
++            None,
++        ),
++        GuardianApprovalRequest::NetworkAccess {
++            id,
++            target,
++            host,
++            protocol,
++            trigger,
++            ..
++        } => (
++            id.clone(),
++            trigger.as_ref().map_or_else(
++                || vec!["network-access".to_string(), target.clone()],
++                |trigger| trigger.command.clone(),
++            ),
++            trigger.as_ref().map_or_else(
++                || {
++                    #[allow(deprecated)]
++                    turn.cwd.clone()
++                },
++                |trigger| trigger.cwd.clone(),
++            ),
++            Some(NetworkApprovalContext {
++                host: host.clone(),
++                protocol: *protocol,
++            }),
++            trigger
++                .as_ref()
++                .and_then(|trigger| trigger.additional_permissions.clone()),
++            Some(format!("network target: {target}")),
++        ),
++        GuardianApprovalRequest::ApplyPatch { id, cwd, files, .. } => {
++            let files = if files.is_empty() {
++                "no files listed".to_string()
++            } else {
++                files
++                    .iter()
++                    .map(|path| path.display().to_string())
++                    .collect::<Vec<_>>()
++                    .join(", ")
++            };
++            (
++                id.clone(),
++                vec!["apply_patch".to_string()],
++                cwd.clone(),
++                None,
++                None,
++                Some(format!("files: {files}")),
++            )
++        }
++        GuardianApprovalRequest::McpToolCall {
++            id,
++            server,
++            tool_name,
++            ..
++        } => (
++            id.clone(),
++            vec!["mcp-tool-call".to_string(), format!("{server}.{tool_name}")],
++            {
++                #[allow(deprecated)]
++                turn.cwd.clone()
++            },
++            None,
++            None,
++            None,
++        ),
++        GuardianApprovalRequest::RequestPermissions { id, reason, .. } => (
++            id.clone(),
++            reason.as_ref().map_or_else(
++                || vec!["request-permissions".to_string()],
++                |reason| vec!["request-permissions".to_string(), reason.clone()],
++            ),
++            {
++                #[allow(deprecated)]
++                turn.cwd.clone()
++            },
++            None,
++            None,
++            None,
++        ),
++    };
++    let reason = Some(match detail {
++        Some(detail) => {
++            format!("Auto-review did not approve this action. {rationale}\n{detail}")
++        }
++        None => format!("Auto-review did not approve this action. {rationale}"),
++    });
++    match session
++        .request_command_approval(
++            turn,
++            call_id,
++            /*approval_id*/ None,
++            /*environment_id*/ None,
++            command,
++            cwd,
++            reason,
++            network_context,
++            /*proposed_execpolicy_amendment*/ None,
++            additional_permissions,
++            Some(vec![ReviewDecision::Approved, ReviewDecision::Abort]),
++        )
++        .await
++    {
++        ReviewDecision::Approved => ReviewDecision::Approved,
++        ReviewDecision::ApprovedExecpolicyAmendment { .. }
++        | ReviewDecision::ApprovedForSession
++        | ReviewDecision::NetworkPolicyAmendment { .. }
++        | ReviewDecision::Denied
++        | ReviewDecision::TimedOut
++        | ReviewDecision::Abort => ReviewDecision::Abort,
++    }
++}
++
+ #[cfg(test)]
+ pub(crate) async fn record_guardian_denial_for_test(
+     session: &Arc<Session>,
+@@ -275,9 +436,8 @@ pub(crate) async fn record_guardian_denial_for_test(
+     record_guardian_denial(session, turn, turn_id).await;
+ }
+ 
+-/// This function always fails closed: timeouts, review-session failures, and
+-/// parse failures all block execution, but timeouts are still surfaced to the
+-/// caller as distinct from explicit guardian denials.
++/// Guardian failures block automatic execution and defer the final decision to
++/// the existing user approval surface.
+ async fn run_guardian_review(
+     session: Arc<Session>,
+     turn: Arc<TurnContext>,
+@@ -286,6 +446,30 @@ async fn run_guardian_review(
+     retry_reason: Option<String>,
+     approval_request_source: GuardianApprovalRequestSource,
+     external_cancel: Option<CancellationToken>,
++) -> ReviewDecision {
++    run_guardian_review_with_timeout(
++        session,
++        turn,
++        review_id,
++        request,
++        retry_reason,
++        approval_request_source,
++        external_cancel,
++        GUARDIAN_REVIEW_TIMEOUT,
++    )
++    .await
++}
++
++#[allow(clippy::too_many_arguments)]
++async fn run_guardian_review_with_timeout(
++    session: Arc<Session>,
++    turn: Arc<TurnContext>,
++    review_id: String,
++    request: GuardianApprovalRequest,
++    retry_reason: Option<String>,
++    approval_request_source: GuardianApprovalRequestSource,
++    external_cancel: Option<CancellationToken>,
++    review_timeout: Duration,
+ ) -> ReviewDecision {
+     let target_item_id = guardian_request_target_item_id(&request).map(str::to_string);
+     let assessment_turn_id = guardian_request_turn_id(&request, &turn.sub_id).to_string();
+@@ -303,7 +487,7 @@ async fn run_guardian_review(
+         target_item_id.clone(),
+         approval_request_source,
+         reviewed_action.clone(),
+-        GUARDIAN_REVIEW_TIMEOUT.as_millis() as u64,
++        review_timeout.as_millis() as u64,
+     );
+     let started_at_ms = review_tracking.started_at_ms.try_into().unwrap_or_default();
+     session
+@@ -375,11 +559,12 @@ async fn run_guardian_review(
+                 session.clone(),
+                 turn.clone(),
+                 session_config,
+-                request,
++                request.clone(),
+                 retry_reason.clone(),
+                 schema,
+                 external_cancel,
+                 GUARDIAN_REVIEW_MAX_ATTEMPTS,
++                review_timeout,
+             ))
+             .await
+         }
+@@ -459,7 +644,7 @@ async fn run_guardian_review(
+                             status: GuardianAssessmentStatus::TimedOut,
+                             risk_level: None,
+                             user_authorization: None,
+-                            rationale: Some(rationale),
++                            rationale: Some(rationale.clone()),
+                             decision_source: Some(GuardianAssessmentDecisionSource::Agent),
+                             reviewer: reviewer.clone(),
+                             action: terminal_action,
+@@ -467,7 +652,13 @@ async fn run_guardian_review(
+                     )
+                     .await;
+                 record_guardian_non_denial(&session, &assessment_turn_id).await;
+-                return ReviewDecision::TimedOut;
++                return request_user_review_after_guardian_block(
++                    &session,
++                    turn.as_ref(),
++                    &request,
++                    &rationale,
++                )
++                .await;
+             }
+             GuardianReviewError::Cancelled => {
+                 track_guardian_review(
+@@ -611,7 +802,13 @@ async fn run_guardian_review(
+     if approved {
+         ReviewDecision::Approved
+     } else {
+-        ReviewDecision::Denied
++        request_user_review_after_guardian_block(
++            &session,
++            turn.as_ref(),
++            &request,
++            &assessment.rationale,
++        )
++        .await
+     }
+ }
+ 
+@@ -658,6 +855,28 @@ pub(crate) async fn review_approval_request_with_cancel(
+     .await
+ }
+ 
++#[cfg(test)]
++pub(crate) async fn review_approval_request_with_timeout_for_test(
++    session: &Arc<Session>,
++    turn: &Arc<TurnContext>,
++    review_id: String,
++    request: GuardianApprovalRequest,
++    retry_reason: Option<String>,
++    review_timeout: Duration,
++) -> ReviewDecision {
++    run_guardian_review_with_timeout(
++        Arc::clone(session),
++        Arc::clone(turn),
++        review_id,
++        request,
++        retry_reason,
++        GuardianApprovalRequestSource::MainTurn,
++        /*external_cancel*/ None,
++        review_timeout,
++    )
++    .await
++}
++
+ pub(crate) fn spawn_approval_request_review(
+     session: Arc<Session>,
+     turn: Arc<TurnContext>,
+@@ -906,9 +1125,10 @@ async fn run_guardian_review_session_with_retry_config(
+     schema: serde_json::Value,
+     external_cancel: Option<CancellationToken>,
+     max_attempts: i64,
++    review_timeout: Duration,
+ ) -> (GuardianReviewOutcome, GuardianReviewAnalyticsResult) {
+     assert!(max_attempts > 0, "guardian review must run at least once");
+-    let deadline = Instant::now() + GUARDIAN_REVIEW_TIMEOUT;
++    let deadline = Instant::now() + review_timeout;
+     let mut attempt_count = 1;
+     loop {
+         let (outcome, mut analytics_result) = run_guardian_review_session_before_deadline(
+@@ -964,6 +1184,7 @@ pub(super) async fn run_guardian_review_session_with_retry(
+         schema,
+         external_cancel,
+         max_attempts,
++        GUARDIAN_REVIEW_TIMEOUT,
+     )
+     .await
+ }
+diff --git a/codex-rs/core/src/guardian/tests.rs b/codex-rs/core/src/guardian/tests.rs
+index 5f7e6bdffb..9ee61a67a8 100644
+--- a/codex-rs/core/src/guardian/tests.rs
++++ b/codex-rs/core/src/guardian/tests.rs
+@@ -47,6 +47,7 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
+ use codex_protocol::protocol::AskForApproval;
+ use codex_protocol::protocol::Event;
+ use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::ExecApprovalRequestEvent;
+ use codex_protocol::protocol::GranularApprovalConfig;
+ use codex_protocol::protocol::GuardianAssessmentStatus;
+ use codex_protocol::protocol::GuardianRiskLevel;
+@@ -75,9 +76,12 @@ use insta::assert_snapshot;
+ use pretty_assertions::assert_eq;
+ use std::collections::BTreeMap;
+ use std::collections::HashMap;
++use std::future::Future;
++use std::pin::Pin;
+ use std::sync::Arc;
+ use std::time::Duration;
+ use tempfile::TempDir;
++use tokio::sync::oneshot;
+ use tokio_util::sync::CancellationToken;
+ 
+ fn fixed_guardian_parent_session_id() -> ThreadId {
+@@ -228,6 +232,16 @@ async fn guardian_test_session_turn_and_rx(
+     Arc<Session>,
+     Arc<TurnContext>,
+     async_channel::Receiver<Event>,
++) {
++    guardian_test_session_turn_rx_with_base_url(&server.uri()).await
++}
++
++async fn guardian_test_session_turn_rx_with_base_url(
++    base_url: &str,
++) -> (
++    Arc<Session>,
++    Arc<TurnContext>,
++    async_channel::Receiver<Event>,
+ ) {
+     let (mut session, mut turn, rx) =
+         crate::session::tests::make_session_and_context_with_rx().await;
+@@ -235,7 +249,7 @@ async fn guardian_test_session_turn_and_rx(
+         .expect("session should be uniquely owned")
+         .thread_id = fixed_guardian_parent_session_id();
+     let mut config = (*turn.config).clone();
+-    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
++    config.model_provider.base_url = Some(format!("{base_url}/v1"));
+     config.model_provider.supports_websockets = false;
+     let config = Arc::new(config);
+     let models_manager = test_support::models_manager_with_provider(
+@@ -255,6 +269,55 @@ async fn guardian_test_session_turn_and_rx(
+     (session, turn, rx)
+ }
+ 
++struct GuardianManualApprovalEvents {
++    approval_request: ExecApprovalRequestEvent,
++    warnings: Vec<String>,
++    denial_rationales: Vec<Option<String>>,
++    statuses: Vec<GuardianAssessmentStatus>,
++}
++
++async fn enable_manual_approval_responses(session: &Arc<Session>) {
++    *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
++}
++
++async fn receive_guardian_manual_approval(
++    rx: &async_channel::Receiver<Event>,
++    mut review: Pin<&mut impl Future<Output = ReviewDecision>>,
++) -> anyhow::Result<GuardianManualApprovalEvents> {
++    let mut warnings = Vec::new();
++    let mut denial_rationales = Vec::new();
++    let mut statuses = Vec::new();
++    loop {
++        let event = tokio::select! {
++            event = rx.recv() => event?,
++            decision = review.as_mut() => {
++                anyhow::bail!("guardian review finished before requesting manual approval: {decision:?}");
++            }
++            _ = tokio::time::sleep(Duration::from_secs(30)) => {
++                anyhow::bail!("timed out waiting for manual approval request");
++            }
++        };
++        match event.msg {
++            EventMsg::GuardianWarning(event) => warnings.push(event.message),
++            EventMsg::GuardianAssessment(event) => {
++                if event.status == GuardianAssessmentStatus::Denied {
++                    denial_rationales.push(event.rationale.clone());
++                }
++                statuses.push(event.status);
++            }
++            EventMsg::ExecApprovalRequest(event) => {
++                return Ok(GuardianManualApprovalEvents {
++                    approval_request: event,
++                    warnings,
++                    denial_rationales,
++                    statuses,
++                });
++            }
++            _ => {}
++        }
++    }
++}
++
+ fn guardian_shell_request(id: &str) -> GuardianApprovalRequest {
+     GuardianApprovalRequest::Shell {
+         id: id.to_string(),
+@@ -1173,10 +1236,12 @@ async fn cancelled_guardian_review_emits_terminal_abort_without_warning() {
+ 
+     let mut guardian_statuses = Vec::new();
+     let mut warnings = Vec::new();
++    let mut manual_approval_requests = Vec::new();
+     while let Ok(event) = rx.try_recv() {
+         match event.msg {
+             EventMsg::GuardianAssessment(event) => guardian_statuses.push(event.status),
+             EventMsg::GuardianWarning(event) => warnings.push(event.message),
++            EventMsg::ExecApprovalRequest(event) => manual_approval_requests.push(event),
+             _ => {}
+         }
+     }
+@@ -1189,6 +1254,7 @@ async fn cancelled_guardian_review_emits_terminal_abort_without_warning() {
+         ]
+     );
+     assert!(warnings.is_empty());
++    assert!(manual_approval_requests.is_empty());
+ }
+ 
+ #[test]
+@@ -2290,7 +2356,7 @@ async fn guardian_reused_trunk_ignores_stale_prior_turn_completion() -> anyhow::
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn guardian_review_surfaces_responses_api_errors_in_rejection_reason() -> anyhow::Result<()> {
++async fn guardian_review_api_errors_route_to_manual_approval() -> anyhow::Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+     let server = start_mock_server().await;
+@@ -2310,29 +2376,11 @@ async fn guardian_review_surfaces_responses_api_errors_in_rejection_reason() ->
+     )
+     .await;
+ 
+-    let (mut session, mut turn, rx) =
+-        crate::session::tests::make_session_and_context_with_rx().await;
+-    let mut config = (*turn.config).clone();
+-    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+-    config.model_provider.supports_websockets = false;
+-    let config = Arc::new(config);
+-    let models_manager = test_support::models_manager_with_provider(
+-        config.codex_home.to_path_buf(),
+-        Arc::clone(&session.services.auth_manager),
+-        config.model_provider.clone(),
+-    );
+-    Arc::get_mut(&mut session)
+-        .expect("session should be uniquely owned")
+-        .services
+-        .models_manager = models_manager;
+-    let turn_mut = Arc::get_mut(&mut turn).expect("turn should be uniquely owned");
+-    turn_mut.config = Arc::clone(&config);
+-    turn_mut.provider =
+-        create_model_provider(config.model_provider.clone(), turn_mut.auth_manager.clone());
+-
++    let (session, turn, rx) = guardian_test_session_turn_and_rx(&server).await;
+     seed_guardian_parent_history(&session, &turn).await;
++    enable_manual_approval_responses(&session).await;
+ 
+-    let decision = review_approval_request(
++    let review = review_approval_request(
+         &session,
+         &turn,
+         "review-shell-guardian-error".to_string(),
+@@ -2345,43 +2393,55 @@ async fn guardian_review_surfaces_responses_api_errors_in_rejection_reason() ->
+             justification: Some("Need to push the reviewed docs fix.".to_string()),
+         },
+         /*retry_reason*/ None,
+-    )
+-    .await;
++    );
++    tokio::pin!(review);
+ 
+-    assert_eq!(decision, ReviewDecision::Denied);
+-    assert_eq!(request_log.requests().len(), 1);
++    let approval_events = receive_guardian_manual_approval(&rx, review.as_mut()).await?;
++    let approval_request = approval_events.approval_request;
++    assert_eq!(
++        approval_request.available_decisions,
++        Some(vec![ReviewDecision::Approved, ReviewDecision::Abort])
++    );
++    assert!(
++        approval_request
++            .reason
++            .as_deref()
++            .is_some_and(|reason| reason.contains(error_message)),
++        "approval request should include guardian failure rationale: {approval_request:?}"
++    );
++    session
++        .notify_approval(
++            &approval_request.effective_approval_id(),
++            ReviewDecision::Abort,
++        )
++        .await;
+ 
+-    let mut warnings = Vec::new();
+-    let mut denial_rationales = Vec::new();
+-    while let Ok(event) = rx.try_recv() {
+-        match event.msg {
+-            EventMsg::GuardianWarning(event) => warnings.push(event.message),
+-            EventMsg::GuardianAssessment(event)
+-                if event.status == GuardianAssessmentStatus::Denied =>
+-            {
+-                denial_rationales.push(event.rationale)
+-            }
+-            _ => {}
+-        }
+-    }
++    assert_eq!(review.await, ReviewDecision::Abort);
++    assert_eq!(request_log.requests().len(), 1);
+ 
+     assert!(
+-        warnings
++        approval_events
++            .warnings
+             .iter()
+             .any(|message| message.contains(error_message)),
+         "warning should include the underlying responses api error"
+     );
+     assert!(
+-        denial_rationales
++        approval_events
++            .denial_rationales
+             .iter()
+             .flatten()
+             .any(|message| message.contains(error_message)),
+         "denial rationale should include the underlying responses api error"
+     );
+     assert!(
+-        denial_rationales.iter().flatten().all(|message| {
+-            !message.contains("guardian review completed without an assessment payload")
+-        }),
++        approval_events
++            .denial_rationales
++            .iter()
++            .flatten()
++            .all(|message| {
++                !message.contains("guardian review completed without an assessment payload")
++            }),
+         "denial rationale should not fall back to the generic missing payload error"
+     );
+     {
+@@ -2454,7 +2514,8 @@ async fn guardian_review_sampling_retry_transient_stream_failure_then_approves()
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn guardian_review_does_not_retry_missing_assessment_payload() -> anyhow::Result<()> {
++async fn guardian_review_missing_assessment_payload_routes_to_manual_approval() -> anyhow::Result<()>
++{
+     skip_if_no_network!(Ok(()));
+ 
+     let server = start_mock_server().await;
+@@ -2466,19 +2527,45 @@ async fn guardian_review_does_not_retry_missing_assessment_payload() -> anyhow::
+         ])],
+     )
+     .await;
+-    let (session, turn) = guardian_test_session_and_turn(&server).await;
++    let (session, turn, rx) = guardian_test_session_turn_and_rx(&server).await;
+     seed_guardian_parent_history(&session, &turn).await;
++    enable_manual_approval_responses(&session).await;
+ 
+-    let decision = review_approval_request(
++    let review = review_approval_request(
+         &session,
+         &turn,
+         "review-missing-assessment".to_string(),
+         guardian_shell_request("shell-missing-assessment"),
+         /*retry_reason*/ None,
+-    )
+-    .await;
++    );
++    tokio::pin!(review);
++
++    let approval_events = receive_guardian_manual_approval(&rx, review.as_mut()).await?;
++    let approval_request = approval_events.approval_request;
++    assert_eq!(
++        approval_request.available_decisions,
++        Some(vec![ReviewDecision::Approved, ReviewDecision::Abort])
++    );
++    assert!(
++        approval_request
++            .reason
++            .as_deref()
++            .is_some_and(|reason| reason.contains("completed without an assessment payload")),
++        "approval request should include missing-payload failure: {approval_request:?}"
++    );
++    assert!(
++        approval_events
++            .statuses
++            .contains(&GuardianAssessmentStatus::Denied)
++    );
++    session
++        .notify_approval(
++            &approval_request.effective_approval_id(),
++            ReviewDecision::Abort,
++        )
++        .await;
+ 
+-    assert_eq!(decision, ReviewDecision::Denied);
++    assert_eq!(review.await, ReviewDecision::Abort);
+     assert_eq!(request_log.requests().len(), 1);
+     Ok(())
+ }
+@@ -2545,7 +2632,8 @@ async fn guardian_review_retries_two_parse_failures_then_approves() -> anyhow::R
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn guardian_review_exhausts_three_failures_with_one_terminal_event() -> anyhow::Result<()> {
++async fn guardian_review_exhausts_three_parse_failures_routes_to_manual_approval()
++-> anyhow::Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+     let server = start_mock_server().await;
+@@ -2572,36 +2660,51 @@ async fn guardian_review_exhausts_three_failures_with_one_terminal_event() -> an
+     .await;
+     let (session, turn, rx) = guardian_test_session_turn_and_rx(&server).await;
+     seed_guardian_parent_history(&session, &turn).await;
++    enable_manual_approval_responses(&session).await;
+ 
+-    let decision = review_approval_request(
++    let review = review_approval_request(
+         &session,
+         &turn,
+         "review-exhausted-retry".to_string(),
+         guardian_shell_request("shell-exhausted-retry"),
+         /*retry_reason*/ None,
+-    )
+-    .await;
++    );
++    tokio::pin!(review);
+ 
+-    assert_eq!(decision, ReviewDecision::Denied);
+-    assert_eq!(request_log.requests().len(), 3);
+-    let mut statuses = Vec::new();
+-    while let Ok(event) = rx.try_recv() {
+-        if let EventMsg::GuardianAssessment(event) = event.msg {
+-            statuses.push(event.status);
+-        }
+-    }
++    let approval_events = receive_guardian_manual_approval(&rx, review.as_mut()).await?;
++    let approval_request = approval_events.approval_request;
+     assert_eq!(
+-        statuses,
++        approval_request.available_decisions,
++        Some(vec![ReviewDecision::Approved, ReviewDecision::Abort])
++    );
++    assert!(
++        approval_request
++            .reason
++            .as_deref()
++            .is_some_and(|reason| reason.contains("Automatic approval review failed")),
++        "approval request should include parse failure rationale: {approval_request:?}"
++    );
++    assert_eq!(
++        approval_events.statuses,
+         vec![
+             GuardianAssessmentStatus::InProgress,
+             GuardianAssessmentStatus::Denied,
+         ]
+     );
++    session
++        .notify_approval(
++            &approval_request.effective_approval_id(),
++            ReviewDecision::Abort,
++        )
++        .await;
++
++    assert_eq!(review.await, ReviewDecision::Abort);
++    assert_eq!(request_log.requests().len(), 3);
+     Ok(())
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn guardian_review_does_not_retry_valid_denial() -> anyhow::Result<()> {
++async fn guardian_review_denial_routes_to_manual_approval() -> anyhow::Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+     let server = start_mock_server().await;
+@@ -2621,23 +2724,104 @@ async fn guardian_review_does_not_retry_valid_denial() -> anyhow::Result<()> {
+         ])],
+     )
+     .await;
+-    let (session, turn) = guardian_test_session_and_turn(&server).await;
++    let (session, turn, rx) = guardian_test_session_turn_and_rx(&server).await;
+     seed_guardian_parent_history(&session, &turn).await;
++    enable_manual_approval_responses(&session).await;
+ 
+-    let decision = review_approval_request(
++    let review = review_approval_request(
+         &session,
+         &turn,
+         "review-valid-denial".to_string(),
+         guardian_shell_request("shell-valid-denial"),
+         /*retry_reason*/ None,
+-    )
+-    .await;
++    );
++    tokio::pin!(review);
+ 
+-    assert_eq!(decision, ReviewDecision::Denied);
++    let approval_events = receive_guardian_manual_approval(&rx, review.as_mut()).await?;
++    let approval_request = approval_events.approval_request;
++    assert_eq!(
++        approval_request.available_decisions,
++        Some(vec![ReviewDecision::Approved, ReviewDecision::Abort])
++    );
++    assert!(
++        approval_request
++            .reason
++            .as_deref()
++            .is_some_and(|reason| reason.contains("unsafe")),
++        "approval request should include Guardian rationale: {approval_request:?}"
++    );
++    session
++        .notify_approval(
++            &approval_request.effective_approval_id(),
++            ReviewDecision::Approved,
++        )
++        .await;
++
++    assert_eq!(review.await, ReviewDecision::Approved);
+     assert_eq!(request_log.requests().len(), 1);
+     Ok(())
+ }
+ 
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn guardian_review_timeout_routes_to_manual_approval() -> anyhow::Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let (_gate_tx, gate_rx) = oneshot::channel();
++    let (server, _completions) = start_streaming_sse_server(vec![vec![
++        StreamingSseChunk {
++            gate: None,
++            body: sse(vec![ev_response_created("resp-guardian-timeout")]),
++        },
++        StreamingSseChunk {
++            gate: Some(gate_rx),
++            body: String::new(),
++        },
++    ]])
++    .await;
++    let (session, turn, rx) = guardian_test_session_turn_rx_with_base_url(server.uri()).await;
++    seed_guardian_parent_history(&session, &turn).await;
++    enable_manual_approval_responses(&session).await;
++
++    let review = review_approval_request_with_timeout_for_test(
++        &session,
++        &turn,
++        "review-shell-guardian-timeout".to_string(),
++        guardian_shell_request("shell-guardian-timeout"),
++        /*retry_reason*/ None,
++        Duration::from_millis(50),
++    );
++    tokio::pin!(review);
++
++    let approval_events = receive_guardian_manual_approval(&rx, review.as_mut()).await?;
++    let approval_request = approval_events.approval_request;
++    assert_eq!(
++        approval_request.available_decisions,
++        Some(vec![ReviewDecision::Approved, ReviewDecision::Abort])
++    );
++    assert!(
++        approval_request
++            .reason
++            .as_deref()
++            .is_some_and(|reason| reason.contains("timed out while evaluating")),
++        "approval request should include timeout rationale: {approval_request:?}"
++    );
++    assert!(
++        approval_events
++            .statuses
++            .contains(&GuardianAssessmentStatus::TimedOut)
++    );
++    session
++        .notify_approval(
++            &approval_request.effective_approval_id(),
++            ReviewDecision::Abort,
++        )
++        .await;
++
++    assert_eq!(review.await, ReviewDecision::Abort);
++    server.shutdown().await;
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() -> anyhow::Result<()>
+ {
+diff --git a/codex-rs/core/src/mcp_tool_call_tests.rs b/codex-rs/core/src/mcp_tool_call_tests.rs
+index 99bc824fcb..c1b81952ea 100644
+--- a/codex-rs/core/src/mcp_tool_call_tests.rs
++++ b/codex-rs/core/src/mcp_tool_call_tests.rs
+@@ -2818,7 +2818,7 @@ async fn permission_request_hook_runs_after_remembered_mcp_approval() {
+     );
+ }
+ 
+-#[tokio::test]
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn guardian_mode_mcp_denial_returns_rationale_message() {
+     let server = start_mock_server().await;
+     let guardian_request_log = mount_sse_once(
+@@ -2840,12 +2840,13 @@ async fn guardian_mode_mcp_denial_returns_rationale_message() {
+     )
+     .await;
+ 
+-    let (mut session, mut turn_context) = make_session_and_context().await;
+-    turn_context
++    let (mut session, mut turn_context, rx_event) = make_session_and_context_with_rx().await;
++    let turn_context_raw = Arc::get_mut(&mut turn_context).expect("single turn context ref");
++    turn_context_raw
+         .approval_policy
+         .set(AskForApproval::OnRequest)
+         .expect("test setup should allow updating approval policy");
+-    let mut config = (*turn_context.config).clone();
++    let mut config = (*turn_context_raw.config).clone();
+     config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+     config.model_provider.supports_websockets = false;
+     config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+@@ -2855,15 +2856,15 @@ async fn guardian_mode_mcp_denial_returns_rationale_message() {
+         Arc::clone(&session.services.auth_manager),
+         config.model_provider.clone(),
+     );
+-    session.services.models_manager = models_manager;
+-    turn_context.config = Arc::clone(&config);
+-    turn_context.provider = create_model_provider(
++    Arc::get_mut(&mut session)
++        .expect("single session ref")
++        .services
++        .models_manager = models_manager;
++    turn_context_raw.config = Arc::clone(&config);
++    turn_context_raw.provider = create_model_provider(
+         config.model_provider.clone(),
+-        turn_context.auth_manager.clone(),
++        turn_context_raw.auth_manager.clone(),
+     );
+-
+-    let session = Arc::new(session);
+-    let turn_context = Arc::new(turn_context);
+     let invocation = McpInvocation {
+         server: "custom_server".to_string(),
+         tool: "dangerous_tool".to_string(),
+@@ -2884,25 +2885,59 @@ async fn guardian_mode_mcp_denial_returns_rationale_message() {
+         openai_file_input_optional_fields: None,
+     };
+ 
+-    let decision = maybe_request_mcp_tool_approval(
++    *session.active_turn.lock().await = Some(ActiveTurn::default());
++    let hook_tool_name = HookToolName::new("mcp__test__tool");
++    let step_context = StepContext::for_test(Arc::clone(&turn_context));
++    let approval = maybe_request_mcp_tool_approval(
+         &session,
+-        &StepContext::for_test(Arc::clone(&turn_context)),
++        &step_context,
+         "call-guardian-deny",
+         &invocation,
+-        &HookToolName::new("mcp__test__tool"),
++        &hook_tool_name,
+         Some(&metadata),
+         AppToolApproval::Auto,
+-    )
+-    .await;
++    );
++    tokio::pin!(approval);
+ 
+-    let Some(McpToolApprovalDecision::Decline {
+-        message: Some(message),
+-    }) = decision
+-    else {
+-        panic!("guardian-denied MCP approval should carry a rejection message");
++    let approval_request = loop {
++        let event = tokio::select! {
++            event = rx_event.recv() => event.expect("event channel should be open"),
++            decision = approval.as_mut() => {
++                panic!("guardian-denied MCP approval should request manual approval first: {decision:?}");
++            }
++            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
++                panic!("timed out waiting for guardian-denied MCP manual approval");
++            }
++        };
++        if let EventMsg::ExecApprovalRequest(approval_request) = event.msg {
++            break approval_request;
++        }
+     };
+-    assert!(message.contains("Reason: The tool call would expose private calendar data"));
+-    assert!(message.contains("policy circumvention"));
++    assert_eq!(
++        approval_request.available_decisions,
++        Some(vec![ReviewDecision::Approved, ReviewDecision::Abort])
++    );
++    assert!(
++        approval_request
++            .reason
++            .as_deref()
++            .is_some_and(|reason| reason.contains(
++                "The tool call would expose private calendar data without clear user authorization."
++            )),
++        "manual approval reason should include guardian rationale: {approval_request:?}"
++    );
++    session
++        .notify_approval(
++            &approval_request.effective_approval_id(),
++            ReviewDecision::Abort,
++        )
++        .await;
++
++    let decision = approval.await;
++    assert_eq!(
++        decision,
++        Some(McpToolApprovalDecision::Decline { message: None })
++    );
+     assert_eq!(
+         guardian_request_log.single_request().path(),
+         "/v1/responses"
+diff --git a/codex-rs/core/tests/suite/guardian_review.rs b/codex-rs/core/tests/suite/guardian_review.rs
+index e96a374e27..85e5ebfca8 100644
+--- a/codex-rs/core/tests/suite/guardian_review.rs
++++ b/codex-rs/core/tests/suite/guardian_review.rs
+@@ -9,6 +9,7 @@ use codex_protocol::openai_models::ModelsResponse;
+ use codex_protocol::protocol::AskForApproval;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::Op;
++use codex_protocol::protocol::ReviewDecision;
+ use codex_protocol::protocol::SandboxPolicy;
+ use codex_protocol::user_input::UserInput;
+ use core_test_support::fs_wait;
+@@ -139,7 +140,7 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review() -> Result<()
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn guardian_denial_rejects_tool_call_with_rationale() -> Result<()> {
++async fn guardian_denial_routes_tool_call_to_manual_approval() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+     skip_if_sandbox!(Ok(()));
+     skip_if_wine_exec!(
+@@ -199,11 +200,6 @@ async fn guardian_denial_rejects_tool_call_with_rationale() -> Result<()> {
+                 ),
+                 ev_completed("resp-guardian-denied"),
+             ]),
+-            sse(vec![
+-                ev_response_created("resp-parent-after-denial"),
+-                ev_assistant_message("msg-parent-after-denial", "denied"),
+-                ev_completed("resp-parent-after-denial"),
+-            ]),
+         ],
+     )
+     .await;
+@@ -225,8 +221,38 @@ async fn guardian_denial_rejects_tool_call_with_rationale() -> Result<()> {
+             },
+         })
+         .await?;
++    let approval = wait_for_event(&test.codex, |event| {
++        matches!(
++            event,
++            EventMsg::ExecApprovalRequest(_)
++                | EventMsg::TurnAborted(_)
++                | EventMsg::TurnComplete(_)
++                | EventMsg::Error(_)
++        )
++    })
++    .await;
++    let EventMsg::ExecApprovalRequest(approval) = approval else {
++        panic!("expected manual approval before terminal event: {approval:?}");
++    };
++    assert_eq!(
++        approval.available_decisions,
++        Some(vec![ReviewDecision::Approved, ReviewDecision::Abort])
++    );
++    assert!(
++        approval.reason.as_deref().is_some_and(
++            |reason| reason.contains("The requested write has unacceptable test risk.")
++        ),
++        "manual approval should include Guardian rationale: {approval:?}"
++    );
++    test.codex
++        .submit(Op::ExecApproval {
++            id: approval.effective_approval_id(),
++            turn_id: Some(approval.turn_id),
++            decision: ReviewDecision::Abort,
++        })
++        .await?;
+     wait_for_event(&test.codex, |event| {
+-        matches!(event, EventMsg::TurnComplete(_))
++        matches!(event, EventMsg::TurnAborted(_))
+     })
+     .await;
+ 
+@@ -237,14 +263,6 @@ async fn guardian_denial_rejects_tool_call_with_rationale() -> Result<()> {
+         .expect("expected Guardian review request");
+     assert!(guardian_request.body_contains_text(&command));
+ 
+-    let tool_output = requests
+-        .iter()
+-        .find_map(|request| request.function_call_output_text("exec-call-denied"))
+-        .expect("expected rejected tool output to be returned to the parent model");
+-    assert!(
+-        tool_output.contains("The requested write has unacceptable test risk."),
+-        "Guardian rationale missing from rejected tool output: {tool_output}"
+-    );
+     assert!(
+         !output_file.exists(),
+         "Guardian-denied command unexpectedly executed"
+diff --git a/codex-rs/core/tests/suite/network_approval.rs b/codex-rs/core/tests/suite/network_approval.rs
+index 56656d7199..45e3d83a43 100644
+--- a/codex-rs/core/tests/suite/network_approval.rs
++++ b/codex-rs/core/tests/suite/network_approval.rs
+@@ -69,7 +69,7 @@ const NETWORK_TEST_TARGET: &str = "http://codex-network-test.invalid:80";
+     not(target_os = "linux"),
+     ignore = "requires the trusted Linux proxy bridge"
+ )]
+-async fn guardian_network_approval_preserves_action_and_outcome_routing() -> Result<()> {
++async fn guardian_network_approval_preserves_action_and_manual_fallback() -> Result<()> {
+     skip_if_target_windows!(Ok(()), "uses the POSIX/Python network fixture");
+     skip_if_host_windows!(Ok(()));
+     skip_if_no_network!(Ok(()));
+@@ -142,17 +142,48 @@ async fn guardian_network_approval_preserves_action_and_outcome_routing() -> Res
+     )
+     .await;
+ 
+-    for prompt in ["approve the network request", "deny the network request"] {
+-        submit_managed_network_turn(
+-            &test,
+-            prompt,
+-            vec![local(test.config.cwd.clone())],
+-            ApprovalsReviewer::AutoReview,
+-            AskForApproval::OnRequest,
+-        )
++    submit_managed_network_turn(
++        &test,
++        "approve the network request",
++        vec![local(test.config.cwd.clone())],
++        ApprovalsReviewer::AutoReview,
++        AskForApproval::OnRequest,
++    )
++    .await?;
++    wait_for_completion_without_network_prompt(&test).await;
++
++    submit_managed_network_turn(
++        &test,
++        "deny the network request",
++        vec![local(test.config.cwd.clone())],
++        ApprovalsReviewer::AutoReview,
++        AskForApproval::OnRequest,
++    )
++    .await?;
++    let approval = expect_guardian_network_fallback(
++        &test,
++        Some(NETWORK_TEST_HOST),
++        NetworkApprovalProtocol::Http,
++    )
++    .await?;
++    assert_eq!(
++        approval.command,
++        vec!["/bin/sh", "-c", second_command.as_str()]
++    );
++    assert!(
++        approval
++            .reason
++            .as_deref()
++            .is_some_and(|reason| reason.contains(denial))
++    );
++    test.codex
++        .submit(Op::ExecApproval {
++            id: approval.effective_approval_id(),
++            turn_id: Some(approval.turn_id),
++            decision: ReviewDecision::Approved,
++        })
+         .await?;
+-        wait_for_completion_without_network_prompt(&test).await;
+-    }
++    wait_for_turn_complete(&test).await;
+ 
+     let actions = guardian_network_actions(&responses)?;
+     assert_eq!(actions.len(), 2);
+@@ -197,7 +228,8 @@ async fn guardian_network_approval_preserves_action_and_outcome_routing() -> Res
+         .iter()
+         .find_map(|request| request.function_call_output_text(second_call_id))
+         .context("expected denied network tool output")?;
+-    assert!(denied_output.contains(denial));
++    assert!(!denied_output.contains(denial));
++    assert!(!denied_output.contains("rejected"));
+ 
+     Ok(())
+ }
+@@ -292,8 +324,7 @@ async fn cancelled_guardian_network_review_fails_closed_without_rewriting_turn_s
+     not(target_os = "linux"),
+     ignore = "requires the trusted Linux proxy bridge"
+ )]
+-async fn timed_out_guardian_network_review_uses_timeout_outcome_without_user_fallback() -> Result<()>
+-{
++async fn timed_out_guardian_network_review_routes_to_manual_fallback() -> Result<()> {
+     skip_if_target_windows!(Ok(()), "uses the POSIX/Python network fixture");
+     skip_if_host_windows!(Ok(()));
+     skip_if_no_network!(Ok(()));
+@@ -302,7 +333,11 @@ async fn timed_out_guardian_network_review_uses_timeout_outcome_without_user_fal
+     let server = start_mock_server().await;
+     let test = managed_network_unified_exec_test(&server).await?;
+     let call_id = "guardian-network-timeout";
+-    let poll_call_id = "guardian-network-timeout-poll";
++    let command_args = network_fetch_args(LOCAL_ENVIRONMENT_ID);
++    let command = command_args["cmd"]
++        .as_str()
++        .context("expected network command")?
++        .to_string();
+     mount_sse_once_match(
+         &server,
+         |request: &wiremock::Request| {
+@@ -314,7 +349,7 @@ async fn timed_out_guardian_network_review_uses_timeout_outcome_without_user_fal
+             ev_function_call(
+                 call_id,
+                 "exec_command",
+-                &serde_json::to_string(&network_fetch_args(LOCAL_ENVIRONMENT_ID))?,
++                &serde_json::to_string(&command_args)?,
+             ),
+             ev_completed("resp-guardian-timeout-parent"),
+         ]),
+@@ -331,39 +366,6 @@ async fn timed_out_guardian_network_review_uses_timeout_outcome_without_user_fal
+         .set_delay(Duration::from_secs(300)),
+     )
+     .await;
+-    mount_sse_once_match(
+-        &server,
+-        |request: &wiremock::Request| {
+-            !is_guardian_request(request) && request_body_contains(request, call_id)
+-        },
+-        sse(vec![
+-            ev_response_created("resp-guardian-timeout-parent-followup"),
+-            ev_function_call(
+-                poll_call_id,
+-                "write_stdin",
+-                &serde_json::to_string(&json!({
+-                    "session_id": 1000,
+-                    "chars": "",
+-                    "yield_time_ms": 1_000,
+-                }))?,
+-            ),
+-            ev_completed("resp-guardian-timeout-parent-followup"),
+-        ]),
+-    )
+-    .await;
+-    let parent_final = mount_sse_once_match(
+-        &server,
+-        |request: &wiremock::Request| {
+-            !is_guardian_request(request) && request_body_contains(request, poll_call_id)
+-        },
+-        sse(vec![
+-            ev_response_created("resp-guardian-timeout-parent-final"),
+-            ev_assistant_message("msg-guardian-timeout-parent-final", "timed out"),
+-            ev_completed("resp-guardian-timeout-parent-final"),
+-        ]),
+-    )
+-    .await;
+-
+     submit_managed_network_turn(
+         &test,
+         "time out the Guardian network review",
+@@ -374,24 +376,34 @@ async fn timed_out_guardian_network_review_uses_timeout_outcome_without_user_fal
+     .await?;
+     wait_for_response_request(&pending_guardian).await;
+     tokio::time::pause();
+-    tokio::time::advance(Duration::from_secs(91)).await;
++    tokio::time::advance(Duration::from_secs(90)).await;
++    tokio::task::yield_now().await;
++    let approval = expect_guardian_network_fallback(
++        &test,
++        Some(NETWORK_TEST_HOST),
++        NetworkApprovalProtocol::Http,
++    )
++    .await?;
+     tokio::time::resume();
+-    wait_for_completion_without_network_prompt(&test).await;
+-
+-    let tool_output = parent_final
+-        .requests()
+-        .iter()
+-        .find_map(|request| request.function_call_output_text(poll_call_id))
+-        .context("expected timed-out Guardian tool output")?;
++    assert_eq!(approval.command, vec!["/bin/sh", "-c", command.as_str()]);
+     assert!(
+-        tool_output.contains(concat!(
+-            "The automatic permission approval review did not finish before its deadline. ",
+-            "Do not assume the action is unsafe based on the timeout alone. ",
+-            "You may retry once, or ask the user for guidance or explicit approval."
+-        )),
+-        "unexpected timed-out Guardian tool output: {tool_output}"
++        approval
++            .reason
++            .as_deref()
++            .is_some_and(|reason| reason.contains("timed out while evaluating")),
++        "manual fallback should include the Guardian timeout rationale: {approval:?}"
+     );
+-    assert!(!tool_output.contains("rejected by user"));
++    test.codex
++        .submit(Op::ExecApproval {
++            id: approval.effective_approval_id(),
++            turn_id: Some(approval.turn_id),
++            decision: ReviewDecision::Abort,
++        })
++        .await?;
++    wait_for_event(&test.codex, |event| {
++        matches!(event, EventMsg::TurnAborted(_))
++    })
++    .await;
+ 
+     Ok(())
+ }
+@@ -918,21 +930,6 @@ async fn guardian_receives_exact_triggers_for_concurrent_network_requests() -> R
+         ]),
+     )
+     .await;
+-    let final_response = mount_sse_once_match(
+-        &server,
+-        |request: &wiremock::Request| {
+-            !is_guardian_request(request)
+-                && request_body_contains(request, "exec-network-first")
+-                && request_body_contains(request, "exec-network-second")
+-        },
+-        sse(vec![
+-            ev_response_created("resp-network-done"),
+-            ev_assistant_message("msg-network-done", "done"),
+-            ev_completed("resp-network-done"),
+-        ]),
+-    )
+-    .await;
+-
+     submit_managed_network_turn(
+         &test,
+         "run both network requests",
+@@ -954,28 +951,45 @@ async fn guardian_receives_exact_triggers_for_concurrent_network_requests() -> R
+         }
+         tokio::time::sleep(Duration::from_millis(10)).await;
+     };
+-    wait_for_turn_complete(&test).await;
+-
+     assert_eq!(
+         actual_triggers,
+         vec![
+-            ("exec-network-first".to_string(), first_command),
+-            ("exec-network-second".to_string(), second_command),
++            ("exec-network-first".to_string(), first_command.clone()),
++            ("exec-network-second".to_string(), second_command.clone()),
+         ]
+     );
+-    let requests = final_response.requests();
+-    let first_output = requests
+-        .iter()
+-        .find_map(|request| request.function_call_output_text("exec-network-first"))
+-        .context("expected first concurrent tool output")?;
+-    let second_output = requests
+-        .iter()
+-        .find_map(|request| request.function_call_output_text("exec-network-second"))
+-        .context("expected second concurrent tool output")?;
+-    assert!(first_output.contains(first_denial));
+-    assert!(!first_output.contains(second_denial));
+-    assert!(second_output.contains(second_denial));
+-    assert!(!second_output.contains(first_denial));
++
++    let mut fallback_requests = Vec::new();
++    for _ in 0..2 {
++        let approval =
++            expect_guardian_network_fallback(&test, None, NetworkApprovalProtocol::Http).await?;
++        let host = approval
++            .network_approval_context
++            .as_ref()
++            .context("expected Guardian network context")?
++            .host
++            .clone();
++        fallback_requests.push((host, approval.command));
++    }
++    fallback_requests.sort();
++    let mut expected_requests = vec![
++        (
++            "1.1.1.1".to_string(),
++            vec!["/bin/sh".to_string(), "-c".to_string(), first_command],
++        ),
++        (
++            "8.8.8.8".to_string(),
++            vec!["/bin/sh".to_string(), "-c".to_string(), second_command],
++        ),
++    ];
++    expected_requests.sort();
++    assert_eq!(fallback_requests, expected_requests);
++
++    test.codex.submit(Op::Interrupt).await?;
++    wait_for_event(&test.codex, |event| {
++        matches!(event, EventMsg::TurnAborted(_))
++    })
++    .await;
+ 
+     Ok(())
+ }
+@@ -1388,6 +1402,46 @@ fn guardian_network_actions(responses: &ResponseMock) -> Result<Vec<Value>> {
+         .collect()
+ }
+ 
++async fn expect_guardian_network_fallback(
++    test: &TestCodex,
++    expected_host: Option<&str>,
++    expected_protocol: NetworkApprovalProtocol,
++) -> Result<ExecApprovalRequestEvent> {
++    let event = wait_for_event_with_timeout(
++        &test.codex,
++        |event| {
++            matches!(
++                event,
++                EventMsg::ExecApprovalRequest(_) | EventMsg::TurnComplete(_)
++            )
++        },
++        Duration::from_secs(30),
++    )
++    .await;
++    match event {
++        EventMsg::ExecApprovalRequest(approval) => {
++            let network_context = approval
++                .network_approval_context
++                .as_ref()
++                .context("expected Guardian network context")?;
++            assert_eq!(network_context.protocol, expected_protocol);
++            if let Some(expected_host) = expected_host {
++                assert_eq!(network_context.host, expected_host);
++            }
++            assert_eq!(approval.environment_id, None);
++            assert_eq!(
++                approval.available_decisions,
++                Some(vec![ReviewDecision::Approved, ReviewDecision::Abort])
++            );
++            Ok(approval)
++        }
++        EventMsg::TurnComplete(_) => {
++            panic!("expected Guardian manual fallback before completion");
++        }
++        other => panic!("unexpected event: {other:?}"),
++    }
++}
++
+ async fn expect_network_approval(
+     test: &TestCodex,
+     expected_environment_id: &str,

@@ -1,0 +1,1662 @@
+diff --git a/codex-rs/app-server-daemon/src/backend/mod.rs b/codex-rs/app-server-daemon/src/backend/mod.rs
+index d40df07a0e..b2e935ffe9 100644
+--- a/codex-rs/app-server-daemon/src/backend/mod.rs
++++ b/codex-rs/app-server-daemon/src/backend/mod.rs
+@@ -33,6 +33,10 @@ pub(crate) fn pid_update_loop_backend(paths: BackendPaths) -> PidBackend {
+     PidBackend::new_update_loop(paths.codex_bin, paths.update_pid_file)
+ }
+ 
++pub(crate) fn force_terminate_pid(pid: u32) -> anyhow::Result<()> {
++    pid::force_terminate_process(pid)
++}
++
+ pub(crate) async fn append_stderr_log_tail_context(pid_file: &Path, context: &mut String) {
+     match pid::read_stderr_log_tail(pid_file).await {
+         Ok(Some(tail)) => tail.append_to_context(context),
+diff --git a/codex-rs/app-server-daemon/src/backend/pid.rs b/codex-rs/app-server-daemon/src/backend/pid.rs
+index aa05e1db8e..a4f3560c6b 100644
+--- a/codex-rs/app-server-daemon/src/backend/pid.rs
++++ b/codex-rs/app-server-daemon/src/backend/pid.rs
+@@ -284,6 +284,37 @@ impl PidBackend {
+         }
+     }
+ 
++    pub(crate) async fn force_stop(&self) -> Result<()> {
++        loop {
++            let Some(record) = self.wait_for_pid_start().await? else {
++                return Ok(());
++            };
++            if !self.record_is_active(&record).await? {
++                match self.refresh_after_stale_record(&record).await? {
++                    PidFileState::Missing => return Ok(()),
++                    PidFileState::Starting | PidFileState::Running(_) => continue,
++                }
++            }
++
++            let pid = record.pid;
++            self.force_terminate_process(pid)?;
++            let deadline = tokio::time::Instant::now() + START_TIMEOUT;
++            while tokio::time::Instant::now() < deadline {
++                if !self.record_is_active(&record).await? {
++                    match self.refresh_after_stale_record(&record).await? {
++                        PidFileState::Missing => return Ok(()),
++                        PidFileState::Starting | PidFileState::Running(_) => break,
++                    }
++                }
++                sleep(STOP_POLL_INTERVAL).await;
++            }
++
++            if self.record_is_active(&record).await? {
++                bail!("timed out waiting for pid-managed app server {pid} to force-stop");
++            }
++        }
++    }
++
+     async fn wait_for_pid_start(&self) -> Result<Option<PidRecord>> {
+         let deadline = tokio::time::Instant::now() + START_TIMEOUT;
+         loop {
+@@ -505,7 +536,7 @@ async fn read_log_tail(path: &Path, byte_limit: u64) -> Result<Option<String>> {
+ }
+ 
+ #[cfg(unix)]
+-fn process_exists(pid: u32) -> bool {
++pub(crate) fn process_exists(pid: u32) -> bool {
+     let Ok(pid) = libc::pid_t::try_from(pid) else {
+         return false;
+     };
+@@ -514,7 +545,7 @@ fn process_exists(pid: u32) -> bool {
+ }
+ 
+ #[cfg(unix)]
+-fn terminate_process(pid: u32) -> Result<()> {
++pub(crate) fn terminate_process(pid: u32) -> Result<()> {
+     let raw_pid = libc::pid_t::try_from(pid)
+         .with_context(|| format!("pid-managed app server pid {pid} is out of range"))?;
+     let result = unsafe { libc::kill(raw_pid, libc::SIGTERM) };
+@@ -529,7 +560,7 @@ fn terminate_process(pid: u32) -> Result<()> {
+ }
+ 
+ #[cfg(unix)]
+-fn force_terminate_process(pid: u32) -> Result<()> {
++pub(crate) fn force_terminate_process(pid: u32) -> Result<()> {
+     let raw_pid = libc::pid_t::try_from(pid)
+         .with_context(|| format!("pid-managed app server pid {pid} is out of range"))?;
+     let result = unsafe { libc::kill(raw_pid, libc::SIGKILL) };
+@@ -559,12 +590,12 @@ fn force_terminate_process_group(pid: u32) -> Result<()> {
+ }
+ 
+ #[cfg(not(unix))]
+-fn terminate_process(_pid: u32) -> Result<()> {
++pub(crate) fn terminate_process(_pid: u32) -> Result<()> {
+     bail!("pid-managed app-server shutdown is unsupported on this platform")
+ }
+ 
+ #[cfg(not(unix))]
+-fn force_terminate_process(_pid: u32) -> Result<()> {
++pub(crate) fn force_terminate_process(_pid: u32) -> Result<()> {
+     bail!("pid-managed app-server shutdown is unsupported on this platform")
+ }
+ 
+@@ -573,11 +604,38 @@ fn force_terminate_process_group(_pid: u32) -> Result<()> {
+     bail!("pid-managed updater shutdown is unsupported on this platform")
+ }
+ 
++#[cfg(target_os = "linux")]
++async fn process_is_zombie(pid: u32) -> Result<bool> {
++    let stat_path = format!("/proc/{pid}/stat");
++    let stat = match fs::read_to_string(&stat_path).await {
++        Ok(stat) => stat,
++        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
++        Err(err) => return Err(err).with_context(|| format!("failed to read {stat_path}")),
++    };
++    Ok(process_stat_is_zombie(&stat))
++}
++
++#[cfg(target_os = "linux")]
++fn process_stat_is_zombie(stat: &str) -> bool {
++    let Some((_before_name, after_name)) = stat.rsplit_once(") ") else {
++        return false;
++    };
++    after_name.starts_with("Z ")
++}
++
++#[cfg(all(unix, not(target_os = "linux")))]
++async fn process_is_zombie(_pid: u32) -> Result<bool> {
++    Ok(false)
++}
++
+ #[cfg(unix)]
+ async fn process_matches_record(record: &PidRecord) -> Result<bool> {
+     if !process_exists(record.pid) {
+         return Ok(false);
+     }
++    if process_is_zombie(record.pid).await? {
++        return Ok(false);
++    }
+ 
+     match read_process_start_time(record.pid).await {
+         Ok(start_time) => Ok(start_time == record.process_start_time),
+diff --git a/codex-rs/app-server-daemon/src/backend/pid_tests.rs b/codex-rs/app-server-daemon/src/backend/pid_tests.rs
+index de67fa4e3d..9c5d5daaa6 100644
+--- a/codex-rs/app-server-daemon/src/backend/pid_tests.rs
++++ b/codex-rs/app-server-daemon/src/backend/pid_tests.rs
+@@ -11,6 +11,8 @@ use super::PidCommandKind;
+ use super::PidFileState;
+ use super::PidLogTail;
+ use super::PidRecord;
++#[cfg(target_os = "linux")]
++use super::process_stat_is_zombie;
+ use super::read_process_start_time;
+ use super::read_stderr_log_tail;
+ use super::stderr_log_file_for_pid_file;
+@@ -235,6 +237,17 @@ fn app_server_disabled_remote_control_uses_compatible_args_and_runtime_env() {
+     );
+ }
+ 
++#[cfg(target_os = "linux")]
++#[test]
++fn linux_zombie_process_stat_is_not_active() {
++    assert!(process_stat_is_zombie(
++        "21860 (rust-v0.137.0) Z 21748 21860 21860 0 -1 4228100 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0"
++    ));
++    assert!(!process_stat_is_zombie(
++        "21860 (rust-v0.137.0) S 21748 21860 21860 0 -1 4228100 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0"
++    ));
++}
++
+ #[tokio::test]
+ async fn read_stderr_log_tail_returns_recent_complete_lines() {
+     let temp_dir = TempDir::new().expect("temp dir");
+diff --git a/codex-rs/app-server-daemon/src/client.rs b/codex-rs/app-server-daemon/src/client.rs
+index 450bf7fcc0..4ba24b6df8 100644
+--- a/codex-rs/app-server-daemon/src/client.rs
++++ b/codex-rs/app-server-daemon/src/client.rs
+@@ -31,12 +31,20 @@ const INTERNAL_DAEMON_STATUS_METHOD: &str = "internal/daemon/status";
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub(crate) struct ProbeInfo {
+     pub(crate) app_server_version: String,
++    pub(crate) app_server_binary_id: Option<String>,
+     pub(crate) active_client_count: Option<usize>,
+     pub(crate) running_assistant_turn_count: Option<usize>,
+ }
+ 
+ pub(crate) async fn probe(socket_path: &Path) -> Result<ProbeInfo> {
+-    timeout(CONTROL_SOCKET_RESPONSE_TIMEOUT, probe_inner(socket_path))
++    probe_with_timeout(socket_path, CONTROL_SOCKET_RESPONSE_TIMEOUT).await
++}
++
++pub(crate) async fn probe_with_timeout(
++    socket_path: &Path,
++    response_timeout: Duration,
++) -> Result<ProbeInfo> {
++    timeout(response_timeout, probe_inner(socket_path))
+         .await
+         .with_context(|| {
+             format!(
+@@ -62,6 +70,7 @@ async fn probe_inner(socket_path: &Path) -> Result<ProbeInfo> {
+ 
+     Ok(ProbeInfo {
+         app_server_version: parse_version_from_user_agent(&initialize_response.user_agent)?,
++        app_server_binary_id: status.as_ref().and_then(|status| status.binary_id.clone()),
+         active_client_count: status
+             .as_ref()
+             .and_then(|status| status.active_client_count),
+@@ -131,6 +140,8 @@ struct DaemonStatusResponse {
+     active_client_count: Option<usize>,
+     #[serde(default)]
+     running_assistant_turn_count: Option<usize>,
++    #[serde(default)]
++    binary_id: Option<String>,
+ }
+ 
+ async fn daemon_status<S>(websocket: &mut WebSocketStream<S>) -> Result<DaemonStatusResponse>
+@@ -261,6 +272,7 @@ mod tests {
+             probe,
+             ProbeInfo {
+                 app_server_version: "1.2.3".to_string(),
++                app_server_binary_id: None,
+                 active_client_count: None,
+                 running_assistant_turn_count: None,
+             }
+diff --git a/codex-rs/app-server-daemon/src/lib.rs b/codex-rs/app-server-daemon/src/lib.rs
+index a3388d1b11..9e96080712 100644
+--- a/codex-rs/app-server-daemon/src/lib.rs
++++ b/codex-rs/app-server-daemon/src/lib.rs
+@@ -21,12 +21,15 @@ use codex_app_server_transport::app_server_control_socket_path;
+ use codex_utils_home_dir::find_codex_home;
+ use managed_install::codex_bin_from_path;
+ #[cfg(unix)]
++use managed_install::executable_identity;
++#[cfg(unix)]
+ use managed_install::managed_codex_version;
+ use serde::Serialize;
+ use settings::DaemonSettings;
+ use tokio::time::sleep;
+ 
+ const START_POLL_INTERVAL: Duration = Duration::from_millis(50);
++const START_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+ const START_TIMEOUT: Duration = Duration::from_secs(10);
+ const OPERATION_LOCK_TIMEOUT: Duration = Duration::from_secs(75);
+ const PID_FILE_NAME: &str = "app-server.pid";
+@@ -70,6 +73,8 @@ pub struct LifecycleOutput {
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub app_server_version: Option<String>,
+     #[serde(skip_serializing_if = "Option::is_none")]
++    pub app_server_binary_id: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
+     pub active_client_count: Option<usize>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub running_assistant_turn_count: Option<usize>,
+@@ -306,33 +311,28 @@ impl Daemon {
+ 
+     async fn start(&self) -> Result<LifecycleOutput> {
+         let settings = self.load_settings().await?;
+-        if let Ok(info) = client::probe(&self.socket_path).await {
+-            let managed_version = self.managed_codex_version_best_effort().await;
+-            ensure_running_version_is_current_for_attach(&info, managed_version.as_deref())?;
++        let backend = self.running_backend_instance(&settings).await?;
++        let managed_binary_id = self.managed_codex_binary_id_best_effort().await;
++        if let Ok(info) = client::probe_with_timeout(&self.socket_path, START_PROBE_TIMEOUT).await {
++            if should_replace_running_backend_for_start(&info) {
++                return self.restart_backend_for_start(&settings, backend).await;
++            }
++            ensure_running_binary_id_is_current_for_attach(&info, managed_binary_id.as_deref())?;
+             return Ok(self
+                 .output(
+                     LifecycleStatus::AlreadyRunning,
+-                    self.running_backend(&settings).await?,
++                    backend.as_ref().map(|_| BackendKind::Pid),
+                     /*pid*/ None,
+                     Some(info.app_server_version),
++                    info.app_server_binary_id,
+                     info.active_client_count,
+                     info.running_assistant_turn_count,
+                 )
+                 .await);
+         }
+ 
+-        if self.running_backend_instance(&settings).await?.is_some() {
+-            let info = self.wait_until_ready().await?;
+-            return Ok(self
+-                .output(
+-                    LifecycleStatus::AlreadyRunning,
+-                    Some(BackendKind::Pid),
+-                    /*pid*/ None,
+-                    Some(info.app_server_version),
+-                    info.active_client_count,
+-                    info.running_assistant_turn_count,
+-                )
+-                .await);
++        if backend.is_some() {
++            return self.restart_backend_for_start(&settings, backend).await;
+         }
+ 
+         self.ensure_managed_codex_bin()?;
+@@ -344,6 +344,34 @@ impl Daemon {
+                 Some(BackendKind::Pid),
+                 pid,
+                 Some(info.app_server_version),
++                info.app_server_binary_id,
++                info.active_client_count,
++                info.running_assistant_turn_count,
++            )
++            .await)
++    }
++
++    async fn restart_backend_for_start(
++        &self,
++        settings: &DaemonSettings,
++        backend: Option<backend::PidBackend>,
++    ) -> Result<LifecycleOutput> {
++        self.ensure_managed_codex_bin()?;
++        if let Some(backend) = backend {
++            backend.force_stop().await?;
++            self.clear_replaced_backend_state().await?;
++        } else {
++            self.clear_unmanaged_backend_for_restart().await?;
++        }
++        let pid = self.start_managed_backend(&settings).await?;
++        let info = self.wait_until_ready().await?;
++        Ok(self
++            .output(
++                LifecycleStatus::Restarted,
++                Some(BackendKind::Pid),
++                pid,
++                Some(info.app_server_version),
++                info.app_server_binary_id,
+                 info.active_client_count,
+                 info.running_assistant_turn_count,
+             )
+@@ -363,6 +391,7 @@ impl Daemon {
+         self.ensure_managed_codex_bin()?;
+         if let Some(backend) = self.running_backend_instance(&settings).await? {
+             backend.stop().await?;
++            self.clear_replaced_backend_state().await?;
+         }
+ 
+         let pid = self.start_managed_backend(&settings).await?;
+@@ -373,6 +402,7 @@ impl Daemon {
+                 Some(BackendKind::Pid),
+                 pid,
+                 Some(info.app_server_version),
++                info.app_server_binary_id,
+                 info.active_client_count,
+                 info.running_assistant_turn_count,
+             )
+@@ -404,6 +434,7 @@ impl Daemon {
+                 RestartDecision::AlreadyCurrent => RestartIfRunningOutcome::AlreadyCurrent,
+                 RestartDecision::Restart => {
+                     backend.stop().await?;
++                    self.clear_replaced_backend_state().await?;
+                     let _ = self
+                         .start_managed_backend_with_bin(&settings, managed_codex_bin)
+                         .await?;
+@@ -436,6 +467,7 @@ impl Daemon {
+                     Some(BackendKind::Pid),
+                     /*pid*/ None,
+                     /*app_server_version*/ None,
++                    /*app_server_binary_id*/ None,
+                     /*active_client_count*/ None,
+                     /*running_assistant_turn_count*/ None,
+                 )
+@@ -454,6 +486,7 @@ impl Daemon {
+                 /*backend*/ None,
+                 /*pid*/ None,
+                 /*app_server_version*/ None,
++                /*app_server_binary_id*/ None,
+                 /*active_client_count*/ None,
+                 /*running_assistant_turn_count*/ None,
+             )
+@@ -469,6 +502,7 @@ impl Daemon {
+                 self.running_backend(&settings).await?,
+                 /*pid*/ None,
+                 Some(info.app_server_version),
++                info.app_server_binary_id,
+                 info.active_client_count,
+                 info.running_assistant_turn_count,
+             )
+@@ -597,6 +631,7 @@ impl Daemon {
+         let app_server_version = if let Some(backend) = backend {
+             self.ensure_managed_codex_bin()?;
+             backend.stop().await?;
++            self.clear_replaced_backend_state().await?;
+             let _ = self.start_managed_backend(&settings).await?;
+             Some(self.wait_until_ready().await?.app_server_version)
+         } else {
+@@ -628,6 +663,7 @@ impl Daemon {
+ 
+         if let Some(backend) = self.running_backend_instance(&settings).await? {
+             backend.stop().await?;
++            self.clear_replaced_backend_state().await?;
+         }
+ 
+         let backend = backend::pid_backend(self.backend_paths(&settings));
+@@ -713,11 +749,24 @@ impl Daemon {
+         managed_codex_version(&self.managed_codex_bin).await.ok()
+     }
+ 
++    #[cfg(unix)]
++    async fn managed_codex_binary_id_best_effort(&self) -> Option<String> {
++        executable_identity(&self.managed_codex_bin)
++            .await
++            .ok()
++            .map(|identity| identity.id().to_string())
++    }
++
+     #[cfg(not(unix))]
+     async fn managed_codex_version_best_effort(&self) -> Option<String> {
+         None
+     }
+ 
++    #[cfg(not(unix))]
++    async fn managed_codex_binary_id_best_effort(&self) -> Option<String> {
++        None
++    }
++
+     fn backend_paths(&self, settings: &DaemonSettings) -> BackendPaths {
+         self.backend_paths_with_bin(settings, &self.managed_codex_bin)
+     }
+@@ -735,6 +784,19 @@ impl Daemon {
+         }
+     }
+ 
++    async fn clear_replaced_backend_state(&self) -> Result<()> {
++        remove_file_if_exists(&self.socket_path).await?;
++        remove_file_if_exists(&self.pid_file).await?;
++        remove_file_if_exists(&self.pid_file.with_extension("pid.lock")).await?;
++        remove_file_if_exists(&self.pid_file.with_extension("stderr.log")).await?;
++        Ok(())
++    }
++
++    async fn clear_unmanaged_backend_for_restart(&self) -> Result<()> {
++        terminate_socket_owner(&self.socket_path).await?;
++        self.clear_replaced_backend_state().await
++    }
++
+     async fn load_settings(&self) -> Result<DaemonSettings> {
+         DaemonSettings::load(&self.settings_file).await
+     }
+@@ -783,6 +845,7 @@ impl Daemon {
+         backend: Option<BackendKind>,
+         pid: Option<u32>,
+         app_server_version: Option<String>,
++        app_server_binary_id: Option<String>,
+         active_client_count: Option<usize>,
+         running_assistant_turn_count: Option<usize>,
+     ) -> LifecycleOutput {
+@@ -796,6 +859,7 @@ impl Daemon {
+             socket_path: self.socket_path.clone(),
+             cli_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+             app_server_version,
++            app_server_binary_id,
+             active_client_count,
+             running_assistant_turn_count,
+         }
+@@ -859,23 +923,126 @@ fn should_reexec_updater(
+         && outcome == RestartIfRunningOutcome::Restarted
+ }
+ 
+-fn ensure_running_version_is_current_for_attach(
++#[cfg(unix)]
++fn should_replace_running_backend_for_start(info: &client::ProbeInfo) -> bool {
++    matches!(
++        (info.active_client_count, info.running_assistant_turn_count,),
++        (None, None) | (Some(0), Some(0))
++    )
++}
++
++fn ensure_running_binary_id_is_current_for_attach(
+     info: &client::ProbeInfo,
+-    managed_version: Option<&str>,
++    managed_binary_id: Option<&str>,
+ ) -> Result<()> {
+-    if running_version_is_stale(info, managed_version) {
+-        let managed_version = managed_version.unwrap_or("unknown");
++    if running_binary_id_is_stale(info, managed_binary_id) {
+         bail!(
+-            "app server {} is still active but managed Codex is {}; refusing to attach to stale daemon",
+-            info.app_server_version,
+-            managed_version
++            "app server binary id differs from managed Codex; refusing to attach to stale daemon"
+         );
+     }
+     Ok(())
+ }
+ 
+-fn running_version_is_stale(info: &client::ProbeInfo, managed_version: Option<&str>) -> bool {
+-    managed_version.is_some_and(|managed_version| info.app_server_version != managed_version)
++fn running_binary_id_is_stale(info: &client::ProbeInfo, managed_binary_id: Option<&str>) -> bool {
++    match (info.app_server_binary_id.as_deref(), managed_binary_id) {
++        (Some(app_server), Some(managed)) => app_server != managed,
++        _ => true,
++    }
++}
++
++async fn remove_file_if_exists(path: &Path) -> Result<()> {
++    match tokio::fs::remove_file(path).await {
++        Ok(()) => Ok(()),
++        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
++        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
++    }
++}
++
++#[cfg(target_os = "linux")]
++async fn terminate_socket_owner(socket_path: &Path) -> Result<()> {
++    let inode = linux_unix_socket_inode(socket_path).await?.ok_or_else(|| {
++        anyhow!(
++            "app server is idle but no socket owner was found for {}",
++            socket_path.display()
++        )
++    })?;
++    let pid = linux_pid_for_socket_inode(&inode).await?.ok_or_else(|| {
++        anyhow!(
++            "app server is idle but no process owns socket inode {inode} for {}",
++            socket_path.display()
++        )
++    })?;
++    backend::force_terminate_pid(pid)?;
++    let _ = tokio::fs::remove_file(socket_path).await;
++    Ok(())
++}
++
++#[cfg(all(unix, not(target_os = "linux")))]
++async fn terminate_socket_owner(socket_path: &Path) -> Result<()> {
++    bail!(
++        "app server is idle but unmanaged socket cleanup is unsupported for {}",
++        socket_path.display()
++    )
++}
++
++#[cfg(target_os = "linux")]
++async fn linux_unix_socket_inode(socket_path: &Path) -> Result<Option<String>> {
++    let proc_net_unix = tokio::fs::read_to_string("/proc/net/unix")
++        .await
++        .context("failed to read /proc/net/unix")?;
++    let socket_path = socket_path.to_string_lossy();
++    Ok(proc_net_unix
++        .lines()
++        .find_map(|line| linux_unix_socket_inode_from_line(line, &socket_path)))
++}
++
++#[cfg(target_os = "linux")]
++fn linux_unix_socket_inode_from_line(line: &str, socket_path: &str) -> Option<String> {
++    let mut fields = line.split_whitespace();
++    let _num = fields.next()?;
++    let _ref_count = fields.next()?;
++    let _protocol = fields.next()?;
++    let _flags = fields.next()?;
++    let _type = fields.next()?;
++    let _state = fields.next()?;
++    let inode = fields.next()?;
++    let path = fields.next()?;
++    (path == socket_path).then(|| inode.to_string())
++}
++
++#[cfg(target_os = "linux")]
++async fn linux_pid_for_socket_inode(inode: &str) -> Result<Option<u32>> {
++    let socket_link = format!("socket:[{inode}]");
++    let mut proc_entries = tokio::fs::read_dir("/proc")
++        .await
++        .context("failed to read /proc")?;
++    while let Some(entry) = proc_entries
++        .next_entry()
++        .await
++        .context("failed to read /proc entry")?
++    {
++        let file_name = entry.file_name();
++        let Some(pid) = file_name.to_string_lossy().parse::<u32>().ok() else {
++            continue;
++        };
++        let fd_dir = entry.path().join("fd");
++        let Ok(mut fd_entries) = tokio::fs::read_dir(fd_dir).await else {
++            continue;
++        };
++        while let Some(fd_entry) = fd_entries
++            .next_entry()
++            .await
++            .context("failed to read /proc fd entry")?
++        {
++            let Ok(target) = tokio::fs::read_link(fd_entry.path()).await else {
++                continue;
++            };
++            if target.to_string_lossy() == socket_link {
++                return Ok(Some(pid));
++            }
++        }
++    }
++    Ok(None)
+ }
+ 
+ #[cfg(unix)]
+@@ -915,10 +1082,15 @@ mod tests {
+     use super::RestartDecision;
+     use super::RestartIfRunningOutcome;
+     use super::RestartMode;
++    use super::START_PROBE_TIMEOUT;
+     use super::UpdaterRefreshMode;
+-    use super::ensure_running_version_is_current_for_attach;
++    use super::ensure_running_binary_id_is_current_for_attach;
++    #[cfg(target_os = "linux")]
++    use super::linux_unix_socket_inode_from_line;
+     use super::restart_decision;
+     use super::should_reexec_updater;
++    use super::should_replace_running_backend_for_start;
++    use crate::client::CONTROL_SOCKET_RESPONSE_TIMEOUT;
+     use crate::client::ProbeInfo;
+ 
+     #[test]
+@@ -965,6 +1137,7 @@ mod tests {
+     fn restart_decision_preserves_forced_refreshes() {
+         let current_info = ProbeInfo {
+             app_server_version: "0.1.0".to_string(),
++            app_server_binary_id: Some("binary-old".to_string()),
+             active_client_count: None,
+             running_assistant_turn_count: None,
+         };
+@@ -998,15 +1171,216 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn stale_attach_error_mentions_refusing_to_attach() {
++    fn start_replaces_only_when_status_reports_no_clients_or_turns() {
++        let idle_no_active_clients = ProbeInfo {
++            app_server_version: "0.1.0".to_string(),
++            app_server_binary_id: Some("binary-old".to_string()),
++            active_client_count: Some(0),
++            running_assistant_turn_count: Some(0),
++        };
++        let detached_running_turn = ProbeInfo {
++            app_server_version: "0.1.0".to_string(),
++            app_server_binary_id: Some("binary-old".to_string()),
++            active_client_count: Some(0),
++            running_assistant_turn_count: Some(1),
++        };
++        let active_clients = ProbeInfo {
++            app_server_version: "0.1.0".to_string(),
++            app_server_binary_id: Some("binary-old".to_string()),
++            active_client_count: Some(1),
++            running_assistant_turn_count: Some(0),
++        };
++
++        assert_eq!(
++            [
++                should_replace_running_backend_for_start(&idle_no_active_clients),
++                should_replace_running_backend_for_start(&detached_running_turn),
++                should_replace_running_backend_for_start(&active_clients),
++            ],
++            [true, false, false]
++        );
++    }
++
++    #[test]
++    fn start_replaces_when_status_counts_are_unknown() {
++        let unknown_counts = ProbeInfo {
++            app_server_version: "0.1.0".to_string(),
++            app_server_binary_id: Some("binary-old".to_string()),
++            active_client_count: None,
++            running_assistant_turn_count: None,
++        };
++
++        assert!(
++            should_replace_running_backend_for_start(&unknown_counts),
++            "missing lifecycle counts are treated as an unprobeable daemon start path"
++        );
++    }
++
++    #[test]
++    fn start_preserves_backends_with_partial_status_counts() {
++        for (active_client_count, running_assistant_turn_count) in [
++            (None, Some(0)),
++            (None, Some(1)),
++            (Some(0), None),
++            (Some(1), None),
++        ] {
++            let partial_counts = ProbeInfo {
++                app_server_version: "0.1.0".to_string(),
++                app_server_binary_id: Some("binary-old".to_string()),
++                active_client_count,
++                running_assistant_turn_count,
++            };
++
++            assert!(
++                !should_replace_running_backend_for_start(&partial_counts),
++                "partial lifecycle counts must preserve the running backend"
++            );
++        }
++    }
++
++    #[test]
++    fn start_probe_timeout_is_shorter_than_general_control_socket_timeout() {
++        assert!(START_PROBE_TIMEOUT < CONTROL_SOCKET_RESPONSE_TIMEOUT);
++    }
++
++    #[cfg(target_os = "linux")]
++    #[test]
++    fn linux_unix_socket_inode_parser_matches_exact_path() {
++        let line = "0000000000000000: 00000002 00000000 00010000 0001 01 12345 /tmp/codex.sock";
++
++        assert_eq!(
++            linux_unix_socket_inode_from_line(line, "/tmp/codex.sock"),
++            Some("12345".to_string())
++        );
++        assert_eq!(
++            linux_unix_socket_inode_from_line(line, "/tmp/other.sock"),
++            None
++        );
++    }
++
++    #[test]
++    fn start_keeps_active_backends_for_attach_or_embedded_fallback() {
++        let active_stale = ProbeInfo {
++            app_server_version: "0.1.0".to_string(),
++            app_server_binary_id: Some("binary-old".to_string()),
++            active_client_count: Some(1),
++            running_assistant_turn_count: Some(0),
++        };
++
++        assert!(!should_replace_running_backend_for_start(&active_stale));
++    }
++
++    #[test]
++    fn start_keeps_detached_running_turn_for_resume_or_attach() {
++        let detached_running_turn = ProbeInfo {
++            app_server_version: "0.1.0".to_string(),
++            app_server_binary_id: Some("binary-old".to_string()),
++            active_client_count: Some(0),
++            running_assistant_turn_count: Some(1),
++        };
++
++        assert!(
++            !should_replace_running_backend_for_start(&detached_running_turn),
++            "detached daemons with active turns must survive for resume or reattach"
++        );
++    }
++
++    #[test]
++    fn different_binary_id_attach_error_mentions_refusing_to_attach() {
+         let active_stale = ProbeInfo {
+             app_server_version: "0.1.0".to_string(),
++            app_server_binary_id: Some("binary-old".to_string()),
+             active_client_count: Some(1),
+             running_assistant_turn_count: Some(0),
+         };
+ 
+-        let err = ensure_running_version_is_current_for_attach(&active_stale, Some("0.2.0"))
+-            .expect_err("active stale daemon should be rejected");
++        let err = ensure_running_binary_id_is_current_for_attach(&active_stale, Some("binary-new"))
++            .expect_err("active daemon with a different binary id should be rejected");
++        assert!(err.to_string().contains("refusing to attach"));
++    }
++
++    #[test]
++    fn matching_version_with_different_binary_id_is_stale() {
++        let active_mismatch = ProbeInfo {
++            app_server_version: "0.2.0".to_string(),
++            app_server_binary_id: Some("binary-old".to_string()),
++            active_client_count: Some(1),
++            running_assistant_turn_count: Some(0),
++        };
++
++        let err =
++            ensure_running_binary_id_is_current_for_attach(&active_mismatch, Some("binary-new"))
++                .expect_err("matching version with different binary id should be rejected");
++        assert!(err.to_string().contains("refusing to attach"));
++    }
++
++    #[test]
++    fn different_version_with_matching_binary_id_can_attach() {
++        let active_match = ProbeInfo {
++            app_server_version: "0.1.0".to_string(),
++            app_server_binary_id: Some("binary-current".to_string()),
++            active_client_count: Some(1),
++            running_assistant_turn_count: Some(0),
++        };
++
++        ensure_running_binary_id_is_current_for_attach(&active_match, Some("binary-current"))
++            .expect("binary id is the attach contract");
++    }
++
++    #[test]
++    fn matching_version_with_missing_binary_id_is_preserved_but_not_attached() {
++        let active_missing_id = ProbeInfo {
++            app_server_version: "0.2.0".to_string(),
++            app_server_binary_id: None,
++            active_client_count: Some(1),
++            running_assistant_turn_count: Some(0),
++        };
++
++        assert!(
++            !should_replace_running_backend_for_start(&active_missing_id),
++            "active daemons must not be killed just because binary id is missing"
++        );
++        let err = ensure_running_binary_id_is_current_for_attach(&active_missing_id, Some("new"))
++            .expect_err("active daemon with missing binary id should force embedded fallback");
++        assert!(err.to_string().contains("refusing to attach"));
++    }
++
++    #[test]
++    fn missing_managed_binary_id_is_preserved_but_not_attached() {
++        let active_current_id = ProbeInfo {
++            app_server_version: "0.2.0".to_string(),
++            app_server_binary_id: Some("binary-current".to_string()),
++            active_client_count: Some(1),
++            running_assistant_turn_count: Some(0),
++        };
++
++        assert!(
++            !should_replace_running_backend_for_start(&active_current_id),
++            "active daemons must not be killed when managed binary id is unavailable"
++        );
++        let err = ensure_running_binary_id_is_current_for_attach(&active_current_id, None)
++            .expect_err("active daemon without managed binary id should force embedded fallback");
++        assert!(err.to_string().contains("refusing to attach"));
++    }
++
++    #[test]
++    fn stale_detached_running_turn_is_preserved_but_not_attached() {
++        let detached_stale = ProbeInfo {
++            app_server_version: "0.1.0".to_string(),
++            app_server_binary_id: Some("binary-old".to_string()),
++            active_client_count: Some(0),
++            running_assistant_turn_count: Some(1),
++        };
++
++        assert!(
++            !should_replace_running_backend_for_start(&detached_stale),
++            "detached active turns should not be destroyed during startup arbitration"
++        );
++        let err =
++            ensure_running_binary_id_is_current_for_attach(&detached_stale, Some("binary-new"))
++                .expect_err(
++                    "detached daemon with a different binary id should force embedded fallback",
++                );
+         assert!(err.to_string().contains("refusing to attach"));
+     }
+ 
+@@ -1021,6 +1395,7 @@ mod tests {
+             socket_path: "codex.sock".into(),
+             cli_version: Some("1.2.3".to_string()),
+             app_server_version: Some("1.2.4".to_string()),
++            app_server_binary_id: Some("binary-current".to_string()),
+             active_client_count: Some(0),
+             running_assistant_turn_count: Some(0),
+         };
+@@ -1036,6 +1411,7 @@ mod tests {
+                 "socketPath": "codex.sock",
+                 "cliVersion": "1.2.3",
+                 "appServerVersion": "1.2.4",
++                "appServerBinaryId": "binary-current",
+                 "activeClientCount": 0,
+                 "runningAssistantTurnCount": 0,
+             })
+@@ -1106,4 +1482,97 @@ mod tests {
+             )
+         );
+     }
++
++    #[tokio::test]
++    async fn clear_replaced_backend_state_removes_socket_and_pid_artifacts() {
++        let temp_dir = TempDir::new().expect("temp dir");
++        let daemon = Daemon {
++            socket_path: temp_dir.path().join("app-server-control.sock"),
++            pid_file: temp_dir.path().join("app-server.pid"),
++            update_pid_file: temp_dir.path().join("app-server-updater.pid"),
++            operation_lock_file: temp_dir.path().join("daemon.lock"),
++            settings_file: temp_dir.path().join("settings.json"),
++            managed_codex_bin: temp_dir.path().join("codex"),
++        };
++        let pid_lock = daemon.pid_file.with_extension("pid.lock");
++        let stderr_log = daemon.pid_file.with_extension("stderr.log");
++
++        tokio::fs::write(&daemon.socket_path, "")
++            .await
++            .expect("socket placeholder");
++        tokio::fs::write(&daemon.pid_file, "{}")
++            .await
++            .expect("pid placeholder");
++        tokio::fs::write(&pid_lock, "")
++            .await
++            .expect("pid lock placeholder");
++        tokio::fs::write(&stderr_log, "stderr")
++            .await
++            .expect("stderr placeholder");
++
++        daemon
++            .clear_replaced_backend_state()
++            .await
++            .expect("cleanup should succeed");
++
++        for path in [
++            &daemon.socket_path,
++            &daemon.pid_file,
++            &pid_lock,
++            &stderr_log,
++        ] {
++            assert!(
++                tokio::fs::metadata(path).await.is_err(),
++                "{} should be removed",
++                path.display()
++            );
++        }
++    }
++
++    #[tokio::test]
++    async fn clear_unmanaged_backend_for_restart_preserves_state_when_owner_is_missing() {
++        let temp_dir = TempDir::new().expect("temp dir");
++        let daemon = Daemon {
++            socket_path: temp_dir.path().join("app-server-control.sock"),
++            pid_file: temp_dir.path().join("app-server.pid"),
++            update_pid_file: temp_dir.path().join("app-server-updater.pid"),
++            operation_lock_file: temp_dir.path().join("daemon.lock"),
++            settings_file: temp_dir.path().join("settings.json"),
++            managed_codex_bin: temp_dir.path().join("codex"),
++        };
++        let pid_lock = daemon.pid_file.with_extension("pid.lock");
++        let stderr_log = daemon.pid_file.with_extension("stderr.log");
++
++        tokio::fs::write(&daemon.socket_path, "")
++            .await
++            .expect("socket placeholder");
++        tokio::fs::write(&daemon.pid_file, "{}")
++            .await
++            .expect("pid placeholder");
++        tokio::fs::write(&pid_lock, "")
++            .await
++            .expect("pid lock placeholder");
++        tokio::fs::write(&stderr_log, "stderr")
++            .await
++            .expect("stderr placeholder");
++
++        let err = daemon
++            .clear_unmanaged_backend_for_restart()
++            .await
++            .expect_err("missing owner must block cleanup");
++        assert!(err.to_string().contains("no socket owner was found"));
++
++        for path in [
++            &daemon.socket_path,
++            &daemon.pid_file,
++            &pid_lock,
++            &stderr_log,
++        ] {
++            assert!(
++                tokio::fs::metadata(path).await.is_ok(),
++                "{} should be preserved",
++                path.display()
++            );
++        }
++    }
+ }
+diff --git a/codex-rs/app-server-daemon/src/managed_install.rs b/codex-rs/app-server-daemon/src/managed_install.rs
+index d9fcfb1d9f..36a28109fc 100644
+--- a/codex-rs/app-server-daemon/src/managed_install.rs
++++ b/codex-rs/app-server-daemon/src/managed_install.rs
+@@ -92,7 +92,14 @@ pub(crate) async fn managed_codex_version(codex_bin: &Path) -> Result<String> {
+ #[cfg(unix)]
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub(crate) struct ExecutableIdentity {
+-    digest: [u8; 32],
++    id: String,
++}
++
++#[cfg(unix)]
++impl ExecutableIdentity {
++    pub(crate) fn id(&self) -> &str {
++        &self.id
++    }
+ }
+ 
+ #[cfg(unix)]
+@@ -106,7 +113,7 @@ pub(crate) async fn executable_identity(executable: &Path) -> Result<ExecutableI
+ #[cfg(unix)]
+ pub(crate) fn executable_identity_from_bytes(bytes: &[u8]) -> ExecutableIdentity {
+     ExecutableIdentity {
+-        digest: Sha256::digest(bytes).into(),
++        id: format!("{:x}", Sha256::digest(bytes)),
+     }
+ }
+ 
+diff --git a/codex-rs/app-server-daemon/src/managed_install_tests.rs b/codex-rs/app-server-daemon/src/managed_install_tests.rs
+index 93caa468e4..dfd8d88984 100644
+--- a/codex-rs/app-server-daemon/src/managed_install_tests.rs
++++ b/codex-rs/app-server-daemon/src/managed_install_tests.rs
+@@ -24,4 +24,6 @@ fn executable_identity_uses_binary_contents() {
+ 
+     assert_eq!(old, same);
+     assert_ne!(old, new);
++    assert_eq!(old.id().len(), 64);
++    assert!(old.id().bytes().all(|byte| byte.is_ascii_hexdigit()));
+ }
+diff --git a/codex-rs/app-server-protocol/schema/json/ClientNotification.json b/codex-rs/app-server-protocol/schema/json/ClientNotification.json
+index dde0b31fbd..8b7309e53a 100644
+--- a/codex-rs/app-server-protocol/schema/json/ClientNotification.json
++++ b/codex-rs/app-server-protocol/schema/json/ClientNotification.json
+@@ -16,6 +16,22 @@
+       ],
+       "title": "InitializedNotification",
+       "type": "object"
++    },
++    {
++      "properties": {
++        "method": {
++          "enum": [
++            "shutdownWhenNoActiveClients"
++          ],
++          "title": "ShutdownWhenNoActiveClientsNotificationMethod",
++          "type": "string"
++        }
++      },
++      "required": [
++        "method"
++      ],
++      "title": "ShutdownWhenNoActiveClientsNotification",
++      "type": "object"
+     }
+   ],
+   "title": "ClientNotification"
+diff --git a/codex-rs/app-server-protocol/schema/json/ServerNotification.json b/codex-rs/app-server-protocol/schema/json/ServerNotification.json
+index 42038ba371..fb8b414675 100644
+--- a/codex-rs/app-server-protocol/schema/json/ServerNotification.json
++++ b/codex-rs/app-server-protocol/schema/json/ServerNotification.json
+@@ -65,6 +65,19 @@
+       },
+       "type": "object"
+     },
++    "ActiveClientCountChangedNotification": {
++      "properties": {
++        "activeClientCount": {
++          "format": "uint",
++          "minimum": 0.0,
++          "type": "integer"
++        }
++      },
++      "required": [
++        "activeClientCount"
++      ],
++      "type": "object"
++    },
+     "ActivePermissionProfile": {
+       "properties": {
+         "extends": {
+@@ -6633,6 +6646,26 @@
+       "title": "RemoteControl/status/changedNotification",
+       "type": "object"
+     },
++    {
++      "properties": {
++        "method": {
++          "enum": [
++            "appServer/activeClientCount/changed"
++          ],
++          "title": "AppServer/activeClientCount/changedNotificationMethod",
++          "type": "string"
++        },
++        "params": {
++          "$ref": "#/definitions/ActiveClientCountChangedNotification"
++        }
++      },
++      "required": [
++        "method",
++        "params"
++      ],
++      "title": "AppServer/activeClientCount/changedNotification",
++      "type": "object"
++    },
+     {
+       "properties": {
+         "method": {
+diff --git a/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json b/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json
+index e0f638b0c4..d0f1e2fc03 100644
+--- a/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json
++++ b/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json
+@@ -195,6 +195,22 @@
+           ],
+           "title": "InitializedNotification",
+           "type": "object"
++        },
++        {
++          "properties": {
++            "method": {
++              "enum": [
++                "shutdownWhenNoActiveClients"
++              ],
++              "title": "ShutdownWhenNoActiveClientsNotificationMethod",
++              "type": "string"
++            }
++          },
++          "required": [
++            "method"
++          ],
++          "title": "ShutdownWhenNoActiveClientsNotification",
++          "type": "object"
+         }
+       ],
+       "title": "ClientNotification"
+@@ -5025,6 +5041,26 @@
+           "title": "RemoteControl/status/changedNotification",
+           "type": "object"
+         },
++        {
++          "properties": {
++            "method": {
++              "enum": [
++                "appServer/activeClientCount/changed"
++              ],
++              "title": "AppServer/activeClientCount/changedNotificationMethod",
++              "type": "string"
++            },
++            "params": {
++              "$ref": "#/definitions/v2/ActiveClientCountChangedNotification"
++            }
++          },
++          "required": [
++            "method",
++            "params"
++          ],
++          "title": "AppServer/activeClientCount/changedNotification",
++          "type": "object"
++        },
+         {
+           "properties": {
+             "method": {
+@@ -6187,6 +6223,21 @@
+         "title": "AccountUpdatedNotification",
+         "type": "object"
+       },
++      "ActiveClientCountChangedNotification": {
++        "$schema": "http://json-schema.org/draft-07/schema#",
++        "properties": {
++          "activeClientCount": {
++            "format": "uint",
++            "minimum": 0.0,
++            "type": "integer"
++          }
++        },
++        "required": [
++          "activeClientCount"
++        ],
++        "title": "ActiveClientCountChangedNotification",
++        "type": "object"
++      },
+       "ActivePermissionProfile": {
+         "properties": {
+           "extends": {
+diff --git a/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json b/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json
+index 981a1f1247..77cd3df146 100644
+--- a/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json
++++ b/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.v2.schemas.json
+@@ -194,6 +194,21 @@
+       "title": "AccountUpdatedNotification",
+       "type": "object"
+     },
++    "ActiveClientCountChangedNotification": {
++      "$schema": "http://json-schema.org/draft-07/schema#",
++      "properties": {
++        "activeClientCount": {
++          "format": "uint",
++          "minimum": 0.0,
++          "type": "integer"
++        }
++      },
++      "required": [
++        "activeClientCount"
++      ],
++      "title": "ActiveClientCountChangedNotification",
++      "type": "object"
++    },
+     "ActivePermissionProfile": {
+       "properties": {
+         "extends": {
+@@ -14237,6 +14252,26 @@
+           "title": "RemoteControl/status/changedNotification",
+           "type": "object"
+         },
++        {
++          "properties": {
++            "method": {
++              "enum": [
++                "appServer/activeClientCount/changed"
++              ],
++              "title": "AppServer/activeClientCount/changedNotificationMethod",
++              "type": "string"
++            },
++            "params": {
++              "$ref": "#/definitions/ActiveClientCountChangedNotification"
++            }
++          },
++          "required": [
++            "method",
++            "params"
++          ],
++          "title": "AppServer/activeClientCount/changedNotification",
++          "type": "object"
++        },
+         {
+           "properties": {
+             "method": {
+diff --git a/codex-rs/app-server-protocol/schema/json/v2/ActiveClientCountChangedNotification.json b/codex-rs/app-server-protocol/schema/json/v2/ActiveClientCountChangedNotification.json
+new file mode 100644
+index 0000000000..040550ee32
+--- /dev/null
++++ b/codex-rs/app-server-protocol/schema/json/v2/ActiveClientCountChangedNotification.json
+@@ -0,0 +1,15 @@
++{
++  "$schema": "http://json-schema.org/draft-07/schema#",
++  "properties": {
++    "activeClientCount": {
++      "format": "uint",
++      "minimum": 0.0,
++      "type": "integer"
++    }
++  },
++  "required": [
++    "activeClientCount"
++  ],
++  "title": "ActiveClientCountChangedNotification",
++  "type": "object"
++}
+\ No newline at end of file
+diff --git a/codex-rs/app-server-protocol/schema/typescript/ClientNotification.ts b/codex-rs/app-server-protocol/schema/typescript/ClientNotification.ts
+index 8ce2839108..7e6327df23 100644
+--- a/codex-rs/app-server-protocol/schema/typescript/ClientNotification.ts
++++ b/codex-rs/app-server-protocol/schema/typescript/ClientNotification.ts
+@@ -2,4 +2,4 @@
+ 
+ // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+ 
+-export type ClientNotification = { "method": "initialized" };
++export type ClientNotification = { "method": "initialized" } | { "method": "shutdownWhenNoActiveClients" };
+diff --git a/codex-rs/app-server-protocol/schema/typescript/ServerNotification.ts b/codex-rs/app-server-protocol/schema/typescript/ServerNotification.ts
+index 271bfd4fa0..6578f03e7a 100644
+--- a/codex-rs/app-server-protocol/schema/typescript/ServerNotification.ts
++++ b/codex-rs/app-server-protocol/schema/typescript/ServerNotification.ts
+@@ -6,6 +6,7 @@ import type { FuzzyFileSearchSessionUpdatedNotification } from "./FuzzyFileSearc
+ import type { AccountLoginCompletedNotification } from "./v2/AccountLoginCompletedNotification";
+ import type { AccountRateLimitsUpdatedNotification } from "./v2/AccountRateLimitsUpdatedNotification";
+ import type { AccountUpdatedNotification } from "./v2/AccountUpdatedNotification";
++import type { ActiveClientCountChangedNotification } from "./v2/ActiveClientCountChangedNotification";
+ import type { AgentMessageDeltaNotification } from "./v2/AgentMessageDeltaNotification";
+ import type { AppListUpdatedNotification } from "./v2/AppListUpdatedNotification";
+ import type { CommandExecOutputDeltaNotification } from "./v2/CommandExecOutputDeltaNotification";
+@@ -76,4 +77,4 @@ import type { WindowsWorldWritableWarningNotification } from "./v2/WindowsWorldW
+ /**
+  * Notification sent from the server to the client.
+  */
+-export type ServerNotification = { "method": "error", "params": ErrorNotification } | { "method": "thread/started", "params": ThreadStartedNotification } | { "method": "thread/status/changed", "params": ThreadStatusChangedNotification } | { "method": "thread/archived", "params": ThreadArchivedNotification } | { "method": "thread/deleted", "params": ThreadDeletedNotification } | { "method": "thread/unarchived", "params": ThreadUnarchivedNotification } | { "method": "thread/closed", "params": ThreadClosedNotification } | { "method": "skills/changed", "params": SkillsChangedNotification } | { "method": "thread/name/updated", "params": ThreadNameUpdatedNotification } | { "method": "thread/goal/updated", "params": ThreadGoalUpdatedNotification } | { "method": "thread/goal/cleared", "params": ThreadGoalClearedNotification } | { "method": "thread/environment/connected", "params": EnvironmentConnectionNotification } | { "method": "thread/environment/disconnected", "params": EnvironmentConnectionNotification } | { "method": "thread/settings/updated", "params": ThreadSettingsUpdatedNotification } | { "method": "thread/tokenUsage/updated", "params": ThreadTokenUsageUpdatedNotification } | { "method": "turn/started", "params": TurnStartedNotification } | { "method": "hook/started", "params": HookStartedNotification } | { "method": "turn/completed", "params": TurnCompletedNotification } | { "method": "hook/completed", "params": HookCompletedNotification } | { "method": "turn/diff/updated", "params": TurnDiffUpdatedNotification } | { "method": "turn/plan/updated", "params": TurnPlanUpdatedNotification } | { "method": "item/started", "params": ItemStartedNotification } | { "method": "item/autoApprovalReview/started", "params": ItemGuardianApprovalReviewStartedNotification } | { "method": "item/autoApprovalReview/completed", "params": ItemGuardianApprovalReviewCompletedNotification } | { "method": "item/completed", "params": ItemCompletedNotification } | { "method": "rawResponseItem/completed", "params": RawResponseItemCompletedNotification } | { "method": "rawResponse/completed", "params": RawResponseCompletedNotification } | { "method": "item/agentMessage/delta", "params": AgentMessageDeltaNotification } | { "method": "item/plan/delta", "params": PlanDeltaNotification } | { "method": "command/exec/outputDelta", "params": CommandExecOutputDeltaNotification } | { "method": "process/outputDelta", "params": ProcessOutputDeltaNotification } | { "method": "process/exited", "params": ProcessExitedNotification } | { "method": "item/commandExecution/outputDelta", "params": CommandExecutionOutputDeltaNotification } | { "method": "item/commandExecution/terminalInteraction", "params": TerminalInteractionNotification } | { "method": "item/fileChange/outputDelta", "params": FileChangeOutputDeltaNotification } | { "method": "item/fileChange/patchUpdated", "params": FileChangePatchUpdatedNotification } | { "method": "serverRequest/resolved", "params": ServerRequestResolvedNotification } | { "method": "item/mcpToolCall/progress", "params": McpToolCallProgressNotification } | { "method": "mcpServer/oauthLogin/completed", "params": McpServerOauthLoginCompletedNotification } | { "method": "mcpServer/startupStatus/updated", "params": McpServerStatusUpdatedNotification } | { "method": "account/updated", "params": AccountUpdatedNotification } | { "method": "account/rateLimits/updated", "params": AccountRateLimitsUpdatedNotification } | { "method": "app/list/updated", "params": AppListUpdatedNotification } | { "method": "remoteControl/status/changed", "params": RemoteControlStatusChangedNotification } | { "method": "externalAgentConfig/import/progress", "params": ExternalAgentConfigImportProgressNotification } | { "method": "externalAgentConfig/import/completed", "params": ExternalAgentConfigImportCompletedNotification } | { "method": "fs/changed", "params": FsChangedNotification } | { "method": "item/reasoning/summaryTextDelta", "params": ReasoningSummaryTextDeltaNotification } | { "method": "item/reasoning/summaryPartAdded", "params": ReasoningSummaryPartAddedNotification } | { "method": "item/reasoning/textDelta", "params": ReasoningTextDeltaNotification } | { "method": "thread/compacted", "params": ContextCompactedNotification } | { "method": "model/rerouted", "params": ModelReroutedNotification } | { "method": "model/verification", "params": ModelVerificationNotification } | { "method": "turn/moderationMetadata", "params": TurnModerationMetadataNotification } | { "method": "model/safetyBuffering/updated", "params": ModelSafetyBufferingUpdatedNotification } | { "method": "warning", "params": WarningNotification } | { "method": "guardianWarning", "params": GuardianWarningNotification } | { "method": "deprecationNotice", "params": DeprecationNoticeNotification } | { "method": "configWarning", "params": ConfigWarningNotification } | { "method": "fuzzyFileSearch/sessionUpdated", "params": FuzzyFileSearchSessionUpdatedNotification } | { "method": "fuzzyFileSearch/sessionCompleted", "params": FuzzyFileSearchSessionCompletedNotification } | { "method": "thread/realtime/started", "params": ThreadRealtimeStartedNotification } | { "method": "thread/realtime/itemAdded", "params": ThreadRealtimeItemAddedNotification } | { "method": "thread/realtime/transcript/delta", "params": ThreadRealtimeTranscriptDeltaNotification } | { "method": "thread/realtime/transcript/done", "params": ThreadRealtimeTranscriptDoneNotification } | { "method": "thread/realtime/outputAudio/delta", "params": ThreadRealtimeOutputAudioDeltaNotification } | { "method": "thread/realtime/sdp", "params": ThreadRealtimeSdpNotification } | { "method": "thread/realtime/error", "params": ThreadRealtimeErrorNotification } | { "method": "thread/realtime/closed", "params": ThreadRealtimeClosedNotification } | { "method": "windows/worldWritableWarning", "params": WindowsWorldWritableWarningNotification } | { "method": "windowsSandbox/setupCompleted", "params": WindowsSandboxSetupCompletedNotification } | { "method": "account/login/completed", "params": AccountLoginCompletedNotification };
++export type ServerNotification = { "method": "error", "params": ErrorNotification } | { "method": "thread/started", "params": ThreadStartedNotification } | { "method": "thread/status/changed", "params": ThreadStatusChangedNotification } | { "method": "thread/archived", "params": ThreadArchivedNotification } | { "method": "thread/deleted", "params": ThreadDeletedNotification } | { "method": "thread/unarchived", "params": ThreadUnarchivedNotification } | { "method": "thread/closed", "params": ThreadClosedNotification } | { "method": "skills/changed", "params": SkillsChangedNotification } | { "method": "thread/name/updated", "params": ThreadNameUpdatedNotification } | { "method": "thread/goal/updated", "params": ThreadGoalUpdatedNotification } | { "method": "thread/goal/cleared", "params": ThreadGoalClearedNotification } | { "method": "thread/environment/connected", "params": EnvironmentConnectionNotification } | { "method": "thread/environment/disconnected", "params": EnvironmentConnectionNotification } | { "method": "thread/settings/updated", "params": ThreadSettingsUpdatedNotification } | { "method": "thread/tokenUsage/updated", "params": ThreadTokenUsageUpdatedNotification } | { "method": "turn/started", "params": TurnStartedNotification } | { "method": "hook/started", "params": HookStartedNotification } | { "method": "turn/completed", "params": TurnCompletedNotification } | { "method": "hook/completed", "params": HookCompletedNotification } | { "method": "turn/diff/updated", "params": TurnDiffUpdatedNotification } | { "method": "turn/plan/updated", "params": TurnPlanUpdatedNotification } | { "method": "item/started", "params": ItemStartedNotification } | { "method": "item/autoApprovalReview/started", "params": ItemGuardianApprovalReviewStartedNotification } | { "method": "item/autoApprovalReview/completed", "params": ItemGuardianApprovalReviewCompletedNotification } | { "method": "item/completed", "params": ItemCompletedNotification } | { "method": "rawResponseItem/completed", "params": RawResponseItemCompletedNotification } | { "method": "rawResponse/completed", "params": RawResponseCompletedNotification } | { "method": "item/agentMessage/delta", "params": AgentMessageDeltaNotification } | { "method": "item/plan/delta", "params": PlanDeltaNotification } | { "method": "command/exec/outputDelta", "params": CommandExecOutputDeltaNotification } | { "method": "process/outputDelta", "params": ProcessOutputDeltaNotification } | { "method": "process/exited", "params": ProcessExitedNotification } | { "method": "item/commandExecution/outputDelta", "params": CommandExecutionOutputDeltaNotification } | { "method": "item/commandExecution/terminalInteraction", "params": TerminalInteractionNotification } | { "method": "item/fileChange/outputDelta", "params": FileChangeOutputDeltaNotification } | { "method": "item/fileChange/patchUpdated", "params": FileChangePatchUpdatedNotification } | { "method": "serverRequest/resolved", "params": ServerRequestResolvedNotification } | { "method": "item/mcpToolCall/progress", "params": McpToolCallProgressNotification } | { "method": "mcpServer/oauthLogin/completed", "params": McpServerOauthLoginCompletedNotification } | { "method": "mcpServer/startupStatus/updated", "params": McpServerStatusUpdatedNotification } | { "method": "account/updated", "params": AccountUpdatedNotification } | { "method": "account/rateLimits/updated", "params": AccountRateLimitsUpdatedNotification } | { "method": "app/list/updated", "params": AppListUpdatedNotification } | { "method": "remoteControl/status/changed", "params": RemoteControlStatusChangedNotification } | { "method": "appServer/activeClientCount/changed", "params": ActiveClientCountChangedNotification } | { "method": "externalAgentConfig/import/progress", "params": ExternalAgentConfigImportProgressNotification } | { "method": "externalAgentConfig/import/completed", "params": ExternalAgentConfigImportCompletedNotification } | { "method": "fs/changed", "params": FsChangedNotification } | { "method": "item/reasoning/summaryTextDelta", "params": ReasoningSummaryTextDeltaNotification } | { "method": "item/reasoning/summaryPartAdded", "params": ReasoningSummaryPartAddedNotification } | { "method": "item/reasoning/textDelta", "params": ReasoningTextDeltaNotification } | { "method": "thread/compacted", "params": ContextCompactedNotification } | { "method": "model/rerouted", "params": ModelReroutedNotification } | { "method": "model/verification", "params": ModelVerificationNotification } | { "method": "turn/moderationMetadata", "params": TurnModerationMetadataNotification } | { "method": "model/safetyBuffering/updated", "params": ModelSafetyBufferingUpdatedNotification } | { "method": "warning", "params": WarningNotification } | { "method": "guardianWarning", "params": GuardianWarningNotification } | { "method": "deprecationNotice", "params": DeprecationNoticeNotification } | { "method": "configWarning", "params": ConfigWarningNotification } | { "method": "fuzzyFileSearch/sessionUpdated", "params": FuzzyFileSearchSessionUpdatedNotification } | { "method": "fuzzyFileSearch/sessionCompleted", "params": FuzzyFileSearchSessionCompletedNotification } | { "method": "thread/realtime/started", "params": ThreadRealtimeStartedNotification } | { "method": "thread/realtime/itemAdded", "params": ThreadRealtimeItemAddedNotification } | { "method": "thread/realtime/transcript/delta", "params": ThreadRealtimeTranscriptDeltaNotification } | { "method": "thread/realtime/transcript/done", "params": ThreadRealtimeTranscriptDoneNotification } | { "method": "thread/realtime/outputAudio/delta", "params": ThreadRealtimeOutputAudioDeltaNotification } | { "method": "thread/realtime/sdp", "params": ThreadRealtimeSdpNotification } | { "method": "thread/realtime/error", "params": ThreadRealtimeErrorNotification } | { "method": "thread/realtime/closed", "params": ThreadRealtimeClosedNotification } | { "method": "windows/worldWritableWarning", "params": WindowsWorldWritableWarningNotification } | { "method": "windowsSandbox/setupCompleted", "params": WindowsSandboxSetupCompletedNotification } | { "method": "account/login/completed", "params": AccountLoginCompletedNotification };
+diff --git a/codex-rs/app-server-protocol/schema/typescript/ServerNotificationEnvelope.ts b/codex-rs/app-server-protocol/schema/typescript/ServerNotificationEnvelope.ts
+index 46c4fb068b..01903f3ce9 100644
+--- a/codex-rs/app-server-protocol/schema/typescript/ServerNotificationEnvelope.ts
++++ b/codex-rs/app-server-protocol/schema/typescript/ServerNotificationEnvelope.ts
+@@ -6,6 +6,7 @@ import type { FuzzyFileSearchSessionUpdatedNotification } from "./FuzzyFileSearc
+ import type { AccountLoginCompletedNotification } from "./v2/AccountLoginCompletedNotification";
+ import type { AccountRateLimitsUpdatedNotification } from "./v2/AccountRateLimitsUpdatedNotification";
+ import type { AccountUpdatedNotification } from "./v2/AccountUpdatedNotification";
++import type { ActiveClientCountChangedNotification } from "./v2/ActiveClientCountChangedNotification";
+ import type { AgentMessageDeltaNotification } from "./v2/AgentMessageDeltaNotification";
+ import type { AppListUpdatedNotification } from "./v2/AppListUpdatedNotification";
+ import type { CommandExecOutputDeltaNotification } from "./v2/CommandExecOutputDeltaNotification";
+@@ -86,4 +87,4 @@ export type ServerNotificationEnvelope = {
+  * Optional so clients can decode notifications from older app-server
+  * versions. Current app-server versions always populate it.
+  */
+-emittedAtMs?: number, } & ({ "method": "error", "params": ErrorNotification } | { "method": "thread/started", "params": ThreadStartedNotification } | { "method": "thread/status/changed", "params": ThreadStatusChangedNotification } | { "method": "thread/archived", "params": ThreadArchivedNotification } | { "method": "thread/deleted", "params": ThreadDeletedNotification } | { "method": "thread/unarchived", "params": ThreadUnarchivedNotification } | { "method": "thread/closed", "params": ThreadClosedNotification } | { "method": "skills/changed", "params": SkillsChangedNotification } | { "method": "thread/name/updated", "params": ThreadNameUpdatedNotification } | { "method": "thread/goal/updated", "params": ThreadGoalUpdatedNotification } | { "method": "thread/goal/cleared", "params": ThreadGoalClearedNotification } | { "method": "thread/environment/connected", "params": EnvironmentConnectionNotification } | { "method": "thread/environment/disconnected", "params": EnvironmentConnectionNotification } | { "method": "thread/settings/updated", "params": ThreadSettingsUpdatedNotification } | { "method": "thread/tokenUsage/updated", "params": ThreadTokenUsageUpdatedNotification } | { "method": "turn/started", "params": TurnStartedNotification } | { "method": "hook/started", "params": HookStartedNotification } | { "method": "turn/completed", "params": TurnCompletedNotification } | { "method": "hook/completed", "params": HookCompletedNotification } | { "method": "turn/diff/updated", "params": TurnDiffUpdatedNotification } | { "method": "turn/plan/updated", "params": TurnPlanUpdatedNotification } | { "method": "item/started", "params": ItemStartedNotification } | { "method": "item/autoApprovalReview/started", "params": ItemGuardianApprovalReviewStartedNotification } | { "method": "item/autoApprovalReview/completed", "params": ItemGuardianApprovalReviewCompletedNotification } | { "method": "item/completed", "params": ItemCompletedNotification } | { "method": "rawResponseItem/completed", "params": RawResponseItemCompletedNotification } | { "method": "rawResponse/completed", "params": RawResponseCompletedNotification } | { "method": "item/agentMessage/delta", "params": AgentMessageDeltaNotification } | { "method": "item/plan/delta", "params": PlanDeltaNotification } | { "method": "command/exec/outputDelta", "params": CommandExecOutputDeltaNotification } | { "method": "process/outputDelta", "params": ProcessOutputDeltaNotification } | { "method": "process/exited", "params": ProcessExitedNotification } | { "method": "item/commandExecution/outputDelta", "params": CommandExecutionOutputDeltaNotification } | { "method": "item/commandExecution/terminalInteraction", "params": TerminalInteractionNotification } | { "method": "item/fileChange/outputDelta", "params": FileChangeOutputDeltaNotification } | { "method": "item/fileChange/patchUpdated", "params": FileChangePatchUpdatedNotification } | { "method": "serverRequest/resolved", "params": ServerRequestResolvedNotification } | { "method": "item/mcpToolCall/progress", "params": McpToolCallProgressNotification } | { "method": "mcpServer/oauthLogin/completed", "params": McpServerOauthLoginCompletedNotification } | { "method": "mcpServer/startupStatus/updated", "params": McpServerStatusUpdatedNotification } | { "method": "account/updated", "params": AccountUpdatedNotification } | { "method": "account/rateLimits/updated", "params": AccountRateLimitsUpdatedNotification } | { "method": "app/list/updated", "params": AppListUpdatedNotification } | { "method": "remoteControl/status/changed", "params": RemoteControlStatusChangedNotification } | { "method": "externalAgentConfig/import/progress", "params": ExternalAgentConfigImportProgressNotification } | { "method": "externalAgentConfig/import/completed", "params": ExternalAgentConfigImportCompletedNotification } | { "method": "fs/changed", "params": FsChangedNotification } | { "method": "item/reasoning/summaryTextDelta", "params": ReasoningSummaryTextDeltaNotification } | { "method": "item/reasoning/summaryPartAdded", "params": ReasoningSummaryPartAddedNotification } | { "method": "item/reasoning/textDelta", "params": ReasoningTextDeltaNotification } | { "method": "thread/compacted", "params": ContextCompactedNotification } | { "method": "model/rerouted", "params": ModelReroutedNotification } | { "method": "model/verification", "params": ModelVerificationNotification } | { "method": "turn/moderationMetadata", "params": TurnModerationMetadataNotification } | { "method": "model/safetyBuffering/updated", "params": ModelSafetyBufferingUpdatedNotification } | { "method": "warning", "params": WarningNotification } | { "method": "guardianWarning", "params": GuardianWarningNotification } | { "method": "deprecationNotice", "params": DeprecationNoticeNotification } | { "method": "configWarning", "params": ConfigWarningNotification } | { "method": "fuzzyFileSearch/sessionUpdated", "params": FuzzyFileSearchSessionUpdatedNotification } | { "method": "fuzzyFileSearch/sessionCompleted", "params": FuzzyFileSearchSessionCompletedNotification } | { "method": "thread/realtime/started", "params": ThreadRealtimeStartedNotification } | { "method": "thread/realtime/itemAdded", "params": ThreadRealtimeItemAddedNotification } | { "method": "thread/realtime/transcript/delta", "params": ThreadRealtimeTranscriptDeltaNotification } | { "method": "thread/realtime/transcript/done", "params": ThreadRealtimeTranscriptDoneNotification } | { "method": "thread/realtime/outputAudio/delta", "params": ThreadRealtimeOutputAudioDeltaNotification } | { "method": "thread/realtime/sdp", "params": ThreadRealtimeSdpNotification } | { "method": "thread/realtime/error", "params": ThreadRealtimeErrorNotification } | { "method": "thread/realtime/closed", "params": ThreadRealtimeClosedNotification } | { "method": "windows/worldWritableWarning", "params": WindowsWorldWritableWarningNotification } | { "method": "windowsSandbox/setupCompleted", "params": WindowsSandboxSetupCompletedNotification } | { "method": "account/login/completed", "params": AccountLoginCompletedNotification });
++emittedAtMs?: number, } & ({ "method": "error", "params": ErrorNotification } | { "method": "thread/started", "params": ThreadStartedNotification } | { "method": "thread/status/changed", "params": ThreadStatusChangedNotification } | { "method": "thread/archived", "params": ThreadArchivedNotification } | { "method": "thread/deleted", "params": ThreadDeletedNotification } | { "method": "thread/unarchived", "params": ThreadUnarchivedNotification } | { "method": "thread/closed", "params": ThreadClosedNotification } | { "method": "skills/changed", "params": SkillsChangedNotification } | { "method": "thread/name/updated", "params": ThreadNameUpdatedNotification } | { "method": "thread/goal/updated", "params": ThreadGoalUpdatedNotification } | { "method": "thread/goal/cleared", "params": ThreadGoalClearedNotification } | { "method": "thread/environment/connected", "params": EnvironmentConnectionNotification } | { "method": "thread/environment/disconnected", "params": EnvironmentConnectionNotification } | { "method": "thread/settings/updated", "params": ThreadSettingsUpdatedNotification } | { "method": "thread/tokenUsage/updated", "params": ThreadTokenUsageUpdatedNotification } | { "method": "turn/started", "params": TurnStartedNotification } | { "method": "hook/started", "params": HookStartedNotification } | { "method": "turn/completed", "params": TurnCompletedNotification } | { "method": "hook/completed", "params": HookCompletedNotification } | { "method": "turn/diff/updated", "params": TurnDiffUpdatedNotification } | { "method": "turn/plan/updated", "params": TurnPlanUpdatedNotification } | { "method": "item/started", "params": ItemStartedNotification } | { "method": "item/autoApprovalReview/started", "params": ItemGuardianApprovalReviewStartedNotification } | { "method": "item/autoApprovalReview/completed", "params": ItemGuardianApprovalReviewCompletedNotification } | { "method": "item/completed", "params": ItemCompletedNotification } | { "method": "rawResponseItem/completed", "params": RawResponseItemCompletedNotification } | { "method": "rawResponse/completed", "params": RawResponseCompletedNotification } | { "method": "item/agentMessage/delta", "params": AgentMessageDeltaNotification } | { "method": "item/plan/delta", "params": PlanDeltaNotification } | { "method": "command/exec/outputDelta", "params": CommandExecOutputDeltaNotification } | { "method": "process/outputDelta", "params": ProcessOutputDeltaNotification } | { "method": "process/exited", "params": ProcessExitedNotification } | { "method": "item/commandExecution/outputDelta", "params": CommandExecutionOutputDeltaNotification } | { "method": "item/commandExecution/terminalInteraction", "params": TerminalInteractionNotification } | { "method": "item/fileChange/outputDelta", "params": FileChangeOutputDeltaNotification } | { "method": "item/fileChange/patchUpdated", "params": FileChangePatchUpdatedNotification } | { "method": "serverRequest/resolved", "params": ServerRequestResolvedNotification } | { "method": "item/mcpToolCall/progress", "params": McpToolCallProgressNotification } | { "method": "mcpServer/oauthLogin/completed", "params": McpServerOauthLoginCompletedNotification } | { "method": "mcpServer/startupStatus/updated", "params": McpServerStatusUpdatedNotification } | { "method": "account/updated", "params": AccountUpdatedNotification } | { "method": "account/rateLimits/updated", "params": AccountRateLimitsUpdatedNotification } | { "method": "app/list/updated", "params": AppListUpdatedNotification } | { "method": "remoteControl/status/changed", "params": RemoteControlStatusChangedNotification } | { "method": "appServer/activeClientCount/changed", "params": ActiveClientCountChangedNotification } | { "method": "externalAgentConfig/import/progress", "params": ExternalAgentConfigImportProgressNotification } | { "method": "externalAgentConfig/import/completed", "params": ExternalAgentConfigImportCompletedNotification } | { "method": "fs/changed", "params": FsChangedNotification } | { "method": "item/reasoning/summaryTextDelta", "params": ReasoningSummaryTextDeltaNotification } | { "method": "item/reasoning/summaryPartAdded", "params": ReasoningSummaryPartAddedNotification } | { "method": "item/reasoning/textDelta", "params": ReasoningTextDeltaNotification } | { "method": "thread/compacted", "params": ContextCompactedNotification } | { "method": "model/rerouted", "params": ModelReroutedNotification } | { "method": "model/verification", "params": ModelVerificationNotification } | { "method": "turn/moderationMetadata", "params": TurnModerationMetadataNotification } | { "method": "model/safetyBuffering/updated", "params": ModelSafetyBufferingUpdatedNotification } | { "method": "warning", "params": WarningNotification } | { "method": "guardianWarning", "params": GuardianWarningNotification } | { "method": "deprecationNotice", "params": DeprecationNoticeNotification } | { "method": "configWarning", "params": ConfigWarningNotification } | { "method": "fuzzyFileSearch/sessionUpdated", "params": FuzzyFileSearchSessionUpdatedNotification } | { "method": "fuzzyFileSearch/sessionCompleted", "params": FuzzyFileSearchSessionCompletedNotification } | { "method": "thread/realtime/started", "params": ThreadRealtimeStartedNotification } | { "method": "thread/realtime/itemAdded", "params": ThreadRealtimeItemAddedNotification } | { "method": "thread/realtime/transcript/delta", "params": ThreadRealtimeTranscriptDeltaNotification } | { "method": "thread/realtime/transcript/done", "params": ThreadRealtimeTranscriptDoneNotification } | { "method": "thread/realtime/outputAudio/delta", "params": ThreadRealtimeOutputAudioDeltaNotification } | { "method": "thread/realtime/sdp", "params": ThreadRealtimeSdpNotification } | { "method": "thread/realtime/error", "params": ThreadRealtimeErrorNotification } | { "method": "thread/realtime/closed", "params": ThreadRealtimeClosedNotification } | { "method": "windows/worldWritableWarning", "params": WindowsWorldWritableWarningNotification } | { "method": "windowsSandbox/setupCompleted", "params": WindowsSandboxSetupCompletedNotification } | { "method": "account/login/completed", "params": AccountLoginCompletedNotification });
+diff --git a/codex-rs/app-server-protocol/schema/typescript/v2/ActiveClientCountChangedNotification.ts b/codex-rs/app-server-protocol/schema/typescript/v2/ActiveClientCountChangedNotification.ts
+new file mode 100644
+index 0000000000..fe8105f4f9
+--- /dev/null
++++ b/codex-rs/app-server-protocol/schema/typescript/v2/ActiveClientCountChangedNotification.ts
+@@ -0,0 +1,5 @@
++// GENERATED CODE! DO NOT MODIFY BY HAND!
++
++// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
++
++export type ActiveClientCountChangedNotification = { activeClientCount: number, };
+diff --git a/codex-rs/app-server-protocol/schema/typescript/v2/index.ts b/codex-rs/app-server-protocol/schema/typescript/v2/index.ts
+index dbe50ae06c..92daf2f4a3 100644
+--- a/codex-rs/app-server-protocol/schema/typescript/v2/index.ts
++++ b/codex-rs/app-server-protocol/schema/typescript/v2/index.ts
+@@ -6,6 +6,7 @@ export type { AccountRateLimitsUpdatedNotification } from "./AccountRateLimitsUp
+ export type { AccountTokenUsageDailyBucket } from "./AccountTokenUsageDailyBucket";
+ export type { AccountTokenUsageSummary } from "./AccountTokenUsageSummary";
+ export type { AccountUpdatedNotification } from "./AccountUpdatedNotification";
++export type { ActiveClientCountChangedNotification } from "./ActiveClientCountChangedNotification";
+ export type { ActivePermissionProfile } from "./ActivePermissionProfile";
+ export type { AddCreditsNudgeCreditType } from "./AddCreditsNudgeCreditType";
+ export type { AddCreditsNudgeEmailStatus } from "./AddCreditsNudgeEmailStatus";
+diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
+index 3d1a1f271d..a893e35d54 100644
+--- a/codex-rs/app-server/Cargo.toml
++++ b/codex-rs/app-server/Cargo.toml
+@@ -90,6 +90,7 @@ clap = { workspace = true, features = ["derive"] }
+ futures = { workspace = true }
+ serde = { workspace = true, features = ["derive"] }
+ serde_json = { workspace = true }
++sha2 = { workspace = true }
+ tempfile = { workspace = true }
+ thiserror = { workspace = true }
+ time = { workspace = true }
+@@ -134,7 +135,6 @@ rmcp = { workspace = true, default-features = false, features = [
+     "transport-streamable-http-server",
+ ] }
+ serial_test = { workspace = true }
+-sha2 = { workspace = true }
+ shlex = { workspace = true }
+ tar = { workspace = true }
+ tokio-tungstenite = { workspace = true }
+diff --git a/codex-rs/app-server/src/in_process.rs b/codex-rs/app-server/src/in_process.rs
+index 2f19dd7e38..d68ff2f185 100644
+--- a/codex-rs/app-server/src/in_process.rs
++++ b/codex-rs/app-server/src/in_process.rs
+@@ -435,6 +435,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
+         let mut processor_handle = tokio::spawn(async move {
+             let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+                 outgoing: Arc::clone(&processor_outgoing),
++                app_server_binary_id: None,
+                 active_client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                 shutdown_when_no_active_clients_requested: Arc::new(
+                     std::sync::atomic::AtomicBool::new(false),
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+index bbc64fe7e8..924cd5d173 100644
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -28,6 +28,7 @@ use crate::config_manager::ConfigManager;
+ use crate::connection_cleanup::ConnectionCleanupTasks;
+ use crate::message_processor::MessageProcessor;
+ use crate::message_processor::MessageProcessorArgs;
++use crate::message_processor::current_binary_id;
+ use crate::outgoing_message::ConnectionId;
+ use crate::outgoing_message::OutgoingEnvelope;
+ use crate::outgoing_message::OutgoingMessageSender;
+@@ -821,6 +822,15 @@ pub async fn run_main_with_transport_options(
+     }
+     transport_accept_handles.push(remote_control_accept_handle);
+ 
++    let app_server_binary_id = if matches!(
++        &transport,
++        AppServerTransport::UnixSocket { .. } | AppServerTransport::WebSocket { .. }
++    ) {
++        current_binary_id().await.ok()
++    } else {
++        None
++    };
++
+     let outbound_handle = tokio::spawn(async move {
+         let mut outbound_connections = HashMap::<ConnectionId, OutboundConnectionState>::new();
+         loop {
+@@ -890,6 +900,7 @@ pub async fn run_main_with_transport_options(
+         let shutdown_when_no_active_clients_requested = Arc::new(AtomicBool::new(false));
+         let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+             outgoing: outgoing_message_sender,
++            app_server_binary_id,
+             active_client_count,
+             shutdown_when_no_active_clients_requested: Arc::clone(
+                 &shutdown_when_no_active_clients_requested,
+@@ -1226,6 +1237,7 @@ pub async fn run_main_with_transport_options(
+             };
+ 
+             if !shutdown_state.forced() {
++                processor.clear_runtime_references();
+                 futures::future::join_all(
+                     connections
+                         .values()
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 4a6de08eb9..11d6e6e065 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -1,5 +1,11 @@
++#[cfg(unix)]
++use sha2::Digest;
++#[cfg(unix)]
++use sha2::Sha256;
+ use std::collections::HashSet;
+ use std::future::Future;
++#[cfg(unix)]
++use std::path::Path;
+ use std::sync::Arc;
+ use std::sync::OnceLock;
+ use std::sync::atomic::AtomicBool;
+@@ -80,6 +86,8 @@ use codex_protocol::protocol::SessionSource;
+ use codex_protocol::protocol::W3cTraceContext;
+ use codex_rollout::StateDbHandle;
+ use codex_state::log_db::LogDbLayer;
++#[cfg(unix)]
++use tokio::io::AsyncReadExt;
+ use tokio::sync::Mutex;
+ use tokio::sync::Semaphore;
+ use tokio::sync::broadcast;
+@@ -92,6 +100,7 @@ use tracing::Instrument;
+ use crate::models_refresh_worker::ModelsRefreshWorker;
+ 
+ const CONNECTION_RPC_DRAIN_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
++const APP_SERVER_BINARY_ID_ENV_VAR: &str = "CODEX_INTERNAL_APP_SERVER_BINARY_ID";
+ const DAEMON_CLIENT_NAME: &str = "codex_app_server_daemon";
+ const INTERNAL_DAEMON_STATUS_METHOD: &str = "internal/daemon/status";
+ const NON_TUI_THREAD_LIST_LIMIT: u32 = 5;
+@@ -134,6 +143,7 @@ pub(crate) struct MessageProcessor {
+     turn_processor: TurnRequestProcessor,
+     windows_sandbox_processor: WindowsSandboxRequestProcessor,
+     request_serialization_queues: RequestSerializationQueues,
++    app_server_binary_id: Option<String>,
+     active_client_count: Arc<AtomicUsize>,
+     shutdown_when_no_active_clients_requested: Arc<AtomicBool>,
+ }
+@@ -223,6 +233,7 @@ impl ConnectionSessionState {
+ 
+ pub(crate) struct MessageProcessorArgs {
+     pub(crate) outgoing: Arc<OutgoingMessageSender>,
++    pub(crate) app_server_binary_id: Option<String>,
+     pub(crate) active_client_count: Arc<AtomicUsize>,
+     pub(crate) shutdown_when_no_active_clients_requested: Arc<AtomicBool>,
+     pub(crate) analytics_events_client: AnalyticsEventsClient,
+@@ -248,6 +259,7 @@ impl MessageProcessor {
+     pub(crate) fn new(args: MessageProcessorArgs) -> Self {
+         let MessageProcessorArgs {
+             outgoing,
++            app_server_binary_id,
+             active_client_count,
+             shutdown_when_no_active_clients_requested,
+             analytics_events_client,
+@@ -529,6 +541,7 @@ impl MessageProcessor {
+             turn_processor,
+             windows_sandbox_processor,
+             request_serialization_queues,
++            app_server_binary_id,
+             active_client_count,
+             shutdown_when_no_active_clients_requested,
+         }
+@@ -714,6 +727,7 @@ impl MessageProcessor {
+                 serde_json::json!({
+                     "activeClientCount": self.active_client_count.load(Ordering::Acquire),
+                     "runningAssistantTurnCount": running_assistant_turn_count,
++                    "binaryId": self.app_server_binary_id.as_deref(),
+                 }),
+             )
+             .await;
+@@ -1574,6 +1588,50 @@ impl MessageProcessor {
+     }
+ }
+ 
++pub(crate) async fn current_binary_id() -> std::io::Result<String> {
++    if let Ok(binary_id) = std::env::var(APP_SERVER_BINARY_ID_ENV_VAR)
++        && binary_id.len() == 64
++        && binary_id.bytes().all(|byte| byte.is_ascii_hexdigit())
++    {
++        return Ok(binary_id);
++    }
++    current_binary_id_from_executable().await
++}
++
++#[cfg(unix)]
++async fn current_binary_id_from_executable() -> std::io::Result<String> {
++    let path = current_executable_identity_path();
++    let mut file = tokio::fs::File::open(path).await?;
++    let mut hasher = Sha256::new();
++    let mut buffer = vec![0_u8; 1024 * 1024];
++    loop {
++        let read = file.read(&mut buffer).await?;
++        if read == 0 {
++            break;
++        }
++        hasher.update(&buffer[..read]);
++    }
++    Ok(format!("{:x}", hasher.finalize()))
++}
++
++#[cfg(target_os = "linux")]
++fn current_executable_identity_path() -> &'static Path {
++    Path::new("/proc/self/exe")
++}
++
++#[cfg(all(unix, not(target_os = "linux")))]
++fn current_executable_identity_path() -> std::path::PathBuf {
++    std::env::current_exe().unwrap_or_else(|_| Path::new("").to_path_buf())
++}
++
++#[cfg(not(unix))]
++async fn current_binary_id_from_executable() -> std::io::Result<String> {
++    Err(std::io::Error::new(
++        std::io::ErrorKind::Unsupported,
++        "binary identity is unsupported on this platform",
++    ))
++}
++
+ fn should_limit_thread_list_for_client(client_name: Option<&str>) -> bool {
+     client_name != Some(TUI_CLIENT_NAME)
+ }
+diff --git a/codex-rs/app-server/src/message_processor_tracing_tests.rs b/codex-rs/app-server/src/message_processor_tracing_tests.rs
+index 8897911df6..4bef9a9a70 100644
+--- a/codex-rs/app-server/src/message_processor_tracing_tests.rs
++++ b/codex-rs/app-server/src/message_processor_tracing_tests.rs
+@@ -161,6 +161,7 @@ impl TracingHarness {
+     }
+ 
+     async fn shutdown(self) {
++        self.processor.clear_runtime_references();
+         self.processor.shutdown_threads().await;
+         self.processor.drain_background_tasks().await;
+     }
+@@ -252,6 +253,7 @@ async fn build_test_processor(
+     ));
+     let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
+         outgoing,
++        app_server_binary_id: None,
+         active_client_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+         shutdown_when_no_active_clients_requested: Arc::new(std::sync::atomic::AtomicBool::new(
+             false,
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+index 6da21bd82b..078456f699 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -2848,12 +2848,26 @@ impl ThreadRequestProcessor {
+     }
+ 
+     pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
+-        let thread_ids = self
++        let (subscribed_thread_ids, thread_ids_without_connections) = self
+             .thread_state_manager
+             .remove_connection(connection_id)
+             .await;
+ 
+-        for thread_id in thread_ids {
++        for thread_id in subscribed_thread_ids {
++            if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
++                let cleared_count = thread.clear_pending_steers_for_active_turn().await;
++                if cleared_count > 0 {
++                    tracing::debug!(
++                        ?connection_id,
++                        %thread_id,
++                        cleared_count,
++                        "cleared pending steers after client disconnect"
++                    );
++                }
++            }
++        }
++
++        for thread_id in thread_ids_without_connections {
+             if self.thread_manager.get_thread(thread_id).await.is_err() {
+                 // Reconcile stale app-server bookkeeping when the thread has already been
+                 // removed from the core manager.
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor_tests.rs b/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
+index 38a94ab812..fbb922713c 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
+@@ -1324,7 +1324,9 @@ mod thread_processor_behavior_tests {
+             state.lock().await.cancel_tx = Some(cancel_tx);
+         }
+ 
+-        let threads_to_unload = manager.remove_connection(connection_a).await;
++        let (subscribed_threads, threads_to_unload) =
++            manager.remove_connection(connection_a).await;
++        assert_eq!(subscribed_threads, vec![thread_id]);
+         assert_eq!(threads_to_unload, Vec::<ThreadId>::new());
+         assert!(
+             tokio::time::timeout(Duration::from_millis(20), &mut cancel_rx)
+@@ -1424,7 +1426,8 @@ mod thread_processor_behavior_tests {
+         manager
+             .connection_initialized(connection, ConnectionCapabilities::default())
+             .await;
+-        let threads_to_unload = manager.remove_connection(connection).await;
++        let (subscribed_threads, threads_to_unload) = manager.remove_connection(connection).await;
++        assert_eq!(subscribed_threads, Vec::<ThreadId>::new());
+         assert_eq!(threads_to_unload, Vec::<ThreadId>::new());
+ 
+         assert!(
+diff --git a/codex-rs/app-server/src/thread_state.rs b/codex-rs/app-server/src/thread_state.rs
+index 0e634e3f7f..9908690b9b 100644
+--- a/codex-rs/app-server/src/thread_state.rs
++++ b/codex-rs/app-server/src/thread_state.rs
+@@ -540,7 +540,10 @@ impl ThreadStateManager {
+         true
+     }
+ 
+-    pub(crate) async fn remove_connection(&self, connection_id: ConnectionId) -> Vec<ThreadId> {
++    pub(crate) async fn remove_connection(
++        &self,
++        connection_id: ConnectionId,
++    ) -> (Vec<ThreadId>, Vec<ThreadId>) {
+         {
+             let mut state = self.state.lock().await;
+             state.live_connections.remove(&connection_id);
+@@ -554,15 +557,17 @@ impl ThreadStateManager {
+                     thread_entry.update_has_connections();
+                 }
+             }
+-            thread_ids
+-                .into_iter()
++            let threads_without_connections = thread_ids
++                .iter()
++                .copied()
+                 .filter(|thread_id| {
+                     state
+                         .threads
+                         .get(thread_id)
+                         .is_some_and(|thread_entry| thread_entry.connection_ids.is_empty())
+                 })
+-                .collect::<Vec<_>>()
++                .collect::<Vec<_>>();
++            (thread_ids.into_iter().collect(), threads_without_connections)
+         }
+     }
+ 
+diff --git a/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs b/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs
+index 3c9a376416..792770f894 100644
+--- a/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs
++++ b/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs
+@@ -63,12 +63,15 @@ pub(super) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
+ 
+ pub(super) type WsClient = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+ type HmacSha256 = Hmac<Sha256>;
++const TEST_APP_SERVER_BINARY_ID: &str =
++    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+ 
+ #[derive(Debug, Deserialize)]
+ #[serde(rename_all = "camelCase")]
+ struct DaemonStatusResponse {
+     active_client_count: usize,
+     running_assistant_turn_count: usize,
++    binary_id: Option<String>,
+ }
+ 
+ #[tokio::test]
+@@ -131,6 +134,8 @@ async fn initialize_reports_daemon_restart_probe_counts() -> Result<()> {
+     let daemon_status = read_daemon_status_response(&mut daemon_probe, /*id*/ 101).await?;
+     assert_eq!(daemon_status.active_client_count, 0);
+     assert_eq!(daemon_status.running_assistant_turn_count, 0);
++    let binary_id = daemon_status.binary_id.as_deref().expect("binary id");
++    assert_eq!(binary_id, TEST_APP_SERVER_BINARY_ID);
+ 
+     let mut client = connect_websocket(bind_addr).await?;
+     send_initialize_request(&mut client, /*id*/ 2, "ws_client").await?;
+@@ -570,6 +575,10 @@ pub(super) async fn spawn_websocket_server_with_args(
+         .stdout(Stdio::null())
+         .stderr(Stdio::piped())
+         .env("CODEX_HOME", codex_home)
++        .env(
++            "CODEX_INTERNAL_APP_SERVER_BINARY_ID",
++            TEST_APP_SERVER_BINARY_ID,
++        )
+         .env("RUST_LOG", "warn");
+     let mut process = cmd
+         .kill_on_drop(true)
+diff --git a/codex-rs/cli/src/remote_control_cmd.rs b/codex-rs/cli/src/remote_control_cmd.rs
+index 840e19bc36..0680423cd6 100644
+--- a/codex-rs/cli/src/remote_control_cmd.rs
++++ b/codex-rs/cli/src/remote_control_cmd.rs
+@@ -531,6 +531,7 @@ mod tests {
+                 socket_path: PathBuf::from("/tmp/app-server-control.sock"),
+                 cli_version: Some("1.0.0".to_string()),
+                 app_server_version: Some("2.0.0".to_string()),
++                app_server_binary_id: Some("binary-current".to_string()),
+                 active_client_count: Some(0),
+                 running_assistant_turn_count: Some(0),
+             }),
+@@ -654,6 +655,7 @@ mod tests {
+                     "socketPath": "/tmp/app-server-control.sock",
+                     "cliVersion": "1.0.0",
+                     "appServerVersion": "2.0.0",
++                    "appServerBinaryId": "binary-current",
+                     "activeClientCount": 0,
+                     "runningAssistantTurnCount": 0,
+                 },

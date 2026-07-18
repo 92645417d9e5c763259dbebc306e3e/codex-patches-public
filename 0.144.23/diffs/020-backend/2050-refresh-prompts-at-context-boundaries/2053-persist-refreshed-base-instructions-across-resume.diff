@@ -1,0 +1,864 @@
+diff --git a/codex-rs/app-server-protocol/src/protocol/thread_history.rs b/codex-rs/app-server-protocol/src/protocol/thread_history.rs
+index 7bb42c1935..53baa36579 100644
+--- a/codex-rs/app-server-protocol/src/protocol/thread_history.rs
++++ b/codex-rs/app-server-protocol/src/protocol/thread_history.rs
+@@ -3651,6 +3651,7 @@ mod tests {
+             RolloutItem::Compacted(CompactedItem {
+                 message: String::new(),
+                 replacement_history: None,
++                base_instructions_update: None,
+                 window_number: None,
+                 first_window_id: None,
+                 previous_window_id: None,
+diff --git a/codex-rs/app-server-protocol/src/protocol/thread_history_projection_tests.rs b/codex-rs/app-server-protocol/src/protocol/thread_history_projection_tests.rs
+index 851b95ecbe..12fd7a955d 100644
+--- a/codex-rs/app-server-protocol/src/protocol/thread_history_projection_tests.rs
++++ b/codex-rs/app-server-protocol/src/protocol/thread_history_projection_tests.rs
+@@ -155,6 +155,7 @@ fn ignores_legacy_abort_without_turn_id_and_context_only_records() {
+     let compacted = project(RolloutItem::Compacted(CompactedItem {
+         message: String::new(),
+         replacement_history: None,
++        base_instructions_update: None,
+         window_number: None,
+         first_window_id: None,
+         previous_window_id: None,
+diff --git a/codex-rs/core/src/agent/control_tests.rs b/codex-rs/core/src/agent/control_tests.rs
+index 97016c0bd4..cb2c65426d 100644
+--- a/codex-rs/core/src/agent/control_tests.rs
++++ b/codex-rs/core/src/agent/control_tests.rs
+@@ -1145,6 +1145,7 @@ async fn spawn_agent_numeric_fork_from_compacted_paginated_parent_clamps_to_prov
+                     phase: None,
+                     internal_chat_message_metadata_passthrough: None,
+                 }]),
++                base_instructions_update: None,
+                 window_number: None,
+                 first_window_id: None,
+                 previous_window_id: None,
+@@ -1471,6 +1472,7 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
+             RolloutItem::Compacted(CompactedItem {
+                 message: String::new(),
+                 replacement_history: Some(replacement_history),
++                base_instructions_update: None,
+                 window_number: None,
+                 first_window_id: None,
+                 previous_window_id: None,
+diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
+index 827f55174a..60fa0a3707 100644
+--- a/codex-rs/core/src/compact.rs
++++ b/codex-rs/core/src/compact.rs
+@@ -380,6 +380,7 @@ async fn run_compact_task_inner_impl(
+     let compacted_item = CompactedItem {
+         message: summary_text.clone(),
+         replacement_history: Some(new_history.clone()),
++        base_instructions_update: None,
+         window_number: Some(window_number),
+         first_window_id: Some(window_ids.first_window_id.to_string()),
+         previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
+diff --git a/codex-rs/core/src/compact_remote.rs b/codex-rs/core/src/compact_remote.rs
+index 209101138e..b9c4a98848 100644
+--- a/codex-rs/core/src/compact_remote.rs
++++ b/codex-rs/core/src/compact_remote.rs
+@@ -287,6 +287,7 @@ async fn run_remote_compact_task_inner_impl(
+     let compacted_item = CompactedItem {
+         message: String::new(),
+         replacement_history: Some(new_history.clone()),
++        base_instructions_update: None,
+         window_number: Some(new_window_number),
+         first_window_id: Some(new_window_ids.first_window_id.to_string()),
+         previous_window_id: new_window_ids.previous_window_id.map(|id| id.to_string()),
+diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_remote_v2.rs
+index 8628c0e2a6..937ad805bf 100644
+--- a/codex-rs/core/src/compact_remote_v2.rs
++++ b/codex-rs/core/src/compact_remote_v2.rs
+@@ -309,6 +309,7 @@ async fn run_remote_compact_task_inner_impl(
+     let compacted_item = CompactedItem {
+         message: String::new(),
+         replacement_history: Some(new_history.clone()),
++        base_instructions_update: None,
+         window_number: Some(new_window_number),
+         first_window_id: Some(new_window_ids.first_window_id.to_string()),
+         previous_window_id: new_window_ids.previous_window_id.map(|id| id.to_string()),
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 368509030a..b586aea898 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -125,6 +125,7 @@ use codex_protocol::protocol::RawResponseItemEvent;
+ use codex_protocol::protocol::RolloutItem;
+ use codex_protocol::protocol::SessionSource;
+ use codex_protocol::protocol::SubAgentSource;
++use codex_protocol::protocol::ThreadBaseInstructionsUpdate;
+ use codex_protocol::protocol::ThreadHistoryMode;
+ use codex_protocol::protocol::ThreadSource;
+ use codex_protocol::protocol::TurnAbortReason;
+@@ -601,7 +602,7 @@ impl Session {
+ 
+         // Resolve base instructions for the session. Priority order:
+         // 1. config.base_instructions override
+-        // 2. conversation history => session_meta.base_instructions
++        // 2. conversation history => latest thread-owned update, then creation metadata
+         // 3. base_instructions for current model
+         let model_info = models_manager
+             .get_model_info(model.as_str(), &config.to_models_manager_config())
+@@ -3172,6 +3173,10 @@ impl Session {
+         };
+         let compacted_item = CompactedItem {
+             replacement_history: Some(items.clone()),
++            base_instructions_update: Some(ThreadBaseInstructionsUpdate {
++                thread_id: self.thread_id,
++                base_instructions: instruction_refresh.base_instructions.clone(),
++            }),
+             ..compacted_item
+         };
+         // Compaction starts a new history window, so its WorldState baseline must be full.
+@@ -3732,6 +3737,7 @@ impl Session {
+             CompactedItem {
+                 message: String::new(),
+                 replacement_history: None,
++                base_instructions_update: None,
+                 window_number: Some(window_number),
+                 first_window_id: Some(window_ids.first_window_id.to_string()),
+                 previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
+diff --git a/codex-rs/core/src/session/rollout_reconstruction_tests.rs b/codex-rs/core/src/session/rollout_reconstruction_tests.rs
+index e420224117..4ba4201c48 100644
+--- a/codex-rs/core/src/session/rollout_reconstruction_tests.rs
++++ b/codex-rs/core/src/session/rollout_reconstruction_tests.rs
+@@ -953,6 +953,7 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
+         RolloutItem::Compacted(CompactedItem {
+             message: String::new(),
+             replacement_history: Some(Vec::new()),
++            base_instructions_update: None,
+             window_number: None,
+             first_window_id: None,
+             previous_window_id: None,
+@@ -1013,6 +1014,7 @@ async fn record_initial_history_resumed_does_not_seed_reference_context_item_aft
+         RolloutItem::Compacted(CompactedItem {
+             message: String::new(),
+             replacement_history: Some(Vec::new()),
++            base_instructions_update: None,
+             window_number: None,
+             first_window_id: None,
+             previous_window_id: None,
+@@ -1082,6 +1084,7 @@ async fn reconstruct_history_prefers_compacted_window_over_session_meta() {
+         RolloutItem::Compacted(CompactedItem {
+             message: String::new(),
+             replacement_history: Some(Vec::new()),
++            base_instructions_update: None,
+             window_number: Some(2),
+             first_window_id: Some(compacted_first_window_id.to_string()),
+             previous_window_id: Some(compacted_previous_window_id.to_string()),
+@@ -1117,6 +1120,7 @@ async fn reconstruct_history_replays_world_state_from_latest_compaction_window()
+             RolloutItem::Compacted(CompactedItem {
+                 message: String::new(),
+                 replacement_history: Some(Vec::new()),
++                base_instructions_update: None,
+                 window_number: Some(1),
+                 first_window_id: None,
+                 previous_window_id: None,
+@@ -1164,6 +1168,7 @@ async fn reconstruct_history_preserves_legacy_compaction_count_with_session_meta
+         RolloutItem::Compacted(CompactedItem {
+             message: "legacy summary".to_string(),
+             replacement_history: None,
++            base_instructions_update: None,
+             window_number: None,
+             first_window_id: None,
+             previous_window_id: None,
+@@ -1191,6 +1196,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_does_
+         RolloutItem::Compacted(CompactedItem {
+             message: "legacy summary".to_string(),
+             replacement_history: None,
++            base_instructions_update: None,
+             window_number: None,
+             first_window_id: None,
+             previous_window_id: None,
+@@ -1226,6 +1232,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_clear
+         RolloutItem::Compacted(CompactedItem {
+             message: "legacy summary".to_string(),
+             replacement_history: None,
++            base_instructions_update: None,
+             window_number: None,
+             first_window_id: None,
+             previous_window_id: None,
+@@ -1327,6 +1334,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
+         RolloutItem::Compacted(CompactedItem {
+             message: String::new(),
+             replacement_history: Some(Vec::new()),
++            base_instructions_update: None,
+             window_number: None,
+             first_window_id: None,
+             previous_window_id: None,
+@@ -1489,6 +1497,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
+         RolloutItem::Compacted(CompactedItem {
+             message: String::new(),
+             replacement_history: Some(Vec::new()),
++            base_instructions_update: None,
+             window_number: None,
+             first_window_id: None,
+             previous_window_id: None,
+@@ -1737,6 +1746,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
+         RolloutItem::Compacted(CompactedItem {
+             message: String::new(),
+             replacement_history: Some(Vec::new()),
++            base_instructions_update: None,
+             window_number: None,
+             first_window_id: None,
+             previous_window_id: None,
+@@ -1908,6 +1918,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
+         RolloutItem::Compacted(CompactedItem {
+             message: String::new(),
+             replacement_history: Some(Vec::new()),
++            base_instructions_update: None,
+             window_number: None,
+             first_window_id: None,
+             previous_window_id: None,
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index 377e218a61..ee7946cd7a 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -1803,6 +1803,7 @@ async fn reconstruct_history_uses_replacement_history_verbatim() {
+     let rollout_items = vec![RolloutItem::Compacted(CompactedItem {
+         message: String::new(),
+         replacement_history: Some(replacement_history.clone()),
++        base_instructions_update: None,
+         window_number: Some(42),
+         first_window_id: Some(first_window_id.to_string()),
+         previous_window_id: Some(previous_window_id.to_string()),
+@@ -2489,6 +2490,7 @@ async fn context_boundary_personality_uses_model_info_for_staged_base_instructio
+         }),
+         approvals: None,
+         auto_review: None,
++        permissions: None,
+     };
+     turn_context.model_info.model_messages = Some(model_messages("OLD"));
+     let mut refreshed_model_info = turn_context.model_info.clone();
+@@ -3640,6 +3642,7 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
+         RolloutItem::Compacted(CompactedItem {
+             message: "summary after compaction".to_string(),
+             replacement_history: Some(compacted_history.clone()),
++            base_instructions_update: None,
+             window_number: Some(7),
+             first_window_id: Some(first_window_id.to_string()),
+             previous_window_id: Some(previous_window_id.to_string()),
+@@ -10767,6 +10770,7 @@ async fn sample_rollout(
+     rollout_items.push(RolloutItem::Compacted(CompactedItem {
+         message: summary1.to_string(),
+         replacement_history: None,
++        base_instructions_update: None,
+         window_number: Some(window_number),
+         first_window_id: Some(window_ids.first_window_id.to_string()),
+         previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
+@@ -10814,6 +10818,7 @@ async fn sample_rollout(
+     rollout_items.push(RolloutItem::Compacted(CompactedItem {
+         message: summary2.to_string(),
+         replacement_history: None,
++        base_instructions_update: None,
+         window_number: Some(window_number),
+         first_window_id: Some(window_ids.first_window_id.to_string()),
+         previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
+diff --git a/codex-rs/core/tests/suite/compact.rs b/codex-rs/core/tests/suite/compact.rs
+index 0e40cd65aa..722c474d61 100644
+--- a/codex-rs/core/tests/suite/compact.rs
++++ b/codex-rs/core/tests/suite/compact.rs
+@@ -5471,6 +5471,10 @@ async fn failed_remote_compaction_does_not_refresh_global_instructions() -> Resu
+                 responses::ev_response_created("remote-failure-follow-up-response"),
+                 responses::ev_completed("remote-failure-follow-up-response"),
+             ]),
++            responses::sse(vec![
++                responses::ev_response_created("remote-failure-resumed-response"),
++                responses::ev_completed("remote-failure-resumed-response"),
++            ]),
+         ],
+     )
+     .await;
+@@ -5555,6 +5559,37 @@ async fn failed_remote_compaction_does_not_refresh_global_instructions() -> Resu
+     }
+     assert_eq!(instructions_provider.load_count(), 1);
+ 
++    let rollout_path = test.codex.rollout_path().expect("rollout path");
++    test.codex.submit(Op::Shutdown).await?;
++    wait_for_event(&test.codex, |event| {
++        matches!(event, EventMsg::ShutdownComplete)
++    })
++    .await;
++
++    let resumed_cwd = test.config.cwd.clone();
++    let mut resume_builder = test_codex()
++        .with_home(Arc::clone(&home))
++        .with_user_instructions_provider(instructions_provider.clone())
++        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
++        .with_model_info_override(model, |model_info| {
++            model_info.base_instructions = NEW_MODEL_INSTRUCTIONS.to_string();
++            model_info.model_messages = None;
++        })
++        .with_config(move |config| {
++            config.cwd = resumed_cwd;
++            let _ = config.features.disable(Feature::RemoteCompactionV2);
++        });
++    let resumed = resume_builder
++        .resume(&server, Arc::clone(&home), rollout_path)
++        .await?;
++    resumed
++        .submit_turn("after failed compaction cold resume")
++        .await?;
++
++    let requests = response_mock.requests();
++    assert_eq!(requests.len(), 3);
++    assert_eq!(requests[2].instructions_text(), initial_instructions);
++
+     Ok(())
+ }
+ 
+@@ -5649,6 +5684,7 @@ async fn remote_v2_compaction_refreshes_global_instructions_after_success() -> R
+ 
+     // Set up an ordinary turn, a remote-v2 compact response, and a post-compaction turn.
+     let server = responses::start_mock_server().await;
++    let model = "gpt-5.4";
+     let response_mock = responses::mount_sse_sequence(
+         &server,
+         vec![
+@@ -5683,6 +5719,7 @@ async fn remote_v2_compaction_refreshes_global_instructions_after_success() -> R
+         .with_home(Arc::clone(&home))
+         .with_user_instructions_provider(instructions_provider.clone())
+         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
++        .with_model(model)
+         .with_config(|config| {
+             let _ = config.features.enable(Feature::RemoteCompactionV2);
+         });
+@@ -5691,6 +5728,26 @@ async fn remote_v2_compaction_refreshes_global_instructions_after_success() -> R
+ 
+     // Materialize the old snapshot, rewrite the selected file in place, and compact remotely.
+     test.submit_turn("before remote v2 compaction").await?;
++    let initial_instructions = response_mock.single_request().instructions_text();
++    assert_ne!(initial_instructions, NEW_MODEL_INSTRUCTIONS);
++    let models_manager = test.thread_manager.get_models_manager();
++    let new_models_mock = mount_models_once(
++        &server,
++        ModelsResponse {
++            models: vec![with_base_instructions(
++                model_info_with_optional_comp_hash(model, /*comp_hash*/ None),
++                NEW_MODEL_INSTRUCTIONS,
++            )],
++        },
++    )
++    .await;
++    let _ = models_manager
++        .list_models(
++            RefreshStrategy::Online,
++            codex_core::test_support::default_http_client_factory(),
++        )
++        .await;
++    assert_eq!(new_models_mock.requests().len(), 1);
+     let rewritten_source = write_global_file(
+         home.as_ref(),
+         GLOBAL_AGENTS_FILENAME,
+@@ -5710,6 +5767,9 @@ async fn remote_v2_compaction_refreshes_global_instructions_after_success() -> R
+     assert_single_instruction_fragment(&requests[0], &old_fragment);
+     assert_single_instruction_fragment(&requests[1], &old_fragment);
+     assert_single_instruction_fragment(&requests[2], &new_fragment);
++    assert_eq!(requests[0].instructions_text(), initial_instructions);
++    assert_eq!(requests[1].instructions_text(), NEW_MODEL_INSTRUCTIONS);
++    assert_eq!(requests[2].instructions_text(), NEW_MODEL_INSTRUCTIONS);
+     assert_eq!(instructions_provider.load_count(), 2);
+     assert_eq!(
+         requests[1].input().last(),
+@@ -5741,10 +5801,15 @@ async fn remote_v2_compaction_refreshes_global_instructions_after_success() -> R
+     })
+     .await;
+     let resumed_cwd = test.config.cwd.clone();
++    let resume_initial_instructions = initial_instructions.clone();
+     let mut resume_builder = test_codex()
+         .with_home(Arc::clone(&home))
+         .with_user_instructions_provider(instructions_provider.clone())
+         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
++        .with_model_info_override(model, move |model_info| {
++            model_info.base_instructions = resume_initial_instructions;
++            model_info.model_messages = None;
++        })
+         .with_config(move |config| {
+             config.cwd = resumed_cwd;
+             let _ = config.features.enable(Feature::RemoteCompactionV2);
+@@ -5761,6 +5826,7 @@ async fn remote_v2_compaction_refreshes_global_instructions_after_success() -> R
+     // Cold resume replays the persisted post-compaction context without duplicating instructions.
+     let requests = response_mock.requests();
+     assert_eq!(requests.len(), 4);
++    assert_eq!(requests[3].instructions_text(), NEW_MODEL_INSTRUCTIONS);
+     assert_eq!(instruction_fragments(&requests[3]), vec![new_fragment]);
+     let resumed_input = requests[3].input();
+     assert_eq!(
+diff --git a/codex-rs/protocol/src/compacted_item.rs b/codex-rs/protocol/src/compacted_item.rs
+index 0f437e0bb6..cc44eaa55b 100644
+--- a/codex-rs/protocol/src/compacted_item.rs
++++ b/codex-rs/protocol/src/compacted_item.rs
+@@ -1,5 +1,6 @@
+ use crate::models::ResponseItem;
+ use crate::protocol::CompactedItem;
++use crate::protocol::ThreadBaseInstructionsUpdate;
+ use serde::Deserialize;
+ 
+ // Before `window_number` was introduced, the numeric window number was serialized as
+@@ -22,6 +23,7 @@ impl<'de> Deserialize<'de> for CompactedItem {
+         Ok(Self {
+             message: serialized.message,
+             replacement_history: serialized.replacement_history,
++            base_instructions_update: serialized.base_instructions_update,
+             window_number,
+             first_window_id: serialized.first_window_id,
+             previous_window_id: serialized.previous_window_id,
+@@ -36,6 +38,8 @@ struct SerializedCompactedItem {
+     #[serde(default)]
+     replacement_history: Option<Vec<ResponseItem>>,
+     #[serde(default)]
++    base_instructions_update: Option<ThreadBaseInstructionsUpdate>,
++    #[serde(default)]
+     window_number: Option<u64>,
+     #[serde(default)]
+     first_window_id: Option<String>,
+@@ -55,6 +59,8 @@ enum SerializedWindowId {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::ThreadId;
++    use crate::models::BaseInstructions;
+     use anyhow::Result;
+     use pretty_assertions::assert_eq;
+     use serde_json::json;
+@@ -64,6 +70,7 @@ mod tests {
+         let item = CompactedItem {
+             message: "summary".to_string(),
+             replacement_history: None,
++            base_instructions_update: None,
+             window_number: Some(3),
+             first_window_id: Some("019b3f6e-0000-7000-8000-000000000001".to_string()),
+             previous_window_id: Some("019b3f6e-0000-7000-8000-000000000002".to_string()),
+@@ -95,6 +102,7 @@ mod tests {
+             CompactedItem {
+                 message: "summary".to_string(),
+                 replacement_history: None,
++                base_instructions_update: None,
+                 window_number: Some(3),
+                 first_window_id: None,
+                 previous_window_id: None,
+@@ -103,4 +111,29 @@ mod tests {
+         );
+         Ok(())
+     }
++
++    #[test]
++    fn round_trips_thread_owned_base_instructions_update() -> Result<()> {
++        let update = ThreadBaseInstructionsUpdate {
++            thread_id: ThreadId::new(),
++            base_instructions: BaseInstructions {
++                text: "refreshed base instructions".to_string(),
++            },
++        };
++        let item = CompactedItem {
++            message: "summary".to_string(),
++            replacement_history: None,
++            base_instructions_update: Some(update.clone()),
++            window_number: None,
++            first_window_id: None,
++            previous_window_id: None,
++            window_id: None,
++        };
++
++        let serialized = serde_json::to_value(&item)?;
++        let deserialized = serde_json::from_value::<CompactedItem>(serialized)?;
++
++        assert_eq!(deserialized.base_instructions_update, Some(update));
++        Ok(())
++    }
+ }
+diff --git a/codex-rs/protocol/src/protocol.rs b/codex-rs/protocol/src/protocol.rs
+index 621b6ec403..510500df1a 100644
+--- a/codex-rs/protocol/src/protocol.rs
++++ b/codex-rs/protocol/src/protocol.rs
+@@ -2608,19 +2608,18 @@ impl InitialHistory {
+     }
+ 
+     pub fn get_base_instructions(&self) -> Option<BaseInstructions> {
+-        // TODO: SessionMeta should (in theory) always be first in the history, so we can probably only check the first item?
+         match self {
+             InitialHistory::New | InitialHistory::Cleared => None,
+             InitialHistory::Resumed(resumed) => {
+-                resumed.history.iter().find_map(|item| match item {
+-                    RolloutItem::SessionMeta(meta_line) => meta_line.meta.base_instructions.clone(),
++                base_instructions_for_thread(resumed.history.as_ref(), resumed.conversation_id)
++            }
++            InitialHistory::Forked(items) => {
++                let source_thread_id = items.iter().find_map(|item| match item {
++                    RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.id),
+                     _ => None,
+-                })
++                })?;
++                base_instructions_for_thread(items, source_thread_id)
+             }
+-            InitialHistory::Forked(items) => items.iter().find_map(|item| match item {
+-                RolloutItem::SessionMeta(meta_line) => meta_line.meta.base_instructions.clone(),
+-                _ => None,
+-            }),
+         }
+     }
+ 
+@@ -2742,6 +2741,31 @@ impl InitialHistory {
+     }
+ }
+ 
++fn base_instructions_for_thread(
++    items: &[RolloutItem],
++    thread_id: ThreadId,
++) -> Option<BaseInstructions> {
++    items
++        .iter()
++        .rev()
++        .find_map(|item| match item {
++            RolloutItem::Compacted(compacted) => compacted
++                .base_instructions_update
++                .as_ref()
++                .filter(|update| update.thread_id == thread_id)
++                .map(|update| update.base_instructions.clone()),
++            _ => None,
++        })
++        .or_else(|| {
++            items.iter().find_map(|item| match item {
++                RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == thread_id => {
++                    meta_line.meta.base_instructions.clone()
++                }
++                _ => None,
++            })
++        })
++}
++
+ fn session_cwd_from_items(items: &[RolloutItem]) -> Option<PathBuf> {
+     items.iter().find_map(|item| match item {
+         RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.cwd.clone()),
+@@ -3052,8 +3076,8 @@ impl SessionContextWindow {
+ /// SessionMeta contains session-level data that doesn't correspond to a specific turn.
+ ///
+ /// NOTE: There used to be an `instructions` field here, which stored user_instructions, but we
+-/// now save that on TurnContext. base_instructions stores the base instructions for the session,
+-/// and should be used when there is no config override.
++/// now save that on TurnContext. base_instructions stores the creation-time fallback when there is
++/// no config override; a successful compaction can supersede it with a thread-owned update.
+ #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
+ pub struct SessionMeta {
+     pub session_id: SessionId,
+@@ -3081,9 +3105,9 @@ pub struct SessionMeta {
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub agent_path: Option<String>,
+     pub model_provider: Option<String>,
+-    /// base_instructions for the session. This *should* always be present when creating a new session,
+-    /// but may be missing for older sessions. If not present, fall back to rendering the base_instructions
+-    /// from ModelsManager.
++    /// Creation-time base instructions. This *should* always be present for a new session, but may
++    /// be missing for older sessions. Successful compactions can supersede it in later rollout
++    /// records. If no persisted value exists, fall back to ModelsManager.
+     pub base_instructions: Option<BaseInstructions>,
+     #[serde(
+         default,
+@@ -3213,11 +3237,19 @@ impl WorldStateItem {
+     }
+ }
+ 
++#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, TS)]
++pub struct ThreadBaseInstructionsUpdate {
++    pub thread_id: ThreadId,
++    pub base_instructions: BaseInstructions,
++}
++
+ #[derive(Serialize, Clone, Debug, PartialEq, JsonSchema, TS)]
+ pub struct CompactedItem {
+     pub message: String,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub replacement_history: Option<Vec<ResponseItem>>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub base_instructions_update: Option<ThreadBaseInstructionsUpdate>,
+     /// Monotonic position of this context window within the thread.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub window_number: Option<u64>,
+@@ -4442,6 +4474,37 @@ mod tests {
+     use tempfile::NamedTempFile;
+     use tempfile::TempDir;
+ 
++    fn session_meta_with_base(thread_id: ThreadId, text: &str) -> RolloutItem {
++        RolloutItem::SessionMeta(SessionMetaLine {
++            meta: SessionMeta {
++                session_id: thread_id.into(),
++                id: thread_id,
++                base_instructions: Some(BaseInstructions {
++                    text: text.to_string(),
++                }),
++                ..SessionMeta::default()
++            },
++            git: None,
++        })
++    }
++
++    fn compacted_base_update(thread_id: ThreadId, text: &str) -> RolloutItem {
++        RolloutItem::Compacted(CompactedItem {
++            message: String::new(),
++            replacement_history: None,
++            base_instructions_update: Some(ThreadBaseInstructionsUpdate {
++                thread_id,
++                base_instructions: BaseInstructions {
++                    text: text.to_string(),
++                },
++            }),
++            window_number: None,
++            first_window_id: None,
++            previous_window_id: None,
++            window_id: None,
++        })
++    }
++
+     #[test]
+     fn feature_thread_source_serializes_as_its_app_owned_label() -> Result<()> {
+         let source = ThreadSource::Feature("automation".to_string());
+@@ -5905,6 +5968,83 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[test]
++    fn resumed_base_instructions_use_latest_target_owned_update() -> Result<()> {
++        let target = ThreadId::new();
++        let foreign = ThreadId::new();
++        let legacy = InitialHistory::Resumed(ResumedHistory {
++            conversation_id: target,
++            history: Arc::new(vec![session_meta_with_base(target, "creation")]),
++            rollout_path: None,
++        });
++        assert_eq!(
++            legacy.get_base_instructions().map(|base| base.text),
++            Some("creation".to_string())
++        );
++
++        let resumed = InitialHistory::Resumed(ResumedHistory {
++            conversation_id: target,
++            history: Arc::new(vec![
++                session_meta_with_base(target, "creation"),
++                compacted_base_update(target, "first refresh"),
++                compacted_base_update(target, "latest refresh"),
++                compacted_base_update(foreign, "foreign refresh"),
++            ]),
++            rollout_path: None,
++        });
++        assert_eq!(
++            resumed.get_base_instructions().map(|base| base.text),
++            Some("latest refresh".to_string())
++        );
++        Ok(())
++    }
++
++    #[test]
++    fn fork_base_instructions_follow_canonical_thread_owner() {
++        let parent = ThreadId::new();
++        let child = ThreadId::new();
++        let truncated_parent =
++            InitialHistory::Forked(vec![session_meta_with_base(parent, "parent old")]);
++        assert_eq!(
++            truncated_parent
++                .get_base_instructions()
++                .map(|base| base.text),
++            Some("parent old".to_string())
++        );
++        let full_parent = InitialHistory::Forked(vec![
++            session_meta_with_base(parent, "parent old"),
++            compacted_base_update(parent, "parent refreshed"),
++        ]);
++        assert_eq!(
++            full_parent.get_base_instructions().map(|base| base.text),
++            Some("parent refreshed".to_string())
++        );
++
++        let child_with_copied_parent = InitialHistory::Forked(vec![
++            session_meta_with_base(child, "child base"),
++            session_meta_with_base(parent, "parent old"),
++            compacted_base_update(parent, "parent refreshed"),
++        ]);
++        assert_eq!(
++            child_with_copied_parent
++                .get_base_instructions()
++                .map(|base| base.text),
++            Some("child base".to_string())
++        );
++        let child_with_own_update = InitialHistory::Forked(vec![
++            session_meta_with_base(child, "child base"),
++            session_meta_with_base(parent, "parent old"),
++            compacted_base_update(parent, "parent refreshed"),
++            compacted_base_update(child, "child refreshed"),
++        ]);
++        assert_eq!(
++            child_with_own_update
++                .get_base_instructions()
++                .map(|base| base.text),
++            Some("child refreshed".to_string())
++        );
++    }
++
+     #[test]
+     fn turn_context_item_deserializes_without_network() -> Result<()> {
+         let item: TurnContextItem = serde_json::from_value(json!({
+diff --git a/codex-rs/rollout/src/metadata_tests.rs b/codex-rs/rollout/src/metadata_tests.rs
+index 2399a92fd2..f154504584 100644
+--- a/codex-rs/rollout/src/metadata_tests.rs
++++ b/codex-rs/rollout/src/metadata_tests.rs
+@@ -204,6 +204,7 @@ fn builder_from_items_falls_back_to_filename() {
+     let items = vec![RolloutItem::Compacted(CompactedItem {
+         message: "noop".to_string(),
+         replacement_history: None,
++        base_instructions_update: None,
+         window_number: None,
+         first_window_id: None,
+         previous_window_id: None,
+diff --git a/codex-rs/rollout/src/recorder_tests.rs b/codex-rs/rollout/src/recorder_tests.rs
+index 855215ec86..6c648675ac 100644
+--- a/codex-rs/rollout/src/recorder_tests.rs
++++ b/codex-rs/rollout/src/recorder_tests.rs
+@@ -5,16 +5,21 @@ use crate::config::RolloutConfig;
+ use chrono::TimeZone;
+ use codex_protocol::SessionId;
+ use codex_protocol::ThreadId;
++use codex_protocol::models::BaseInstructions;
+ use codex_protocol::models::ResponseItem;
+ use codex_protocol::protocol::AgentMessageEvent;
+ use codex_protocol::protocol::AskForApproval;
++use codex_protocol::protocol::CompactedItem;
+ use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::InitialHistory;
++use codex_protocol::protocol::ResumedHistory;
+ use codex_protocol::protocol::RolloutItem;
+ use codex_protocol::protocol::RolloutLine;
+ use codex_protocol::protocol::SandboxPolicy;
+ use codex_protocol::protocol::SessionMeta;
+ use codex_protocol::protocol::SessionMetaLine;
+ use codex_protocol::protocol::SessionSource;
++use codex_protocol::protocol::ThreadBaseInstructionsUpdate;
+ use codex_protocol::protocol::ThreadHistoryMode;
+ use codex_protocol::protocol::TurnContextItem;
+ use codex_protocol::protocol::UserMessageEvent;
+@@ -645,6 +650,103 @@ async fn resumed_empty_rollout_omits_ordinals() -> std::io::Result<()> {
+     recorder.shutdown().await
+ }
+ 
++#[tokio::test]
++async fn flushed_compaction_is_atomic_across_crash_snapshots() -> std::io::Result<()> {
++    let home = TempDir::new().expect("temp dir");
++    let config = test_config(home.path());
++    let thread_id = ThreadId::new();
++    let recorder = RolloutRecorder::new(
++        &config,
++        RolloutRecorderParams::new(
++            thread_id,
++            /*forked_from_id*/ None,
++            /*parent_thread_id*/ None,
++            SessionSource::Exec,
++            /*thread_source*/ None,
++            "test_originator".to_string(),
++            BaseInstructions {
++                text: "creation base".to_string(),
++            },
++            Vec::new(),
++        ),
++    )
++    .await?;
++    let rollout_path = recorder.rollout_path().to_path_buf();
++    recorder
++        .record_canonical_items(&[RolloutItem::Compacted(CompactedItem {
++            message: "summary".to_string(),
++            replacement_history: Some(Vec::new()),
++            base_instructions_update: Some(ThreadBaseInstructionsUpdate {
++                thread_id,
++                base_instructions: BaseInstructions {
++                    text: "refreshed base".to_string(),
++                },
++            }),
++            window_number: None,
++            first_window_id: None,
++            previous_window_id: None,
++            window_id: None,
++        })])
++        .await?;
++    recorder.flush().await?;
++
++    let persisted = fs::read_to_string(&rollout_path)?;
++    let mut persisted_lines = persisted.lines();
++    let session_meta_line = persisted_lines.next().expect("session metadata line");
++    let compacted_line = persisted_lines.next().expect("compacted line");
++    assert!(persisted_lines.next().is_none());
++
++    let complete_snapshot = home.path().join("complete-crash-snapshot.jsonl");
++    fs::copy(&rollout_path, &complete_snapshot)?;
++    let mut corrupt_tail = std::fs::OpenOptions::new()
++        .append(true)
++        .open(&complete_snapshot)?;
++    writeln!(corrupt_tail, "{{\"timestamp\":")?;
++    let (complete_items, complete_thread_id, complete_parse_errors) =
++        RolloutRecorder::load_rollout_items(&complete_snapshot).await?;
++    assert_eq!(complete_thread_id, Some(thread_id));
++    assert_eq!(complete_parse_errors, 1);
++    let complete_history = InitialHistory::Resumed(ResumedHistory {
++        conversation_id: thread_id,
++        history: std::sync::Arc::new(complete_items),
++        rollout_path: Some(complete_snapshot),
++    });
++    assert_eq!(
++        complete_history
++            .get_base_instructions()
++            .map(|base| base.text),
++        Some("refreshed base".to_string())
++    );
++
++    let torn_snapshot = home.path().join("torn-compaction-snapshot.jsonl");
++    let compacted_prefix = &compacted_line[..compacted_line.len() / 2];
++    fs::write(
++        &torn_snapshot,
++        format!("{session_meta_line}\n{compacted_prefix}\n"),
++    )?;
++    let (torn_items, torn_thread_id, torn_parse_errors) =
++        RolloutRecorder::load_rollout_items(&torn_snapshot).await?;
++    assert_eq!(torn_thread_id, Some(thread_id));
++    assert_eq!(torn_parse_errors, 1);
++    assert!(
++        torn_items
++            .iter()
++            .all(|item| !matches!(item, RolloutItem::Compacted(_)))
++    );
++    let torn_history = InitialHistory::Resumed(ResumedHistory {
++        conversation_id: thread_id,
++        history: std::sync::Arc::new(torn_items),
++        rollout_path: Some(torn_snapshot),
++    });
++    assert_eq!(
++        torn_history.get_base_instructions().map(|base| base.text),
++        Some("creation base".to_string())
++    );
++
++    recorder.shutdown().await?;
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn persist_reports_filesystem_error_and_retries_buffered_items() -> std::io::Result<()> {
+     let home = TempDir::new().expect("temp dir");
+diff --git a/codex-rs/thread-store/src/local/model_context_tests.rs b/codex-rs/thread-store/src/local/model_context_tests.rs
+index 89a7c0bdaf..accb626b86 100644
+--- a/codex-rs/thread-store/src/local/model_context_tests.rs
++++ b/codex-rs/thread-store/src/local/model_context_tests.rs
+@@ -390,6 +390,7 @@ fn compacted(message: &str, replacement_history: Option<Vec<ResponseItem>>) -> R
+     RolloutItem::Compacted(CompactedItem {
+         message: message.to_string(),
+         replacement_history,
++        base_instructions_update: None,
+         window_number: Some(1),
+         first_window_id: None,
+         previous_window_id: None,
+diff --git a/codex-rs/thread-store/src/thread_metadata_sync.rs b/codex-rs/thread-store/src/thread_metadata_sync.rs
+index 54ef305c07..15da35e20f 100644
+--- a/codex-rs/thread-store/src/thread_metadata_sync.rs
++++ b/codex-rs/thread-store/src/thread_metadata_sync.rs
+@@ -527,6 +527,7 @@ mod tests {
+         let item = RolloutItem::Compacted(CompactedItem {
+             message: "compacted".to_string(),
+             replacement_history: None,
++            base_instructions_update: None,
+             window_number: None,
+             first_window_id: None,
+             previous_window_id: None,
