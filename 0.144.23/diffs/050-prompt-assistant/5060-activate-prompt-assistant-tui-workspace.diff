@@ -1,0 +1,2176 @@
+diff --git a/codex-rs/tui/src/app/app_server_event_targets.rs b/codex-rs/tui/src/app/app_server_event_targets.rs
+index e7b2cf05b7acded79ad383a323fa3db976a0fae2..40e337a31d40e1b94888125274808120cb70c7bc 100644
+--- a/codex-rs/tui/src/app/app_server_event_targets.rs
++++ b/codex-rs/tui/src/app/app_server_event_targets.rs
+@@ -90,6 +90,9 @@ pub(super) fn server_notification_thread_target(
+         ServerNotification::RawResponseCompleted(notification) => {
+             Some(notification.thread_id.as_str())
+         }
++        ServerNotification::PromptAssistantProgress(notification) => {
++            Some(notification.thread_id.as_str())
++        }
+         ServerNotification::AgentMessageDelta(notification) => {
+             Some(notification.thread_id.as_str())
+         }
+@@ -209,6 +212,7 @@ mod tests {
+     use codex_app_server_protocol::GuardianWarningNotification;
+     use codex_app_server_protocol::McpServerStartupState;
+     use codex_app_server_protocol::McpServerStatusUpdatedNotification;
++    use codex_app_server_protocol::PromptAssistantProgressNotification;
+     use codex_app_server_protocol::ServerNotification;
+     use codex_app_server_protocol::ThreadSettings;
+     use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
+@@ -285,6 +289,23 @@ mod tests {
+         assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
+     }
+ 
++    #[test]
++    fn prompt_assistant_progress_routes_to_its_fixed_parent_thread() {
++        let thread_id = ThreadId::new();
++        let notification =
++            ServerNotification::PromptAssistantProgress(PromptAssistantProgressNotification {
++                thread_id: thread_id.to_string(),
++                workspace_id: "workspace-1".to_string(),
++                generation: 1,
++                byte_count: 10,
++                reset: false,
++            });
++
++        let target = server_notification_thread_target(&notification);
++
++        assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
++    }
++
+     #[test]
+     fn mcp_startup_notifications_route_to_threads() {
+         let thread_id = ThreadId::new();
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index 6359085429c1c07155b82f0818872436bf066f16..652de091869b0f0c8ac1bddc66a83e4723fee472 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -487,8 +487,89 @@ impl App {
+                     .approve_recent_auto_review_denial(thread_id, id);
+             }
+             AppEvent::SubmitThreadOp { thread_id, op } => {
++                self.chat_widget
++                    .prepare_prompt_assistant_operation(thread_id, &op);
+                 self.submit_thread_op(app_server, thread_id, op).await?;
+             }
++            AppEvent::OpenPromptAssistantModelPicker {
++                parent_thread_id,
++                operation,
++                input,
++            } => {
++                self.chat_widget.open_prompt_assistant_model_picker(
++                    parent_thread_id,
++                    operation,
++                    input,
++                );
++            }
++            AppEvent::StartPromptAssistant {
++                parent_thread_id,
++                operation,
++                input,
++                model,
++            } => {
++                self.chat_widget
++                    .start_prompt_assistant(parent_thread_id, operation, input, model);
++            }
++            AppEvent::RestorePromptAssistant {
++                parent_thread_id,
++                workspace_id,
++            } => {
++                self.chat_widget
++                    .restore_prompt_assistant(parent_thread_id, &workspace_id);
++            }
++            AppEvent::CopyPromptAssistantCandidate {
++                parent_thread_id,
++                workspace_id,
++                candidate,
++            } => {
++                self.chat_widget.copy_prompt_assistant_candidate(
++                    parent_thread_id,
++                    workspace_id,
++                    candidate,
++                );
++            }
++            AppEvent::PromptAssistantWorkspaceFinished {
++                parent_thread_id,
++                expected_workspace_id,
++                expected_generation,
++                result,
++            } => {
++                self.chat_widget.handle_prompt_assistant_workspace_finished(
++                    parent_thread_id,
++                    expected_workspace_id,
++                    expected_generation,
++                    result,
++                );
++            }
++            AppEvent::PromptAssistantApplyFinished {
++                parent_thread_id,
++                expected_workspace_id,
++                expected_generation,
++                expected_candidate_hash,
++                result,
++            } => {
++                self.chat_widget.handle_prompt_assistant_apply_finished(
++                    parent_thread_id,
++                    expected_workspace_id,
++                    expected_generation,
++                    expected_candidate_hash,
++                    result,
++                );
++            }
++            AppEvent::PromptAssistantCancelFinished {
++                parent_thread_id,
++                expected_workspace_id,
++                expected_generation,
++                result,
++            } => {
++                self.chat_widget.handle_prompt_assistant_cancel_finished(
++                    parent_thread_id,
++                    expected_workspace_id,
++                    expected_generation,
++                    result,
++                );
++            }
+             AppEvent::ThreadHistoryEntryResponse { thread_id, event } => {
+                 self.enqueue_thread_history_entry_response(thread_id, event)
+                     .await?;
+diff --git a/codex-rs/tui/src/app/input.rs b/codex-rs/tui/src/app/input.rs
+index e7aaf4811ec4bce1ffd9c1565d47aed585a1ef27..b552326cc79583aa6469d045f9331edc2762b243 100644
+--- a/codex-rs/tui/src/app/input.rs
++++ b/codex-rs/tui/src/app/input.rs
+@@ -170,6 +170,13 @@ impl App {
+ 
+         let app_keymap_shortcuts_available = self.app_keymap_shortcuts_available();
+ 
++        if app_keymap_shortcuts_available
++            && self.keymap.composer.prompt_assistant.is_pressed(key_event)
++        {
++            self.chat_widget.open_prompt_assistant();
++            return;
++        }
++
+         if app_keymap_shortcuts_available && self.keymap.app.toggle_vim_mode.is_pressed(key_event) {
+             self.chat_widget.toggle_vim_mode_and_notify();
+             return;
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+index ff6d4e61f84a6869986fb5f658f75b3a0a39898b..f398b1d23d277229ee84c7dba44dece3163c56c3 100644
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -855,6 +855,183 @@ impl App {
+                     .await?;
+                 Ok(true)
+             }
++            AppCommand::PromptAssistantStart {
++                workspace_id,
++                operation,
++                input,
++                model,
++            } => {
++                let request_handle = app_server.request_handle();
++                let app_event_tx = self.app_event_tx.clone();
++                let parent_thread_id = thread_id;
++                let expected_workspace_id = workspace_id.clone();
++                let params = codex_app_server_protocol::PromptAssistantStartParams {
++                    thread_id: thread_id.to_string(),
++                    operation: match operation {
++                        codex_app_server_protocol::PromptAssistantOperation::Translate => {
++                            codex_app_server_protocol::PromptAssistantStartOperation::Translate
++                        }
++                        codex_app_server_protocol::PromptAssistantOperation::Generate => {
++                            codex_app_server_protocol::PromptAssistantStartOperation::Generate
++                        }
++                        codex_app_server_protocol::PromptAssistantOperation::Refine
++                        | codex_app_server_protocol::PromptAssistantOperation::Review => {
++                            return Err(color_eyre::eyre::eyre!(
++                                "Prompt Assistant start requires translate or generate"
++                            ));
++                        }
++                    },
++                    input: input.clone(),
++                    model: Some(model.clone()),
++                    workspace_id: Some(workspace_id.clone()),
++                };
++                tokio::spawn(async move {
++                    let result =
++                        crate::app_server_session::prompt_assistant_start_with_request_handle(
++                            request_handle,
++                            params,
++                        )
++                        .await
++                        .map(|response| response.workspace);
++                    app_event_tx.send(AppEvent::PromptAssistantWorkspaceFinished {
++                        parent_thread_id,
++                        expected_workspace_id,
++                        expected_generation: 0,
++                        result,
++                    });
++                });
++                Ok(true)
++            }
++            AppCommand::PromptAssistantRefine {
++                workspace_id,
++                generation,
++                instructions,
++            } => {
++                let request_handle = app_server.request_handle();
++                let app_event_tx = self.app_event_tx.clone();
++                let parent_thread_id = thread_id;
++                let expected_workspace_id = workspace_id.clone();
++                let expected_generation = *generation;
++                let params = codex_app_server_protocol::PromptAssistantRefineParams {
++                    thread_id: thread_id.to_string(),
++                    workspace_id: workspace_id.clone(),
++                    generation: *generation,
++                    instructions: instructions.clone(),
++                };
++                tokio::spawn(async move {
++                    let result =
++                        crate::app_server_session::prompt_assistant_refine_with_request_handle(
++                            request_handle,
++                            params,
++                        )
++                        .await
++                        .map(|response| response.workspace);
++                    app_event_tx.send(AppEvent::PromptAssistantWorkspaceFinished {
++                        parent_thread_id,
++                        expected_workspace_id,
++                        expected_generation,
++                        result,
++                    });
++                });
++                Ok(true)
++            }
++            AppCommand::PromptAssistantReview {
++                workspace_id,
++                generation,
++                candidate_hash,
++            } => {
++                let request_handle = app_server.request_handle();
++                let app_event_tx = self.app_event_tx.clone();
++                let parent_thread_id = thread_id;
++                let expected_workspace_id = workspace_id.clone();
++                let expected_generation = *generation;
++                let params = codex_app_server_protocol::PromptAssistantReviewParams {
++                    thread_id: thread_id.to_string(),
++                    workspace_id: workspace_id.clone(),
++                    generation: *generation,
++                    candidate_hash: candidate_hash.clone(),
++                };
++                tokio::spawn(async move {
++                    let result =
++                        crate::app_server_session::prompt_assistant_review_with_request_handle(
++                            request_handle,
++                            params,
++                        )
++                        .await
++                        .map(|response| response.workspace);
++                    app_event_tx.send(AppEvent::PromptAssistantWorkspaceFinished {
++                        parent_thread_id,
++                        expected_workspace_id,
++                        expected_generation,
++                        result,
++                    });
++                });
++                Ok(true)
++            }
++            AppCommand::PromptAssistantApply {
++                workspace_id,
++                generation,
++                candidate_hash,
++            } => {
++                let request_handle = app_server.request_handle();
++                let app_event_tx = self.app_event_tx.clone();
++                let parent_thread_id = thread_id;
++                let expected_workspace_id = workspace_id.clone();
++                let expected_generation = *generation;
++                let expected_candidate_hash = candidate_hash.clone();
++                let params = codex_app_server_protocol::PromptAssistantApplyParams {
++                    thread_id: thread_id.to_string(),
++                    workspace_id: workspace_id.clone(),
++                    generation: *generation,
++                    candidate_hash: candidate_hash.clone(),
++                };
++                tokio::spawn(async move {
++                    let result =
++                        crate::app_server_session::prompt_assistant_apply_with_request_handle(
++                            request_handle,
++                            params,
++                        )
++                        .await;
++                    app_event_tx.send(AppEvent::PromptAssistantApplyFinished {
++                        parent_thread_id,
++                        expected_workspace_id,
++                        expected_generation,
++                        expected_candidate_hash,
++                        result,
++                    });
++                });
++                Ok(true)
++            }
++            AppCommand::PromptAssistantCancel {
++                workspace_id,
++                generation,
++            } => {
++                let request_handle = app_server.request_handle();
++                let app_event_tx = self.app_event_tx.clone();
++                let parent_thread_id = thread_id;
++                let expected_workspace_id = workspace_id.clone();
++                let expected_generation = *generation;
++                let params = codex_app_server_protocol::PromptAssistantCancelParams {
++                    thread_id: thread_id.to_string(),
++                    workspace_id: workspace_id.clone(),
++                    generation: *generation,
++                };
++                tokio::spawn(async move {
++                    let result =
++                        crate::app_server_session::prompt_assistant_cancel_with_request_handle(
++                            request_handle,
++                            params,
++                        )
++                        .await;
++                    app_event_tx.send(AppEvent::PromptAssistantCancelFinished {
++                        parent_thread_id,
++                        expected_workspace_id,
++                        expected_generation,
++                        result,
++                    });
++                });
++                Ok(true)
++            }
+             _ => Ok(false),
+         }
+     }
+diff --git a/codex-rs/tui/src/app_command.rs b/codex-rs/tui/src/app_command.rs
+index 1783c7e6aa0d315592bfcb594b66b0a82d42fe37..bd74e1dd52881d75a7fc29d45ea8a8fcac6dee60 100644
+--- a/codex-rs/tui/src/app_command.rs
++++ b/codex-rs/tui/src/app_command.rs
+@@ -4,6 +4,7 @@ use codex_app_server_protocol::AskForApproval;
+ use codex_app_server_protocol::CommandExecutionApprovalDecision;
+ use codex_app_server_protocol::FileChangeApprovalDecision;
+ use codex_app_server_protocol::McpServerElicitationAction;
++use codex_app_server_protocol::PromptAssistantOperation;
+ use codex_app_server_protocol::RequestId as AppServerRequestId;
+ use codex_app_server_protocol::ReviewTarget;
+ use codex_app_server_protocol::ToolRequestUserInputResponse;
+@@ -100,6 +101,31 @@ pub(crate) enum AppCommand {
+     ApproveGuardianDeniedAction {
+         event: GuardianAssessmentEvent,
+     },
++    PromptAssistantStart {
++        workspace_id: String,
++        operation: PromptAssistantOperation,
++        input: String,
++        model: String,
++    },
++    PromptAssistantRefine {
++        workspace_id: String,
++        generation: u64,
++        instructions: String,
++    },
++    PromptAssistantReview {
++        workspace_id: String,
++        generation: u64,
++        candidate_hash: String,
++    },
++    PromptAssistantApply {
++        workspace_id: String,
++        generation: u64,
++        candidate_hash: String,
++    },
++    PromptAssistantCancel {
++        workspace_id: String,
++        generation: u64,
++    },
+ }
+ 
+ impl AppCommand {
+@@ -256,6 +282,63 @@ impl AppCommand {
+         Self::ApproveGuardianDeniedAction { event }
+     }
+ 
++    pub(crate) fn prompt_assistant_start(
++        workspace_id: String,
++        operation: PromptAssistantOperation,
++        input: String,
++        model: String,
++    ) -> Self {
++        Self::PromptAssistantStart {
++            workspace_id,
++            operation,
++            input,
++            model,
++        }
++    }
++
++    pub(crate) fn prompt_assistant_refine(
++        workspace_id: String,
++        generation: u64,
++        instructions: String,
++    ) -> Self {
++        Self::PromptAssistantRefine {
++            workspace_id,
++            generation,
++            instructions,
++        }
++    }
++
++    pub(crate) fn prompt_assistant_review(
++        workspace_id: String,
++        generation: u64,
++        candidate_hash: String,
++    ) -> Self {
++        Self::PromptAssistantReview {
++            workspace_id,
++            generation,
++            candidate_hash,
++        }
++    }
++
++    pub(crate) fn prompt_assistant_apply(
++        workspace_id: String,
++        generation: u64,
++        candidate_hash: String,
++    ) -> Self {
++        Self::PromptAssistantApply {
++            workspace_id,
++            generation,
++            candidate_hash,
++        }
++    }
++
++    pub(crate) fn prompt_assistant_cancel(workspace_id: String, generation: u64) -> Self {
++        Self::PromptAssistantCancel {
++            workspace_id,
++            generation,
++        }
++    }
++
+     pub(crate) fn is_review(&self) -> bool {
+         matches!(self, Self::Review { .. })
+     }
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+index 2ac2cf1964ac5349c3495eb5de9fb2298fff857f..be76b4aada39d3da6acc49e98f872f32a0414434 100644
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -27,6 +27,10 @@ use codex_app_server_protocol::PluginMarketplaceEntry;
+ use codex_app_server_protocol::PluginReadParams;
+ use codex_app_server_protocol::PluginReadResponse;
+ use codex_app_server_protocol::PluginUninstallResponse;
++use codex_app_server_protocol::PromptAssistantApplyResponse;
++use codex_app_server_protocol::PromptAssistantCancelResponse;
++use codex_app_server_protocol::PromptAssistantOperation;
++use codex_app_server_protocol::PromptAssistantWorkspace;
+ use codex_app_server_protocol::SkillsListResponse;
+ use codex_app_server_protocol::ThreadGoalStatus;
+ use codex_connectors::AppInfo;
+@@ -160,6 +164,59 @@ pub(crate) enum AppEvent {
+         op: AppCommand,
+     },
+ 
++    /// Continue Prompt Assistant entry after the operation or intent picker closes.
++    OpenPromptAssistantModelPicker {
++        parent_thread_id: ThreadId,
++        operation: PromptAssistantOperation,
++        input: String,
++    },
++
++    /// Create the local workspace view, then start its first server operation.
++    StartPromptAssistant {
++        parent_thread_id: ThreadId,
++        operation: PromptAssistantOperation,
++        input: String,
++        model: String,
++    },
++
++    /// Clear local Prompt Assistant state while leaving the underlying composer untouched.
++    RestorePromptAssistant {
++        parent_thread_id: ThreadId,
++        workspace_id: String,
++    },
++
++    /// Copy a candidate without adding any transcript output.
++    CopyPromptAssistantCandidate {
++        parent_thread_id: ThreadId,
++        workspace_id: String,
++        candidate: String,
++    },
++
++    /// Completion of start, refine, or review for one fixed parent workspace.
++    PromptAssistantWorkspaceFinished {
++        parent_thread_id: ThreadId,
++        expected_workspace_id: String,
++        expected_generation: u64,
++        result: Result<PromptAssistantWorkspace, String>,
++    },
++
++    /// Completion of an apply request for one fixed parent workspace.
++    PromptAssistantApplyFinished {
++        parent_thread_id: ThreadId,
++        expected_workspace_id: String,
++        expected_generation: u64,
++        expected_candidate_hash: String,
++        result: Result<PromptAssistantApplyResponse, String>,
++    },
++
++    /// Completion of a cancel request for one fixed parent workspace.
++    PromptAssistantCancelFinished {
++        parent_thread_id: ThreadId,
++        expected_workspace_id: String,
++        expected_generation: u64,
++        result: Result<PromptAssistantCancelResponse, String>,
++    },
++
+     /// Deliver a synthetic history lookup response to a specific thread channel.
+     ThreadHistoryEntryResponse {
+         thread_id: ThreadId,
+diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+index 863d61437ca1bb08865a270c17584047496ac177..434f4d0302d0bb2168a3343fdb7c58263d1802b6 100644
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -43,6 +43,16 @@ use codex_app_server_protocol::Model as ApiModel;
+ use codex_app_server_protocol::ModelListParams;
+ use codex_app_server_protocol::ModelListResponse;
+ use codex_app_server_protocol::NewThreadModelDefaults;
++use codex_app_server_protocol::PromptAssistantApplyParams;
++use codex_app_server_protocol::PromptAssistantApplyResponse;
++use codex_app_server_protocol::PromptAssistantCancelParams;
++use codex_app_server_protocol::PromptAssistantCancelResponse;
++use codex_app_server_protocol::PromptAssistantRefineParams;
++use codex_app_server_protocol::PromptAssistantRefineResponse;
++use codex_app_server_protocol::PromptAssistantReviewParams;
++use codex_app_server_protocol::PromptAssistantReviewResponse;
++use codex_app_server_protocol::PromptAssistantStartParams;
++use codex_app_server_protocol::PromptAssistantStartResponse;
+ use codex_app_server_protocol::RequestId;
+ use codex_app_server_protocol::ReviewDelivery;
+ use codex_app_server_protocol::ReviewStartParams;
+@@ -1305,6 +1315,75 @@ pub(crate) async fn start_thread_with_request_handle(
+     started_thread_from_start_response(response, &config, thread_params_mode).await
+ }
+ 
++fn prompt_assistant_request_id(operation: &str) -> RequestId {
++    RequestId::String(format!("prompt-assistant-{operation}-{}", Uuid::new_v4()))
++}
++
++pub(crate) async fn prompt_assistant_start_with_request_handle(
++    request_handle: AppServerRequestHandle,
++    params: PromptAssistantStartParams,
++) -> std::result::Result<PromptAssistantStartResponse, String> {
++    request_handle
++        .request_typed(ClientRequest::PromptAssistantStart {
++            request_id: prompt_assistant_request_id("start"),
++            params,
++        })
++        .await
++        .map_err(|error| format!("promptAssistant/start failed: {error}"))
++}
++
++pub(crate) async fn prompt_assistant_refine_with_request_handle(
++    request_handle: AppServerRequestHandle,
++    params: PromptAssistantRefineParams,
++) -> std::result::Result<PromptAssistantRefineResponse, String> {
++    request_handle
++        .request_typed(ClientRequest::PromptAssistantRefine {
++            request_id: prompt_assistant_request_id("refine"),
++            params,
++        })
++        .await
++        .map_err(|error| format!("promptAssistant/refine failed: {error}"))
++}
++
++pub(crate) async fn prompt_assistant_review_with_request_handle(
++    request_handle: AppServerRequestHandle,
++    params: PromptAssistantReviewParams,
++) -> std::result::Result<PromptAssistantReviewResponse, String> {
++    request_handle
++        .request_typed(ClientRequest::PromptAssistantReview {
++            request_id: prompt_assistant_request_id("review"),
++            params,
++        })
++        .await
++        .map_err(|error| format!("promptAssistant/review failed: {error}"))
++}
++
++pub(crate) async fn prompt_assistant_apply_with_request_handle(
++    request_handle: AppServerRequestHandle,
++    params: PromptAssistantApplyParams,
++) -> std::result::Result<PromptAssistantApplyResponse, String> {
++    request_handle
++        .request_typed(ClientRequest::PromptAssistantApply {
++            request_id: prompt_assistant_request_id("apply"),
++            params,
++        })
++        .await
++        .map_err(|error| format!("promptAssistant/apply failed: {error}"))
++}
++
++pub(crate) async fn prompt_assistant_cancel_with_request_handle(
++    request_handle: AppServerRequestHandle,
++    params: PromptAssistantCancelParams,
++) -> std::result::Result<PromptAssistantCancelResponse, String> {
++    request_handle
++        .request_typed(ClientRequest::PromptAssistantCancel {
++            request_id: prompt_assistant_request_id("cancel"),
++            params,
++        })
++        .await
++        .map_err(|error| format!("promptAssistant/cancel failed: {error}"))
++}
++
+ pub(crate) fn status_account_display_from_auth_mode(
+     auth_mode: Option<AuthMode>,
+     plan_type: Option<codex_protocol::account::PlanType>,
+@@ -1368,6 +1447,7 @@ fn model_preset_from_api_model(model: ApiModel) -> ModelPreset {
+         is_default: model.is_default,
+         upgrade,
+         show_in_picker: !model.hidden,
++        visibility: model.visibility,
+         multi_agent_version: None,
+         availability_nux: model.availability_nux.map(|nux| ModelAvailabilityNux {
+             message: nux.message,
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+index 8ea4a10b5fe85ef1d0857dbc58ba9bff5e42b7f4..3f7d04d6bb9a7a16af8cfb1c95440778dfe8d307 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+@@ -1663,6 +1663,16 @@ impl ChatComposer {
+         self.handle_paste_burst_flush(Instant::now())
+     }
+ 
++    /// Materialize every held paste-burst byte before an external workflow freezes the draft.
++    pub(crate) fn flush_paste_burst_before_snapshot(&mut self) -> bool {
++        let Some(pasted) = self.draft.paste_burst.flush_before_modified_input() else {
++            return false;
++        };
++        self.handle_paste(pasted);
++        self.draft.paste_burst.clear_after_explicit_paste();
++        true
++    }
++
+     /// Returns whether the composer is currently in any paste-burst related transient state.
+     ///
+     /// This includes actively buffering, having a non-empty burst buffer, or holding the first
+@@ -4751,8 +4761,7 @@ mod tests {
+             assert_eq!(
+                 composer
+                     .handle_submission(
+-                        /*should_queue*/ false,
+-                        /*run_user_prompt_submit_hook*/ false,
++                        /*should_queue*/ false, /*run_user_prompt_submit_hook*/ false,
+                     )
+                     .0,
+                 InputResult::Command(expected)
+@@ -8342,9 +8351,7 @@ mod tests {
+             now += step;
+ 
+             let (result, _) = composer.handle_submission_with_time(
+-                /*should_queue*/ false,
+-                /*run_user_prompt_submit_hook*/ false,
+-                now,
++                /*should_queue*/ false, /*run_user_prompt_submit_hook*/ false, now,
+             );
+             assert!(
+                 matches!(result, InputResult::None),
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 9ae96e1dd0d7ae8825f8d7635fb1c1d579befba8..7f5af143132ea0d437661c5a8cf9038de55e70ed 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -377,7 +377,9 @@ use self::plugins::PluginInstallAuthFlowState;
+ use self::plugins::PluginListFetchState;
+ use self::plugins::PluginsCacheState;
+ mod plan_implementation;
++mod prompt_assistant;
+ use self::plan_implementation::PLAN_IMPLEMENTATION_TITLE;
++use self::prompt_assistant::PromptAssistantUiState;
+ mod model_popups;
+ mod model_shortcuts;
+ mod notifications;
+@@ -619,6 +621,8 @@ pub(crate) struct ChatWidget {
+     pending_stream_consolidations: usize,
+     /// Holds the platform clipboard lease so copied text remains available while supported.
+     clipboard_lease: Option<crate::clipboard_copy::ClipboardLease>,
++    /// Active Prompt Assistant workspace bound to this widget's fixed parent thread.
++    prompt_assistant: Option<PromptAssistantUiState>,
+     copy_last_response_binding: Vec<KeyBinding>,
+     running_commands: HashMap<String, RunningCommand>,
+     collab_agent_metadata: HashMap<ThreadId, AgentMetadata>,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 78c2dfd4e628a91531526f1e81ee0a9f6481c014..9bdc509fedd7bc448f503dceecc3d087642ed209 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -149,6 +149,7 @@ impl ChatWidget {
+             plan_stream_controller: None,
+             pending_stream_consolidations: 0,
+             clipboard_lease: None,
++            prompt_assistant: None,
+             copy_last_response_binding,
+             running_commands: HashMap::new(),
+             collab_agent_metadata: HashMap::new(),
+diff --git a/codex-rs/tui/src/chatwidget/prompt_assistant.rs b/codex-rs/tui/src/chatwidget/prompt_assistant.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc6afb59a1
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/prompt_assistant.rs
+@@ -0,0 +1,1141 @@
++//! Prompt Assistant activation and app-server result routing.
++
++use codex_app_server_protocol::PromptAssistantApplyResponse;
++use codex_app_server_protocol::PromptAssistantCancelResponse;
++use codex_app_server_protocol::PromptAssistantOperation;
++use codex_app_server_protocol::PromptAssistantReviewDisposition;
++use codex_app_server_protocol::PromptAssistantWorkspace;
++use codex_protocol::ThreadId;
++use codex_protocol::openai_models::ModelPreset;
++use codex_protocol::openai_models::ModelVisibility;
++use uuid::Uuid;
++
++use super::ChatWidget;
++use crate::app_command::AppCommand;
++use crate::app_event::AppEvent;
++use crate::bottom_pane::SelectionItem;
++use crate::bottom_pane::SelectionViewParams;
++use crate::bottom_pane::custom_prompt_view::CustomPromptView;
++use crate::bottom_pane::popup_consts::standard_popup_hint_line;
++use crate::bottom_pane::prompt_assistant_view::PromptAssistantActionContext;
++use crate::bottom_pane::prompt_assistant_view::PromptAssistantCandidate;
++use crate::bottom_pane::prompt_assistant_view::PromptAssistantView;
++use crate::bottom_pane::prompt_assistant_view::PromptAssistantViewAction;
++use crate::bottom_pane::prompt_assistant_view::PromptAssistantViewHandle;
++
++const HIDDEN_MODEL_REQUIREMENT: &str = "Prompt Assistant requires a hidden catalog model";
++
++pub(super) struct PromptAssistantUiState {
++    parent_thread_id: ThreadId,
++    context: PromptAssistantActionContext,
++    handle: PromptAssistantViewHandle,
++    response_bytes: u64,
++    progress_generation: Option<u64>,
++}
++
++impl PromptAssistantUiState {
++    fn matches(&self, parent_thread_id: ThreadId, workspace_id: &str, generation: u64) -> bool {
++        self.parent_thread_id == parent_thread_id
++            && self.context.workspace_id == workspace_id
++            && self.context.operation_generation == generation
++    }
++
++    fn accept_progress(
++        &mut self,
++        workspace_id: &str,
++        generation: u64,
++        byte_count: u64,
++        reset: bool,
++    ) -> bool {
++        if self.context.workspace_id != workspace_id
++            || generation <= self.context.operation_generation
++            || self
++                .progress_generation
++                .is_some_and(|active_generation| active_generation != generation)
++        {
++            return false;
++        }
++
++        let response_bytes = if reset {
++            0
++        } else {
++            self.response_bytes.saturating_add(byte_count)
++        };
++        if !self
++            .handle
++            .set_response_bytes(&self.context, response_bytes)
++        {
++            return false;
++        }
++
++        self.progress_generation = Some(generation);
++        self.response_bytes = response_bytes;
++        true
++    }
++
++    fn reset_progress(&mut self) {
++        self.response_bytes = 0;
++        self.progress_generation = None;
++    }
++}
++
++impl ChatWidget {
++    pub(crate) fn prepare_prompt_assistant_operation(
++        &mut self,
++        parent_thread_id: ThreadId,
++        op: &AppCommand,
++    ) {
++        let (workspace_id, generation) = match op {
++            AppCommand::PromptAssistantStart { workspace_id, .. } => (workspace_id, 0),
++            AppCommand::PromptAssistantRefine {
++                workspace_id,
++                generation,
++                ..
++            }
++            | AppCommand::PromptAssistantReview {
++                workspace_id,
++                generation,
++                ..
++            } => (workspace_id, *generation),
++            _ => return,
++        };
++        let Some(state) = self.prompt_assistant.as_mut() else {
++            return;
++        };
++        if state.matches(parent_thread_id, workspace_id, generation) {
++            state.reset_progress();
++        }
++    }
++
++    /// Open Prompt Assistant without consuming or replacing the underlying draft.
++    pub(crate) fn open_prompt_assistant(&mut self) {
++        self.bottom_pane
++            .flush_composer_paste_burst_before_snapshot();
++        let draft = self.composer_text_with_pending();
++        self.open_prompt_assistant_for_source(draft);
++    }
++
++    /// Open the transform flow for an inline `/prompt <draft>` source.
++    pub(crate) fn open_prompt_assistant_for_inline_draft(&mut self, draft: String) {
++        self.open_prompt_assistant_for_source(draft);
++    }
++
++    fn open_prompt_assistant_for_source(&mut self, draft: String) {
++        if self.active_side_conversation || self.blocks_direct_input {
++            return;
++        }
++        let Some(parent_thread_id) = self.thread_id else {
++            self.add_error_message(
++                "Prompt Assistant is unavailable before the session starts.".to_string(),
++            );
++            return;
++        };
++        if self.prompt_assistant.is_some() {
++            return;
++        }
++
++        if draft.trim().is_empty() {
++            let app_event_tx = self.app_event_tx.clone();
++            let view = CustomPromptView::new(
++                "Generate a prompt".to_string(),
++                "Describe the intended task and press Enter".to_string(),
++                String::new(),
++                Some("Prompt Assistant".to_string()),
++                Box::new(move |intent| {
++                    app_event_tx.send(AppEvent::OpenPromptAssistantModelPicker {
++                        parent_thread_id,
++                        operation: PromptAssistantOperation::Generate,
++                        input: intent,
++                    });
++                }),
++            );
++            self.bottom_pane.show_view(Box::new(view));
++            self.request_redraw();
++            return;
++        }
++
++        let translate_input = draft.clone();
++        let generate_input = draft;
++        self.bottom_pane.show_selection_view(SelectionViewParams {
++            title: Some("Prompt Assistant".to_string()),
++            subtitle: Some("Choose how to transform the current draft".to_string()),
++            footer_hint: Some(standard_popup_hint_line()),
++            items: vec![
++                SelectionItem {
++                    name: "Translate".to_string(),
++                    description: Some(
++                        "Translate the draft while preserving its meaning and constraints"
++                            .to_string(),
++                    ),
++                    actions: vec![Box::new(move |tx| {
++                        tx.send(AppEvent::OpenPromptAssistantModelPicker {
++                            parent_thread_id,
++                            operation: PromptAssistantOperation::Translate,
++                            input: translate_input.clone(),
++                        });
++                    })],
++                    dismiss_on_select: true,
++                    ..Default::default()
++                },
++                SelectionItem {
++                    name: "Generate".to_string(),
++                    description: Some(
++                        "Turn the draft into a complete, execution-ready prompt".to_string(),
++                    ),
++                    actions: vec![Box::new(move |tx| {
++                        tx.send(AppEvent::OpenPromptAssistantModelPicker {
++                            parent_thread_id,
++                            operation: PromptAssistantOperation::Generate,
++                            input: generate_input.clone(),
++                        });
++                    })],
++                    dismiss_on_select: true,
++                    ..Default::default()
++                },
++            ],
++            ..Default::default()
++        });
++        self.request_redraw();
++    }
++
++    pub(crate) fn open_prompt_assistant_model_picker(
++        &mut self,
++        parent_thread_id: ThreadId,
++        operation: PromptAssistantOperation,
++        input: String,
++    ) {
++        if self.thread_id != Some(parent_thread_id) || self.prompt_assistant.is_some() {
++            return;
++        }
++
++        let models =
++            prompt_assistant_models(self.model_catalog.try_list_models().unwrap_or_default());
++        let items = if models.is_empty() {
++            vec![SelectionItem {
++                name: "No hidden functional models available".to_string(),
++                description: Some(HIDDEN_MODEL_REQUIREMENT.to_string()),
++                is_disabled: true,
++                disabled_reason: Some("No eligible model is present in the catalog".to_string()),
++                ..Default::default()
++            }]
++        } else {
++            models
++                .into_iter()
++                .map(|preset| {
++                    let model = preset.model.clone();
++                    let request_input = input.clone();
++                    SelectionItem {
++                        name: preset.display_name,
++                        description: Some(format!("{} — {}", preset.model, preset.description)),
++                        search_value: Some(format!("{} {}", preset.model, preset.description)),
++                        actions: vec![Box::new(move |tx| {
++                            tx.send(AppEvent::StartPromptAssistant {
++                                parent_thread_id,
++                                operation,
++                                input: request_input.clone(),
++                                model: model.clone(),
++                            });
++                        })],
++                        dismiss_on_select: true,
++                        ..Default::default()
++                    }
++                })
++                .collect()
++        };
++
++        self.bottom_pane.show_selection_view(SelectionViewParams {
++            title: Some("Prompt Assistant model".to_string()),
++            subtitle: Some("Choose a hidden functional model".to_string()),
++            footer_hint: Some(standard_popup_hint_line()),
++            items,
++            is_searchable: true,
++            search_placeholder: Some("Search hidden models".to_string()),
++            ..Default::default()
++        });
++        self.request_redraw();
++    }
++
++    pub(crate) fn start_prompt_assistant(
++        &mut self,
++        parent_thread_id: ThreadId,
++        operation: PromptAssistantOperation,
++        input: String,
++        model: String,
++    ) {
++        if self.thread_id != Some(parent_thread_id) || self.prompt_assistant.is_some() {
++            return;
++        }
++
++        let workspace_id = Uuid::new_v4().to_string();
++        let context = PromptAssistantActionContext {
++            workspace_id: workspace_id.clone(),
++            operation_generation: 0,
++        };
++        let app_event_tx = self.app_event_tx.clone();
++        let callback_workspace_id = workspace_id.clone();
++        let view = PromptAssistantView::new(
++            self.composer_text_with_pending(),
++            context.clone(),
++            format!("{} ({model})", operation_label(operation)),
++            move |action| match action {
++                PromptAssistantViewAction::Apply {
++                    context,
++                    candidate_hash,
++                    candidate: _,
++                } => {
++                    app_event_tx.send(AppEvent::SubmitThreadOp {
++                        thread_id: parent_thread_id,
++                        op: AppCommand::prompt_assistant_apply(
++                            context.workspace_id,
++                            context.operation_generation,
++                            candidate_hash,
++                        ),
++                    });
++                }
++                PromptAssistantViewAction::Copy { candidate } => {
++                    app_event_tx.send(AppEvent::CopyPromptAssistantCandidate {
++                        parent_thread_id,
++                        workspace_id: callback_workspace_id.clone(),
++                        candidate,
++                    });
++                }
++                PromptAssistantViewAction::Refine {
++                    context,
++                    instruction,
++                } => {
++                    app_event_tx.send(AppEvent::SubmitThreadOp {
++                        thread_id: parent_thread_id,
++                        op: AppCommand::prompt_assistant_refine(
++                            context.workspace_id,
++                            context.operation_generation,
++                            instruction,
++                        ),
++                    });
++                }
++                PromptAssistantViewAction::Review {
++                    context,
++                    candidate_hash,
++                } => {
++                    app_event_tx.send(AppEvent::SubmitThreadOp {
++                        thread_id: parent_thread_id,
++                        op: AppCommand::prompt_assistant_review(
++                            context.workspace_id,
++                            context.operation_generation,
++                            candidate_hash,
++                        ),
++                    });
++                }
++                PromptAssistantViewAction::Cancel { context } => {
++                    app_event_tx.send(AppEvent::SubmitThreadOp {
++                        thread_id: parent_thread_id,
++                        op: AppCommand::prompt_assistant_cancel(
++                            context.workspace_id,
++                            context.operation_generation,
++                        ),
++                    });
++                }
++                PromptAssistantViewAction::Restore { original_draft: _ } => {
++                    app_event_tx.send(AppEvent::RestorePromptAssistant {
++                        parent_thread_id,
++                        workspace_id: callback_workspace_id.clone(),
++                    });
++                }
++            },
++        );
++        let handle = view.handle();
++        self.prompt_assistant = Some(PromptAssistantUiState {
++            parent_thread_id,
++            context,
++            handle,
++            response_bytes: 0,
++            progress_generation: None,
++        });
++        self.bottom_pane.show_view(Box::new(view));
++        self.app_event_tx.send(AppEvent::SubmitThreadOp {
++            thread_id: parent_thread_id,
++            op: AppCommand::prompt_assistant_start(workspace_id, operation, input, model),
++        });
++        self.request_redraw();
++    }
++
++    pub(crate) fn handle_prompt_assistant_workspace_finished(
++        &mut self,
++        parent_thread_id: ThreadId,
++        expected_workspace_id: String,
++        expected_generation: u64,
++        result: Result<PromptAssistantWorkspace, String>,
++    ) {
++        if self.thread_id != Some(parent_thread_id) {
++            return;
++        }
++        let Some(state) = self.prompt_assistant.as_mut() else {
++            return;
++        };
++        if !state.matches(
++            parent_thread_id,
++            &expected_workspace_id,
++            expected_generation,
++        ) {
++            return;
++        }
++        let expected_context = state.context.clone();
++        let workspace = match result {
++            Ok(workspace) => workspace,
++            Err(error) => {
++                state.reset_progress();
++                state.handle.set_failed(&expected_context, error);
++                self.request_redraw();
++                return;
++            }
++        };
++        let returned_context = PromptAssistantActionContext {
++            workspace_id: workspace.workspace_id.clone(),
++            operation_generation: workspace.generation,
++        };
++        let progress_matches = state
++            .progress_generation
++            .is_none_or(|generation| generation == workspace.generation);
++        if workspace.thread_id != parent_thread_id.to_string()
++            || workspace.workspace_id != expected_workspace_id
++            || workspace.generation <= expected_generation
++            || !progress_matches
++        {
++            state.reset_progress();
++            state.handle.set_failed(
++                &expected_context,
++                "Prompt Assistant returned a stale or mismatched workspace".to_string(),
++            );
++            self.request_redraw();
++            return;
++        }
++
++        let candidate = candidate_from_workspace(&workspace);
++        if state
++            .handle
++            .complete_operation(&expected_context, returned_context.clone(), candidate)
++        {
++            state.context = returned_context;
++            state.reset_progress();
++        }
++        self.request_redraw();
++    }
++
++    pub(crate) fn handle_prompt_assistant_apply_finished(
++        &mut self,
++        parent_thread_id: ThreadId,
++        expected_workspace_id: String,
++        expected_generation: u64,
++        expected_candidate_hash: String,
++        result: Result<PromptAssistantApplyResponse, String>,
++    ) {
++        if self.thread_id != Some(parent_thread_id) {
++            return;
++        }
++        let Some(state) = self.prompt_assistant.as_mut() else {
++            return;
++        };
++        if !state.matches(
++            parent_thread_id,
++            &expected_workspace_id,
++            expected_generation,
++        ) {
++            return;
++        }
++        let expected_context = state.context.clone();
++        let response = match result {
++            Ok(response) => response,
++            Err(error) => {
++                state.handle.set_failed(&expected_context, error);
++                self.request_redraw();
++                return;
++            }
++        };
++        if !response.applied
++            || response.workspace_id != expected_workspace_id
++            || response.generation != expected_generation
++            || response.candidate_hash != expected_candidate_hash
++        {
++            state.handle.set_failed(
++                &expected_context,
++                "Prompt Assistant rejected the selected candidate".to_string(),
++            );
++            self.request_redraw();
++            return;
++        }
++
++        if state.handle.finish_applied(&expected_context) {
++            let candidate = response.candidate;
++            self.prompt_assistant = None;
++            self.apply_external_edit(candidate);
++        }
++        self.request_redraw();
++    }
++
++    pub(crate) fn handle_prompt_assistant_cancel_finished(
++        &mut self,
++        parent_thread_id: ThreadId,
++        expected_workspace_id: String,
++        expected_generation: u64,
++        result: Result<PromptAssistantCancelResponse, String>,
++    ) {
++        if self.thread_id != Some(parent_thread_id) {
++            return;
++        }
++        let Some(state) = self.prompt_assistant.as_mut() else {
++            return;
++        };
++        if !state.matches(
++            parent_thread_id,
++            &expected_workspace_id,
++            expected_generation,
++        ) {
++            return;
++        }
++        let response = match result {
++            Ok(response) => response,
++            Err(error) => {
++                let context = state.context.clone();
++                state.reset_progress();
++                state.handle.set_failed(&context, error);
++                self.request_redraw();
++                return;
++            }
++        };
++        if response.cancelled
++            && response.workspace_id == expected_workspace_id
++            && response.generation == expected_generation
++            && state.handle.finish_cancelled(&state.context)
++        {
++            self.prompt_assistant = None;
++            self.request_redraw();
++        }
++    }
++
++    pub(crate) fn restore_prompt_assistant(
++        &mut self,
++        parent_thread_id: ThreadId,
++        workspace_id: &str,
++    ) {
++        if self.prompt_assistant.as_ref().is_some_and(|state| {
++            state.parent_thread_id == parent_thread_id && state.context.workspace_id == workspace_id
++        }) {
++            self.prompt_assistant = None;
++        }
++    }
++
++    pub(crate) fn copy_prompt_assistant_candidate(
++        &mut self,
++        parent_thread_id: ThreadId,
++        workspace_id: String,
++        candidate: String,
++    ) {
++        self.copy_prompt_assistant_candidate_with(
++            parent_thread_id,
++            &workspace_id,
++            candidate,
++            crate::clipboard_copy::copy_to_clipboard,
++        );
++    }
++
++    fn copy_prompt_assistant_candidate_with(
++        &mut self,
++        parent_thread_id: ThreadId,
++        workspace_id: &str,
++        candidate: String,
++        copy_fn: impl FnOnce(&str) -> Result<Option<crate::clipboard_copy::ClipboardLease>, String>,
++    ) {
++        if self.thread_id != Some(parent_thread_id)
++            || !self.prompt_assistant.as_ref().is_some_and(|state| {
++                state.parent_thread_id == parent_thread_id
++                    && state.context.workspace_id == workspace_id
++            })
++        {
++            return;
++        }
++        match copy_fn(&candidate) {
++            Ok(lease) => self.clipboard_lease = lease,
++            Err(error) => tracing::warn!(error = %error, "Prompt Assistant copy failed"),
++        }
++        self.request_redraw();
++    }
++
++    pub(crate) fn on_prompt_assistant_progress(
++        &mut self,
++        workspace_id: String,
++        generation: u64,
++        byte_count: u64,
++        reset: bool,
++    ) {
++        let Some(state) = self.prompt_assistant.as_mut() else {
++            return;
++        };
++        if state.accept_progress(&workspace_id, generation, byte_count, reset) {
++            self.request_redraw();
++        }
++    }
++}
++
++fn operation_label(operation: PromptAssistantOperation) -> &'static str {
++    match operation {
++        PromptAssistantOperation::Translate => "translate",
++        PromptAssistantOperation::Generate => "generate",
++        PromptAssistantOperation::Refine => "refine",
++        PromptAssistantOperation::Review => "review",
++    }
++}
++
++fn prompt_assistant_models(models: Vec<ModelPreset>) -> Vec<ModelPreset> {
++    models
++        .into_iter()
++        .filter(|preset| prompt_assistant_visibility_is_eligible(preset.visibility))
++        .collect()
++}
++
++fn prompt_assistant_visibility_is_eligible(visibility: ModelVisibility) -> bool {
++    visibility == ModelVisibility::Hide
++}
++
++fn candidate_from_workspace(workspace: &PromptAssistantWorkspace) -> PromptAssistantCandidate {
++    let (apply_allowed, review_summary) = match workspace.review.as_ref() {
++        Some(review) => {
++            let disposition = match review.disposition {
++                PromptAssistantReviewDisposition::Pass => "Pass",
++                PromptAssistantReviewDisposition::Revised => "Revised",
++                PromptAssistantReviewDisposition::Blocked => "Blocked",
++            };
++            (
++                review.disposition != PromptAssistantReviewDisposition::Blocked,
++                Some(format!("{disposition}: {}", review.rationale)),
++            )
++        }
++        None => (true, None),
++    };
++    PromptAssistantCandidate {
++        text: workspace.candidate.clone(),
++        hash: workspace.candidate_hash.clone(),
++        apply_allowed,
++        review_summary,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::app_command::AppCommand;
++    use crate::app_event::AppEvent;
++    use crate::chatwidget::tests::make_chatwidget_manual_with_sender;
++    use crate::chatwidget::tests::render_bottom_popup;
++    use crossterm::event::KeyCode;
++    use crossterm::event::KeyEvent;
++    use crossterm::event::KeyModifiers;
++    use tokio::sync::mpsc::error::TryRecvError;
++
++    fn workspace(parent_thread_id: ThreadId, workspace_id: &str) -> PromptAssistantWorkspace {
++        PromptAssistantWorkspace {
++            thread_id: parent_thread_id.to_string(),
++            workspace_id: workspace_id.to_string(),
++            child_thread_id: ThreadId::new().to_string(),
++            operation: PromptAssistantOperation::Generate,
++            model: "hidden-functional-model".to_string(),
++            reasoning_effort: None,
++            generation: 1,
++            candidate: "preview candidate".to_string(),
++            candidate_hash: "sha256:preview".to_string(),
++            usage: None,
++            review: None,
++        }
++    }
++
++    #[test]
++    fn prompt_assistant_model_picker_accepts_only_hidden_visibility() {
++        assert_eq!(
++            HIDDEN_MODEL_REQUIREMENT,
++            "Prompt Assistant requires a hidden catalog model"
++        );
++        assert!(prompt_assistant_visibility_is_eligible(
++            ModelVisibility::Hide
++        ));
++        assert!(!prompt_assistant_visibility_is_eligible(
++            ModelVisibility::List
++        ));
++        assert!(!prompt_assistant_visibility_is_eligible(
++            ModelVisibility::None
++        ));
++
++        let template = crate::test_support::TEST_MODEL_PRESETS
++            .first()
++            .expect("test model preset")
++            .clone();
++        let mut listed = template.clone();
++        listed.model = "listed".to_string();
++        listed.visibility = ModelVisibility::List;
++        let mut hidden = template.clone();
++        hidden.model = "hidden".to_string();
++        hidden.visibility = ModelVisibility::Hide;
++        let mut unsupported = template;
++        unsupported.model = "unsupported".to_string();
++        unsupported.visibility = ModelVisibility::None;
++
++        let models = prompt_assistant_models(vec![listed, hidden, unsupported]);
++        assert_eq!(
++            models
++                .into_iter()
++                .map(|preset| preset.model)
++                .collect::<Vec<_>>(),
++            vec!["hidden"]
++        );
++    }
++
++    #[tokio::test]
++    async fn start_is_scoped_to_the_fixed_parent_and_does_not_submit_a_turn() {
++        let (mut chat, _app_event_tx, mut events, mut ops) =
++            make_chatwidget_manual_with_sender().await;
++        let parent_thread_id = ThreadId::new();
++        chat.thread_id = Some(parent_thread_id);
++        chat.apply_external_edit("complete original draft".to_string());
++
++        chat.start_prompt_assistant(
++            parent_thread_id,
++            PromptAssistantOperation::Translate,
++            "complete original draft".to_string(),
++            "hidden-functional-model".to_string(),
++        );
++
++        let AppEvent::SubmitThreadOp { thread_id, op } = events.try_recv().expect("start event")
++        else {
++            panic!("expected fixed-parent prompt assistant start");
++        };
++        assert_eq!(thread_id, parent_thread_id);
++        assert!(matches!(
++            op,
++            AppCommand::PromptAssistantStart {
++                operation: PromptAssistantOperation::Translate,
++                ref model,
++                ..
++            } if model == "hidden-functional-model"
++        ));
++        assert!(matches!(ops.try_recv(), Err(TryRecvError::Empty)));
++        assert_eq!(chat.composer_text_with_pending(), "complete original draft");
++    }
++
++    #[tokio::test]
++    async fn bare_prompt_dispatches_from_the_cleared_composer_into_intent_input() {
++        let (mut chat, _app_event_tx, mut events, mut ops) =
++            make_chatwidget_manual_with_sender().await;
++        chat.thread_id = Some(ThreadId::new());
++        chat.insert_str("/prompt");
++
++        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++
++        assert_eq!(chat.composer_text_with_pending(), "");
++        assert!(render_bottom_popup(&chat, 80).contains("Generate a prompt"));
++        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
++        assert!(matches!(ops.try_recv(), Err(TryRecvError::Empty)));
++    }
++
++    #[tokio::test]
++    async fn shortcut_entry_preserves_the_current_draft_as_transform_source() {
++        let (mut chat, _app_event_tx, mut events, mut ops) =
++            make_chatwidget_manual_with_sender().await;
++        let parent_thread_id = ThreadId::new();
++        chat.thread_id = Some(parent_thread_id);
++        chat.apply_external_edit("current draft".to_string());
++
++        chat.open_prompt_assistant();
++        assert!(render_bottom_popup(&chat, 80).contains("Choose how to transform"));
++        assert_eq!(chat.composer_text_with_pending(), "current draft");
++        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++
++        assert!(matches!(
++            events.try_recv(),
++            Ok(AppEvent::OpenPromptAssistantModelPicker {
++                parent_thread_id: event_parent,
++                operation: PromptAssistantOperation::Translate,
++                input,
++            }) if event_parent == parent_thread_id && input == "current draft"
++        ));
++        assert!(matches!(ops.try_recv(), Err(TryRecvError::Empty)));
++        assert_eq!(chat.composer_text_with_pending(), "current draft");
++    }
++
++    #[tokio::test]
++    async fn inline_prompt_uses_only_its_arguments_as_transform_source() {
++        let (mut chat, _app_event_tx, mut events, mut ops) =
++            make_chatwidget_manual_with_sender().await;
++        let parent_thread_id = ThreadId::new();
++        chat.thread_id = Some(parent_thread_id);
++        chat.insert_str("/prompt improve this deployment prompt");
++
++        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++
++        assert_eq!(chat.composer_text_with_pending(), "");
++        assert!(render_bottom_popup(&chat, 80).contains("Choose how to transform"));
++        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
++        assert!(matches!(ops.try_recv(), Err(TryRecvError::Empty)));
++
++        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        assert!(matches!(
++            events.try_recv(),
++            Ok(AppEvent::OpenPromptAssistantModelPicker {
++                parent_thread_id: event_parent,
++                operation: PromptAssistantOperation::Translate,
++                input,
++            }) if event_parent == parent_thread_id
++                && input == "improve this deployment prompt"
++        ));
++        assert!(matches!(ops.try_recv(), Err(TryRecvError::Empty)));
++    }
++
++    #[tokio::test]
++    async fn shortcut_freezes_active_paste_bytes_and_preserves_draft_metadata_on_restore() {
++        let (mut chat, _app_event_tx, mut events, mut ops) =
++            make_chatwidget_manual_with_sender().await;
++        chat.thread_id = Some(ThreadId::new());
++        let large_paste = "x".repeat(1_005);
++        chat.handle_paste(large_paste.clone());
++        let image_path = std::path::PathBuf::from("/tmp/prompt-assistant-test-image.png");
++        chat.bottom_pane.attach_image(image_path.clone());
++        chat.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
++        chat.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
++        assert!(chat.bottom_pane.is_in_paste_burst());
++
++        chat.open_prompt_assistant();
++
++        assert!(!chat.bottom_pane.is_in_paste_burst());
++        let frozen = chat
++            .capture_thread_input_state()
++            .expect("thread input state")
++            .composer
++            .expect("composer state");
++        assert!(frozen.text.ends_with("rc"));
++        assert_eq!(frozen.pending_pastes.len(), 1);
++        assert_eq!(frozen.pending_pastes[0].1, large_paste);
++        assert_eq!(frozen.local_images.len(), 1);
++        assert_eq!(frozen.local_images[0].path, image_path);
++
++        chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
++        let restored = chat
++            .capture_thread_input_state()
++            .expect("restored thread input state")
++            .composer
++            .expect("restored composer state");
++        assert_eq!(restored, frozen);
++        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
++        assert!(matches!(ops.try_recv(), Err(TryRecvError::Empty)));
++    }
++
++    #[tokio::test]
++    async fn apply_uses_only_the_server_candidate_without_submitting_or_writing_history() {
++        let (mut chat, _app_event_tx, mut events, mut ops) =
++            make_chatwidget_manual_with_sender().await;
++        let parent_thread_id = ThreadId::new();
++        chat.thread_id = Some(parent_thread_id);
++        chat.apply_external_edit("complete original draft".to_string());
++        chat.start_prompt_assistant(
++            parent_thread_id,
++            PromptAssistantOperation::Generate,
++            "intent".to_string(),
++            "hidden-functional-model".to_string(),
++        );
++        let AppEvent::SubmitThreadOp {
++            op: AppCommand::PromptAssistantStart { workspace_id, .. },
++            ..
++        } = events.try_recv().expect("start event")
++        else {
++            panic!("expected prompt assistant start");
++        };
++        chat.handle_prompt_assistant_workspace_finished(
++            parent_thread_id,
++            workspace_id.clone(),
++            0,
++            Ok(workspace(parent_thread_id, &workspace_id)),
++        );
++
++        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        let AppEvent::SubmitThreadOp {
++            op: AppCommand::PromptAssistantApply { candidate_hash, .. },
++            ..
++        } = events.try_recv().expect("apply event")
++        else {
++            panic!("expected prompt assistant apply");
++        };
++        assert_eq!(candidate_hash, "sha256:preview");
++
++        chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
++        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
++        assert!(chat.prompt_assistant.is_some());
++        assert_eq!(chat.composer_text_with_pending(), "complete original draft");
++
++        chat.handle_prompt_assistant_apply_finished(
++            parent_thread_id,
++            workspace_id.clone(),
++            1,
++            candidate_hash,
++            Ok(PromptAssistantApplyResponse {
++                workspace_id,
++                generation: 1,
++                candidate: "server-authoritative candidate".to_string(),
++                candidate_hash: "sha256:preview".to_string(),
++                applied: true,
++            }),
++        );
++
++        assert_eq!(
++            chat.composer_text_with_pending(),
++            "server-authoritative candidate"
++        );
++        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
++        assert!(matches!(ops.try_recv(), Err(TryRecvError::Empty)));
++    }
++
++    #[tokio::test]
++    async fn restore_retains_the_complete_underlying_draft_and_copy_has_no_transcript_event() {
++        let (mut chat, _app_event_tx, mut events, mut ops) =
++            make_chatwidget_manual_with_sender().await;
++        let parent_thread_id = ThreadId::new();
++        chat.thread_id = Some(parent_thread_id);
++        chat.apply_external_edit("complete original draft".to_string());
++        chat.start_prompt_assistant(
++            parent_thread_id,
++            PromptAssistantOperation::Generate,
++            "intent".to_string(),
++            "hidden-functional-model".to_string(),
++        );
++        let AppEvent::SubmitThreadOp {
++            op: AppCommand::PromptAssistantStart { workspace_id, .. },
++            ..
++        } = events.try_recv().expect("start event")
++        else {
++            panic!("expected prompt assistant start");
++        };
++        chat.handle_prompt_assistant_workspace_finished(
++            parent_thread_id,
++            workspace_id.clone(),
++            0,
++            Ok(workspace(parent_thread_id, &workspace_id)),
++        );
++
++        chat.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
++        let AppEvent::CopyPromptAssistantCandidate {
++            parent_thread_id: copy_parent,
++            workspace_id: copy_workspace_id,
++            candidate,
++        } = events.try_recv().expect("copy event")
++        else {
++            panic!("expected local prompt assistant copy");
++        };
++        chat.copy_prompt_assistant_candidate_with(
++            copy_parent,
++            &copy_workspace_id,
++            candidate,
++            |_| Ok(Some(crate::clipboard_copy::ClipboardLease::test())),
++        );
++        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
++        assert!(matches!(ops.try_recv(), Err(TryRecvError::Empty)));
++
++        chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
++        let AppEvent::RestorePromptAssistant {
++            parent_thread_id: restore_parent,
++            workspace_id: restore_workspace_id,
++        } = events.try_recv().expect("restore event")
++        else {
++            panic!("expected local prompt assistant restore");
++        };
++        chat.restore_prompt_assistant(restore_parent, &restore_workspace_id);
++        assert_eq!(chat.composer_text_with_pending(), "complete original draft");
++        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
++        assert!(matches!(ops.try_recv(), Err(TryRecvError::Empty)));
++    }
++
++    #[tokio::test]
++    async fn progress_accepts_the_inflight_generation_and_rejects_stale_bytes() {
++        let (mut chat, _app_event_tx, mut events, _ops) =
++            make_chatwidget_manual_with_sender().await;
++        let parent_thread_id = ThreadId::new();
++        chat.thread_id = Some(parent_thread_id);
++        chat.start_prompt_assistant(
++            parent_thread_id,
++            PromptAssistantOperation::Generate,
++            "intent".to_string(),
++            "hidden-functional-model".to_string(),
++        );
++        let AppEvent::SubmitThreadOp {
++            op: AppCommand::PromptAssistantStart { workspace_id, .. },
++            ..
++        } = events.try_recv().expect("start event")
++        else {
++            panic!("expected prompt assistant start");
++        };
++
++        chat.on_prompt_assistant_progress(workspace_id.clone(), 1, 99, true);
++        chat.on_prompt_assistant_progress(workspace_id.clone(), 1, 37, false);
++        assert_eq!(
++            chat.prompt_assistant
++                .as_ref()
++                .expect("active workspace")
++                .response_bytes,
++            37
++        );
++
++        chat.on_prompt_assistant_progress(workspace_id.clone(), 0, 500, false);
++        chat.on_prompt_assistant_progress("other-workspace".to_string(), 1, 500, false);
++        assert_eq!(
++            chat.prompt_assistant
++                .as_ref()
++                .expect("active workspace")
++                .response_bytes,
++            37
++        );
++
++        chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
++        assert!(matches!(
++            events.try_recv(),
++            Ok(AppEvent::SubmitThreadOp {
++                op: AppCommand::PromptAssistantCancel { .. },
++                ..
++            })
++        ));
++        chat.on_prompt_assistant_progress(workspace_id, 1, 500, false);
++        assert_eq!(
++            chat.prompt_assistant
++                .as_ref()
++                .expect("cancelling workspace remains scoped")
++                .response_bytes,
++            37
++        );
++    }
++
++    #[tokio::test]
++    async fn cancel_rpc_failure_returns_to_failed_and_can_restore_the_draft() {
++        let (mut chat, _app_event_tx, mut events, _ops) =
++            make_chatwidget_manual_with_sender().await;
++        let parent_thread_id = ThreadId::new();
++        chat.thread_id = Some(parent_thread_id);
++        chat.apply_external_edit("complete original draft".to_string());
++        chat.start_prompt_assistant(
++            parent_thread_id,
++            PromptAssistantOperation::Generate,
++            "intent".to_string(),
++            "hidden-functional-model".to_string(),
++        );
++        let AppEvent::SubmitThreadOp {
++            op: AppCommand::PromptAssistantStart { workspace_id, .. },
++            ..
++        } = events.try_recv().expect("start event")
++        else {
++            panic!("expected prompt assistant start");
++        };
++
++        chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
++        let AppEvent::SubmitThreadOp {
++            op: AppCommand::PromptAssistantCancel { generation, .. },
++            ..
++        } = events.try_recv().expect("cancel event")
++        else {
++            panic!("expected prompt assistant cancel");
++        };
++        chat.handle_prompt_assistant_cancel_finished(
++            parent_thread_id,
++            workspace_id,
++            generation,
++            Err("cancel transport failed".to_string()),
++        );
++
++        chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
++        let AppEvent::RestorePromptAssistant {
++            parent_thread_id: restore_parent,
++            workspace_id: restore_workspace_id,
++        } = events
++            .try_recv()
++            .expect("restore event after failed cancel")
++        else {
++            panic!("expected restorable failed state");
++        };
++        chat.restore_prompt_assistant(restore_parent, &restore_workspace_id);
++        assert!(chat.prompt_assistant.is_none());
++        assert_eq!(chat.composer_text_with_pending(), "complete original draft");
++    }
++
++    #[tokio::test]
++    async fn failed_after_bytes_clears_progress_before_retrying_the_next_generation() {
++        let (mut chat, _app_event_tx, mut events, _ops) =
++            make_chatwidget_manual_with_sender().await;
++        let parent_thread_id = ThreadId::new();
++        chat.thread_id = Some(parent_thread_id);
++        chat.apply_external_edit("original".to_string());
++        chat.start_prompt_assistant(
++            parent_thread_id,
++            PromptAssistantOperation::Generate,
++            "intent".to_string(),
++            "hidden-functional-model".to_string(),
++        );
++        let AppEvent::SubmitThreadOp {
++            op: AppCommand::PromptAssistantStart { workspace_id, .. },
++            ..
++        } = events.try_recv().expect("start event")
++        else {
++            panic!("expected prompt assistant start");
++        };
++        chat.handle_prompt_assistant_workspace_finished(
++            parent_thread_id,
++            workspace_id.clone(),
++            0,
++            Ok(workspace(parent_thread_id, &workspace_id)),
++        );
++
++        chat.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
++        chat.handle_paste("first retry".to_string());
++        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        let AppEvent::SubmitThreadOp {
++            op: first_retry, ..
++        } = events.try_recv().expect("first refine event")
++        else {
++            panic!("expected first refine op");
++        };
++        chat.prepare_prompt_assistant_operation(parent_thread_id, &first_retry);
++        chat.on_prompt_assistant_progress(workspace_id.clone(), 2, 64, false);
++        chat.handle_prompt_assistant_workspace_finished(
++            parent_thread_id,
++            workspace_id.clone(),
++            1,
++            Err("first retry failed".to_string()),
++        );
++        let state = chat.prompt_assistant.as_ref().expect("failed workspace");
++        assert_eq!(state.response_bytes, 0);
++        assert_eq!(state.progress_generation, None);
++
++        chat.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
++        chat.handle_paste("second retry".to_string());
++        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        let AppEvent::SubmitThreadOp {
++            op: second_retry, ..
++        } = events.try_recv().expect("second refine event")
++        else {
++            panic!("expected second refine op");
++        };
++        chat.prepare_prompt_assistant_operation(parent_thread_id, &second_retry);
++        chat.on_prompt_assistant_progress(workspace_id.clone(), 3, 81, false);
++        assert_eq!(
++            chat.prompt_assistant
++                .as_ref()
++                .expect("retrying workspace")
++                .progress_generation,
++            Some(3)
++        );
++
++        let mut retried = workspace(parent_thread_id, &workspace_id);
++        retried.generation = 3;
++        retried.candidate = "retried candidate".to_string();
++        retried.candidate_hash = "sha256:retried".to_string();
++        chat.handle_prompt_assistant_workspace_finished(
++            parent_thread_id,
++            workspace_id,
++            1,
++            Ok(retried),
++        );
++        let state = chat.prompt_assistant.as_ref().expect("ready workspace");
++        assert_eq!(state.context.operation_generation, 3);
++        assert_eq!(state.progress_generation, None);
++        assert_eq!(state.response_bytes, 0);
++    }
++}
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index 0a42c2914a14a696137874e172bf68898249eaac..254e51be71c8d2aff2f70877170956352ae1b6ec 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -101,6 +101,14 @@ impl ChatWidget {
+                     self.on_agent_reasoning_delta(notification.delta);
+                 }
+             }
++            ServerNotification::PromptAssistantProgress(notification) => {
++                self.on_prompt_assistant_progress(
++                    notification.workspace_id,
++                    notification.generation,
++                    notification.byte_count,
++                    notification.reset,
++                );
++            }
+             ServerNotification::ReasoningSummaryPartAdded(_) => self.on_reasoning_section_break(),
+             ServerNotification::TerminalInteraction(notification) => {
+                 self.on_terminal_interaction(notification.process_id, notification.stdin)
+diff --git a/codex-rs/tui/src/chatwidget/slash_dispatch.rs b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+index f9ead0caa52a65572636e37d15dfe2c1e09f8902..f23258b1b8cd97c74efab246e8f07fc56fccd754 100644
+--- a/codex-rs/tui/src/chatwidget/slash_dispatch.rs
++++ b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+@@ -282,6 +282,9 @@ impl ChatWidget {
+                 self.open_model_popup();
+                 self.defer_input_until_settings_applied();
+             }
++            SlashCommand::Prompt => {
++                self.open_prompt_assistant();
++            }
+             SlashCommand::Personality => {
+                 self.open_personality_popup();
+                 self.defer_input_until_settings_applied();
+@@ -869,6 +872,9 @@ impl ChatWidget {
+                     instructions: args,
+                 }));
+             }
++            SlashCommand::Prompt if !trimmed.is_empty() => {
++                self.open_prompt_assistant_for_inline_draft(args);
++            }
+             SlashCommand::Resume if !trimmed.is_empty() => {
+                 self.app_event_tx
+                     .send(AppEvent::ResumeSessionByIdOrName(args));
+@@ -1070,6 +1076,7 @@ impl ChatWidget {
+             | SlashCommand::Compact
+             | SlashCommand::Review
+             | SlashCommand::Model
++            | SlashCommand::Prompt
+             | SlashCommand::Personality
+             | SlashCommand::Plan
+             | SlashCommand::Goal
+diff --git a/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs b/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
+index 0555a022204bf1451d97d7dff924322dd3055af6..1b218e4f8e2fe90a2a9d265074b1b82b8057b6ee 100644
+--- a/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
++++ b/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
+@@ -12,6 +12,7 @@ use codex_app_server_protocol::PluginShareDiscoverability;
+ use codex_app_server_protocol::PluginSource;
+ use codex_connectors::AppInfo;
+ use codex_features::Stage;
++use codex_protocol::openai_models::ModelVisibility;
+ use pretty_assertions::assert_eq;
+ 
+ #[tokio::test]
+@@ -3143,6 +3144,7 @@ async fn model_picker_hides_show_in_picker_false_models_from_cache() {
+         is_default: false,
+         upgrade: None,
+         show_in_picker,
++        visibility: ModelVisibility::List,
+         multi_agent_version: None,
+         availability_nux: None,
+         supported_in_api: true,
+@@ -3769,6 +3771,7 @@ async fn single_reasoning_option_skips_selection() {
+         is_default: false,
+         upgrade: None,
+         show_in_picker: true,
++        visibility: ModelVisibility::List,
+         multi_agent_version: None,
+         availability_nux: None,
+         supported_in_api: true,
+diff --git a/codex-rs/tui/src/keymap.rs b/codex-rs/tui/src/keymap.rs
+index e1159f98e19a49034e089a02047e2ea41f2c5117..aad919a2b77a53a8af8c38024e64b1abfd30ee7c 100644
+--- a/codex-rs/tui/src/keymap.rs
++++ b/codex-rs/tui/src/keymap.rs
+@@ -107,6 +107,8 @@ pub(crate) struct ComposerKeymap {
+     pub(crate) queue: Vec<KeyBinding>,
+     /// Toggle composer shortcut overlay.
+     pub(crate) toggle_shortcuts: Vec<KeyBinding>,
++    /// Open Prompt Assistant for the current composer draft.
++    pub(crate) prompt_assistant: Vec<KeyBinding>,
+     /// Open reverse history search or move to the previous match.
+     pub(crate) history_search_previous: Vec<KeyBinding>,
+     /// Move to the next match in reverse history search.
+@@ -465,6 +467,7 @@ impl RuntimeKeymap {
+             submit: resolve_with_global!(keymap, defaults, composer, submit),
+             queue: resolve_with_global!(keymap, defaults, composer, queue),
+             toggle_shortcuts: resolve_with_global!(keymap, defaults, composer, toggle_shortcuts),
++            prompt_assistant: resolve_local!(keymap, defaults, composer, prompt_assistant),
+             history_search_previous: resolve_local!(
+                 keymap,
+                 defaults,
+@@ -952,6 +955,7 @@ impl RuntimeKeymap {
+                     plain(KeyCode::Char('?')),
+                     shift(KeyCode::Char('?'))
+                 ],
++                prompt_assistant: default_bindings![alt(KeyCode::Char('p'))],
+                 history_search_previous: default_bindings![ctrl(KeyCode::Char('r'))],
+                 history_search_next: default_bindings![ctrl(KeyCode::Char('s'))],
+             },
+@@ -1212,6 +1216,10 @@ impl RuntimeKeymap {
+                     "composer.toggle_shortcuts",
+                     self.composer.toggle_shortcuts.as_slice(),
+                 ),
++                (
++                    "composer.prompt_assistant",
++                    self.composer.prompt_assistant.as_slice(),
++                ),
+                 (
+                     "composer.history_search_previous",
+                     self.composer.history_search_previous.as_slice(),
+@@ -1257,6 +1265,10 @@ impl RuntimeKeymap {
+                     "composer.toggle_shortcuts",
+                     self.composer.toggle_shortcuts.as_slice(),
+                 ),
++                (
++                    "composer.prompt_assistant",
++                    self.composer.prompt_assistant.as_slice(),
++                ),
+                 (
+                     "composer.history_search_previous",
+                     self.composer.history_search_previous.as_slice(),
+@@ -1360,6 +1372,10 @@ impl RuntimeKeymap {
+                 ("chat.previous_model", self.chat.previous_model.as_slice()),
+                 ("chat.next_model", self.chat.next_model.as_slice()),
+                 ("composer.submit", self.composer.submit.as_slice()),
++                (
++                    "composer.prompt_assistant",
++                    self.composer.prompt_assistant.as_slice(),
++                ),
+                 ("toggle_vim_mode", self.app.toggle_vim_mode.as_slice()),
+                 ("toggle_fast_mode", self.app.toggle_fast_mode.as_slice()),
+                 ("toggle_raw_output", self.app.toggle_raw_output.as_slice()),
+@@ -2102,6 +2118,31 @@ mod tests {
+         assert!(err.contains("open_transcript"));
+     }
+ 
++    #[test]
++    fn prompt_assistant_binding_supports_override_unbind_and_conflict_detection() {
++        let defaults = RuntimeKeymap::defaults();
++        assert_eq!(
++            defaults.composer.prompt_assistant,
++            vec![key_hint::alt(KeyCode::Char('p'))]
++        );
++
++        let mut keymap = TuiKeymap::default();
++        keymap.composer.prompt_assistant = Some(one("ctrl-alt-p"));
++        let runtime = RuntimeKeymap::from_config(&keymap).expect("valid override");
++        assert_eq!(
++            runtime.composer.prompt_assistant,
++            vec![key_hint::ctrl_alt(KeyCode::Char('p'))]
++        );
++
++        keymap.composer.prompt_assistant = Some(KeybindingsSpec::Many(Vec::new()));
++        let runtime = RuntimeKeymap::from_config(&keymap).expect("valid explicit unbind");
++        assert!(runtime.composer.prompt_assistant.is_empty());
++
++        keymap.composer.prompt_assistant = Some(one("ctrl-g"));
++        keymap.global.open_external_editor = Some(one("ctrl-g"));
++        expect_conflict(&keymap, "composer.prompt_assistant", "open_external_editor");
++    }
++
+     #[test]
+     fn rejects_shadowing_editor_binding_in_main_scope() {
+         let mut keymap = TuiKeymap::default();
+diff --git a/codex-rs/tui/src/keymap_setup/actions.rs b/codex-rs/tui/src/keymap_setup/actions.rs
+index 84618ea35ec46f621c208fe82dd18fb205c0e976..d92c17f91d09db2ff54a97e83779eab3355319a3 100644
+--- a/codex-rs/tui/src/keymap_setup/actions.rs
++++ b/codex-rs/tui/src/keymap_setup/actions.rs
+@@ -102,6 +102,7 @@ pub(super) const KEYMAP_ACTIONS: &[KeymapActionDescriptor] = &[
+     action("composer", "Composer", "submit", "Submit the current composer draft."),
+     action("composer", "Composer", "queue", "Queue the draft while a task is running."),
+     action("composer", "Composer", "toggle_shortcuts", "Show or hide the composer shortcut overlay."),
++    action("composer", "Composer", "prompt_assistant", "Open Prompt Assistant for the current draft."),
+     action("composer", "Composer", "history_search_previous", "Open history search or move to the previous match."),
+     action("composer", "Composer", "history_search_next", "Move to the next history search match."),
+     action("editor", "Editor", "insert_newline", "Insert a newline in the editor."),
+@@ -247,6 +248,7 @@ pub(super) fn binding_slot<'a>(
+         ("composer", "submit") => Some(&mut keymap.composer.submit),
+         ("composer", "queue") => Some(&mut keymap.composer.queue),
+         ("composer", "toggle_shortcuts") => Some(&mut keymap.composer.toggle_shortcuts),
++        ("composer", "prompt_assistant") => Some(&mut keymap.composer.prompt_assistant),
+         ("composer", "history_search_previous") => Some(&mut keymap.composer.history_search_previous),
+         ("composer", "history_search_next") => Some(&mut keymap.composer.history_search_next),
+         ("editor", "insert_newline") => Some(&mut keymap.editor.insert_newline),
+@@ -374,6 +376,7 @@ pub(super) fn bindings_for_action<'a>(
+         ("composer", "submit") => Some(runtime_keymap.composer.submit.as_slice()),
+         ("composer", "queue") => Some(runtime_keymap.composer.queue.as_slice()),
+         ("composer", "toggle_shortcuts") => Some(runtime_keymap.composer.toggle_shortcuts.as_slice()),
++        ("composer", "prompt_assistant") => Some(runtime_keymap.composer.prompt_assistant.as_slice()),
+         ("composer", "history_search_previous") => Some(runtime_keymap.composer.history_search_previous.as_slice()),
+         ("composer", "history_search_next") => Some(runtime_keymap.composer.history_search_next.as_slice()),
+         ("editor", "insert_newline") => Some(runtime_keymap.editor.insert_newline.as_slice()),
+diff --git a/codex-rs/tui/src/slash_command.rs b/codex-rs/tui/src/slash_command.rs
+index 50291065c0d7d437df90e963c05f4476ae4ea7e8..980fe5e757e47c8f76fb44dff42a0385db422842 100644
+--- a/codex-rs/tui/src/slash_command.rs
++++ b/codex-rs/tui/src/slash_command.rs
+@@ -13,6 +13,7 @@ pub enum SlashCommand {
+     // DO NOT ALPHA-SORT! Enum order is presentation order in the popup, so
+     // more frequently used commands should be listed first.
+     Model,
++    Prompt,
+     Ide,
+     Permissions,
+     Keymap,
+@@ -127,6 +128,7 @@ impl SlashCommand {
+             SlashCommand::MemoryDrop => "DO NOT USE",
+             SlashCommand::MemoryUpdate => "DO NOT USE",
+             SlashCommand::Model => "choose what model and reasoning effort to use",
++            SlashCommand::Prompt => "translate, generate, refine, and review a prompt",
+             SlashCommand::Ide => {
+                 "include current selection, open files, and other context from your IDE"
+             }
+@@ -167,6 +169,7 @@ impl SlashCommand {
+         matches!(
+             self,
+             SlashCommand::Review
++                | SlashCommand::Prompt
+                 | SlashCommand::Rename
+                 | SlashCommand::Plan
+                 | SlashCommand::Goal
+@@ -225,6 +228,7 @@ impl SlashCommand {
+             | SlashCommand::MemoryUpdate => false,
+             SlashCommand::Diff
+             | SlashCommand::Copy
++            | SlashCommand::Prompt
+             | SlashCommand::Raw
+             | SlashCommand::Rename
+             | SlashCommand::Mention
+@@ -311,6 +315,9 @@ mod tests {
+         assert!(SlashCommand::Raw.available_in_side_conversation());
+         assert!(SlashCommand::Raw.supports_inline_args());
+         assert!(SlashCommand::App.available_during_task());
++        assert!(SlashCommand::Prompt.available_during_task());
++        assert!(SlashCommand::Prompt.supports_inline_args());
++        assert_eq!(SlashCommand::Prompt.command(), "prompt");
+     }
+ 
+     #[test]
+diff --git a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_custom.snap b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_custom.snap
+index 18ed9e17da8ffc3820fbb86eb84cdd0aed87db98..a7aede10b4392bbc040a334611cff8686337fd31 100644
+--- a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_custom.snap
++++ b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_custom.snap
+@@ -5,7 +5,7 @@ expression: "render_picker(params, 120)"
+ 
+   Keymap
+   All configurable shortcuts.
+-  110 actions, 1 customized, 2 unbound.
++  111 actions, 1 customized, 2 unbound.
+ 
+   [All]  Common  Customized (1)  Unbound (2)  App  Composer  Editor  Vim  Navigation  Approval  Debug
+ 
+diff --git a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_fast_mode_enabled.snap b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_fast_mode_enabled.snap
+index d40c1b05dea448697f03aea3cbdafc68495d385d..af6366e411091bc1047c6fc06b3ac46c9367f545 100644
+--- a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_fast_mode_enabled.snap
++++ b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_fast_mode_enabled.snap
+@@ -5,7 +5,7 @@ expression: "render_picker(params, 120)"
+ 
+   Keymap
+   All configurable shortcuts.
+-  111 actions, 0 customized, 3 unbound.
++  112 actions, 0 customized, 3 unbound.
+ 
+   [All]  Common  Customized (0)  Unbound (3)  App  Composer  Editor  Vim  Navigation  Approval  Debug
+ 
+diff --git a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_first_actions.snap b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_first_actions.snap
+index f08a5ad721ee9c5ef589a797fc84b17bb8a0cd93..2e498f9e05a1d71535c51518c5608a8d1c123ae0 100644
+--- a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_first_actions.snap
++++ b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_first_actions.snap
+@@ -2,12 +2,12 @@
+ source: tui/src/keymap_setup.rs
+ expression: snapshot
+ ---
+-tab: All (110 selectable)
++tab: All (111 selectable)
+ tab: Common (20 selectable)
+ tab: Customized (0) (0 selectable)
+ tab: Unbound (2) (2 selectable)
+ tab: App (12 selectable)
+-tab: Composer (5 selectable)
++tab: Composer (6 selectable)
+ tab: Editor (17 selectable)
+ tab: Vim (48 selectable)
+ tab: Navigation (20 selectable)
+diff --git a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_narrow.snap b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_narrow.snap
+index 3d02b83f837e8bfa1656f8c8511f208a79247fa5..335878405cbe0037258220157ec3c2e53ddac78a 100644
+--- a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_narrow.snap
++++ b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_narrow.snap
+@@ -5,7 +5,7 @@ expression: "render_picker(params, 78)"
+ 
+   Keymap
+   All configurable shortcuts.
+-  110 actions, 0 customized, 2 unbound.
++  111 actions, 0 customized, 2 unbound.
+ 
+   [All]  Common  Customized (0)  Unbound (2)  App  Composer  Editor  Vim
+   Navigation  Approval  Debug
+diff --git a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_wide.snap b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_wide.snap
+index 7fba0c41fab5c48c45d09395d436c5a6155d1a9d..070ec812dbc39f829a8c436d459346ad0ace0096 100644
+--- a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_wide.snap
++++ b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_wide.snap
+@@ -5,7 +5,7 @@ expression: "render_picker(params, 120)"
+ 
+   Keymap
+   All configurable shortcuts.
+-  110 actions, 0 customized, 2 unbound.
++  111 actions, 0 customized, 2 unbound.
+ 
+   [All]  Common  Customized (0)  Unbound (2)  App  Composer  Editor  Vim  Navigation  Approval  Debug
+ 

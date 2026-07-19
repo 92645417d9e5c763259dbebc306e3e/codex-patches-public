@@ -1,0 +1,308 @@
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+index 28ab288a120dead6c7a589d5f7a59fe069fe4ec8..b9f899c30c8733607c815f87ec6a5c4fa5543176 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -2421,7 +2421,11 @@ impl ThreadRequestProcessor {
+         let fallback_provider = self.config.model_provider_id.as_str();
+         if include_turns
+             && self
+-                .read_stored_thread_for_read(thread_id, /*include_history*/ false)
++                .read_stored_thread_for_read(
++                    thread_id,
++                    /*include_history*/ false,
++                    ThreadHistoryWindow::Full,
++                )
+                 .await?
+                 .is_some_and(|thread| matches!(thread.history_mode, ThreadHistoryMode::Paginated))
+         {
+@@ -2430,7 +2434,11 @@ impl ThreadRequestProcessor {
+             ));
+         }
+         let Some(stored_thread) = self
+-            .read_stored_thread_for_read(thread_id, /*include_history*/ include_turns)
++            .read_stored_thread_for_read(
++                thread_id,
++                /*include_history*/ include_turns,
++                history_window,
++            )
+             .await?
+         else {
+             return Ok(None);
+@@ -2448,16 +2456,31 @@ impl ThreadRequestProcessor {
+         &self,
+         thread_id: ThreadId,
+         include_history: bool,
++        history_window: ThreadHistoryWindow,
+     ) -> Result<Option<StoredThread>, ThreadReadViewError> {
+-        match self
+-            .thread_store
+-            .read_thread(StoreReadThreadParams {
+-                thread_id,
+-                include_archived: true,
+-                include_history,
+-            })
+-            .await
+-        {
++        let result = if include_history {
++            self.thread_store
++                .read_thread_for_resume(StoreReadThreadForResumeParams {
++                    thread_id,
++                    include_archived: true,
++                    history_window: match history_window {
++                        ThreadHistoryWindow::Full => StoreResumeHistoryWindow::Full,
++                        ThreadHistoryWindow::SinceLatestCompaction => {
++                            StoreResumeHistoryWindow::SinceLatestCompaction
++                        }
++                    },
++                })
++                .await
++        } else {
++            self.thread_store
++                .read_thread(StoreReadThreadParams {
++                    thread_id,
++                    include_archived: true,
++                    include_history: false,
++                })
++                .await
++        };
++        match result {
+             Ok(stored_thread) => Ok(Some(stored_thread)),
+             Err(ThreadStoreError::InvalidRequest { message })
+                 if message == format!("no rollout found for thread id {thread_id}") =>
+@@ -2534,10 +2557,29 @@ impl ThreadRequestProcessor {
+         self.attach_thread_name(thread_id, thread).await;
+ 
+         if include_turns {
+-            let history = loaded_thread
+-                .load_history(/*include_archived*/ true)
++            let stored_thread = self
++                .read_stored_thread_for_read(
++                    thread_id,
++                    /*include_history*/ true,
++                    history_window,
++                )
+                 .await
+-                .map_err(|err| thread_read_history_load_error(thread_id, err))?;
++                .map_err(|err| match err {
++                    ThreadReadViewError::Internal(message) => ThreadReadViewError::Internal(
++                        format!("failed to load history for thread {thread_id}: {message}"),
++                    ),
++                    err => err,
++                })?
++                .ok_or_else(|| {
++                    ThreadReadViewError::InvalidRequest(format!(
++                        "thread not persisted: {thread_id}"
++                    ))
++                })?;
++            let history = stored_thread.history.ok_or_else(|| {
++                ThreadReadViewError::Internal(format!(
++                    "thread store did not return history for thread {thread_id}"
++                ))
++            })?;
+             let window = display_history_window(&history.items, history_window);
+             thread.turns = build_legacy_api_turns_from_rollout_items(&window.items);
+         }
+@@ -2592,8 +2634,9 @@ impl ThreadRequestProcessor {
+             Err(err) => return Err(internal_error(format!("failed to read thread: {err}"))),
+         }
+ 
++        let history_window = history_window.unwrap_or_default();
+         let items = self
+-            .load_thread_turns_list_history(thread_uuid)
++            .load_thread_turns_list_history(thread_uuid, history_window)
+             .await
+             .map_err(thread_read_view_error)?;
+         // This API optimizes network transfer by letting clients page through a
+@@ -2628,7 +2671,7 @@ impl ThreadRequestProcessor {
+                 limit,
+                 sort_direction: sort_direction.unwrap_or(SortDirection::Desc),
+                 items_view: items_view.unwrap_or(TurnItemsView::Summary),
+-                history_window: history_window.unwrap_or_default(),
++                history_window,
+             },
+         )
+     }
+@@ -2852,17 +2895,13 @@ impl ThreadRequestProcessor {
+     async fn load_thread_turns_list_history(
+         &self,
+         thread_id: ThreadId,
++        history_window: ThreadHistoryWindow,
+     ) -> Result<Vec<RolloutItem>, ThreadReadViewError> {
+         match self
+-            .thread_store
+-            .read_thread(StoreReadThreadParams {
+-                thread_id,
+-                include_archived: true,
+-                include_history: true,
+-            })
+-            .await
++            .read_stored_thread_for_read(thread_id, /*include_history*/ true, history_window)
++            .await?
+         {
+-            Ok(stored_thread) => {
++            Some(stored_thread) => {
+                 let history = stored_thread.history.ok_or_else(|| {
+                     ThreadReadViewError::Internal(format!(
+                         "thread store did not return history for thread {thread_id}"
+@@ -2870,22 +2909,7 @@ impl ThreadRequestProcessor {
+                 })?;
+                 return Ok(history.items);
+             }
+-            Err(ThreadStoreError::InvalidRequest { message })
+-                if message == format!("no rollout found for thread id {thread_id}") => {}
+-            Err(ThreadStoreError::ThreadNotFound {
+-                thread_id: missing_thread_id,
+-            }) if missing_thread_id == thread_id => {}
+-            Err(ThreadStoreError::InvalidRequest { message }) => {
+-                return Err(ThreadReadViewError::InvalidRequest(message));
+-            }
+-            Err(ThreadStoreError::Unsupported { operation }) => {
+-                return Err(ThreadReadViewError::Unsupported(operation));
+-            }
+-            Err(err) => {
+-                return Err(ThreadReadViewError::Internal(format!(
+-                    "failed to read thread: {err}"
+-                )));
+-            }
++            None => {}
+         }
+ 
+         let thread = self
+@@ -2902,11 +2926,18 @@ impl ThreadRequestProcessor {
+             ));
+         }
+ 
+-        thread
+-            .load_history(/*include_archived*/ true)
+-            .await
+-            .map(|history| history.items)
+-            .map_err(|err| thread_turns_list_history_load_error(thread_id, err))
++        match history_window {
++            ThreadHistoryWindow::Full => thread
++                .load_history(/*include_archived*/ true)
++                .await
++                .map(|history| history.items)
++                .map_err(|err| thread_turns_list_history_load_error(thread_id, err)),
++            ThreadHistoryWindow::SinceLatestCompaction => {
++                Err(ThreadReadViewError::InvalidRequest(format!(
++                    "bounded history is unavailable for loaded thread {thread_id}; retry with historyWindow=full"
++                )))
++            }
++        }
+     }
+ 
+     pub(crate) fn thread_created_receiver(&self) -> broadcast::Receiver<ThreadId> {
+@@ -4963,33 +4994,6 @@ fn thread_turns_list_history_load_error(
+     }
+ }
+ 
+-fn thread_read_history_load_error(
+-    thread_id: ThreadId,
+-    err: ThreadStoreError,
+-) -> ThreadReadViewError {
+-    match err {
+-        ThreadStoreError::InvalidRequest { message }
+-            if message.starts_with("failed to resolve rollout path `") =>
+-        {
+-            ThreadReadViewError::InvalidRequest(format!(
+-                "thread {thread_id} is not materialized yet; includeTurns is unavailable before first user message"
+-            ))
+-        }
+-        ThreadStoreError::ThreadNotFound {
+-            thread_id: missing_thread_id,
+-        } if missing_thread_id == thread_id => ThreadReadViewError::InvalidRequest(format!(
+-            "thread {thread_id} is not materialized yet; includeTurns is unavailable before first user message"
+-        )),
+-        ThreadStoreError::InvalidRequest { message } => {
+-            ThreadReadViewError::InvalidRequest(message)
+-        }
+-        ThreadStoreError::Unsupported { operation } => ThreadReadViewError::Unsupported(operation),
+-        err => ThreadReadViewError::Internal(format!(
+-            "failed to load thread history for thread {thread_id}: {err}"
+-        )),
+-    }
+-}
+-
+ fn conversation_summary_thread_id_read_error(
+     conversation_id: ThreadId,
+     err: ThreadStoreError,
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_read.rs b/codex-rs/app-server/tests/suite/v2/thread_read.rs
+index acd6c1602161b6d07e38ee1be8f3c5a2fe85e7cc..560d8bb37749284780a077a214728f88917cfbb1 100644
+--- a/codex-rs/app-server/tests/suite/v2/thread_read.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_read.rs
+@@ -743,7 +743,9 @@ async fn thread_turns_list_reads_store_history_without_rollout_path() -> Result<
+                 limit: Some(10),
+                 sort_direction: Some(SortDirection::Asc),
+                 items_view: None,
+-                history_window: None,
++                history_window: Some(
++                    codex_app_server_protocol::ThreadHistoryWindow::SinceLatestCompaction,
++                ),
+             },
+         })
+         .await?
+@@ -751,6 +753,12 @@ async fn thread_turns_list_reads_store_history_without_rollout_path() -> Result<
+     let ThreadTurnsListResponse { data, .. } = serde_json::from_value(result)?;
+ 
+     assert_eq!(turn_user_texts(&data), vec!["history from store"]);
++    let calls = store.calls().await;
++    assert_eq!(calls.read_thread_for_resume, 1);
++    assert_eq!(
++        calls.last_resume_history_window,
++        Some(codex_thread_store::ResumeHistoryWindow::SinceLatestCompaction)
++    );
+ 
+     client.shutdown().await?;
+     Ok(())
+@@ -828,7 +836,9 @@ async fn thread_read_loaded_include_turns_reads_store_history_without_rollout_pa
+             params: ThreadReadParams {
+                 thread_id: thread.id,
+                 include_turns: true,
+-                history_window: None,
++                history_window: Some(
++                    codex_app_server_protocol::ThreadHistoryWindow::SinceLatestCompaction,
++                ),
+             },
+         })
+         .await?
+@@ -836,6 +846,12 @@ async fn thread_read_loaded_include_turns_reads_store_history_without_rollout_pa
+     let ThreadReadResponse { thread, .. } = serde_json::from_value(result)?;
+ 
+     assert_eq!(turn_user_texts(&thread.turns), vec!["history from store"]);
++    let calls = store.calls().await;
++    assert_eq!(calls.read_thread_for_resume, 1);
++    assert_eq!(
++        calls.last_resume_history_window,
++        Some(codex_thread_store::ResumeHistoryWindow::SinceLatestCompaction)
++    );
+ 
+     client.shutdown().await?;
+     Ok(())
+diff --git a/codex-rs/thread-store/src/store.rs b/codex-rs/thread-store/src/store.rs
+index 68f543f5d2b37be88dab0ffa372aaa21b0ae9d52..faf49608f54855b37ebc0100f29d217bea3d9469 100644
+--- a/codex-rs/thread-store/src/store.rs
++++ b/codex-rs/thread-store/src/store.rs
+@@ -106,19 +106,14 @@ pub trait ThreadStore: Any + Send + Sync {
+         params: ReadThreadByRolloutPathParams,
+     ) -> ThreadStoreFuture<'_, StoredThread>;
+ 
+-    /// Reads a thread and its persisted replay for resume.
++    /// Reads a thread and its persisted replay for resume or another selected-history consumer.
+     ///
+-    /// Stores without a bounded representation safely fall back to the full replay.
++    /// Stores without a bounded representation must reject bounded selection instead of silently
++    /// widening it to the full replay.
+     fn read_thread_for_resume(
+         &self,
+         params: ReadThreadForResumeParams,
+-    ) -> ThreadStoreFuture<'_, StoredThread> {
+-        self.read_thread(ReadThreadParams {
+-            thread_id: params.thread_id,
+-            include_archived: params.include_archived,
+-            include_history: true,
+-        })
+-    }
++    ) -> ThreadStoreFuture<'_, StoredThread>;
+ 
+     /// Reads a rollout-backed thread and its persisted replay for resume by path.
+     fn read_thread_for_resume_by_rollout_path(

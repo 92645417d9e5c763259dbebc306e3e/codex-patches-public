@@ -1,0 +1,515 @@
+diff --git a/codex-rs/tui/src/app/agent_status_feed_tests.rs b/codex-rs/tui/src/app/agent_status_feed_tests.rs
+index 00298a1d158f2d4230ae0454a6914bcc73772c8b..d4e588f1f11f54622023ee167a26e4aec3e637b2 100644
+--- a/codex-rs/tui/src/app/agent_status_feed_tests.rs
++++ b/codex-rs/tui/src/app/agent_status_feed_tests.rs
+@@ -35,6 +35,9 @@ fn agent_status_uses_bounded_buffered_activity() {
+                 text: "Finished checking the focused TUI tests.".to_string(),
+                 phase: None,
+                 memory_citation: None,
++                continuation_notice: None,
++                continuation_hidden: false,
++                continuation_instruction: false,
+             },
+             thread_id: "thread-child".to_string(),
+             turn_id: "turn-1".to_string(),
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index 45a8a1ee531f3eebc784bcb793b3d22fdda706f2..db18322342550e242c942f5c422b98139c7a5b74 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -6573,6 +6573,9 @@ async fn replay_thread_snapshot_replays_turn_history_in_order() {
+                             text: "done".to_string(),
+                             phase: None,
+                             memory_citation: None,
++                            continuation_notice: None,
++                            continuation_hidden: false,
++                            continuation_instruction: false,
+                         },
+                     ],
+                     status: TurnStatus::Completed,
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+index 60d867c8bf98491bd55386df8451e4cf5f280d99..7e5118827e9d244611285fe8cc365ecb4a8808ed 100644
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -2022,6 +2022,9 @@ mod tests {
+                             text: "reply".to_string(),
+                             phase: None,
+                             memory_citation: None,
++                            continuation_notice: None,
++                            continuation_hidden: false,
++                            continuation_instruction: false,
+                         },
+                     ],
+                 ),
+diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+index 434f4d0302d0bb2168a3343fdb7c58263d1802b6..5c396f7df95d9c234b15db5f44b93593a96e3f84 100644
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -2635,6 +2635,9 @@ mod tests {
+                             text: "assistant reply".to_string(),
+                             phase: None,
+                             memory_citation: None,
++                            continuation_notice: None,
++                            continuation_hidden: false,
++                            continuation_instruction: false,
+                         },
+                     ],
+                     status: TurnStatus::Completed,
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 18a2b5d568a8142e51fc335d138869ff0776082d..2d77a8161385df9b6638b09cbe0dc15147792df2 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -674,6 +674,8 @@ pub(crate) struct ChatWidget {
+     // Exact response-level reasoning usage accumulated across one V1 continued chain.
+     pending_reasoning_output_tokens: Option<i64>,
+     pending_reasoning_item_ids: Vec<String>,
++    pending_reasoning_continuation_notices:
++        Vec<(codex_protocol::items::ContinuationNoticeKind, usize)>,
+     // Associates streamed assistant deltas with their commentary/final presentation channel.
+     agent_message_phases: HashMap<String, MessagePhase>,
+     status_state: StatusState,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index af0cb09d809501e1c1416299e8d7c01c5c875b88..1a6d68de6db954939a3cbee872b739dafc8125af 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -183,6 +183,7 @@ impl ChatWidget {
+             reasoning_summary_parts: Vec::new(),
+             pending_reasoning_output_tokens: None,
+             pending_reasoning_item_ids: Vec::new(),
++            pending_reasoning_continuation_notices: Vec::new(),
+             agent_message_phases: HashMap::new(),
+             status_state: StatusState::default(),
+             review: ReviewState::default(),
+diff --git a/codex-rs/tui/src/chatwidget/input_flow.rs b/codex-rs/tui/src/chatwidget/input_flow.rs
+index f7ea1b707d73d3b40156557fbf3decf9e32f63b2..ab892b0d5230348dcfcc52ed92d1fdf192439175 100644
+--- a/codex-rs/tui/src/chatwidget/input_flow.rs
++++ b/codex-rs/tui/src/chatwidget/input_flow.rs
+@@ -46,6 +46,7 @@ impl ChatWidget {
+                     self.reasoning_summary_parts.clear();
+                     self.pending_reasoning_output_tokens = None;
+                     self.pending_reasoning_item_ids.clear();
++                    self.pending_reasoning_continuation_notices.clear();
+                     self.set_status_header(String::from("Working"));
+                     self.submit_user_message_with_user_prompt_submit_hook(
+                         user_message,
+diff --git a/codex-rs/tui/src/chatwidget/replay.rs b/codex-rs/tui/src/chatwidget/replay.rs
+index c9916729891e5ec5b490c1be1cf6149a006bc697..27ecf46c8abb389607f308d3d4df939eba70414a 100644
+--- a/codex-rs/tui/src/chatwidget/replay.rs
++++ b/codex-rs/tui/src/chatwidget/replay.rs
+@@ -150,6 +150,9 @@ impl ChatWidget {
+                 text,
+                 phase,
+                 memory_citation,
++                continuation_notice,
++                continuation_hidden,
++                continuation_instruction,
+             } => {
+                 self.on_agent_message_item_completed(
+                     AgentMessageItem {
+@@ -173,6 +176,9 @@ impl ChatWidget {
+                                 rollout_ids: citation.thread_ids,
+                             }
+                         }),
++                        continuation_notice,
++                        continuation_hidden,
++                        continuation_instruction,
+                     },
+                     from_replay,
+                 );
+diff --git a/codex-rs/tui/src/chatwidget/slash_dispatch.rs b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+index b47250bc86470c3c33784b2c9384ce9b061ae96c..746ba660b3fc4066f8ee0d4b4a09c40d9f7f4c6f 100644
+--- a/codex-rs/tui/src/chatwidget/slash_dispatch.rs
++++ b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+@@ -739,6 +739,7 @@ impl ChatWidget {
+                     self.reasoning_summary_parts.clear();
+                     self.pending_reasoning_output_tokens = None;
+                     self.pending_reasoning_item_ids.clear();
++                    self.pending_reasoning_continuation_notices.clear();
+                     self.set_status_header(String::from("Working"));
+                     self.submit_user_message(user_message);
+                 } else {
+diff --git a/codex-rs/tui/src/chatwidget/streaming.rs b/codex-rs/tui/src/chatwidget/streaming.rs
+index 4bc04cab5f713f9ec3c61e361b00ca2199698811..4615825a2173b47a0d9149f5728b95e4e83b7a4c 100644
+--- a/codex-rs/tui/src/chatwidget/streaming.rs
++++ b/codex-rs/tui/src/chatwidget/streaming.rs
+@@ -281,7 +281,8 @@ impl ChatWidget {
+         }
+         if !continued
+             && (!self.reasoning_summary_parts.is_empty()
+-                || !self.pending_reasoning_item_ids.is_empty())
++                || !self.pending_reasoning_item_ids.is_empty()
++                || !self.pending_reasoning_continuation_notices.is_empty())
+         {
+             let mut reasoning_parts = std::mem::take(&mut self.reasoning_summary_parts);
+             if reasoning_parts.is_empty() {
+@@ -292,6 +293,7 @@ impl ChatWidget {
+                 &self.config.cwd,
+                 std::mem::take(&mut self.pending_reasoning_item_ids),
+                 self.pending_reasoning_output_tokens.take(),
++                std::mem::take(&mut self.pending_reasoning_continuation_notices),
+             );
+             self.add_boxed_history(cell);
+         }
+@@ -300,6 +302,7 @@ impl ChatWidget {
+             self.reasoning_summary_parts.clear();
+             self.pending_reasoning_output_tokens = None;
+             self.pending_reasoning_item_ids.clear();
++            self.pending_reasoning_continuation_notices.clear();
+         }
+         self.request_redraw();
+     }
+@@ -331,6 +334,7 @@ impl ChatWidget {
+         self.reasoning_summary_parts.clear();
+         self.pending_reasoning_output_tokens = None;
+         self.pending_reasoning_item_ids.clear();
++        self.pending_reasoning_continuation_notices.clear();
+         self.status_state.remember_retry_status_header();
+         self.bottom_pane.ensure_status_indicator();
+         self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Thinking;
+@@ -395,6 +399,33 @@ impl ChatWidget {
+         item: AgentMessageItem,
+         from_replay: bool,
+     ) {
++        if let Some(notice) = item.continuation_notice {
++            if let Some((_, count)) = self
++                .pending_reasoning_continuation_notices
++                .iter_mut()
++                .find(|(kind, _)| *kind == notice)
++            {
++                *count = count.saturating_add(1);
++            } else {
++                self.pending_reasoning_continuation_notices
++                    .push((notice, 1));
++            }
++            return;
++        }
++        if item.continuation_hidden {
++            return;
++        }
++        if !item.continuation_instruction
++            && (!self.reasoning_buffer.is_empty()
++                || !self.reasoning_summary_parts.is_empty()
++                || !self.pending_reasoning_item_ids.is_empty()
++                || !self.pending_reasoning_continuation_notices.is_empty())
++        {
++            self.on_agent_reasoning_final(
++                /*reasoning_item_id*/ None, /*continued*/ false,
++                /*reasoning_output_tokens*/ None,
++            );
++        }
+         let mut message = String::new();
+         for content in &item.content {
+             match content {
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index a1562299d1ff160f228b56079cd1030a35b29c29..f67baac5c602d34019fd8bb69cae87fac7922ffb 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -632,6 +632,9 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
+                 text: "Yes. What do you need?".to_string(),
+                 phase: Some(MessagePhase::FinalAnswer),
+                 memory_citation: None,
++                continuation_notice: None,
++                continuation_hidden: false,
++                continuation_instruction: false,
+             },
+         }),
+         /*replay_kind*/ None,
+diff --git a/codex-rs/tui/src/chatwidget/tests/helpers.rs b/codex-rs/tui/src/chatwidget/tests/helpers.rs
+index 187c8472e71c7ddcacc1c6ce2d430b398d4a8976..2ff6a349715d8e84e5159853c128ddfa7bdf11cf 100644
+--- a/codex-rs/tui/src/chatwidget/tests/helpers.rs
++++ b/codex-rs/tui/src/chatwidget/tests/helpers.rs
+@@ -860,6 +860,9 @@ pub(super) fn replay_agent_message(
+             text: text.into(),
+             phase: Some(MessagePhase::FinalAnswer),
+             memory_citation: None,
++            continuation_notice: None,
++            continuation_hidden: false,
++            continuation_instruction: false,
+         },
+         "turn-1".to_string(),
+         replay_kind,
+@@ -1008,6 +1011,9 @@ pub(super) fn complete_assistant_message(
+                 text: text.to_string(),
+                 phase,
+                 memory_citation: None,
++                continuation_notice: None,
++                continuation_hidden: false,
++                continuation_instruction: false,
+             },
+         }),
+         /*replay_kind*/ None,
+diff --git a/codex-rs/tui/src/chatwidget/tests/history_replay.rs b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
+index c4a5503847a7fe4a3fae5ee61ad2df7c8985b00d..f222ec9cad16812744e7f843cc80d980b414803b 100644
+--- a/codex-rs/tui/src/chatwidget/tests/history_replay.rs
++++ b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
+@@ -76,6 +76,144 @@ async fn resumed_initial_messages_render_history() {
+     );
+ }
+ 
++#[tokio::test]
++async fn replayed_v1_continuation_items_show_masks_and_commentary_instruction() {
++    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    let marker = "Continue the same turn from the preserved reasoning chain. Unaccepted replies and tool calls have not taken effect; request any still-needed tool again.";
++    chat.on_agent_reasoning_delta("**First reasoning part**".to_string());
++    chat.on_agent_reasoning_final(Some("rs_hidden".to_string()), true, Some(516));
++
++    for (id, text, notice, hidden) in [
++        (
++            "hidden-output",
++            "[Hidden assistant output]",
++            Some(codex_protocol::items::ContinuationNoticeKind::HiddenAssistantOutput),
++            true,
++        ),
++        (
++            "skipped-tool",
++            "[Skipped tool execution]",
++            Some(codex_protocol::items::ContinuationNoticeKind::SkippedToolExecution),
++            true,
++        ),
++        (
++            "skipped-tool-2",
++            "[Skipped tool execution]",
++            Some(codex_protocol::items::ContinuationNoticeKind::SkippedToolExecution),
++            true,
++        ),
++        ("continuation-instruction", marker, None, false),
++    ] {
++        chat.replay_thread_item(
++            AppServerThreadItem::AgentMessage {
++                id: id.to_string(),
++                text: text.to_string(),
++                phase: Some(MessagePhase::Commentary),
++                memory_citation: None,
++                continuation_notice: notice,
++                continuation_hidden: hidden,
++                continuation_instruction: id == "continuation-instruction",
++            },
++            "turn-1".to_string(),
++            ReplayKind::ThreadSnapshot,
++        );
++    }
++    chat.on_agent_reasoning_delta("**Completed reasoning**".to_string());
++    chat.on_agent_reasoning_final(Some("rs_final".to_string()), false, Some(7));
++
++    let rendered = drain_insert_history(&mut rx)
++        .into_iter()
++        .flatten()
++        .flat_map(|line| line.spans)
++        .map(|span| span.content.into_owned())
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert!(rendered.contains("[Hidden assistant output]"));
++    assert!(rendered.contains("[Skipped tool execution]"));
++    assert!(rendered.contains("+1 more"));
++    assert!(
++        rendered
++            .split_whitespace()
++            .collect::<Vec<_>>()
++            .join(" ")
++            .contains(marker),
++        "the visible commentary instruction may wrap but must retain its complete text",
++    );
++}
++
++#[tokio::test]
++async fn live_v1_continuation_items_show_masks_and_commentary_instruction() {
++    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    let marker = "Continue the same turn from the preserved reasoning chain. Unaccepted replies and tool calls have not taken effect; request any still-needed tool again.";
++    let thread_id = chat.thread_id.map(|id| id.to_string()).unwrap_or_default();
++    chat.on_agent_reasoning_delta("**First reasoning part**".to_string());
++    chat.on_agent_reasoning_final(Some("rs_hidden".to_string()), true, Some(516));
++
++    for (index, (id, text, notice, hidden)) in [
++        (
++            "hidden-output",
++            "[Hidden assistant output]",
++            Some(codex_protocol::items::ContinuationNoticeKind::HiddenAssistantOutput),
++            true,
++        ),
++        (
++            "skipped-tool",
++            "[Skipped tool execution]",
++            Some(codex_protocol::items::ContinuationNoticeKind::SkippedToolExecution),
++            true,
++        ),
++        (
++            "skipped-tool-2",
++            "[Skipped tool execution]",
++            Some(codex_protocol::items::ContinuationNoticeKind::SkippedToolExecution),
++            true,
++        ),
++        ("continuation-instruction", marker, None, false),
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        chat.handle_server_notification(
++            ServerNotification::ItemCompleted(ItemCompletedNotification {
++                thread_id: thread_id.clone(),
++                turn_id: "turn-1".to_string(),
++                completed_at_ms: index as i64,
++                item: AppServerThreadItem::AgentMessage {
++                    id: id.to_string(),
++                    text: text.to_string(),
++                    phase: Some(MessagePhase::Commentary),
++                    memory_citation: None,
++                    continuation_notice: notice,
++                    continuation_hidden: hidden,
++                    continuation_instruction: id == "continuation-instruction",
++                },
++            }),
++            /*replay_kind*/ None,
++        );
++    }
++    chat.on_agent_reasoning_delta("**Completed reasoning**".to_string());
++    chat.on_agent_reasoning_final(Some("rs_final".to_string()), false, Some(7));
++
++    let rendered = drain_insert_history(&mut rx)
++        .into_iter()
++        .flatten()
++        .flat_map(|line| line.spans)
++        .map(|span| span.content.into_owned())
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert!(rendered.contains("[Hidden assistant output]"));
++    assert!(rendered.contains("[Skipped tool execution]"));
++    assert!(rendered.contains("+1 more"));
++    assert!(
++        rendered
++            .split_whitespace()
++            .collect::<Vec<_>>()
++            .join(" ")
++            .contains(marker),
++        "the visible commentary instruction may wrap but must retain its complete text",
++    );
++}
++
+ #[tokio::test]
+ async fn restored_conversation_ultra_remains_selected_after_switching_to_plan() {
+     let (mut chat, _rx, _ops) = make_chatwidget_manual(Some("gpt-5.4")).await;
+diff --git a/codex-rs/tui/src/chatwidget/tests/plan_mode.rs b/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
+index 61701e25b53392caa631a094180307ce0c521723..dad57430075f2354c10b61cd61aeb3511f58f7a0 100644
+--- a/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
++++ b/codex-rs/tui/src/chatwidget/tests/plan_mode.rs
+@@ -892,6 +892,9 @@ async fn plan_implementation_popup_skips_replayed_turn_complete() {
+                 text: "Plan details".to_string(),
+                 phase: Some(MessagePhase::FinalAnswer),
+                 memory_citation: None,
++                continuation_notice: None,
++                continuation_hidden: false,
++                continuation_instruction: false,
+             }],
+             status: AppServerTurnStatus::Completed,
+             error: None,
+@@ -930,6 +933,9 @@ async fn plan_implementation_popup_shows_once_when_replay_precedes_live_turn_com
+                 text: "Plan details".to_string(),
+                 phase: Some(MessagePhase::FinalAnswer),
+                 memory_citation: None,
++                continuation_notice: None,
++                continuation_hidden: false,
++                continuation_instruction: false,
+             }],
+             status: AppServerTurnStatus::Completed,
+             error: None,
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+index f7d68038cf2f15e215460fadf542084bcf3ea97b..8daf6418294a44848f5b7169ff05756cd3f5151c 100644
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -91,6 +91,7 @@ impl ChatWidget {
+         self.reasoning_buffer.clear();
+         self.pending_reasoning_output_tokens = None;
+         self.pending_reasoning_item_ids.clear();
++        self.pending_reasoning_continuation_notices.clear();
+         self.set_ambient_pet_notification(
+             crate::pets::PetNotificationKind::Running,
+             /*body*/ None,
+@@ -104,7 +105,11 @@ impl ChatWidget {
+         duration_ms: Option<i64>,
+         from_replay: bool,
+     ) {
+-        if !self.reasoning_buffer.is_empty() || !self.reasoning_summary_parts.is_empty() {
++        if !self.reasoning_buffer.is_empty()
++            || !self.reasoning_summary_parts.is_empty()
++            || !self.pending_reasoning_item_ids.is_empty()
++            || !self.pending_reasoning_continuation_notices.is_empty()
++        {
+             self.on_agent_reasoning_final(
+                 /*reasoning_item_id*/ None, /*continued*/ false,
+                 /*reasoning_output_tokens*/ None,
+diff --git a/codex-rs/tui/src/history_cell/messages.rs b/codex-rs/tui/src/history_cell/messages.rs
+index f401cb7955bf62bfdb3d88e1d89a60eeb3a805bc..2b736e9b40f4844c08c1500d24ff8aace76f6329 100644
+--- a/codex-rs/tui/src/history_cell/messages.rs
++++ b/codex-rs/tui/src/history_cell/messages.rs
+@@ -302,6 +302,7 @@ pub(crate) struct ReasoningSummaryCell {
+     transcript_only: bool,
+     reasoning_item_ids: Vec<String>,
+     reasoning_output_tokens: Option<i64>,
++    continuation_notices: Vec<(codex_protocol::items::ContinuationNoticeKind, usize)>,
+ }
+ 
+ impl ReasoningSummaryCell {
+@@ -315,6 +316,7 @@ impl ReasoningSummaryCell {
+             transcript_only,
+             reasoning_item_ids: Vec::new(),
+             reasoning_output_tokens: None,
++            continuation_notices: Vec::new(),
+         }
+     }
+ 
+@@ -355,6 +357,18 @@ impl ReasoningSummaryCell {
+                     Style::default().fg(Color::DarkGray),
+                 ));
+             }
++            for (kind, count) in &self.continuation_notices {
++                first_line.spans.push(Span::styled(
++                    format!(" ▪ {}", kind.placeholder_text()),
++                    Style::default().fg(Color::DarkGray),
++                ));
++                if *count > 1 {
++                    first_line.spans.push(Span::styled(
++                        format!(" +{} more", count.saturating_sub(1)),
++                        Style::default().fg(Color::DarkGray),
++                    ));
++                }
++            }
+         }
+ 
+         adaptive_wrap_lines(
+@@ -693,7 +707,7 @@ pub(crate) fn new_reasoning_summary_block(
+     reasoning_parts: Vec<String>,
+     cwd: &Path,
+ ) -> Box<dyn HistoryCell> {
+-    new_reasoning_summary_block_with_usage(reasoning_parts, cwd, Vec::new(), None)
++    new_reasoning_summary_block_with_usage(reasoning_parts, cwd, Vec::new(), None, Vec::new())
+ }
+ 
+ pub(crate) fn new_reasoning_summary_block_with_usage(
+@@ -701,6 +715,7 @@ pub(crate) fn new_reasoning_summary_block_with_usage(
+     cwd: &Path,
+     reasoning_item_ids: Vec<String>,
+     reasoning_output_tokens: Option<i64>,
++    continuation_notices: Vec<(codex_protocol::items::ContinuationNoticeKind, usize)>,
+ ) -> Box<dyn HistoryCell> {
+     let (header, content) = split_reasoning_summary_parts(&reasoning_parts);
+     let transcript_only = header.is_empty();
+@@ -710,6 +725,7 @@ pub(crate) fn new_reasoning_summary_block_with_usage(
+         .filter_map(display_reasoning_item_id)
+         .collect();
+     cell.reasoning_output_tokens = reasoning_output_tokens;
++    cell.continuation_notices = continuation_notices;
+     Box::new(cell)
+ }
+ 
+diff --git a/codex-rs/tui/src/resume_picker.rs b/codex-rs/tui/src/resume_picker.rs
+index e71aa9d670437389b3f22dfd926eb062c20796e0..82103e91408628ff0b1a170b783cb3851d7e07ba 100644
+--- a/codex-rs/tui/src/resume_picker.rs
++++ b/codex-rs/tui/src/resume_picker.rs
+@@ -6252,6 +6252,9 @@ session_picker_view = "dense"
+                         text: String::from("hello from assistant"),
+                         phase: None,
+                         memory_citation: None,
++                        continuation_notice: None,
++                        continuation_hidden: false,
++                        continuation_instruction: false,
+                     },
+                     ThreadItem::Plan {
+                         id: String::from("plan-1"),

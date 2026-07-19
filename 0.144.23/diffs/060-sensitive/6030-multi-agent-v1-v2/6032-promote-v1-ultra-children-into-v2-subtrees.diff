@@ -1,0 +1,256 @@
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs b/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs
+index 83bd08fff7174422a7d15f85f0aaa23de43610ed..72372c2296b6e50e527b7d860fc52dbfd0427d57 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents/spawn.rs
+@@ -5,8 +5,11 @@ use crate::agent::exceeds_thread_spawn_depth_limit;
+ use crate::agent::next_thread_spawn_depth;
+ use crate::agent::role::DEFAULT_ROLE_NAME;
+ use crate::agent::role::apply_role_to_config;
++use crate::session::session::Session;
+ use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
+ use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v1;
++use codex_features::Feature;
++use codex_protocol::protocol::MultiAgentVersion;
+ use codex_tools::ToolSpec;
+ 
+ #[derive(Default)]
+@@ -109,6 +112,8 @@ async fn handle_spawn_agent(
+     )
+     .await?;
+     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
++    let promoted_task_name =
++        promote_ultra_child_runtime(&session, &mut config, args.task_name.as_deref()).await?;
+ 
+     let result = Box::pin(session.services.agent_control.spawn_agent_with_metadata(
+         config,
+@@ -118,7 +123,7 @@ async fn handle_spawn_agent(
+             &turn.session_source,
+             child_depth,
+             role_name,
+-            /*task_name*/ None,
++            promoted_task_name,
+         )?),
+         SpawnAgentOptions {
+             fork_parent_spawn_call_id: None,
+@@ -213,6 +218,50 @@ async fn handle_spawn_agent(
+     })
+ }
+ 
++async fn promote_ultra_child_runtime(
++    session: &Session,
++    config: &mut crate::config::Config,
++    task_name: Option<&str>,
++) -> Result<Option<String>, FunctionCallError> {
++    let Some(model) = config.model.as_deref() else {
++        return Ok(None);
++    };
++    let model_info = session
++        .services
++        .models_manager
++        .get_model_info(model, &config.to_models_manager_config())
++        .await;
++    let effective_reasoning_effort = config
++        .model_reasoning_effort
++        .as_ref()
++        .or(model_info.default_reasoning_level.as_ref());
++    if model_info.multi_agent_version != Some(MultiAgentVersion::V2)
++        || effective_reasoning_effort != Some(&ReasoningEffort::Ultra)
++    {
++        return Ok(None);
++    }
++
++    let task_name = task_name
++        .map(str::trim)
++        .filter(|task_name| !task_name.is_empty())
++        .ok_or_else(|| {
++            FunctionCallError::RespondToModel(
++                "task_name is required when an Ultra child is promoted to Multi-Agent V2"
++                    .to_string(),
++            )
++        })?;
++    config
++        .features
++        .enable(Feature::MultiAgentV2)
++        .map_err(|error| {
++            FunctionCallError::RespondToModel(format!(
++                "Multi-Agent V2 could not be enabled for the Ultra child: {error}"
++            ))
++        })?;
++
++    Ok(Some(task_name.to_string()))
++}
++
+ impl CoreToolRuntime for Handler {
+     fn matches_kind(&self, payload: &ToolPayload) -> bool {
+         matches!(payload, ToolPayload::Function { .. })
+@@ -223,6 +272,7 @@ impl CoreToolRuntime for Handler {
+ struct SpawnAgentArgs {
+     message: Option<String>,
+     items: Option<Vec<UserInput>>,
++    task_name: Option<String>,
+     agent_type: Option<String>,
+     model: Option<String>,
+     reasoning_effort: Option<ReasoningEffort>,
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_spec.rs b/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
+index 42fae24227a6c709c73256021865bdd65f372580..7ac85463b822de36c5a61a5fb06f54f0229fd6e4 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_spec.rs
+@@ -78,6 +78,13 @@ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
+     if options.hide_agent_type_model_reasoning {
+         hide_spawn_agent_metadata_options(&mut properties);
+     }
++    properties.insert(
++        "task_name".to_string(),
++        JsonSchema::string(Some(
++            "Optional canonical task name. Required when the final child model supports Multi-Agent V2 and the final reasoning effort is Ultra. Use lowercase letters, digits, and underscores."
++                .to_string(),
++        )),
++    );
+ 
+     ToolSpec::Namespace(ResponsesApiNamespace {
+         name: MULTI_AGENT_V1_NAMESPACE.to_string(),
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs b/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs
+index 1b3fb2fecb39cac510e800a7770e2470a7f32759..1d0fbe0ca00fc91a0bdafc52ab8909374f991093 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_spec_tests.rs
+@@ -162,6 +162,19 @@ fn spawn_agent_tool_v1_starts_fresh_and_excludes_fork_fields() {
+ 
+     assert!(!properties.contains_key("fork_context"));
+     assert!(!properties.contains_key("fork_turns"));
++    assert!(properties.contains_key("task_name"));
++    assert!(
++        parameters
++            .required
++            .as_ref()
++            .is_none_or(|required| !required.contains(&"task_name".to_string()))
++    );
++    assert!(
++        properties["task_name"]
++            .description
++            .as_deref()
++            .is_some_and(|description| description.contains("Required when"))
++    );
+     assert_eq!(
+         properties.get("agent_type"),
+         Some(&JsonSchema::string(Some(format!(
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+index 9eb04eb6663ef0f22ce8094fdf18f31e66cfe79b..5295a56e10a8d10f813c92a79f9d1364745a4770 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_tests.rs
+@@ -47,6 +47,7 @@ use codex_protocol::protocol::FileSystemSandboxEntry;
+ use codex_protocol::protocol::FileSystemSandboxPolicy;
+ use codex_protocol::protocol::InitialHistory;
+ use codex_protocol::protocol::InterAgentCommunication;
++use codex_protocol::protocol::MultiAgentVersion;
+ use codex_protocol::protocol::NetworkSandboxPolicy;
+ use codex_protocol::protocol::Op;
+ use codex_protocol::protocol::RolloutItem;
+@@ -967,6 +968,108 @@ async fn spawn_agent_returns_agent_id_without_task_name() {
+     assert_eq!(success, Some(true));
+ }
+ 
++async fn configure_v1_ultra_promotion(
++    session: &mut crate::session::session::Session,
++    turn: &mut TurnContext,
++) {
++    let model = "gpt-5.6-sol";
++    let mut config = turn.config.as_ref().clone();
++    config.model = Some(model.to_string());
++    config.model_reasoning_effort = Some(ReasoningEffort::Ultra);
++    config
++        .features
++        .enable(Feature::Collab)
++        .expect("test config should allow V1");
++    config
++        .features
++        .disable(Feature::MultiAgentV2)
++        .expect("test config should leave the parent on V1");
++    let model_info = session
++        .services
++        .models_manager
++        .get_model_info(model, &config.to_models_manager_config())
++        .await;
++    assert_eq!(model_info.multi_agent_version, Some(MultiAgentVersion::V2));
++
++    turn.config = Arc::new(config);
++    turn.model_info = model_info;
++    turn.reasoning_effort = Some(ReasoningEffort::Ultra);
++    turn.multi_agent_version = MultiAgentVersion::V1;
++    assert_eq!(session.multi_agent_version(), Some(MultiAgentVersion::V1));
++}
++
++#[tokio::test]
++async fn v1_spawn_promotes_ultra_child_to_v2_with_canonical_path() {
++    let (mut session, mut turn) = make_session_and_context().await;
++    configure_v1_ultra_promotion(&mut session, &mut turn).await;
++    let manager = thread_manager();
++    session.services.agent_control = manager.agent_control();
++
++    let output = SpawnAgentHandler::default()
++        .handle(invocation(
++            Arc::new(session),
++            Arc::new(turn),
++            "spawn_agent",
++            function_payload(json!({
++                "message": "inspect this repo",
++                "task_name": "ultra_worker"
++            })),
++        ))
++        .await
++        .expect("V1 should promote an eligible Ultra child");
++    let (content, success) = expect_text_output(output);
++    let result: serde_json::Value =
++        serde_json::from_str(&content).expect("spawn_agent result should be json");
++    let child_id = parse_agent_id(
++        result["agent_id"]
++            .as_str()
++            .expect("V1 result should retain the UUID control surface"),
++    );
++    let child = manager
++        .get_thread(child_id)
++        .await
++        .expect("promoted child should remain registered");
++
++    assert_eq!(success, Some(true));
++    assert_eq!(child.multi_agent_version(), Some(MultiAgentVersion::V2));
++    assert_eq!(
++        child
++            .config_snapshot()
++            .await
++            .session_source
++            .get_agent_path()
++            .map(String::from)
++            .as_deref(),
++        Some("/root/ultra_worker")
++    );
++}
++
++#[tokio::test]
++async fn v1_spawn_rejects_ultra_promotion_without_task_name_before_creation() {
++    let (mut session, mut turn) = make_session_and_context().await;
++    configure_v1_ultra_promotion(&mut session, &mut turn).await;
++    let manager = thread_manager();
++    session.services.agent_control = manager.agent_control();
++
++    let result = SpawnAgentHandler::default()
++        .handle(invocation(
++            Arc::new(session),
++            Arc::new(turn),
++            "spawn_agent",
++            function_payload(json!({"message": "inspect this repo"})),
++        ))
++        .await;
++    let Err(err) = result else {
++        panic!("pathless Ultra promotion should be rejected");
++    };
++    let FunctionCallError::RespondToModel(message) = err else {
++        panic!("promotion error should be model-facing");
++    };
++
++    assert!(message.contains("task_name is required"));
++    assert!(manager.list_thread_ids().await.is_empty());
++}
++
+ #[tokio::test]
+ async fn multi_agent_v2_spawn_requires_task_name() {
+     let (mut session, mut turn) = make_session_and_context().await;

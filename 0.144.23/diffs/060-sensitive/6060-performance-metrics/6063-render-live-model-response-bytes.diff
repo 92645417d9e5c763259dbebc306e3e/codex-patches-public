@@ -1,0 +1,639 @@
+diff --git a/codex-rs/tui/src/app/app_server_event_targets.rs b/codex-rs/tui/src/app/app_server_event_targets.rs
+index 40e337a31d40e1b94888125274808120cb70c7bc..8c3578ea290572f605377d2840fb00e55c9c1e35 100644
+--- a/codex-rs/tui/src/app/app_server_event_targets.rs
++++ b/codex-rs/tui/src/app/app_server_event_targets.rs
+@@ -90,6 +90,9 @@ pub(super) fn server_notification_thread_target(
+         ServerNotification::RawResponseCompleted(notification) => {
+             Some(notification.thread_id.as_str())
+         }
++        ServerNotification::ResponseOutputBytesDelta(notification) => {
++            Some(notification.thread_id.as_str())
++        }
+         ServerNotification::PromptAssistantProgress(notification) => {
+             Some(notification.thread_id.as_str())
+         }
+@@ -213,6 +216,7 @@ mod tests {
+     use codex_app_server_protocol::McpServerStartupState;
+     use codex_app_server_protocol::McpServerStatusUpdatedNotification;
+     use codex_app_server_protocol::PromptAssistantProgressNotification;
++    use codex_app_server_protocol::ResponseOutputBytesDeltaNotification;
+     use codex_app_server_protocol::ServerNotification;
+     use codex_app_server_protocol::ThreadSettings;
+     use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
+@@ -289,6 +293,23 @@ mod tests {
+         assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
+     }
+ 
++    #[test]
++    fn response_output_bytes_notifications_route_to_threads() {
++        let thread_id = ThreadId::new();
++        let notification =
++            ServerNotification::ResponseOutputBytesDelta(ResponseOutputBytesDeltaNotification {
++                thread_id: thread_id.to_string(),
++                turn_id: "turn-1".to_string(),
++                request_id: "request-1".to_string(),
++                byte_count: 10,
++                reset: false,
++            });
++
++        let target = server_notification_thread_target(&notification);
++
++        assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
++    }
++
+     #[test]
+     fn prompt_assistant_progress_routes_to_its_fixed_parent_thread() {
+         let thread_id = ThreadId::new();
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+index 6e65b5b6f91b9abbc39a6f30a21d7169b8e4d0cd..83bbbd143971145987ae3ee82a4522f846ec3fe1 100644
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -236,6 +236,8 @@ pub(crate) struct BottomPane {
+     /// Inline status indicator shown above the composer while a task is running.
+     status: Option<StatusIndicatorWidget>,
+     status_timer_started_at: Option<Instant>,
++    response_output_request_id: Option<String>,
++    response_output_bytes: Option<u64>,
+     /// Unified exec session summary source.
+     ///
+     /// When a status row exists, this summary is mirrored inline in that row;
+@@ -298,6 +300,8 @@ impl BottomPane {
+             is_task_running: false,
+             status: None,
+             status_timer_started_at: None,
++            response_output_request_id: None,
++            response_output_bytes: None,
+             unified_exec_footer: UnifiedExecFooter::new(),
+             pending_input_preview: PendingInputPreview::new(),
+             pending_thread_approvals: PendingThreadApprovals::new(),
+@@ -1047,6 +1051,7 @@ impl BottomPane {
+                     if let Some(started_at) = self.status_timer_started_at {
+                         status.set_timer_started_at(started_at);
+                     }
++                    status.update_response_output_bytes(self.response_output_bytes);
+                     self.status = Some(status);
+                 }
+                 if let Some(status) = self.status.as_mut() {
+@@ -1084,6 +1089,7 @@ impl BottomPane {
+             if let Some(started_at) = self.status_timer_started_at {
+                 status.set_timer_started_at(started_at);
+             }
++            status.update_response_output_bytes(self.response_output_bytes);
+             self.status = Some(status);
+             if let Some(status) = self.status.as_mut() {
+                 status.set_interrupt_binding(primary_binding(&self.keymap.chat.interrupt_turn));
+@@ -1101,6 +1107,40 @@ impl BottomPane {
+         }
+     }
+ 
++    pub(crate) fn clear_response_output_bytes(&mut self) {
++        self.response_output_request_id = None;
++        self.response_output_bytes = None;
++        if let Some(status) = self.status.as_mut() {
++            status.update_response_output_bytes(None);
++        }
++        self.request_redraw();
++    }
++
++    pub(crate) fn update_response_output_bytes(
++        &mut self,
++        request_id: &str,
++        byte_count: u64,
++        reset: bool,
++    ) {
++        if reset {
++            self.response_output_request_id = Some(request_id.to_string());
++            self.response_output_bytes = None;
++        } else if self.response_output_request_id.as_deref() == Some(request_id) {
++            let total = self
++                .response_output_bytes
++                .unwrap_or(0)
++                .saturating_add(byte_count);
++            self.response_output_bytes = (total > 0).then_some(total);
++        } else {
++            return;
++        }
++
++        if let Some(status) = self.status.as_mut() {
++            status.update_response_output_bytes(self.response_output_bytes);
++        }
++        self.request_redraw();
++    }
++
+     pub(crate) fn set_interrupt_hint_visible(&mut self, visible: bool) {
+         if let Some(status) = self.status.as_mut() {
+             status.set_interrupt_hint_visible(visible);
+diff --git a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_and_composer_fill_height_without_bottom_padding.snap b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_and_composer_fill_height_without_bottom_padding.snap
+index f815ae8ac87fd80a60b3ab98081f4dff2adea504..a59cb4bc3bc0f663d8ee342df2e8bfc1c01ec3e4 100644
+--- a/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_and_composer_fill_height_without_bottom_padding.snap
++++ b/codex-rs/tui/src/bottom_pane/snapshots/codex_tui__bottom_pane__tests__status_and_composer_fill_height_without_bottom_padding.snap
+@@ -1,9 +1,8 @@
+ ---
+ source: tui/src/bottom_pane/mod.rs
+-assertion_line: 2469
+ expression: "render_snapshot(&pane, area)"
+ ---
+-⠋ Working (0s ▪ esc to interr…
++⠋  (0s ▪ esc to interrupt)    
+                               
+ ──────────────────────────────
+  Ask Codex to do anything     
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index b8d713f64c0d5a34f5f423f022b7c6300b507404..45da21158052bd1d33283fc8510b1c0639959667 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -58,6 +58,7 @@ impl ChatWidget {
+                 self.on_thread_settings_updated(notification);
+             }
+             ServerNotification::TurnStarted(notification) => {
++                self.bottom_pane.clear_response_output_bytes();
+                 let started_at = notification
+                     .turn
+                     .started_at
+@@ -81,6 +82,7 @@ impl ChatWidget {
+                 }
+             }
+             ServerNotification::TurnCompleted(notification) => {
++                self.bottom_pane.clear_response_output_bytes();
+                 self.handle_turn_completed_notification(notification, replay_kind);
+             }
+             ServerNotification::ItemStarted(notification) => {
+@@ -101,6 +103,13 @@ impl ChatWidget {
+                     self.on_agent_reasoning_delta(notification.delta);
+                 }
+             }
++            ServerNotification::ResponseOutputBytesDelta(notification) => {
++                self.bottom_pane.update_response_output_bytes(
++                    &notification.request_id,
++                    notification.byte_count,
++                    notification.reset,
++                );
++            }
+             ServerNotification::PromptAssistantProgress(notification) => {
+                 self.on_prompt_assistant_progress(
+                     notification.workspace_id,
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index f67baac5c602d34019fd8bb69cae87fac7922ffb..e7f37d7a8ba74be694ab36522a174bd7668f0530 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -5,6 +5,177 @@ use pretty_assertions::assert_eq;
+ const SAFETY_BUFFERING_HEADER_TEXT: &str =
+     "Our systems are thinking a bit more about this request before responding.";
+ 
++#[tokio::test]
++async fn response_output_bytes_follow_the_active_request_lifecycle_without_history() {
++    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.handle_server_notification(
++        ServerNotification::TurnStarted(TurnStartedNotification {
++            thread_id: "thread-1".to_string(),
++            turn: AppServerTurn {
++                id: "turn-1".to_string(),
++                items_view: codex_app_server_protocol::TurnItemsView::Full,
++                items: Vec::new(),
++                status: AppServerTurnStatus::InProgress,
++                error: None,
++                started_at: Some(0),
++                completed_at: None,
++                duration_ms: None,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++    drain_insert_history(&mut rx);
++
++    chat.handle_server_notification(
++        ServerNotification::ResponseOutputBytesDelta(
++            codex_app_server_protocol::ResponseOutputBytesDeltaNotification {
++                thread_id: "thread-1".to_string(),
++                turn_id: "turn-1".to_string(),
++                request_id: "request-1".to_string(),
++                byte_count: 0,
++                reset: true,
++            },
++        ),
++        /*replay_kind*/ None,
++    );
++    for byte_count in [12, 30] {
++        chat.handle_server_notification(
++            ServerNotification::ResponseOutputBytesDelta(
++                codex_app_server_protocol::ResponseOutputBytesDeltaNotification {
++                    thread_id: "thread-1".to_string(),
++                    turn_id: "turn-1".to_string(),
++                    request_id: "request-1".to_string(),
++                    byte_count,
++                    reset: false,
++                },
++            ),
++            /*replay_kind*/ None,
++        );
++    }
++
++    let status = chat
++        .bottom_pane
++        .status_widget()
++        .expect("status indicator should be visible");
++    assert_eq!(status.response_output_bytes(), Some(42));
++    assert!(drain_insert_history(&mut rx).is_empty());
++
++    chat.handle_server_notification(
++        ServerNotification::RawResponseCompleted(
++            codex_app_server_protocol::RawResponseCompletedNotification {
++                thread_id: "thread-1".to_string(),
++                turn_id: "turn-1".to_string(),
++                response_id: "response-1".to_string(),
++                usage: None,
++            },
++        ),
++        /*replay_kind*/ None,
++    );
++    assert_eq!(
++        chat.bottom_pane
++            .status_widget()
++            .expect("status indicator should remain visible")
++            .response_output_bytes(),
++        Some(42),
++        "response completion must retain the final byte count"
++    );
++
++    chat.handle_server_notification(
++        ServerNotification::ResponseOutputBytesDelta(
++            codex_app_server_protocol::ResponseOutputBytesDeltaNotification {
++                thread_id: "thread-1".to_string(),
++                turn_id: "turn-1".to_string(),
++                request_id: "request-2".to_string(),
++                byte_count: 0,
++                reset: true,
++            },
++        ),
++        /*replay_kind*/ None,
++    );
++    let status = chat
++        .bottom_pane
++        .status_widget()
++        .expect("status indicator should be visible");
++    assert_eq!(status.response_output_bytes(), None);
++
++    for (request_id, byte_count) in [("request-1", 100), ("request-2", 7)] {
++        chat.handle_server_notification(
++            ServerNotification::ResponseOutputBytesDelta(
++                codex_app_server_protocol::ResponseOutputBytesDeltaNotification {
++                    thread_id: "thread-1".to_string(),
++                    turn_id: "turn-1".to_string(),
++                    request_id: request_id.to_string(),
++                    byte_count,
++                    reset: false,
++                },
++            ),
++            /*replay_kind*/ None,
++        );
++    }
++    assert_eq!(
++        chat.bottom_pane
++            .status_widget()
++            .expect("status indicator should be visible")
++            .response_output_bytes(),
++        Some(7),
++        "a late delta from the previous request must be ignored"
++    );
++
++    chat.handle_server_notification(
++        ServerNotification::TurnCompleted(TurnCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn: AppServerTurn {
++                id: "turn-1".to_string(),
++                items_view: codex_app_server_protocol::TurnItemsView::Full,
++                items: Vec::new(),
++                status: AppServerTurnStatus::Completed,
++                error: None,
++                started_at: None,
++                completed_at: Some(1),
++                duration_ms: None,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++    chat.handle_server_notification(
++        ServerNotification::TurnStarted(TurnStartedNotification {
++            thread_id: "thread-1".to_string(),
++            turn: AppServerTurn {
++                id: "turn-2".to_string(),
++                items_view: codex_app_server_protocol::TurnItemsView::Full,
++                items: Vec::new(),
++                status: AppServerTurnStatus::InProgress,
++                error: None,
++                started_at: Some(2),
++                completed_at: None,
++                duration_ms: None,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++    chat.handle_server_notification(
++        ServerNotification::ResponseOutputBytesDelta(
++            codex_app_server_protocol::ResponseOutputBytesDeltaNotification {
++                thread_id: "thread-1".to_string(),
++                turn_id: "turn-1".to_string(),
++                request_id: "request-2".to_string(),
++                byte_count: 9,
++                reset: false,
++            },
++        ),
++        /*replay_kind*/ None,
++    );
++    assert_eq!(
++        chat.bottom_pane
++            .status_widget()
++            .expect("next turn should show a fresh status indicator")
++            .response_output_bytes(),
++        None,
++        "turn completion must clear the active request identity"
++    );
++    assert!(drain_insert_history(&mut rx).is_empty());
++}
++
+ fn thread_settings_for_test(
+     model: &str,
+     thread_id: ThreadId,
+diff --git a/codex-rs/tui/src/status_indicator_widget.rs b/codex-rs/tui/src/status_indicator_widget.rs
+index 2b2a9059ce0472d7a4cac5289a4903d92c162bda..b364a29de3b5f153e2eb873b304584f3c85b027b 100644
+--- a/codex-rs/tui/src/status_indicator_widget.rs
++++ b/codex-rs/tui/src/status_indicator_widget.rs
+@@ -17,6 +17,7 @@ use ratatui::text::Span;
+ use ratatui::text::Text;
+ use ratatui::widgets::Paragraph;
+ use ratatui::widgets::WidgetRef;
++use unicode_segmentation::UnicodeSegmentation;
+ use unicode_width::UnicodeWidthStr;
+ 
+ use crate::app_event_sender::AppEventSender;
+@@ -51,6 +52,49 @@ fn animated_header_span(text: &str, elapsed: Duration) -> Span<'static> {
+         .bold()
+ }
+ 
++fn spans_width(spans: &[Span<'_>]) -> usize {
++    spans
++        .iter()
++        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
++        .sum()
++}
++
++/// Truncate only the variable status title, keeping complete grapheme clusters.
++///
++/// The surrounding status suffix contains the timer, interrupt affordance, and
++/// live byte count, so callers reserve its display width before invoking this
++/// helper. A visible truncation uses the deliberately plain `prefix ...` form.
++fn truncate_header_to_width(header: &str, max_width: usize) -> String {
++    if UnicodeWidthStr::width(header) <= max_width {
++        return header.to_string();
++    }
++
++    const ELLIPSIS: &str = " ...";
++    let ellipsis_width = UnicodeWidthStr::width(ELLIPSIS);
++    if max_width <= ellipsis_width {
++        return String::new();
++    }
++
++    let prefix_width = max_width - ellipsis_width;
++    let mut result = String::new();
++    let mut used_width = 0;
++    for grapheme in header.graphemes(/*is_extended*/ true) {
++        let grapheme_width = UnicodeWidthStr::width(grapheme);
++        if used_width + grapheme_width > prefix_width {
++            break;
++        }
++        result.push_str(grapheme);
++        used_width += grapheme_width;
++    }
++
++    if result.is_empty() {
++        String::new()
++    } else {
++        result.push_str(ELLIPSIS);
++        result
++    }
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub(crate) enum StatusDetailsCapitalization {
+     CapitalizeFirst,
+@@ -65,6 +109,7 @@ pub(crate) struct StatusIndicatorWidget {
+     details_max_lines: usize,
+     /// Optional suffix rendered after the elapsed/interrupt segment.
+     inline_message: Option<String>,
++    response_output_bytes: Option<u64>,
+     show_interrupt_hint: bool,
+     interrupt_binding: Option<KeyBinding>,
+ 
+@@ -93,6 +138,18 @@ pub fn fmt_elapsed_compact(elapsed_secs: u64) -> String {
+     format!("{hours}h {minutes:02}m {seconds:02}s")
+ }
+ 
++fn format_ascii_u64_with_thousands_separators(value: u64) -> String {
++    let digits = value.to_string();
++    let mut grouped = String::with_capacity(digits.len() + digits.len().saturating_sub(1) / 3);
++    for (index, digit) in digits.chars().enumerate() {
++        if index > 0 && (digits.len() - index) % 3 == 0 {
++            grouped.push(',');
++        }
++        grouped.push(digit);
++    }
++    grouped
++}
++
+ impl StatusIndicatorWidget {
+     pub(crate) fn new(
+         app_event_tx: AppEventSender,
+@@ -104,6 +161,7 @@ impl StatusIndicatorWidget {
+             details: None,
+             details_max_lines: STATUS_DETAILS_DEFAULT_MAX_LINES,
+             inline_message: None,
++            response_output_bytes: None,
+             show_interrupt_hint: true,
+             interrupt_binding: Some(key_hint::plain(KeyCode::Esc)),
+             elapsed_running: Duration::ZERO,
+@@ -155,6 +213,15 @@ impl StatusIndicatorWidget {
+             .filter(|message| !message.is_empty());
+     }
+ 
++    pub(crate) fn update_response_output_bytes(&mut self, byte_count: Option<u64>) {
++        self.response_output_bytes = byte_count.filter(|byte_count| *byte_count > 0);
++    }
++
++    #[cfg(test)]
++    pub(crate) fn response_output_bytes(&self) -> Option<u64> {
++        self.response_output_bytes
++    }
++
+     #[cfg(test)]
+     pub(crate) fn header(&self) -> &str {
+         &self.header
+@@ -274,28 +341,21 @@ impl Renderable for StatusIndicatorWidget {
+         let pretty_elapsed = fmt_elapsed_compact(elapsed_duration.as_secs());
+         let motion_mode = MotionMode::from_animations_enabled(self.animations_enabled);
+ 
+-        let mut spans = Vec::with_capacity(5);
++        let mut leading_spans = Vec::with_capacity(2);
+         if let Some(indicator) = activity_indicator(
+             Some(self.last_resume_at),
+             motion_mode,
+             ReducedMotionIndicator::Hidden,
+         ) {
+-            spans.push(indicator);
+-            spans.push(" ".into());
+-        }
+-        match motion_mode {
+-            MotionMode::Animated | MotionMode::Reduced if !self.header.is_empty() => {
+-                spans.push(animated_header_span(&self.header, elapsed_duration));
+-            }
+-            _ => {}
+-        }
+-        if !spans.is_empty() {
+-            spans.push(" ".into());
++            leading_spans.push(indicator);
++            leading_spans.push(" ".into());
+         }
++
++        let mut suffix_spans = vec![Span::from(" ")];
+         if self.show_interrupt_hint
+             && let Some(interrupt_binding) = self.interrupt_binding
+         {
+-            spans.extend(vec![
++            suffix_spans.extend(vec![
+                 "(".dim(),
+                 pretty_elapsed.cyan().bold(),
+                 " ▪ ".dim(),
+@@ -303,15 +363,44 @@ impl Renderable for StatusIndicatorWidget {
+                 " to interrupt)".dim(),
+             ]);
+         } else {
+-            spans.extend(vec!["(".dim(), pretty_elapsed.cyan().bold(), ")".dim()]);
++            suffix_spans.extend(vec!["(".dim(), pretty_elapsed.cyan().bold(), ")".dim()]);
+         }
+         if let Some(message) = &self.inline_message {
+             // Keep optional context after elapsed/interrupt text so that core
+             // interrupt affordances stay in a fixed visual location.
+-            spans.push(" ▪ ".dim());
+-            spans.push(message.clone().dim());
++            suffix_spans.push(" ▪ ".dim());
++            suffix_spans.push(message.clone().dim());
++        }
++        if let Some(byte_count) = self.response_output_bytes {
++            suffix_spans.push(" ▪ ".dim());
++            suffix_spans.push(
++                format!(
++                    "Received {} bytes",
++                    format_ascii_u64_with_thousands_separators(byte_count)
++                )
++                .dim(),
++            );
+         }
+ 
++        let mut spans = leading_spans;
++        if matches!(motion_mode, MotionMode::Animated | MotionMode::Reduced)
++            && !self.header.is_empty()
++        {
++            let reserved_width = spans_width(&spans) + spans_width(&suffix_spans);
++            let area_width = usize::from(area.width);
++            let header = if reserved_width < area_width {
++                truncate_header_to_width(&self.header, area_width - reserved_width)
++            } else {
++                // When the fixed status controls alone exceed the terminal,
++                // preserve the established whole-line truncation behavior.
++                self.header.clone()
++            };
++            if !header.is_empty() {
++                spans.push(animated_header_span(&header, elapsed_duration));
++            }
++        }
++        spans.extend(suffix_spans);
++
+         let mut lines = Vec::new();
+         lines.push(truncate_line_with_ellipsis_if_overflow(
+             Line::from(spans),
+@@ -454,6 +543,86 @@ mod tests {
+         assert!(line.starts_with("Working (0s ▪ esc to interrupt)"));
+     }
+ 
++    #[test]
++    fn renders_live_response_output_bytes_after_interrupt_hint() {
++        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
++        let tx = AppEventSender::new(tx_raw);
++        let mut widget = StatusIndicatorWidget::new(
++            tx,
++            crate::tui::FrameRequester::test_dummy(),
++            /*animations_enabled*/ false,
++        );
++        widget.is_paused = true;
++        widget.elapsed_running = Duration::ZERO;
++        widget.update_response_output_bytes(Some(111_111));
++
++        let mut terminal = Terminal::new(TestBackend::new(80, 1)).expect("terminal");
++        terminal
++            .draw(|frame| widget.render(frame.area(), frame.buffer_mut()))
++            .expect("draw");
++        let line = terminal.backend().buffer().content()[..80]
++            .iter()
++            .map(ratatui::buffer::Cell::symbol)
++            .collect::<String>();
++
++        assert!(line.starts_with("Working (0s ▪ esc to interrupt) ▪ Received 111,111 bytes"));
++    }
++
++    #[test]
++    fn truncates_status_headers_by_display_width_at_grapheme_boundaries() {
++        assert_eq!(truncate_header_to_width("abcdefghij", 8), "abcd ...");
++        assert_eq!(truncate_header_to_width("甲乙丙丁戊", 8), "甲乙 ...");
++        assert_eq!(
++            truncate_header_to_width("a\u{301}bcdefgh", 7),
++            "a\u{301}bc ..."
++        );
++        assert_eq!(truncate_header_to_width("甲乙", 4), "甲乙");
++        assert_eq!(truncate_header_to_width("abcdef", 4), "");
++    }
++
++    #[test]
++    fn long_status_header_keeps_timer_interrupt_and_byte_suffix_visible() {
++        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
++        let tx = AppEventSender::new(tx_raw);
++        let mut widget = StatusIndicatorWidget::new(
++            tx,
++            crate::tui::FrameRequester::test_dummy(),
++            /*animations_enabled*/ false,
++        );
++        widget.is_paused = true;
++        widget.elapsed_running = Duration::ZERO;
++        widget.update_header("Reviewing a deliberately long reasoning summary title".to_string());
++        widget.update_response_output_bytes(Some(111_111));
++
++        let width = 58;
++        let mut terminal = Terminal::new(TestBackend::new(width, 1)).expect("terminal");
++        terminal
++            .draw(|frame| widget.render(frame.area(), frame.buffer_mut()))
++            .expect("draw");
++        let line = terminal.backend().buffer().content()[..usize::from(width)]
++            .iter()
++            .map(ratatui::buffer::Cell::symbol)
++            .collect::<String>();
++        let line = line.trim_end();
++
++        assert!(line.contains(" ... (0s ▪ esc to interrupt)"), "{line:?}");
++        assert!(line.ends_with(" ▪ Received 111,111 bytes"), "{line:?}");
++    }
++
++    #[test]
++    fn response_output_bytes_use_exact_ascii_grouping_for_full_u64_range() {
++        assert_eq!(format_ascii_u64_with_thousands_separators(0), "0");
++        assert_eq!(format_ascii_u64_with_thousands_separators(999), "999");
++        assert_eq!(
++            format_ascii_u64_with_thousands_separators(111_111),
++            "111,111"
++        );
++        assert_eq!(
++            format_ascii_u64_with_thousands_separators(u64::MAX),
++            "18,446,744,073,709,551,615"
++        );
++    }
++
+     #[test]
+     fn renders_remapped_interrupt_hint() {
+         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
