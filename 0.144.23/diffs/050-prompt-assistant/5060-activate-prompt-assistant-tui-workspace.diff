@@ -1,5 +1,5 @@
 diff --git a/codex-rs/tui/src/app/app_server_event_targets.rs b/codex-rs/tui/src/app/app_server_event_targets.rs
-index e7b2cf05b7acded79ad383a323fa3db976a0fae2..40e337a31d40e1b94888125274808120cb70c7bc 100644
+index e7b2cf05b7..40e337a31d 100644
 --- a/codex-rs/tui/src/app/app_server_event_targets.rs
 +++ b/codex-rs/tui/src/app/app_server_event_targets.rs
 @@ -90,6 +90,9 @@ pub(super) fn server_notification_thread_target(
@@ -45,10 +45,10 @@ index e7b2cf05b7acded79ad383a323fa3db976a0fae2..40e337a31d40e1b94888125274808120
      fn mcp_startup_notifications_route_to_threads() {
          let thread_id = ThreadId::new();
 diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
-index 6359085429c1c07155b82f0818872436bf066f16..652de091869b0f0c8ac1bddc66a83e4723fee472 100644
+index 6359085429..f845bd459c 100644
 --- a/codex-rs/tui/src/app/event_dispatch.rs
 +++ b/codex-rs/tui/src/app/event_dispatch.rs
-@@ -487,8 +487,89 @@ impl App {
+@@ -487,8 +487,104 @@ impl App {
                      .approve_recent_auto_review_denial(thread_id, id);
              }
              AppEvent::SubmitThreadOp { thread_id, op } => {
@@ -58,23 +58,38 @@ index 6359085429c1c07155b82f0818872436bf066f16..652de091869b0f0c8ac1bddc66a83e47
              }
 +            AppEvent::OpenPromptAssistantModelPicker {
 +                parent_thread_id,
++                workspace_id,
 +                operation,
 +                input,
 +            } => {
 +                self.chat_widget.open_prompt_assistant_model_picker(
 +                    parent_thread_id,
++                    workspace_id,
 +                    operation,
 +                    input,
 +                );
 +            }
 +            AppEvent::StartPromptAssistant {
 +                parent_thread_id,
++                workspace_id,
 +                operation,
 +                input,
 +                model,
 +            } => {
++                self.chat_widget.start_prompt_assistant(
++                    parent_thread_id,
++                    workspace_id,
++                    operation,
++                    input,
++                    model,
++                );
++            }
++            AppEvent::RequestPromptAssistantCancel {
++                parent_thread_id,
++                workspace_id,
++            } => {
 +                self.chat_widget
-+                    .start_prompt_assistant(parent_thread_id, operation, input, model);
++                    .request_prompt_assistant_cancel(parent_thread_id, &workspace_id);
 +            }
 +            AppEvent::RestorePromptAssistant {
 +                parent_thread_id,
@@ -139,10 +154,40 @@ index 6359085429c1c07155b82f0818872436bf066f16..652de091869b0f0c8ac1bddc66a83e47
                  self.enqueue_thread_history_entry_response(thread_id, event)
                      .await?;
 diff --git a/codex-rs/tui/src/app/input.rs b/codex-rs/tui/src/app/input.rs
-index e7aaf4811ec4bce1ffd9c1565d47aed585a1ef27..b552326cc79583aa6469d045f9331edc2762b243 100644
+index e7aaf4811e..68b779eece 100644
 --- a/codex-rs/tui/src/app/input.rs
 +++ b/codex-rs/tui/src/app/input.rs
-@@ -170,6 +170,13 @@ impl App {
+@@ -8,7 +8,10 @@ use crate::app_backtrack::SIDE_EDIT_PREVIOUS_UNAVAILABLE_MESSAGE;
+ 
+ impl App {
+     pub(super) async fn launch_external_editor(&mut self, tui: &mut tui::Tui) {
+-        let seed = self.chat_widget.composer_text_with_pending();
++        let Some(seed) = self.chat_widget.external_editor_text() else {
++            self.reset_external_editor_state(tui);
++            return;
++        };
+         let session_id = self.chat_widget.thread_id().map(|id| id.to_string());
+         let helper_result = tui
+             .with_restored(tui::RestoreMode::KeepRaw, || async {
+@@ -19,7 +22,7 @@ impl App {
+             Ok(Some(new_text)) => {
+                 self.reset_external_editor_state(tui);
+                 self.chat_widget
+-                    .apply_external_edit(new_text.trim_end().to_string());
++                    .apply_external_editor_text(new_text.trim_end().to_string());
+                 tui.frame_requester().schedule_frame();
+                 return;
+             }
+@@ -67,7 +70,7 @@ impl App {
+             Ok(new_text) => {
+                 // Trim trailing whitespace
+                 let cleaned = new_text.trim_end().to_string();
+-                self.chat_widget.apply_external_edit(cleaned);
++                self.chat_widget.apply_external_editor_text(cleaned);
+             }
+             Err(err) => {
+                 self.chat_widget
+@@ -170,6 +173,13 @@ impl App {
  
          let app_keymap_shortcuts_available = self.app_keymap_shortcuts_available();
  
@@ -157,10 +202,10 @@ index e7aaf4811ec4bce1ffd9c1565d47aed585a1ef27..b552326cc79583aa6469d045f9331edc
              self.chat_widget.toggle_vim_mode_and_notify();
              return;
 diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
-index ff6d4e61f84a6869986fb5f658f75b3a0a39898b..f398b1d23d277229ee84c7dba44dece3163c56c3 100644
+index ff6d4e61f8..f58bd17b26 100644
 --- a/codex-rs/tui/src/app/thread_routing.rs
 +++ b/codex-rs/tui/src/app/thread_routing.rs
-@@ -855,6 +855,183 @@ impl App {
+@@ -855,6 +855,150 @@ impl App {
                      .await?;
                  Ok(true)
              }
@@ -244,39 +289,6 @@ index ff6d4e61f84a6869986fb5f658f75b3a0a39898b..f398b1d23d277229ee84c7dba44dece3
 +                });
 +                Ok(true)
 +            }
-+            AppCommand::PromptAssistantReview {
-+                workspace_id,
-+                generation,
-+                candidate_hash,
-+            } => {
-+                let request_handle = app_server.request_handle();
-+                let app_event_tx = self.app_event_tx.clone();
-+                let parent_thread_id = thread_id;
-+                let expected_workspace_id = workspace_id.clone();
-+                let expected_generation = *generation;
-+                let params = codex_app_server_protocol::PromptAssistantReviewParams {
-+                    thread_id: thread_id.to_string(),
-+                    workspace_id: workspace_id.clone(),
-+                    generation: *generation,
-+                    candidate_hash: candidate_hash.clone(),
-+                };
-+                tokio::spawn(async move {
-+                    let result =
-+                        crate::app_server_session::prompt_assistant_review_with_request_handle(
-+                            request_handle,
-+                            params,
-+                        )
-+                        .await
-+                        .map(|response| response.workspace);
-+                    app_event_tx.send(AppEvent::PromptAssistantWorkspaceFinished {
-+                        parent_thread_id,
-+                        expected_workspace_id,
-+                        expected_generation,
-+                        result,
-+                    });
-+                });
-+                Ok(true)
-+            }
 +            AppCommand::PromptAssistantApply {
 +                workspace_id,
 +                generation,
@@ -345,7 +357,7 @@ index ff6d4e61f84a6869986fb5f658f75b3a0a39898b..f398b1d23d277229ee84c7dba44dece3
          }
      }
 diff --git a/codex-rs/tui/src/app_command.rs b/codex-rs/tui/src/app_command.rs
-index 1783c7e6aa0d315592bfcb594b66b0a82d42fe37..bd74e1dd52881d75a7fc29d45ea8a8fcac6dee60 100644
+index 1783c7e6aa..733f6f53d7 100644
 --- a/codex-rs/tui/src/app_command.rs
 +++ b/codex-rs/tui/src/app_command.rs
 @@ -4,6 +4,7 @@ use codex_app_server_protocol::AskForApproval;
@@ -356,7 +368,7 @@ index 1783c7e6aa0d315592bfcb594b66b0a82d42fe37..bd74e1dd52881d75a7fc29d45ea8a8fc
  use codex_app_server_protocol::RequestId as AppServerRequestId;
  use codex_app_server_protocol::ReviewTarget;
  use codex_app_server_protocol::ToolRequestUserInputResponse;
-@@ -100,6 +101,31 @@ pub(crate) enum AppCommand {
+@@ -100,6 +101,26 @@ pub(crate) enum AppCommand {
      ApproveGuardianDeniedAction {
          event: GuardianAssessmentEvent,
      },
@@ -371,11 +383,6 @@ index 1783c7e6aa0d315592bfcb594b66b0a82d42fe37..bd74e1dd52881d75a7fc29d45ea8a8fc
 +        generation: u64,
 +        instructions: String,
 +    },
-+    PromptAssistantReview {
-+        workspace_id: String,
-+        generation: u64,
-+        candidate_hash: String,
-+    },
 +    PromptAssistantApply {
 +        workspace_id: String,
 +        generation: u64,
@@ -388,7 +395,7 @@ index 1783c7e6aa0d315592bfcb594b66b0a82d42fe37..bd74e1dd52881d75a7fc29d45ea8a8fc
  }
  
  impl AppCommand {
-@@ -256,6 +282,63 @@ impl AppCommand {
+@@ -256,6 +277,51 @@ impl AppCommand {
          Self::ApproveGuardianDeniedAction { event }
      }
  
@@ -418,18 +425,6 @@ index 1783c7e6aa0d315592bfcb594b66b0a82d42fe37..bd74e1dd52881d75a7fc29d45ea8a8fc
 +        }
 +    }
 +
-+    pub(crate) fn prompt_assistant_review(
-+        workspace_id: String,
-+        generation: u64,
-+        candidate_hash: String,
-+    ) -> Self {
-+        Self::PromptAssistantReview {
-+            workspace_id,
-+            generation,
-+            candidate_hash,
-+        }
-+    }
-+
 +    pub(crate) fn prompt_assistant_apply(
 +        workspace_id: String,
 +        generation: u64,
@@ -453,7 +448,7 @@ index 1783c7e6aa0d315592bfcb594b66b0a82d42fe37..bd74e1dd52881d75a7fc29d45ea8a8fc
          matches!(self, Self::Review { .. })
      }
 diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
-index 2ac2cf1964ac5349c3495eb5de9fb2298fff857f..be76b4aada39d3da6acc49e98f872f32a0414434 100644
+index 2ac2cf1964..3ca6821ded 100644
 --- a/codex-rs/tui/src/app_event.rs
 +++ b/codex-rs/tui/src/app_event.rs
 @@ -27,6 +27,10 @@ use codex_app_server_protocol::PluginMarketplaceEntry;
@@ -467,13 +462,14 @@ index 2ac2cf1964ac5349c3495eb5de9fb2298fff857f..be76b4aada39d3da6acc49e98f872f32
  use codex_app_server_protocol::SkillsListResponse;
  use codex_app_server_protocol::ThreadGoalStatus;
  use codex_connectors::AppInfo;
-@@ -160,6 +164,59 @@ pub(crate) enum AppEvent {
+@@ -160,6 +164,67 @@ pub(crate) enum AppEvent {
          op: AppCommand,
      },
  
 +    /// Continue Prompt Assistant entry after the operation or intent picker closes.
 +    OpenPromptAssistantModelPicker {
 +        parent_thread_id: ThreadId,
++        workspace_id: String,
 +        operation: PromptAssistantOperation,
 +        input: String,
 +    },
@@ -481,9 +477,16 @@ index 2ac2cf1964ac5349c3495eb5de9fb2298fff857f..be76b4aada39d3da6acc49e98f872f32
 +    /// Create the local workspace view, then start its first server operation.
 +    StartPromptAssistant {
 +        parent_thread_id: ThreadId,
++        workspace_id: String,
 +        operation: PromptAssistantOperation,
 +        input: String,
 +        model: String,
++    },
++
++    /// Cancel the current in-flight generation after its exact identity is known.
++    RequestPromptAssistantCancel {
++        parent_thread_id: ThreadId,
++        workspace_id: String,
 +    },
 +
 +    /// Clear local Prompt Assistant state while leaving the underlying composer untouched.
@@ -528,10 +531,10 @@ index 2ac2cf1964ac5349c3495eb5de9fb2298fff857f..be76b4aada39d3da6acc49e98f872f32
      ThreadHistoryEntryResponse {
          thread_id: ThreadId,
 diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
-index 863d61437ca1bb08865a270c17584047496ac177..434f4d0302d0bb2168a3343fdb7c58263d1802b6 100644
+index 863d61437c..d7f248e3f8 100644
 --- a/codex-rs/tui/src/app_server_session.rs
 +++ b/codex-rs/tui/src/app_server_session.rs
-@@ -43,6 +43,16 @@ use codex_app_server_protocol::Model as ApiModel;
+@@ -43,6 +43,14 @@ use codex_app_server_protocol::Model as ApiModel;
  use codex_app_server_protocol::ModelListParams;
  use codex_app_server_protocol::ModelListResponse;
  use codex_app_server_protocol::NewThreadModelDefaults;
@@ -541,14 +544,12 @@ index 863d61437ca1bb08865a270c17584047496ac177..434f4d0302d0bb2168a3343fdb7c5826
 +use codex_app_server_protocol::PromptAssistantCancelResponse;
 +use codex_app_server_protocol::PromptAssistantRefineParams;
 +use codex_app_server_protocol::PromptAssistantRefineResponse;
-+use codex_app_server_protocol::PromptAssistantReviewParams;
-+use codex_app_server_protocol::PromptAssistantReviewResponse;
 +use codex_app_server_protocol::PromptAssistantStartParams;
 +use codex_app_server_protocol::PromptAssistantStartResponse;
  use codex_app_server_protocol::RequestId;
  use codex_app_server_protocol::ReviewDelivery;
  use codex_app_server_protocol::ReviewStartParams;
-@@ -1305,6 +1315,75 @@ pub(crate) async fn start_thread_with_request_handle(
+@@ -1305,6 +1313,62 @@ pub(crate) async fn start_thread_with_request_handle(
      started_thread_from_start_response(response, &config, thread_params_mode).await
  }
  
@@ -582,19 +583,6 @@ index 863d61437ca1bb08865a270c17584047496ac177..434f4d0302d0bb2168a3343fdb7c5826
 +        .map_err(|error| format!("promptAssistant/refine failed: {error}"))
 +}
 +
-+pub(crate) async fn prompt_assistant_review_with_request_handle(
-+    request_handle: AppServerRequestHandle,
-+    params: PromptAssistantReviewParams,
-+) -> std::result::Result<PromptAssistantReviewResponse, String> {
-+    request_handle
-+        .request_typed(ClientRequest::PromptAssistantReview {
-+            request_id: prompt_assistant_request_id("review"),
-+            params,
-+        })
-+        .await
-+        .map_err(|error| format!("promptAssistant/review failed: {error}"))
-+}
-+
 +pub(crate) async fn prompt_assistant_apply_with_request_handle(
 +    request_handle: AppServerRequestHandle,
 +    params: PromptAssistantApplyParams,
@@ -624,7 +612,7 @@ index 863d61437ca1bb08865a270c17584047496ac177..434f4d0302d0bb2168a3343fdb7c5826
  pub(crate) fn status_account_display_from_auth_mode(
      auth_mode: Option<AuthMode>,
      plan_type: Option<codex_protocol::account::PlanType>,
-@@ -1368,6 +1447,7 @@ fn model_preset_from_api_model(model: ApiModel) -> ModelPreset {
+@@ -1368,6 +1432,7 @@ fn model_preset_from_api_model(model: ApiModel) -> ModelPreset {
          is_default: model.is_default,
          upgrade,
          show_in_picker: !model.hidden,
@@ -633,10 +621,47 @@ index 863d61437ca1bb08865a270c17584047496ac177..434f4d0302d0bb2168a3343fdb7c5826
          availability_nux: model.availability_nux.map(|nux| ModelAvailabilityNux {
              message: nux.message,
 diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
-index 8ea4a10b5fe85ef1d0857dbc58ba9bff5e42b7f4..3f7d04d6bb9a7a16af8cfb1c95440778dfe8d307 100644
+index 8ea4a10b5f..d851343083 100644
 --- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
 +++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
-@@ -1663,6 +1663,16 @@ impl ChatComposer {
+@@ -504,6 +504,7 @@ pub(crate) struct ComposerDraftSnapshot {
+     pub(crate) remote_image_urls: Vec<String>,
+     pub(crate) mention_bindings: Vec<MentionBinding>,
+     pub(crate) pending_pastes: Vec<(String, String)>,
++    pub(crate) cursor: usize,
+ }
+ 
+ const FOOTER_SPACING_HEIGHT: u16 = 0;
+@@ -1598,9 +1599,28 @@ impl ChatComposer {
+             remote_image_urls: self.remote_image_urls(),
+             mention_bindings: self.mention_bindings(),
+             pending_pastes: self.pending_pastes(),
++            cursor: self.current_cursor(),
+         }
+     }
+ 
++    pub(crate) fn restore_draft_snapshot(&mut self, snapshot: ComposerDraftSnapshot) {
++        let local_image_paths = snapshot
++            .local_images
++            .iter()
++            .map(|image| image.path.clone())
++            .collect();
++        self.set_remote_image_urls(snapshot.remote_image_urls);
++        self.set_text_content_with_mention_bindings(
++            snapshot.text,
++            snapshot.text_elements,
++            local_image_paths,
++            snapshot.mention_bindings,
++        );
++        self.set_pending_pastes(snapshot.pending_pastes);
++        self.set_current_cursor(snapshot.cursor);
++        self.sync_popups();
++    }
++
+     #[cfg(test)]
+     pub(crate) fn local_image_paths(&self) -> Vec<PathBuf> {
+         self.attachments.local_image_paths()
+@@ -1663,6 +1683,16 @@ impl ChatComposer {
          self.handle_paste_burst_flush(Instant::now())
      }
  
@@ -653,7 +678,7 @@ index 8ea4a10b5fe85ef1d0857dbc58ba9bff5e42b7f4..3f7d04d6bb9a7a16af8cfb1c95440778
      /// Returns whether the composer is currently in any paste-burst related transient state.
      ///
      /// This includes actively buffering, having a non-empty burst buffer, or holding the first
-@@ -4751,8 +4761,7 @@ mod tests {
+@@ -4751,8 +4781,7 @@ mod tests {
              assert_eq!(
                  composer
                      .handle_submission(
@@ -663,7 +688,7 @@ index 8ea4a10b5fe85ef1d0857dbc58ba9bff5e42b7f4..3f7d04d6bb9a7a16af8cfb1c95440778
                      )
                      .0,
                  InputResult::Command(expected)
-@@ -8342,9 +8351,7 @@ mod tests {
+@@ -8342,9 +8371,7 @@ mod tests {
              now += step;
  
              let (result, _) = composer.handle_submission_with_time(
@@ -674,8 +699,114 @@ index 8ea4a10b5fe85ef1d0857dbc58ba9bff5e42b7f4..3f7d04d6bb9a7a16af8cfb1c95440778
              );
              assert!(
                  matches!(result, InputResult::None),
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+index 266169ce46..e5d3a983b1 100644
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -189,6 +189,7 @@ pub(crate) enum CancellationEvent {
+ use crate::bottom_pane::prompt_args::parse_slash_name;
+ pub(crate) use chat_composer::ChatComposer;
+ pub(crate) use chat_composer::ChatComposerConfig;
++pub(crate) use chat_composer::ComposerDraftSnapshot;
+ pub(crate) use chat_composer::InputResult;
+ pub(crate) use chat_composer::QueuedInputAction;
+ pub(crate) use chat_composer_history::HistoryEntry;
+@@ -886,6 +887,24 @@ impl BottomPane {
+         self.composer.draft_snapshot()
+     }
+ 
++    pub(crate) fn take_composer_draft_snapshot(&mut self) -> chat_composer::ComposerDraftSnapshot {
++        let snapshot = self.composer.draft_snapshot();
++        self.composer.set_remote_image_urls(Vec::new());
++        self.composer
++            .set_text_content(String::new(), Vec::new(), Vec::new());
++        self.composer.set_pending_pastes(Vec::new());
++        self.request_redraw();
++        snapshot
++    }
++
++    pub(crate) fn restore_composer_draft_snapshot(
++        &mut self,
++        snapshot: chat_composer::ComposerDraftSnapshot,
++    ) {
++        self.composer.restore_draft_snapshot(snapshot);
++        self.request_redraw();
++    }
++
+     pub(crate) fn new_plain_text_composer(
+         &self,
+         initial_text: String,
+@@ -1421,6 +1440,12 @@ impl BottomPane {
+         self.view_stack.last().and_then(|view| view.view_id())
+     }
+ 
++    pub(crate) fn contains_view_id(&self, view_id: &str) -> bool {
++        self.view_stack
++            .iter()
++            .any(|view| view.view_id() == Some(view_id))
++    }
++
+     /// Return true when the pane is in the regular composer state without any
+     /// overlays or popups and not running a task. This is the safe context to
+     /// use Esc-Esc for backtracking from the main view.
+@@ -1430,7 +1455,33 @@ impl BottomPane {
+ 
+     /// Return true when no popups or modal views are active, regardless of task state.
+     pub(crate) fn can_launch_external_editor(&self) -> bool {
+-        self.view_stack.is_empty() && !self.composer.popup_active()
++        if let Some(view) = self.view_stack.last() {
++            return view.external_editor_text().is_some();
++        }
++        !self.composer.popup_active()
++    }
++
++    pub(crate) fn external_editor_text(&self) -> Option<String> {
++        if let Some(view) = self.view_stack.last() {
++            return view.external_editor_text();
++        }
++        (!self.composer.popup_active()).then(|| self.composer.current_text_with_pending())
++    }
++
++    pub(crate) fn apply_external_editor_text(&mut self, text: String) -> bool {
++        if let Some(view) = self.view_stack.last_mut() {
++            let changed = view.apply_external_editor_text(text);
++            if changed {
++                self.request_redraw();
++            }
++            return changed;
++        }
++        if self.composer.popup_active() {
++            return false;
++        }
++        self.composer.apply_external_edit(text);
++        self.request_redraw();
++        true
+     }
+ 
+     /// Returns true when the bottom pane has no active modal view and no active composer popup.
+@@ -1439,7 +1490,7 @@ impl BottomPane {
+     /// It intentionally does not include task state, since some actions are safe while a task is
+     /// running and some are not.
+     pub(crate) fn no_modal_or_popup_active(&self) -> bool {
+-        self.can_launch_external_editor()
++        self.view_stack.is_empty() && !self.composer.popup_active()
+     }
+ 
+     pub(crate) fn show_view(&mut self, view: Box<dyn BottomPaneView>) {
+@@ -2348,8 +2399,11 @@ mod tests {
+         );
+         let assistant_handle = assistant.handle();
+         pane.show_view(Box::new(assistant));
++        assert!(!pane.no_modal_or_popup_active());
++        assert!(pane.can_launch_external_editor());
+         pane.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+         assert!(assistant_handle.begin_initial_operation(&context, "generate (hidden)"));
++        assert!(!pane.can_launch_external_editor());
+ 
+         let now = Instant::now();
+         pane.last_composer_activity_at = Some(now);
 diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
-index 9ae96e1dd0d7ae8825f8d7635fb1c1d579befba8..7f5af143132ea0d437661c5a8cf9038de55e70ed 100644
+index 9ae96e1dd0..7f5af14313 100644
 --- a/codex-rs/tui/src/chatwidget.rs
 +++ b/codex-rs/tui/src/chatwidget.rs
 @@ -377,7 +377,9 @@ use self::plugins::PluginInstallAuthFlowState;
@@ -698,7 +829,7 @@ index 9ae96e1dd0d7ae8825f8d7635fb1c1d579befba8..7f5af143132ea0d437661c5a8cf9038d
      running_commands: HashMap<String, RunningCommand>,
      collab_agent_metadata: HashMap<ThreadId, AgentMetadata>,
 diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
-index 78c2dfd4e628a91531526f1e81ee0a9f6481c014..9bdc509fedd7bc448f503dceecc3d087642ed209 100644
+index 78c2dfd4e6..9bdc509fed 100644
 --- a/codex-rs/tui/src/chatwidget/constructor.rs
 +++ b/codex-rs/tui/src/chatwidget/constructor.rs
 @@ -149,6 +149,7 @@ impl ChatWidget {
@@ -709,18 +840,42 @@ index 78c2dfd4e628a91531526f1e81ee0a9f6481c014..9bdc509fedd7bc448f503dceecc3d087
              copy_last_response_binding,
              running_commands: HashMap::new(),
              collab_agent_metadata: HashMap::new(),
+diff --git a/codex-rs/tui/src/chatwidget/interaction.rs b/codex-rs/tui/src/chatwidget/interaction.rs
+index d8581e7af3..a3e8ba3209 100644
+--- a/codex-rs/tui/src/chatwidget/interaction.rs
++++ b/codex-rs/tui/src/chatwidget/interaction.rs
+@@ -233,6 +233,19 @@ impl ChatWidget {
+         self.bottom_pane.composer_text_with_pending()
+     }
+ 
++    pub(crate) fn external_editor_text(&self) -> Option<String> {
++        self.bottom_pane.external_editor_text()
++    }
++
++    pub(crate) fn apply_external_editor_text(&mut self, text: String) -> bool {
++        let changed = self.bottom_pane.apply_external_editor_text(text);
++        if changed {
++            self.refresh_plan_mode_nudge();
++            self.request_redraw();
++        }
++        changed
++    }
++
+     pub(crate) fn apply_external_edit(&mut self, text: String) {
+         self.bottom_pane.apply_external_edit(text);
+         self.refresh_plan_mode_nudge();
 diff --git a/codex-rs/tui/src/chatwidget/prompt_assistant.rs b/codex-rs/tui/src/chatwidget/prompt_assistant.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc6afb59a1
+index 0000000000..3f2f8b2288
 --- /dev/null
 +++ b/codex-rs/tui/src/chatwidget/prompt_assistant.rs
-@@ -0,0 +1,1141 @@
+@@ -0,0 +1,1411 @@
 +//! Prompt Assistant activation and app-server result routing.
 +
 +use codex_app_server_protocol::PromptAssistantApplyResponse;
 +use codex_app_server_protocol::PromptAssistantCancelResponse;
 +use codex_app_server_protocol::PromptAssistantOperation;
-+use codex_app_server_protocol::PromptAssistantReviewDisposition;
++use codex_app_server_protocol::PromptAssistantReviewStatus;
 +use codex_app_server_protocol::PromptAssistantWorkspace;
 +use codex_protocol::ThreadId;
 +use codex_protocol::openai_models::ModelPreset;
@@ -730,10 +885,11 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +use super::ChatWidget;
 +use crate::app_command::AppCommand;
 +use crate::app_event::AppEvent;
++use crate::bottom_pane::ComposerDraftSnapshot;
 +use crate::bottom_pane::SelectionItem;
 +use crate::bottom_pane::SelectionViewParams;
-+use crate::bottom_pane::custom_prompt_view::CustomPromptView;
 +use crate::bottom_pane::popup_consts::standard_popup_hint_line;
++use crate::bottom_pane::prompt_assistant_view::PROMPT_ASSISTANT_VIEW_ID;
 +use crate::bottom_pane::prompt_assistant_view::PromptAssistantActionContext;
 +use crate::bottom_pane::prompt_assistant_view::PromptAssistantCandidate;
 +use crate::bottom_pane::prompt_assistant_view::PromptAssistantView;
@@ -746,8 +902,12 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +    parent_thread_id: ThreadId,
 +    context: PromptAssistantActionContext,
 +    handle: PromptAssistantViewHandle,
++    operation: PromptAssistantOperation,
++    original_draft: ComposerDraftSnapshot,
 +    response_bytes: u64,
 +    progress_generation: Option<u64>,
++    cancel_requested: bool,
++    cancel_dispatched_generation: Option<u64>,
 +}
 +
 +impl PromptAssistantUiState {
@@ -766,11 +926,13 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +    ) -> bool {
 +        if self.context.workspace_id != workspace_id
 +            || generation <= self.context.operation_generation
-+            || self
-+                .progress_generation
-+                .is_some_and(|active_generation| active_generation != generation)
 +        {
 +            return false;
++        }
++        match self.progress_generation {
++            Some(active_generation) if active_generation != generation => return false,
++            None if !reset || byte_count != 0 => return false,
++            _ => {}
 +        }
 +
 +        let response_bytes = if reset {
@@ -778,21 +940,44 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +        } else {
 +            self.response_bytes.saturating_add(byte_count)
 +        };
-+        if !self
-+            .handle
-+            .set_response_bytes(&self.context, response_bytes)
++        let cancelling = self.handle.is_cancelling();
++        if !cancelling
++            && !self
++                .handle
++                .set_response_bytes(&self.context, response_bytes)
 +        {
 +            return false;
 +        }
 +
 +        self.progress_generation = Some(generation);
-+        self.response_bytes = response_bytes;
++        if !cancelling {
++            self.response_bytes = response_bytes;
++        }
 +        true
 +    }
 +
 +    fn reset_progress(&mut self) {
 +        self.response_bytes = 0;
 +        self.progress_generation = None;
++        self.cancel_requested = false;
++        self.cancel_dispatched_generation = None;
++    }
++
++    fn request_cancel(&mut self) -> Option<AppCommand> {
++        self.cancel_requested = true;
++        self.cancel_command_if_ready()
++    }
++
++    fn cancel_command_if_ready(&mut self) -> Option<AppCommand> {
++        let generation = self.progress_generation?;
++        if !self.cancel_requested || self.cancel_dispatched_generation == Some(generation) {
++            return None;
++        }
++        self.cancel_dispatched_generation = Some(generation);
++        Some(AppCommand::prompt_assistant_cancel(
++            self.context.workspace_id.clone(),
++            generation,
++        ))
 +    }
 +}
 +
@@ -808,11 +993,6 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +                workspace_id,
 +                generation,
 +                ..
-+            }
-+            | AppCommand::PromptAssistantReview {
-+                workspace_id,
-+                generation,
-+                ..
 +            } => (workspace_id, *generation),
 +            _ => return,
 +        };
@@ -824,7 +1004,7 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +        }
 +    }
 +
-+    /// Open Prompt Assistant without consuming or replacing the underlying draft.
++    /// Move the current draft into an independent Prompt Assistant workspace.
 +    pub(crate) fn open_prompt_assistant(&mut self) {
 +        self.bottom_pane
 +            .flush_composer_paste_burst_before_snapshot();
@@ -851,150 +1031,35 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +            return;
 +        }
 +
-+        if draft.trim().is_empty() {
-+            let app_event_tx = self.app_event_tx.clone();
-+            let view = CustomPromptView::new(
-+                "Generate a prompt".to_string(),
-+                "Describe the intended task and press Enter".to_string(),
-+                String::new(),
-+                Some("Prompt Assistant".to_string()),
-+                Box::new(move |intent| {
-+                    app_event_tx.send(AppEvent::OpenPromptAssistantModelPicker {
-+                        parent_thread_id,
-+                        operation: PromptAssistantOperation::Generate,
-+                        input: intent,
-+                    });
-+                }),
-+            );
-+            self.bottom_pane.show_view(Box::new(view));
-+            self.request_redraw();
-+            return;
-+        }
-+
-+        let translate_input = draft.clone();
-+        let generate_input = draft;
-+        self.bottom_pane.show_selection_view(SelectionViewParams {
-+            title: Some("Prompt Assistant".to_string()),
-+            subtitle: Some("Choose how to transform the current draft".to_string()),
-+            footer_hint: Some(standard_popup_hint_line()),
-+            items: vec![
-+                SelectionItem {
-+                    name: "Translate".to_string(),
-+                    description: Some(
-+                        "Translate the draft while preserving its meaning and constraints"
-+                            .to_string(),
-+                    ),
-+                    actions: vec![Box::new(move |tx| {
-+                        tx.send(AppEvent::OpenPromptAssistantModelPicker {
-+                            parent_thread_id,
-+                            operation: PromptAssistantOperation::Translate,
-+                            input: translate_input.clone(),
-+                        });
-+                    })],
-+                    dismiss_on_select: true,
-+                    ..Default::default()
-+                },
-+                SelectionItem {
-+                    name: "Generate".to_string(),
-+                    description: Some(
-+                        "Turn the draft into a complete, execution-ready prompt".to_string(),
-+                    ),
-+                    actions: vec![Box::new(move |tx| {
-+                        tx.send(AppEvent::OpenPromptAssistantModelPicker {
-+                            parent_thread_id,
-+                            operation: PromptAssistantOperation::Generate,
-+                            input: generate_input.clone(),
-+                        });
-+                    })],
-+                    dismiss_on_select: true,
-+                    ..Default::default()
-+                },
-+            ],
-+            ..Default::default()
-+        });
-+        self.request_redraw();
-+    }
-+
-+    pub(crate) fn open_prompt_assistant_model_picker(
-+        &mut self,
-+        parent_thread_id: ThreadId,
-+        operation: PromptAssistantOperation,
-+        input: String,
-+    ) {
-+        if self.thread_id != Some(parent_thread_id) || self.prompt_assistant.is_some() {
-+            return;
-+        }
-+
-+        let models =
-+            prompt_assistant_models(self.model_catalog.try_list_models().unwrap_or_default());
-+        let items = if models.is_empty() {
-+            vec![SelectionItem {
-+                name: "No hidden functional models available".to_string(),
-+                description: Some(HIDDEN_MODEL_REQUIREMENT.to_string()),
-+                is_disabled: true,
-+                disabled_reason: Some("No eligible model is present in the catalog".to_string()),
-+                ..Default::default()
-+            }]
++        let operation = if draft.trim().is_empty() {
++            PromptAssistantOperation::Generate
 +        } else {
-+            models
-+                .into_iter()
-+                .map(|preset| {
-+                    let model = preset.model.clone();
-+                    let request_input = input.clone();
-+                    SelectionItem {
-+                        name: preset.display_name,
-+                        description: Some(format!("{} — {}", preset.model, preset.description)),
-+                        search_value: Some(format!("{} {}", preset.model, preset.description)),
-+                        actions: vec![Box::new(move |tx| {
-+                            tx.send(AppEvent::StartPromptAssistant {
-+                                parent_thread_id,
-+                                operation,
-+                                input: request_input.clone(),
-+                                model: model.clone(),
-+                            });
-+                        })],
-+                        dismiss_on_select: true,
-+                        ..Default::default()
-+                    }
-+                })
-+                .collect()
++            PromptAssistantOperation::Translate
 +        };
-+
-+        self.bottom_pane.show_selection_view(SelectionViewParams {
-+            title: Some("Prompt Assistant model".to_string()),
-+            subtitle: Some("Choose a hidden functional model".to_string()),
-+            footer_hint: Some(standard_popup_hint_line()),
-+            items,
-+            is_searchable: true,
-+            search_placeholder: Some("Search hidden models".to_string()),
-+            ..Default::default()
-+        });
-+        self.request_redraw();
-+    }
-+
-+    pub(crate) fn start_prompt_assistant(
-+        &mut self,
-+        parent_thread_id: ThreadId,
-+        operation: PromptAssistantOperation,
-+        input: String,
-+        model: String,
-+    ) {
-+        if self.thread_id != Some(parent_thread_id) || self.prompt_assistant.is_some() {
-+            return;
-+        }
-+
 +        let workspace_id = Uuid::new_v4().to_string();
 +        let context = PromptAssistantActionContext {
 +            workspace_id: workspace_id.clone(),
 +            operation_generation: 0,
 +        };
++        let original_draft = self.bottom_pane.take_composer_draft_snapshot();
++        let composer = self
++            .bottom_pane
++            .new_plain_text_composer(draft, "Write or refine the prompt".to_string());
 +        let app_event_tx = self.app_event_tx.clone();
 +        let callback_workspace_id = workspace_id.clone();
 +        let view = PromptAssistantView::new(
-+            self.composer_text_with_pending(),
++            composer,
 +            context.clone(),
-+            format!("{} ({model})", operation_label(operation)),
++            operation_label(operation),
 +            move |action| match action {
++                PromptAssistantViewAction::ChooseModel { context, input } => {
++                    app_event_tx.send(AppEvent::OpenPromptAssistantModelPicker {
++                        parent_thread_id,
++                        workspace_id: context.workspace_id,
++                        operation,
++                        input,
++                    });
++                }
 +                PromptAssistantViewAction::Apply {
 +                    context,
 +                    candidate_hash,
@@ -1029,29 +1094,13 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +                        ),
 +                    });
 +                }
-+                PromptAssistantViewAction::Review {
-+                    context,
-+                    candidate_hash,
-+                } => {
-+                    app_event_tx.send(AppEvent::SubmitThreadOp {
-+                        thread_id: parent_thread_id,
-+                        op: AppCommand::prompt_assistant_review(
-+                            context.workspace_id,
-+                            context.operation_generation,
-+                            candidate_hash,
-+                        ),
-+                    });
-+                }
 +                PromptAssistantViewAction::Cancel { context } => {
-+                    app_event_tx.send(AppEvent::SubmitThreadOp {
-+                        thread_id: parent_thread_id,
-+                        op: AppCommand::prompt_assistant_cancel(
-+                            context.workspace_id,
-+                            context.operation_generation,
-+                        ),
++                    app_event_tx.send(AppEvent::RequestPromptAssistantCancel {
++                        parent_thread_id,
++                        workspace_id: context.workspace_id,
 +                    });
 +                }
-+                PromptAssistantViewAction::Restore { original_draft: _ } => {
++                PromptAssistantViewAction::Restore => {
 +                    app_event_tx.send(AppEvent::RestorePromptAssistant {
 +                        parent_thread_id,
 +                        workspace_id: callback_workspace_id.clone(),
@@ -1064,10 +1113,114 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +            parent_thread_id,
 +            context,
 +            handle,
++            operation,
++            original_draft,
 +            response_bytes: 0,
 +            progress_generation: None,
++            cancel_requested: false,
++            cancel_dispatched_generation: None,
 +        });
 +        self.bottom_pane.show_view(Box::new(view));
++        self.request_redraw();
++    }
++
++    pub(crate) fn open_prompt_assistant_model_picker(
++        &mut self,
++        parent_thread_id: ThreadId,
++        workspace_id: String,
++        operation: PromptAssistantOperation,
++        input: String,
++    ) {
++        if self.thread_id != Some(parent_thread_id)
++            || !self.bottom_pane.contains_view_id(PROMPT_ASSISTANT_VIEW_ID)
++            || !self.prompt_assistant.as_ref().is_some_and(|state| {
++                state.parent_thread_id == parent_thread_id
++                    && state.context.workspace_id == workspace_id
++                    && state.context.operation_generation == 0
++                    && state.operation == operation
++            })
++        {
++            return;
++        }
++
++        let models =
++            prompt_assistant_models(self.model_catalog.try_list_models().unwrap_or_default());
++        let items = if models.is_empty() {
++            vec![SelectionItem {
++                name: "No hidden functional models available".to_string(),
++                description: Some(HIDDEN_MODEL_REQUIREMENT.to_string()),
++                is_disabled: true,
++                disabled_reason: Some("No eligible model is present in the catalog".to_string()),
++                ..Default::default()
++            }]
++        } else {
++            models
++                .into_iter()
++                .map(|preset| {
++                    let model = preset.model.clone();
++                    let request_input = input.clone();
++                    let request_workspace_id = workspace_id.clone();
++                    SelectionItem {
++                        name: preset.display_name,
++                        description: Some(format!("{} — {}", preset.model, preset.description)),
++                        search_value: Some(format!("{} {}", preset.model, preset.description)),
++                        actions: vec![Box::new(move |tx| {
++                            tx.send(AppEvent::StartPromptAssistant {
++                                parent_thread_id,
++                                workspace_id: request_workspace_id.clone(),
++                                operation,
++                                input: request_input.clone(),
++                                model: model.clone(),
++                            });
++                        })],
++                        dismiss_on_select: true,
++                        ..Default::default()
++                    }
++                })
++                .collect()
++        };
++
++        self.bottom_pane.show_selection_view(SelectionViewParams {
++            title: Some("Prompt Assistant model".to_string()),
++            subtitle: Some("Choose a hidden functional model".to_string()),
++            footer_hint: Some(standard_popup_hint_line()),
++            items,
++            is_searchable: true,
++            search_placeholder: Some("Search hidden models".to_string()),
++            ..Default::default()
++        });
++        self.request_redraw();
++    }
++
++    pub(crate) fn start_prompt_assistant(
++        &mut self,
++        parent_thread_id: ThreadId,
++        workspace_id: String,
++        operation: PromptAssistantOperation,
++        input: String,
++        model: String,
++    ) {
++        if self.thread_id != Some(parent_thread_id) {
++            return;
++        }
++        if !self.bottom_pane.contains_view_id(PROMPT_ASSISTANT_VIEW_ID) {
++            return;
++        }
++        let Some(state) = self.prompt_assistant.as_mut() else {
++            return;
++        };
++        if state.parent_thread_id != parent_thread_id
++            || state.context.workspace_id != workspace_id
++            || state.context.operation_generation != 0
++            || state.operation != operation
++            || !state.handle.begin_initial_operation(
++                &state.context,
++                format!("{} ({model})", operation_label(operation)),
++            )
++        {
++            return;
++        }
++        state.reset_progress();
 +        self.app_event_tx.send(AppEvent::SubmitThreadOp {
 +            thread_id: parent_thread_id,
 +            op: AppCommand::prompt_assistant_start(workspace_id, operation, input, model),
@@ -1096,6 +1249,21 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +            return;
 +        }
 +        let expected_context = state.context.clone();
++        if state.handle.is_cancelling() {
++            if state.cancel_dispatched_generation.is_some() {
++                return;
++            }
++            if state.handle.finish_cancelled(&expected_context) {
++                let state = self
++                    .prompt_assistant
++                    .take()
++                    .expect("matched Prompt Assistant state must exist");
++                self.bottom_pane
++                    .restore_composer_draft_snapshot(state.original_draft);
++                self.request_redraw();
++            }
++            return;
++        }
 +        let workspace = match result {
 +            Ok(workspace) => workspace,
 +            Err(error) => {
@@ -1182,7 +1350,12 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +
 +        if state.handle.finish_applied(&expected_context) {
 +            let candidate = response.candidate;
-+            self.prompt_assistant = None;
++            let state = self
++                .prompt_assistant
++                .take()
++                .expect("matched Prompt Assistant state must exist");
++            self.bottom_pane
++                .restore_composer_draft_snapshot(state.original_draft);
 +            self.apply_external_edit(candidate);
 +        }
 +        self.request_redraw();
@@ -1201,11 +1374,10 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +        let Some(state) = self.prompt_assistant.as_mut() else {
 +            return;
 +        };
-+        if !state.matches(
-+            parent_thread_id,
-+            &expected_workspace_id,
-+            expected_generation,
-+        ) {
++        if state.parent_thread_id != parent_thread_id
++            || state.context.workspace_id != expected_workspace_id
++            || state.cancel_dispatched_generation != Some(expected_generation)
++        {
 +            return;
 +        }
 +        let response = match result {
@@ -1223,7 +1395,12 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +            && response.generation == expected_generation
 +            && state.handle.finish_cancelled(&state.context)
 +        {
-+            self.prompt_assistant = None;
++            let state = self
++                .prompt_assistant
++                .take()
++                .expect("matched Prompt Assistant state must exist");
++            self.bottom_pane
++                .restore_composer_draft_snapshot(state.original_draft);
 +            self.request_redraw();
 +        }
 +    }
@@ -1236,7 +1413,12 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +        if self.prompt_assistant.as_ref().is_some_and(|state| {
 +            state.parent_thread_id == parent_thread_id && state.context.workspace_id == workspace_id
 +        }) {
-+            self.prompt_assistant = None;
++            let state = self
++                .prompt_assistant
++                .take()
++                .expect("matched Prompt Assistant state must exist");
++            self.bottom_pane
++                .restore_composer_draft_snapshot(state.original_draft);
 +        }
 +    }
 +
@@ -1283,10 +1465,56 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +        byte_count: u64,
 +        reset: bool,
 +    ) {
-+        let Some(state) = self.prompt_assistant.as_mut() else {
-+            return;
++        let cancel = {
++            let Some(state) = self.prompt_assistant.as_mut() else {
++                return;
++            };
++            if !state.accept_progress(&workspace_id, generation, byte_count, reset) {
++                return;
++            }
++            state.cancel_command_if_ready()
 +        };
-+        if state.accept_progress(&workspace_id, generation, byte_count, reset) {
++        if let Some(op) = cancel {
++            let parent_thread_id = self
++                .prompt_assistant
++                .as_ref()
++                .expect("accepted Prompt Assistant progress requires active state")
++                .parent_thread_id;
++            self.app_event_tx.send(AppEvent::SubmitThreadOp {
++                thread_id: parent_thread_id,
++                op,
++            });
++        }
++        self.request_redraw();
++    }
++
++    pub(crate) fn request_prompt_assistant_cancel(
++        &mut self,
++        parent_thread_id: ThreadId,
++        workspace_id: &str,
++    ) {
++        if self.thread_id != Some(parent_thread_id) {
++            return;
++        }
++        let op = {
++            let Some(state) = self.prompt_assistant.as_mut() else {
++                return;
++            };
++            if state.parent_thread_id != parent_thread_id
++                || state.context.workspace_id != workspace_id
++                || !state.handle.is_cancelling()
++            {
++                return;
++            }
++            state.request_cancel()
++        };
++        if let Some(op) = op {
++            self.app_event_tx.send(AppEvent::SubmitThreadOp {
++                thread_id: parent_thread_id,
++                op,
++            });
++        }
++        if self.prompt_assistant.is_some() {
 +            self.request_redraw();
 +        }
 +    }
@@ -1313,25 +1541,16 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +}
 +
 +fn candidate_from_workspace(workspace: &PromptAssistantWorkspace) -> PromptAssistantCandidate {
-+    let (apply_allowed, review_summary) = match workspace.review.as_ref() {
-+        Some(review) => {
-+            let disposition = match review.disposition {
-+                PromptAssistantReviewDisposition::Pass => "Pass",
-+                PromptAssistantReviewDisposition::Revised => "Revised",
-+                PromptAssistantReviewDisposition::Blocked => "Blocked",
-+            };
-+            (
-+                review.disposition != PromptAssistantReviewDisposition::Blocked,
-+                Some(format!("{disposition}: {}", review.rationale)),
-+            )
-+        }
-+        None => (true, None),
-+    };
++    let apply_allowed = workspace.review.as_ref().is_some_and(|review| {
++        review.status != PromptAssistantReviewStatus::Blocked
++            && !workspace.candidate.trim().is_empty()
++            && workspace.candidate.is_ascii()
++    });
 +    PromptAssistantCandidate {
 +        text: workspace.candidate.clone(),
 +        hash: workspace.candidate_hash.clone(),
 +        apply_allowed,
-+        review_summary,
++        review: workspace.review.clone(),
 +    }
 +}
 +
@@ -1359,8 +1578,64 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +            candidate: "preview candidate".to_string(),
 +            candidate_hash: "sha256:preview".to_string(),
 +            usage: None,
-+            review: None,
++            review: Some(codex_app_server_protocol::PromptAssistantReview {
++                intent_summary: "Preserve the requested task.".to_string(),
++                risk_level: codex_app_server_protocol::GuardianRiskLevel::Low,
++                user_authorization: codex_app_server_protocol::GuardianUserAuthorization::High,
++                status: PromptAssistantReviewStatus::Pass,
++                rationale: "Intent preserved.".to_string(),
++            }),
 +        }
++    }
++
++    fn start_for_test(
++        chat: &mut ChatWidget,
++        parent_thread_id: ThreadId,
++        operation: PromptAssistantOperation,
++        input: &str,
++        model: &str,
++        events: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
++    ) -> String {
++        match operation {
++            PromptAssistantOperation::Generate => {
++                chat.open_prompt_assistant_for_source(String::new());
++                chat.handle_paste(input.to_string());
++            }
++            PromptAssistantOperation::Translate => {
++                chat.open_prompt_assistant_for_source(input.to_string());
++            }
++            PromptAssistantOperation::Refine | PromptAssistantOperation::Review => {
++                panic!("test helper only starts a new workspace")
++            }
++        }
++        let workspace_id = chat
++            .prompt_assistant
++            .as_ref()
++            .expect("Prompt Assistant state")
++            .context
++            .workspace_id
++            .clone();
++        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        assert!(matches!(
++            events.try_recv(),
++            Ok(AppEvent::OpenPromptAssistantModelPicker {
++                parent_thread_id: event_parent,
++                workspace_id: event_workspace,
++                operation: event_operation,
++                input: event_input,
++            }) if event_parent == parent_thread_id
++                && event_workspace == workspace_id
++                && event_operation == operation
++                && event_input == input
++        ));
++        chat.start_prompt_assistant(
++            parent_thread_id,
++            workspace_id.clone(),
++            operation,
++            input.to_string(),
++            model.to_string(),
++        );
++        workspace_id
 +    }
 +
 +    #[test]
@@ -1411,11 +1686,13 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +        chat.thread_id = Some(parent_thread_id);
 +        chat.apply_external_edit("complete original draft".to_string());
 +
-+        chat.start_prompt_assistant(
++        let workspace_id = start_for_test(
++            &mut chat,
 +            parent_thread_id,
 +            PromptAssistantOperation::Translate,
-+            "complete original draft".to_string(),
-+            "hidden-functional-model".to_string(),
++            "complete original draft",
++            "hidden-functional-model",
++            &mut events,
 +        );
 +
 +        let AppEvent::SubmitThreadOp { thread_id, op } = events.try_recv().expect("start event")
@@ -1432,7 +1709,15 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +            } if model == "hidden-functional-model"
 +        ));
 +        assert!(matches!(ops.try_recv(), Err(TryRecvError::Empty)));
-+        assert_eq!(chat.composer_text_with_pending(), "complete original draft");
++        assert_eq!(chat.composer_text_with_pending(), "");
++        assert_eq!(
++            chat.prompt_assistant
++                .as_ref()
++                .expect("workspace")
++                .context
++                .workspace_id,
++            workspace_id
++        );
 +    }
 +
 +    #[tokio::test]
@@ -1445,13 +1730,14 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 +
 +        assert_eq!(chat.composer_text_with_pending(), "");
-+        assert!(render_bottom_popup(&chat, 80).contains("Generate a prompt"));
++        assert!(render_bottom_popup(&chat, 80).contains("Prompt Assistant"));
++        assert!(render_bottom_popup(&chat, 80).contains("Editing"));
 +        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
 +        assert!(matches!(ops.try_recv(), Err(TryRecvError::Empty)));
 +    }
 +
 +    #[tokio::test]
-+    async fn shortcut_entry_preserves_the_current_draft_as_transform_source() {
++    async fn shortcut_moves_the_current_draft_into_the_independent_workspace() {
 +        let (mut chat, _app_event_tx, mut events, mut ops) =
 +            make_chatwidget_manual_with_sender().await;
 +        let parent_thread_id = ThreadId::new();
@@ -1459,20 +1745,82 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +        chat.apply_external_edit("current draft".to_string());
 +
 +        chat.open_prompt_assistant();
-+        assert!(render_bottom_popup(&chat, 80).contains("Choose how to transform"));
-+        assert_eq!(chat.composer_text_with_pending(), "current draft");
++        assert!(render_bottom_popup(&chat, 80).contains("current draft"));
++        assert_eq!(chat.composer_text_with_pending(), "");
 +        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 +
 +        assert!(matches!(
 +            events.try_recv(),
 +            Ok(AppEvent::OpenPromptAssistantModelPicker {
 +                parent_thread_id: event_parent,
++                workspace_id: _,
 +                operation: PromptAssistantOperation::Translate,
 +                input,
 +            }) if event_parent == parent_thread_id && input == "current draft"
 +        ));
 +        assert!(matches!(ops.try_recv(), Err(TryRecvError::Empty)));
++        assert_eq!(chat.composer_text_with_pending(), "");
++    }
++
++    #[tokio::test]
++    async fn cancelled_entry_rejects_a_queued_model_picker_and_restores_the_draft() {
++        let (mut chat, _app_event_tx, mut events, mut ops) =
++            make_chatwidget_manual_with_sender().await;
++        let parent_thread_id = ThreadId::new();
++        chat.thread_id = Some(parent_thread_id);
++        chat.apply_external_edit("current draft".to_string());
++        chat.open_prompt_assistant();
++        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        let AppEvent::OpenPromptAssistantModelPicker {
++            parent_thread_id: event_parent,
++            workspace_id,
++            operation,
++            input,
++        } = events.try_recv().expect("queued model picker")
++        else {
++            panic!("expected queued model picker");
++        };
++
++        chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
++        let AppEvent::RestorePromptAssistant {
++            parent_thread_id: restore_parent,
++            workspace_id: restore_workspace,
++        } = events.try_recv().expect("restore event")
++        else {
++            panic!("expected restore event");
++        };
++        chat.open_prompt_assistant_model_picker(event_parent, workspace_id, operation, input);
++        assert!(!chat.bottom_pane.contains_view_id(PROMPT_ASSISTANT_VIEW_ID));
++        chat.restore_prompt_assistant(restore_parent, &restore_workspace);
 +        assert_eq!(chat.composer_text_with_pending(), "current draft");
++        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
++        assert!(matches!(ops.try_recv(), Err(TryRecvError::Empty)));
++    }
++
++    #[tokio::test]
++    async fn shared_external_editor_route_targets_only_the_prompt_assistant_composer() {
++        let (mut chat, _app_event_tx, mut events, mut ops) =
++            make_chatwidget_manual_with_sender().await;
++        chat.thread_id = Some(ThreadId::new());
++        chat.apply_external_edit("main draft".to_string());
++        chat.open_prompt_assistant();
++
++        assert_eq!(chat.external_editor_text().as_deref(), Some("main draft"));
++        assert!(chat.apply_external_editor_text("edited by helper".to_string()));
++        assert_eq!(chat.composer_text_with_pending(), "");
++        assert!(render_bottom_popup(&chat, 80).contains("edited by helper"));
++
++        chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
++        let AppEvent::RestorePromptAssistant {
++            parent_thread_id,
++            workspace_id,
++        } = events.try_recv().expect("restore event")
++        else {
++            panic!("expected restore event");
++        };
++        chat.restore_prompt_assistant(parent_thread_id, &workspace_id);
++        assert_eq!(chat.composer_text_with_pending(), "main draft");
++        assert!(matches!(ops.try_recv(), Err(TryRecvError::Empty)));
 +    }
 +
 +    #[tokio::test]
@@ -1486,7 +1834,7 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 +
 +        assert_eq!(chat.composer_text_with_pending(), "");
-+        assert!(render_bottom_popup(&chat, 80).contains("Choose how to transform"));
++        assert!(render_bottom_popup(&chat, 80).contains("improve this deployment prompt"));
 +        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
 +        assert!(matches!(ops.try_recv(), Err(TryRecvError::Empty)));
 +
@@ -1495,6 +1843,7 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +            events.try_recv(),
 +            Ok(AppEvent::OpenPromptAssistantModelPicker {
 +                parent_thread_id: event_parent,
++                workspace_id: _,
 +                operation: PromptAssistantOperation::Translate,
 +                input,
 +            }) if event_parent == parent_thread_id
@@ -1520,10 +1869,11 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +
 +        assert!(!chat.bottom_pane.is_in_paste_burst());
 +        let frozen = chat
-+            .capture_thread_input_state()
-+            .expect("thread input state")
-+            .composer
-+            .expect("composer state");
++            .prompt_assistant
++            .as_ref()
++            .expect("Prompt Assistant state")
++            .original_draft
++            .clone();
 +        assert!(frozen.text.ends_with("rc"));
 +        assert_eq!(frozen.pending_pastes.len(), 1);
 +        assert_eq!(frozen.pending_pastes[0].1, large_paste);
@@ -1531,11 +1881,15 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +        assert_eq!(frozen.local_images[0].path, image_path);
 +
 +        chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-+        let restored = chat
-+            .capture_thread_input_state()
-+            .expect("restored thread input state")
-+            .composer
-+            .expect("restored composer state");
++        let AppEvent::RestorePromptAssistant {
++            parent_thread_id,
++            workspace_id,
++        } = events.try_recv().expect("restore event")
++        else {
++            panic!("expected restore event")
++        };
++        chat.restore_prompt_assistant(parent_thread_id, &workspace_id);
++        let restored = chat.bottom_pane.composer_draft_snapshot();
 +        assert_eq!(restored, frozen);
 +        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
 +        assert!(matches!(ops.try_recv(), Err(TryRecvError::Empty)));
@@ -1548,19 +1902,15 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +        let parent_thread_id = ThreadId::new();
 +        chat.thread_id = Some(parent_thread_id);
 +        chat.apply_external_edit("complete original draft".to_string());
-+        chat.start_prompt_assistant(
++        let workspace_id = start_for_test(
++            &mut chat,
 +            parent_thread_id,
 +            PromptAssistantOperation::Generate,
-+            "intent".to_string(),
-+            "hidden-functional-model".to_string(),
++            "intent",
++            "hidden-functional-model",
++            &mut events,
 +        );
-+        let AppEvent::SubmitThreadOp {
-+            op: AppCommand::PromptAssistantStart { workspace_id, .. },
-+            ..
-+        } = events.try_recv().expect("start event")
-+        else {
-+            panic!("expected prompt assistant start");
-+        };
++        let _ = events.try_recv().expect("start event");
 +        chat.handle_prompt_assistant_workspace_finished(
 +            parent_thread_id,
 +            workspace_id.clone(),
@@ -1581,7 +1931,7 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +        chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 +        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
 +        assert!(chat.prompt_assistant.is_some());
-+        assert_eq!(chat.composer_text_with_pending(), "complete original draft");
++        assert_eq!(chat.composer_text_with_pending(), "");
 +
 +        chat.handle_prompt_assistant_apply_finished(
 +            parent_thread_id,
@@ -1612,19 +1962,19 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +        let parent_thread_id = ThreadId::new();
 +        chat.thread_id = Some(parent_thread_id);
 +        chat.apply_external_edit("complete original draft".to_string());
-+        chat.start_prompt_assistant(
++        for _ in 0..6 {
++            chat.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
++        }
++        let original_draft = chat.bottom_pane.composer_draft_snapshot();
++        let workspace_id = start_for_test(
++            &mut chat,
 +            parent_thread_id,
 +            PromptAssistantOperation::Generate,
-+            "intent".to_string(),
-+            "hidden-functional-model".to_string(),
++            "intent",
++            "hidden-functional-model",
++            &mut events,
 +        );
-+        let AppEvent::SubmitThreadOp {
-+            op: AppCommand::PromptAssistantStart { workspace_id, .. },
-+            ..
-+        } = events.try_recv().expect("start event")
-+        else {
-+            panic!("expected prompt assistant start");
-+        };
++        let _ = events.try_recv().expect("start event");
 +        chat.handle_prompt_assistant_workspace_finished(
 +            parent_thread_id,
 +            workspace_id.clone(),
@@ -1632,7 +1982,7 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +            Ok(workspace(parent_thread_id, &workspace_id)),
 +        );
 +
-+        chat.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
++        chat.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT));
 +        let AppEvent::CopyPromptAssistantCandidate {
 +            parent_thread_id: copy_parent,
 +            workspace_id: copy_workspace_id,
@@ -1659,7 +2009,7 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +            panic!("expected local prompt assistant restore");
 +        };
 +        chat.restore_prompt_assistant(restore_parent, &restore_workspace_id);
-+        assert_eq!(chat.composer_text_with_pending(), "complete original draft");
++        assert_eq!(chat.bottom_pane.composer_draft_snapshot(), original_draft);
 +        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
 +        assert!(matches!(ops.try_recv(), Err(TryRecvError::Empty)));
 +    }
@@ -1670,21 +2020,18 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +            make_chatwidget_manual_with_sender().await;
 +        let parent_thread_id = ThreadId::new();
 +        chat.thread_id = Some(parent_thread_id);
-+        chat.start_prompt_assistant(
++        let workspace_id = start_for_test(
++            &mut chat,
 +            parent_thread_id,
 +            PromptAssistantOperation::Generate,
-+            "intent".to_string(),
-+            "hidden-functional-model".to_string(),
++            "intent",
++            "hidden-functional-model",
++            &mut events,
 +        );
-+        let AppEvent::SubmitThreadOp {
-+            op: AppCommand::PromptAssistantStart { workspace_id, .. },
-+            ..
-+        } = events.try_recv().expect("start event")
-+        else {
-+            panic!("expected prompt assistant start");
-+        };
++        let _ = events.try_recv().expect("start event");
 +
-+        chat.on_prompt_assistant_progress(workspace_id.clone(), 1, 99, true);
++        chat.on_prompt_assistant_progress(workspace_id.clone(), 99, 500, false);
++        chat.on_prompt_assistant_progress(workspace_id.clone(), 1, 0, true);
 +        chat.on_prompt_assistant_progress(workspace_id.clone(), 1, 37, false);
 +        assert_eq!(
 +            chat.prompt_assistant
@@ -1705,10 +2052,18 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +        );
 +
 +        chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
++        let AppEvent::RequestPromptAssistantCancel {
++            parent_thread_id: cancel_parent,
++            workspace_id: cancel_workspace,
++        } = events.try_recv().expect("cancel request")
++        else {
++            panic!("expected prompt assistant cancel request");
++        };
++        chat.request_prompt_assistant_cancel(cancel_parent, &cancel_workspace);
 +        assert!(matches!(
 +            events.try_recv(),
 +            Ok(AppEvent::SubmitThreadOp {
-+                op: AppCommand::PromptAssistantCancel { .. },
++                op: AppCommand::PromptAssistantCancel { generation: 1, .. },
 +                ..
 +            })
 +        ));
@@ -1729,21 +2084,27 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +        let parent_thread_id = ThreadId::new();
 +        chat.thread_id = Some(parent_thread_id);
 +        chat.apply_external_edit("complete original draft".to_string());
-+        chat.start_prompt_assistant(
++        let workspace_id = start_for_test(
++            &mut chat,
 +            parent_thread_id,
 +            PromptAssistantOperation::Generate,
-+            "intent".to_string(),
-+            "hidden-functional-model".to_string(),
++            "intent",
++            "hidden-functional-model",
++            &mut events,
 +        );
-+        let AppEvent::SubmitThreadOp {
-+            op: AppCommand::PromptAssistantStart { workspace_id, .. },
-+            ..
-+        } = events.try_recv().expect("start event")
-+        else {
-+            panic!("expected prompt assistant start");
-+        };
++        let _ = events.try_recv().expect("start event");
 +
 +        chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
++        let AppEvent::RequestPromptAssistantCancel {
++            parent_thread_id: cancel_parent,
++            workspace_id: cancel_workspace,
++        } = events.try_recv().expect("cancel request")
++        else {
++            panic!("expected prompt assistant cancel request");
++        };
++        chat.request_prompt_assistant_cancel(cancel_parent, &cancel_workspace);
++        assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
++        chat.on_prompt_assistant_progress(workspace_id.clone(), 1, 0, true);
 +        let AppEvent::SubmitThreadOp {
 +            op: AppCommand::PromptAssistantCancel { generation, .. },
 +            ..
@@ -1774,25 +2135,89 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +    }
 +
 +    #[tokio::test]
++    async fn cancel_restores_the_draft_for_both_original_result_and_ack_orderings() {
++        for original_result_first in [true, false] {
++            let (mut chat, _app_event_tx, mut events, _ops) =
++                make_chatwidget_manual_with_sender().await;
++            let parent_thread_id = ThreadId::new();
++            chat.thread_id = Some(parent_thread_id);
++            chat.apply_external_edit("complete original draft".to_string());
++            let workspace_id = start_for_test(
++                &mut chat,
++                parent_thread_id,
++                PromptAssistantOperation::Generate,
++                "intent",
++                "hidden-functional-model",
++                &mut events,
++            );
++            let _ = events.try_recv().expect("start event");
++            chat.on_prompt_assistant_progress(workspace_id.clone(), 1, 0, true);
++            chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
++            let AppEvent::RequestPromptAssistantCancel {
++                parent_thread_id: cancel_parent,
++                workspace_id: cancel_workspace,
++            } = events.try_recv().expect("cancel request")
++            else {
++                panic!("expected prompt assistant cancel request");
++            };
++            chat.request_prompt_assistant_cancel(cancel_parent, &cancel_workspace);
++            let AppEvent::SubmitThreadOp {
++                op: AppCommand::PromptAssistantCancel { generation, .. },
++                ..
++            } = events.try_recv().expect("cancel operation")
++            else {
++                panic!("expected prompt assistant cancel operation");
++            };
++            assert_eq!(generation, 1);
++
++            if original_result_first {
++                chat.handle_prompt_assistant_workspace_finished(
++                    parent_thread_id,
++                    workspace_id.clone(),
++                    0,
++                    Err("operation cancelled".to_string()),
++                );
++                assert!(chat.prompt_assistant.is_some());
++            }
++            chat.handle_prompt_assistant_cancel_finished(
++                parent_thread_id,
++                workspace_id.clone(),
++                generation,
++                Ok(PromptAssistantCancelResponse {
++                    workspace_id: workspace_id.clone(),
++                    generation,
++                    cancelled: true,
++                }),
++            );
++            if !original_result_first {
++                chat.handle_prompt_assistant_workspace_finished(
++                    parent_thread_id,
++                    workspace_id,
++                    0,
++                    Err("operation cancelled".to_string()),
++                );
++            }
++            assert!(chat.prompt_assistant.is_none());
++            assert_eq!(chat.composer_text_with_pending(), "complete original draft");
++        }
++    }
++
++    #[tokio::test]
 +    async fn failed_after_bytes_clears_progress_before_retrying_the_next_generation() {
 +        let (mut chat, _app_event_tx, mut events, _ops) =
 +            make_chatwidget_manual_with_sender().await;
 +        let parent_thread_id = ThreadId::new();
 +        chat.thread_id = Some(parent_thread_id);
 +        chat.apply_external_edit("original".to_string());
-+        chat.start_prompt_assistant(
++        let workspace_id = start_for_test(
++            &mut chat,
 +            parent_thread_id,
 +            PromptAssistantOperation::Generate,
-+            "intent".to_string(),
-+            "hidden-functional-model".to_string(),
++            "intent",
++            "hidden-functional-model",
++            &mut events,
 +        );
-+        let AppEvent::SubmitThreadOp {
-+            op: AppCommand::PromptAssistantStart { workspace_id, .. },
-+            ..
-+        } = events.try_recv().expect("start event")
-+        else {
-+            panic!("expected prompt assistant start");
-+        };
++        let _ = events.try_recv().expect("start event");
 +        chat.handle_prompt_assistant_workspace_finished(
 +            parent_thread_id,
 +            workspace_id.clone(),
@@ -1800,7 +2225,6 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +            Ok(workspace(parent_thread_id, &workspace_id)),
 +        );
 +
-+        chat.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
 +        chat.handle_paste("first retry".to_string());
 +        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 +        let AppEvent::SubmitThreadOp {
@@ -1810,6 +2234,7 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +            panic!("expected first refine op");
 +        };
 +        chat.prepare_prompt_assistant_operation(parent_thread_id, &first_retry);
++        chat.on_prompt_assistant_progress(workspace_id.clone(), 2, 0, true);
 +        chat.on_prompt_assistant_progress(workspace_id.clone(), 2, 64, false);
 +        chat.handle_prompt_assistant_workspace_finished(
 +            parent_thread_id,
@@ -1821,7 +2246,6 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +        assert_eq!(state.response_bytes, 0);
 +        assert_eq!(state.progress_generation, None);
 +
-+        chat.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
 +        chat.handle_paste("second retry".to_string());
 +        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 +        let AppEvent::SubmitThreadOp {
@@ -1831,6 +2255,7 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +            panic!("expected second refine op");
 +        };
 +        chat.prepare_prompt_assistant_operation(parent_thread_id, &second_retry);
++        chat.on_prompt_assistant_progress(workspace_id.clone(), 3, 0, true);
 +        chat.on_prompt_assistant_progress(workspace_id.clone(), 3, 81, false);
 +        assert_eq!(
 +            chat.prompt_assistant
@@ -1857,7 +2282,7 @@ index 0000000000000000000000000000000000000000..5374367f5e9f4eaceffc2bdfdfb684dc
 +    }
 +}
 diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
-index 0a42c2914a14a696137874e172bf68898249eaac..254e51be71c8d2aff2f70877170956352ae1b6ec 100644
+index 0a42c2914a..254e51be71 100644
 --- a/codex-rs/tui/src/chatwidget/protocol.rs
 +++ b/codex-rs/tui/src/chatwidget/protocol.rs
 @@ -101,6 +101,14 @@ impl ChatWidget {
@@ -1876,7 +2301,7 @@ index 0a42c2914a14a696137874e172bf68898249eaac..254e51be71c8d2aff2f7087717095635
              ServerNotification::TerminalInteraction(notification) => {
                  self.on_terminal_interaction(notification.process_id, notification.stdin)
 diff --git a/codex-rs/tui/src/chatwidget/slash_dispatch.rs b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
-index f9ead0caa52a65572636e37d15dfe2c1e09f8902..f23258b1b8cd97c74efab246e8f07fc56fccd754 100644
+index f9ead0caa5..f23258b1b8 100644
 --- a/codex-rs/tui/src/chatwidget/slash_dispatch.rs
 +++ b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
 @@ -282,6 +282,9 @@ impl ChatWidget {
@@ -1908,7 +2333,7 @@ index f9ead0caa52a65572636e37d15dfe2c1e09f8902..f23258b1b8cd97c74efab246e8f07fc5
              | SlashCommand::Plan
              | SlashCommand::Goal
 diff --git a/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs b/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
-index 0555a022204bf1451d97d7dff924322dd3055af6..1b218e4f8e2fe90a2a9d265074b1b82b8057b6ee 100644
+index 0555a02220..1b218e4f8e 100644
 --- a/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
 +++ b/codex-rs/tui/src/chatwidget/tests/popups_and_settings.rs
 @@ -12,6 +12,7 @@ use codex_app_server_protocol::PluginShareDiscoverability;
@@ -1936,7 +2361,7 @@ index 0555a022204bf1451d97d7dff924322dd3055af6..1b218e4f8e2fe90a2a9d265074b1b82b
          availability_nux: None,
          supported_in_api: true,
 diff --git a/codex-rs/tui/src/keymap.rs b/codex-rs/tui/src/keymap.rs
-index e1159f98e19a49034e089a02047e2ea41f2c5117..aad919a2b77a53a8af8c38024e64b1abfd30ee7c 100644
+index e1159f98e1..aad919a2b7 100644
 --- a/codex-rs/tui/src/keymap.rs
 +++ b/codex-rs/tui/src/keymap.rs
 @@ -107,6 +107,8 @@ pub(crate) struct ComposerKeymap {
@@ -2030,7 +2455,7 @@ index e1159f98e19a49034e089a02047e2ea41f2c5117..aad919a2b77a53a8af8c38024e64b1ab
      fn rejects_shadowing_editor_binding_in_main_scope() {
          let mut keymap = TuiKeymap::default();
 diff --git a/codex-rs/tui/src/keymap_setup/actions.rs b/codex-rs/tui/src/keymap_setup/actions.rs
-index 84618ea35ec46f621c208fe82dd18fb205c0e976..d92c17f91d09db2ff54a97e83779eab3355319a3 100644
+index 84618ea35e..d92c17f91d 100644
 --- a/codex-rs/tui/src/keymap_setup/actions.rs
 +++ b/codex-rs/tui/src/keymap_setup/actions.rs
 @@ -102,6 +102,7 @@ pub(super) const KEYMAP_ACTIONS: &[KeymapActionDescriptor] = &[
@@ -2058,7 +2483,7 @@ index 84618ea35ec46f621c208fe82dd18fb205c0e976..d92c17f91d09db2ff54a97e83779eab3
          ("composer", "history_search_next") => Some(runtime_keymap.composer.history_search_next.as_slice()),
          ("editor", "insert_newline") => Some(runtime_keymap.editor.insert_newline.as_slice()),
 diff --git a/codex-rs/tui/src/slash_command.rs b/codex-rs/tui/src/slash_command.rs
-index 50291065c0d7d437df90e963c05f4476ae4ea7e8..980fe5e757e47c8f76fb44dff42a0385db422842 100644
+index 50291065c0..980fe5e757 100644
 --- a/codex-rs/tui/src/slash_command.rs
 +++ b/codex-rs/tui/src/slash_command.rs
 @@ -13,6 +13,7 @@ pub enum SlashCommand {
@@ -2104,7 +2529,7 @@ index 50291065c0d7d437df90e963c05f4476ae4ea7e8..980fe5e757e47c8f76fb44dff42a0385
  
      #[test]
 diff --git a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_custom.snap b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_custom.snap
-index 18ed9e17da8ffc3820fbb86eb84cdd0aed87db98..a7aede10b4392bbc040a334611cff8686337fd31 100644
+index 18ed9e17da..a7aede10b4 100644
 --- a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_custom.snap
 +++ b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_custom.snap
 @@ -5,7 +5,7 @@ expression: "render_picker(params, 120)"
@@ -2117,7 +2542,7 @@ index 18ed9e17da8ffc3820fbb86eb84cdd0aed87db98..a7aede10b4392bbc040a334611cff868
    [All]  Common  Customized (1)  Unbound (2)  App  Composer  Editor  Vim  Navigation  Approval  Debug
  
 diff --git a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_fast_mode_enabled.snap b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_fast_mode_enabled.snap
-index d40c1b05dea448697f03aea3cbdafc68495d385d..af6366e411091bc1047c6fc06b3ac46c9367f545 100644
+index d40c1b05de..af6366e411 100644
 --- a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_fast_mode_enabled.snap
 +++ b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_fast_mode_enabled.snap
 @@ -5,7 +5,7 @@ expression: "render_picker(params, 120)"
@@ -2130,7 +2555,7 @@ index d40c1b05dea448697f03aea3cbdafc68495d385d..af6366e411091bc1047c6fc06b3ac46c
    [All]  Common  Customized (0)  Unbound (3)  App  Composer  Editor  Vim  Navigation  Approval  Debug
  
 diff --git a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_first_actions.snap b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_first_actions.snap
-index f08a5ad721ee9c5ef589a797fc84b17bb8a0cd93..2e498f9e05a1d71535c51518c5608a8d1c123ae0 100644
+index f08a5ad721..2e498f9e05 100644
 --- a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_first_actions.snap
 +++ b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_first_actions.snap
 @@ -2,12 +2,12 @@
@@ -2149,7 +2574,7 @@ index f08a5ad721ee9c5ef589a797fc84b17bb8a0cd93..2e498f9e05a1d71535c51518c5608a8d
  tab: Vim (48 selectable)
  tab: Navigation (20 selectable)
 diff --git a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_narrow.snap b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_narrow.snap
-index 3d02b83f837e8bfa1656f8c8511f208a79247fa5..335878405cbe0037258220157ec3c2e53ddac78a 100644
+index 3d02b83f83..335878405c 100644
 --- a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_narrow.snap
 +++ b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_narrow.snap
 @@ -5,7 +5,7 @@ expression: "render_picker(params, 78)"
@@ -2162,7 +2587,7 @@ index 3d02b83f837e8bfa1656f8c8511f208a79247fa5..335878405cbe0037258220157ec3c2e5
    [All]  Common  Customized (0)  Unbound (2)  App  Composer  Editor  Vim
    Navigation  Approval  Debug
 diff --git a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_wide.snap b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_wide.snap
-index 7fba0c41fab5c48c45d09395d436c5a6155d1a9d..070ec812dbc39f829a8c436d459346ad0ace0096 100644
+index 7fba0c41fa..070ec812db 100644
 --- a/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_wide.snap
 +++ b/codex-rs/tui/src/snapshots/codex_tui__keymap_setup__tests__keymap_picker_wide.snap
 @@ -5,7 +5,7 @@ expression: "render_picker(params, 120)"

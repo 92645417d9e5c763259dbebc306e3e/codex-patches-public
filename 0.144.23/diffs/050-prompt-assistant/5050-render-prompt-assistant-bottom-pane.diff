@@ -1,5 +1,5 @@
 diff --git a/codex-rs/tui/src/bottom_pane/bottom_pane_view.rs b/codex-rs/tui/src/bottom_pane/bottom_pane_view.rs
-index 551bacd25acb6b514ccc179a9602297b59a6376c..863223f01a0f0389aa83f4f093aa74ef0a95b82c 100644
+index 551bacd25a..4b6d63686e 100644
 --- a/codex-rs/tui/src/bottom_pane/bottom_pane_view.rs
 +++ b/codex-rs/tui/src/bottom_pane/bottom_pane_view.rs
 @@ -39,11 +39,27 @@ pub(crate) trait BottomPaneView: Renderable {
@@ -30,8 +30,30 @@ index 551bacd25acb6b514ccc179a9602297b59a6376c..863223f01a0f0389aa83f4f093aa74ef
      /// Actual item index for list-based views that want to preserve selection
      /// across external refreshes.
      fn selected_index(&self) -> Option<usize> {
+@@ -78,6 +94,21 @@ pub(crate) trait BottomPaneView: Renderable {
+         false
+     }
+ 
++    /// Return the editable text owned by this view for the shared external-editor route.
++    fn external_editor_text(&self) -> Option<String> {
++        None
++    }
++
++    /// Apply text returned by the shared external-editor route to this view.
++    fn apply_external_editor_text(&mut self, _text: String) -> bool {
++        false
++    }
++
++    /// Return true while this view owns an interactive text composer.
++    fn has_editable_composer(&self) -> bool {
++        false
++    }
++
+     /// Flush any pending paste-burst state. Return true if state changed.
+     ///
+     /// This lets a modal that reuses `ChatComposer` participate in the same
 diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
-index 88d50dab5ff8e4611c5724b4a6bf8e9d5a6ab8f1..6e65b5b6f91b9abbc39a6f30a21d7169b8e4d0cd 100644
+index 88d50dab5f..266169ce46 100644
 --- a/codex-rs/tui/src/bottom_pane/mod.rs
 +++ b/codex-rs/tui/src/bottom_pane/mod.rs
 @@ -107,6 +107,7 @@ mod list_selection_view;
@@ -58,9 +80,18 @@ index 88d50dab5ff8e4611c5724b4a6bf8e9d5a6ab8f1..6e65b5b6f91b9abbc39a6f30a21d7169
              return;
          }
          if let Some(delay) = self.approval_prompt_delay_remaining(now) {
-@@ -597,10 +605,15 @@ impl BottomPane {
+@@ -596,11 +604,24 @@ impl BottomPane {
+             if key_event.kind == KeyEventKind::Release {
                  return InputResult::None;
              }
++            if matches!(key_event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
++                && self
++                    .view_stack
++                    .last()
++                    .is_some_and(|view| view.has_editable_composer())
++            {
++                self.record_composer_activity_at(Instant::now());
++            }
  
 -            // We need three pieces of information after routing the key:
 -            // whether Esc completed the view, whether the view finished for any
@@ -78,7 +109,7 @@ index 88d50dab5ff8e4611c5724b4a6bf8e9d5a6ab8f1..6e65b5b6f91b9abbc39a6f30a21d7169
                  let last_index = self.view_stack.len() - 1;
                  let view = &mut self.view_stack[last_index];
                  let prefer_esc =
-@@ -610,14 +623,21 @@ impl BottomPane {
+@@ -610,14 +631,21 @@ impl BottomPane {
                      && matches!(view.on_ctrl_c(), CancellationEvent::Handled)
                      && view.is_complete();
                  if ctrl_c_completed {
@@ -102,7 +133,7 @@ index 88d50dab5ff8e4611c5724b4a6bf8e9d5a6ab8f1..6e65b5b6f91b9abbc39a6f30a21d7169
                      )
                  }
              };
-@@ -634,6 +654,9 @@ impl BottomPane {
+@@ -634,6 +662,9 @@ impl BottomPane {
              } else if view_in_paste_burst {
                  self.request_redraw_in(ChatComposer::recommended_paste_flush_delay());
              }
@@ -112,7 +143,34 @@ index 88d50dab5ff8e4611c5724b4a6bf8e9d5a6ab8f1..6e65b5b6f91b9abbc39a6f30a21d7169
              self.request_redraw();
              InputResult::None
          } else {
-@@ -1639,6 +1662,15 @@ impl BottomPane {
+@@ -855,6 +886,26 @@ impl BottomPane {
+         self.composer.draft_snapshot()
+     }
+ 
++    pub(crate) fn new_plain_text_composer(
++        &self,
++        initial_text: String,
++        placeholder_text: String,
++    ) -> ChatComposer {
++        let mut composer = ChatComposer::new_with_config(
++            self.has_input_focus,
++            self.app_event_tx.clone(),
++            self.enhanced_keys_supported,
++            placeholder_text,
++            self.disable_paste_burst,
++            ChatComposerConfig::plain_text(),
++        );
++        composer.set_frame_requester(self.frame_requester.clone());
++        composer.set_keymap_bindings(&self.keymap);
++        composer.set_footer_hint_override(Some(Vec::new()));
++        composer.apply_external_edit(initial_text);
++        composer
++    }
++
+     #[cfg(test)]
+     pub(crate) fn composer_text_elements(&self) -> Vec<TextElement> {
+         self.composer.text_elements()
+@@ -1639,6 +1690,15 @@ impl BottomPane {
          self.composer.flush_paste_burst_if_due()
      }
  
@@ -128,7 +186,7 @@ index 88d50dab5ff8e4611c5724b4a6bf8e9d5a6ab8f1..6e65b5b6f91b9abbc39a6f30a21d7169
      pub(crate) fn is_in_paste_burst(&self) -> bool {
          // A view can hold paste-burst state independently of the primary
          // composer, so check it first.
-@@ -2037,6 +2069,41 @@ mod tests {
+@@ -2037,6 +2097,41 @@ mod tests {
          }
      }
  
@@ -170,7 +228,7 @@ index 88d50dab5ff8e4611c5724b4a6bf8e9d5a6ab8f1..6e65b5b6f91b9abbc39a6f30a21d7169
      #[test]
      fn ctrl_c_on_modal_consumes_without_showing_quit_hint() {
          let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-@@ -2231,6 +2298,65 @@ mod tests {
+@@ -2231,6 +2326,71 @@ mod tests {
          );
      }
  
@@ -182,16 +240,22 @@ index 88d50dab5ff8e4611c5724b4a6bf8e9d5a6ab8f1..6e65b5b6f91b9abbc39a6f30a21d7169
 +        let mut pane = test_pane(tx);
 +        let context = prompt_assistant_view::PromptAssistantActionContext {
 +            workspace_id: "workspace-1".to_string(),
-+            operation_generation: 1,
++            operation_generation: 0,
 +        };
-+        let assistant = prompt_assistant_view::PromptAssistantView::new(
++        let composer = pane.new_plain_text_composer(
 +            "preserved draft".to_string(),
++            "Write or refine the prompt".to_string(),
++        );
++        let assistant = prompt_assistant_view::PromptAssistantView::new(
++            composer,
 +            context.clone(),
 +            "generate",
 +            |_| {},
 +        );
 +        let assistant_handle = assistant.handle();
 +        pane.show_view(Box::new(assistant));
++        pane.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        assert!(assistant_handle.begin_initial_operation(&context, "generate (hidden)"));
 +
 +        let now = Instant::now();
 +        pane.last_composer_activity_at = Some(now);
@@ -236,7 +300,7 @@ index 88d50dab5ff8e4611c5724b4a6bf8e9d5a6ab8f1..6e65b5b6f91b9abbc39a6f30a21d7169
      #[test]
      fn dismiss_app_server_request_prunes_delayed_approval() {
          let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-@@ -2335,6 +2461,30 @@ mod tests {
+@@ -2335,6 +2495,30 @@ mod tests {
          );
      }
  
@@ -269,15 +333,15 @@ index 88d50dab5ff8e4611c5724b4a6bf8e9d5a6ab8f1..6e65b5b6f91b9abbc39a6f30a21d7169
          let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
 diff --git a/codex-rs/tui/src/bottom_pane/prompt_assistant_view.rs b/codex-rs/tui/src/bottom_pane/prompt_assistant_view.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3de736d15
+index 0000000000..19fad49f92
 --- /dev/null
 +++ b/codex-rs/tui/src/bottom_pane/prompt_assistant_view.rs
-@@ -0,0 +1,1292 @@
-+//! Reusable bottom-pane surface for Prompt Assistant.
+@@ -0,0 +1,1241 @@
++//! Persistent Prompt Assistant workspace rendered in the bottom pane.
 +//!
-+//! The view owns only local presentation and key routing. Runtime work is
-+//! represented by [`PromptAssistantViewAction`] callbacks and state updates
-+//! through [`PromptAssistantViewHandle`]; it never submits the main composer.
++//! The view reuses the plain-text chat composer for its independent message
++//! input. Runtime work is emitted as typed actions and never submits the main
++//! session composer.
 +
 +use std::cell::RefCell;
 +use std::sync::Arc;
@@ -286,6 +350,10 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +use std::time::Duration;
 +use std::time::Instant;
 +
++use codex_app_server_protocol::GuardianRiskLevel;
++use codex_app_server_protocol::GuardianUserAuthorization;
++use codex_app_server_protocol::PromptAssistantReview;
++use codex_app_server_protocol::PromptAssistantReviewStatus;
 +use crossterm::event::KeyCode;
 +use crossterm::event::KeyEvent;
 +use crossterm::event::KeyModifiers;
@@ -303,15 +371,17 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +use crate::wrapping::word_wrap_lines;
 +
 +use super::CancellationEvent;
++use super::ChatComposer;
++use super::InputResult;
 +use super::bottom_pane_view::BottomPaneView;
 +use super::bottom_pane_view::ViewCompletion;
-+use super::custom_prompt_view::CustomPromptView;
 +
 +pub(crate) const PROMPT_ASSISTANT_VIEW_ID: &str = "prompt-assistant";
 +
 +const MAX_PREVIEW_ROWS: usize = 8;
 +const MAX_PREVIEW_CHARS: usize = 32 * 1024;
 +const MAX_WRAPPED_PREVIEW_ROWS: usize = 2 * 1024;
++const MAX_REVIEW_FIELD_ROWS: usize = 2;
 +const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_millis(250);
 +
 +#[derive(Clone, Debug, Eq, PartialEq)]
@@ -325,11 +395,15 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +    pub(crate) text: String,
 +    pub(crate) hash: String,
 +    pub(crate) apply_allowed: bool,
-+    pub(crate) review_summary: Option<String>,
++    pub(crate) review: Option<PromptAssistantReview>,
 +}
 +
 +#[derive(Clone, Debug, Eq, PartialEq)]
 +pub(crate) enum PromptAssistantViewAction {
++    ChooseModel {
++        context: PromptAssistantActionContext,
++        input: String,
++    },
 +    Apply {
 +        context: PromptAssistantActionContext,
 +        candidate_hash: String,
@@ -342,25 +416,19 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +        context: PromptAssistantActionContext,
 +        instruction: String,
 +    },
-+    Review {
-+        context: PromptAssistantActionContext,
-+        candidate_hash: String,
-+    },
 +    Cancel {
 +        context: PromptAssistantActionContext,
 +    },
-+    Restore {
-+        original_draft: String,
-+    },
++    Restore,
 +}
 +
 +#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 +pub(crate) enum PromptAssistantViewPhase {
++    EditingInitial,
++    SelectingModel,
 +    Running,
 +    Ready,
 +    Applying,
-+    EditingRefinement,
-+    Reviewing,
 +    Cancelling,
 +    Failed,
 +}
@@ -380,7 +448,7 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +    response_bytes: u64,
 +    apply_requested: bool,
 +    completion: Option<ViewCompletion>,
-+    refinement_return_phase: Option<PromptAssistantViewPhase>,
++    pending_input: Option<String>,
 +}
 +
 +#[derive(Clone)]
@@ -389,10 +457,29 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +}
 +
 +impl PromptAssistantViewHandle {
++    pub(crate) fn begin_initial_operation(
++        &self,
++        expected_context: &PromptAssistantActionContext,
++        operation_label: impl Into<String>,
++    ) -> bool {
++        let mut model = lock_model(&self.model);
++        if model.context != *expected_context
++            || model.phase != PromptAssistantViewPhase::SelectingModel
++            || model.completion.is_some()
++        {
++            return false;
++        }
++        let now = Instant::now();
++        model.phase = PromptAssistantViewPhase::Running;
++        model.operation_label = operation_label.into();
++        model.started_at = now;
++        model.observed_at = now;
++        model.response_bytes = 0;
++        model.error = None;
++        true
++    }
++
 +    /// Atomically finish one request and install the generation returned by the server.
-+    ///
-+    /// The explicit expected-to-returned transition also supports a provisional
-+    /// context used while the first start RPC is in flight.
 +    pub(crate) fn complete_operation(
 +        &self,
 +        expected_context: &PromptAssistantActionContext,
@@ -416,13 +503,13 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +    ) -> bool {
 +        let mut model = lock_model(&self.model);
 +        if model.context != *expected_context
-+            || !matches!(
-+                model.phase,
-+                PromptAssistantViewPhase::Running | PromptAssistantViewPhase::Reviewing
-+            )
++            || model.phase != PromptAssistantViewPhase::Running
 +            || model.completion.is_some()
 +        {
 +            return false;
++        }
++        if candidate.apply_allowed {
++            model.pending_input = None;
 +        }
 +        model.phase = PromptAssistantViewPhase::Ready;
 +        model.context = returned_context;
@@ -431,7 +518,6 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +        model.error = None;
 +        model.observed_at = now;
 +        model.apply_requested = false;
-+        model.refinement_return_phase = None;
 +        true
 +    }
 +
@@ -444,22 +530,24 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +        let may_fail = matches!(
 +            model.phase,
 +            PromptAssistantViewPhase::Running
-+                | PromptAssistantViewPhase::Reviewing
 +                | PromptAssistantViewPhase::Applying
 +                | PromptAssistantViewPhase::Cancelling
 +        );
 +        if model.context != *context || !may_fail || model.completion.is_some() {
 +            return false;
 +        }
-+        model.phase = PromptAssistantViewPhase::Failed;
++        model.phase = if model.phase == PromptAssistantViewPhase::Applying {
++            PromptAssistantViewPhase::Ready
++        } else {
++            PromptAssistantViewPhase::Failed
++        };
 +        model.error = Some(error.into());
 +        model.observed_at = Instant::now();
 +        model.apply_requested = false;
-+        model.refinement_return_phase = None;
 +        true
 +    }
 +
-+    /// Replace the request byte total without changing TTFB/TPS or any other lifecycle.
++    /// Replace request byte progress without coupling it to any other metric lifecycle.
 +    pub(crate) fn set_response_bytes(
 +        &self,
 +        context: &PromptAssistantActionContext,
@@ -467,10 +555,7 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +    ) -> bool {
 +        let mut model = lock_model(&self.model);
 +        if model.context != *context
-+            || !matches!(
-+                model.phase,
-+                PromptAssistantViewPhase::Running | PromptAssistantViewPhase::Reviewing
-+            )
++            || model.phase != PromptAssistantViewPhase::Running
 +            || model.completion.is_some()
 +        {
 +            return false;
@@ -479,7 +564,6 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +        true
 +    }
 +
-+    /// Complete an acknowledged apply. The bridge replaces the composer separately.
 +    pub(crate) fn finish_applied(&self, context: &PromptAssistantActionContext) -> bool {
 +        let mut model = lock_model(&self.model);
 +        if model.context != *context
@@ -493,7 +577,6 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +        true
 +    }
 +
-+    /// Dismiss the view after backend cancellation has completed.
 +    pub(crate) fn finish_cancelled(&self, context: &PromptAssistantActionContext) -> bool {
 +        let mut model = lock_model(&self.model);
 +        if model.context != *context
@@ -517,16 +600,12 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +    }
 +
 +    #[cfg(test)]
-+    fn candidate_text(&self) -> Option<String> {
-+        lock_model(&self.model)
-+            .candidate
-+            .as_ref()
-+            .map(|candidate| candidate.text.clone())
-+    }
-+
-+    #[cfg(test)]
 +    fn observe_at(&self, now: Instant) {
 +        lock_model(&self.model).observed_at = now;
++    }
++
++    pub(crate) fn is_cancelling(&self) -> bool {
++        lock_model(&self.model).phase == PromptAssistantViewPhase::Cancelling
 +    }
 +}
 +
@@ -575,35 +654,24 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +        self.top = self.top.saturating_add(rows.max(1)).min(max_top);
 +        self.follow_tail = self.top == max_top;
 +    }
-+
-+    fn jump_top(&mut self) {
-+        self.top = 0;
-+        self.follow_tail = false;
-+    }
-+
-+    fn jump_bottom(&mut self) {
-+        self.top = self.lines.len().saturating_sub(self.visible_rows);
-+        self.follow_tail = true;
-+    }
 +}
 +
 +pub(crate) struct PromptAssistantView {
-+    original_draft: Arc<str>,
++    composer: ChatComposer,
 +    model: Arc<Mutex<PromptAssistantViewModel>>,
 +    on_action: ActionCallback,
 +    preview: RefCell<PreviewViewport>,
-+    pending_child_view: Option<Box<dyn BottomPaneView>>,
 +}
 +
 +impl PromptAssistantView {
 +    pub(crate) fn new(
-+        original_draft: String,
++        composer: ChatComposer,
 +        context: PromptAssistantActionContext,
 +        operation_label: impl Into<String>,
 +        on_action: impl Fn(PromptAssistantViewAction) + Send + Sync + 'static,
 +    ) -> Self {
 +        Self::new_at(
-+            original_draft,
++            composer,
 +            context,
 +            operation_label,
 +            on_action,
@@ -612,16 +680,16 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +    }
 +
 +    fn new_at(
-+        original_draft: String,
++        composer: ChatComposer,
 +        context: PromptAssistantActionContext,
 +        operation_label: impl Into<String>,
 +        on_action: impl Fn(PromptAssistantViewAction) + Send + Sync + 'static,
 +        now: Instant,
 +    ) -> Self {
 +        Self {
-+            original_draft: Arc::from(original_draft),
++            composer,
 +            model: Arc::new(Mutex::new(PromptAssistantViewModel {
-+                phase: PromptAssistantViewPhase::Running,
++                phase: PromptAssistantViewPhase::EditingInitial,
 +                context,
 +                operation_label: operation_label.into(),
 +                candidate: None,
@@ -632,14 +700,13 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +                response_bytes: 0,
 +                apply_requested: false,
 +                completion: None,
-+                refinement_return_phase: None,
++                pending_input: None,
 +            })),
 +            on_action: Arc::new(on_action),
 +            preview: RefCell::new(PreviewViewport {
 +                follow_tail: true,
 +                ..PreviewViewport::default()
 +            }),
-+            pending_child_view: None,
 +        }
 +    }
 +
@@ -651,6 +718,58 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +
 +    fn emit(&self, action: PromptAssistantViewAction) {
 +        (self.on_action)(action);
++    }
++
++    fn input_is_editable(phase: PromptAssistantViewPhase) -> bool {
++        matches!(
++            phase,
++            PromptAssistantViewPhase::EditingInitial
++                | PromptAssistantViewPhase::Ready
++                | PromptAssistantViewPhase::Failed
++        )
++    }
++
++    fn handle_composer_result(&mut self, result: InputResult) {
++        let InputResult::Submitted { text, .. } = result else {
++            return;
++        };
++        if text.trim().is_empty() {
++            return;
++        }
++        let action = {
++            let mut model = lock_model(&self.model);
++            if model.completion.is_some() {
++                return;
++            }
++            model.pending_input = Some(text.clone());
++            model.error = None;
++            model.response_bytes = 0;
++            match model.phase {
++                PromptAssistantViewPhase::EditingInitial | PromptAssistantViewPhase::Failed
++                    if model.context.operation_generation == 0 =>
++                {
++                    model.phase = PromptAssistantViewPhase::SelectingModel;
++                    PromptAssistantViewAction::ChooseModel {
++                        context: model.context.clone(),
++                        input: text,
++                    }
++                }
++                PromptAssistantViewPhase::Ready | PromptAssistantViewPhase::Failed => {
++                    let now = Instant::now();
++                    model.phase = PromptAssistantViewPhase::Running;
++                    model.operation_label = "refine".to_string();
++                    model.started_at = now;
++                    model.observed_at = now;
++                    model.apply_requested = false;
++                    PromptAssistantViewAction::Refine {
++                        context: model.context.clone(),
++                        instruction: text,
++                    }
++                }
++                _ => return,
++            }
++        };
++        self.emit(action);
 +    }
 +
 +    fn request_apply(&mut self) {
@@ -692,91 +811,6 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +        }
 +    }
 +
-+    fn request_review(&mut self) {
-+        let action = {
-+            let mut model = lock_model(&self.model);
-+            if model.phase != PromptAssistantViewPhase::Ready
-+                || model.apply_requested
-+                || model.completion.is_some()
-+            {
-+                return;
-+            }
-+            let Some(candidate_hash) = model
-+                .candidate
-+                .as_ref()
-+                .map(|candidate| candidate.hash.clone())
-+            else {
-+                return;
-+            };
-+            let action = PromptAssistantViewAction::Review {
-+                context: model.context.clone(),
-+                candidate_hash,
-+            };
-+            let now = Instant::now();
-+            model.phase = PromptAssistantViewPhase::Reviewing;
-+            model.operation_label = "review".to_string();
-+            model.started_at = now;
-+            model.observed_at = now;
-+            model.response_bytes = 0;
-+            action
-+        };
-+        self.emit(action);
-+    }
-+
-+    fn open_refinement(&mut self) {
-+        if self.pending_child_view.is_some() {
-+            return;
-+        }
-+        let context_label = {
-+            let mut model = lock_model(&self.model);
-+            if !matches!(
-+                model.phase,
-+                PromptAssistantViewPhase::Ready | PromptAssistantViewPhase::Failed
-+            ) || model.candidate.is_none()
-+                || model.completion.is_some()
-+            {
-+                return;
-+            }
-+            model.refinement_return_phase = Some(model.phase);
-+            model.phase = PromptAssistantViewPhase::EditingRefinement;
-+            Some(format!("{} candidate", model.operation_label))
-+        };
-+
-+        let model = Arc::clone(&self.model);
-+        let on_action = Arc::clone(&self.on_action);
-+        self.pending_child_view = Some(Box::new(CustomPromptView::new(
-+            "Refine prompt".to_string(),
-+            "Describe the change and press Enter".to_string(),
-+            String::new(),
-+            context_label,
-+            Box::new(move |instruction| {
-+                let action = {
-+                    let mut model = lock_model(&model);
-+                    if model.phase != PromptAssistantViewPhase::EditingRefinement
-+                        || model.completion.is_some()
-+                    {
-+                        return;
-+                    }
-+                    let action = PromptAssistantViewAction::Refine {
-+                        context: model.context.clone(),
-+                        instruction,
-+                    };
-+                    let now = Instant::now();
-+                    model.phase = PromptAssistantViewPhase::Running;
-+                    model.operation_label = "refine".to_string();
-+                    model.started_at = now;
-+                    model.observed_at = now;
-+                    model.response_bytes = 0;
-+                    model.error = None;
-+                    model.apply_requested = false;
-+                    model.refinement_return_phase = None;
-+                    action
-+                };
-+                on_action(action);
-+            }),
-+        )));
-+    }
-+
 +    fn cancel_or_restore(&mut self) {
 +        let action = {
 +            let mut model = lock_model(&self.model);
@@ -784,20 +818,20 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +                return;
 +            }
 +            match model.phase {
-+                PromptAssistantViewPhase::Running | PromptAssistantViewPhase::Reviewing => {
++                PromptAssistantViewPhase::Running => {
 +                    model.phase = PromptAssistantViewPhase::Cancelling;
 +                    Some(PromptAssistantViewAction::Cancel {
 +                        context: model.context.clone(),
 +                    })
 +                }
 +                PromptAssistantViewPhase::Applying | PromptAssistantViewPhase::Cancelling => None,
-+                PromptAssistantViewPhase::Ready | PromptAssistantViewPhase::Failed => {
++                PromptAssistantViewPhase::EditingInitial
++                | PromptAssistantViewPhase::SelectingModel
++                | PromptAssistantViewPhase::Ready
++                | PromptAssistantViewPhase::Failed => {
 +                    model.completion = Some(ViewCompletion::Cancelled);
-+                    Some(PromptAssistantViewAction::Restore {
-+                        original_draft: self.original_draft.to_string(),
-+                    })
++                    Some(PromptAssistantViewAction::Restore)
 +                }
-+                PromptAssistantViewPhase::EditingRefinement => None,
 +            }
 +        };
 +        if let Some(action) = action {
@@ -805,22 +839,35 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +        }
 +    }
 +
-+    fn scroll_preview(&self, key_code: KeyCode) {
++    fn restore_pending_input(&mut self) -> bool {
++        let pending = {
++            let mut model = lock_model(&self.model);
++            let should_restore = model.phase == PromptAssistantViewPhase::Failed
++                || model.phase == PromptAssistantViewPhase::Ready
++                    && model
++                        .candidate
++                        .as_ref()
++                        .is_none_or(|candidate| !candidate.apply_allowed);
++            should_restore.then(|| model.pending_input.take()).flatten()
++        };
++        let Some(pending) = pending else {
++            return false;
++        };
++        if self.composer.current_text_with_pending().is_empty() {
++            self.composer.apply_external_edit(pending);
++            true
++        } else {
++            false
++        }
++    }
++
++    fn scroll_preview(&self, up: bool) {
 +        let mut preview = self.preview.borrow_mut();
-+        match key_code {
-+            KeyCode::Up => preview.scroll_up(1),
-+            KeyCode::Down => preview.scroll_down(1),
-+            KeyCode::PageUp => {
-+                let rows = preview.visible_rows;
-+                preview.scroll_up(rows);
-+            }
-+            KeyCode::PageDown => {
-+                let rows = preview.visible_rows;
-+                preview.scroll_down(rows);
-+            }
-+            KeyCode::Home => preview.jump_top(),
-+            KeyCode::End => preview.jump_bottom(),
-+            _ => {}
++        let rows = preview.visible_rows.max(1);
++        if up {
++            preview.scroll_up(rows);
++        } else {
++            preview.scroll_down(rows);
 +        }
 +    }
 +
@@ -832,33 +879,118 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +            visible_rows,
 +        );
 +    }
++
++    fn review_lines(&self, model: &PromptAssistantViewModel, width: u16) -> Vec<Line<'static>> {
++        if let Some(error) = &model.error {
++            return vec![Line::from(vec!["  ".into(), error.clone().red()])];
++        }
++        let Some(candidate) = &model.candidate else {
++            let status = match model.phase {
++                PromptAssistantViewPhase::EditingInitial => "Edit the prompt, then press Enter",
++                PromptAssistantViewPhase::SelectingModel => "Choose a hidden functional model",
++                PromptAssistantViewPhase::Running => "Generating and reviewing the candidate",
++                PromptAssistantViewPhase::Applying => "Applying prompt candidate",
++                PromptAssistantViewPhase::Cancelling => "Waiting for cancellation",
++                PromptAssistantViewPhase::Failed => "Prompt Assistant failed",
++                PromptAssistantViewPhase::Ready => "Candidate ready",
++            };
++            return vec![Line::from(vec!["  ".into(), status.dim()])];
++        };
++        let Some(review) = candidate.review.as_ref() else {
++            return vec![Line::from(vec![
++                "  Review: ".into(),
++                "missing; apply disabled".red(),
++            ])];
++        };
++
++        let mut lines = vec![Line::from(vec![
++            "  Review: ".into(),
++            review_status_label(review.status),
++            " ▪ risk ".dim(),
++            risk_label(review.risk_level),
++            " ▪ authorization ".dim(),
++            authorization_label(review.user_authorization),
++        ])];
++        lines.extend(wrapped_review_field(
++            "Intent",
++            &review.intent_summary,
++            width,
++        ));
++        lines.extend(wrapped_review_field("Rationale", &review.rationale, width));
++        lines
++    }
++
++    fn composer_height(&self, width: u16) -> u16 {
++        self.composer.desired_height(width).clamp(3, 9)
++    }
++
++    fn composer_area(&self, area: Rect) -> Rect {
++        let model = lock_model(&self.model).clone();
++        let review_rows = self.review_lines(&model, area.width).len() as u16;
++        let composer_height = self.composer_height(area.width).min(area.height);
++        let footer_height = u16::from(area.height > 0);
++        Rect {
++            x: area.x,
++            y: area
++                .y
++                .saturating_add(area.height.saturating_sub(composer_height + footer_height)),
++            width: area.width,
++            height: composer_height.min(
++                area.height.saturating_sub(
++                    1u16.saturating_add(review_rows)
++                        .saturating_add(footer_height),
++                ),
++            ),
++        }
++    }
 +}
 +
 +impl BottomPaneView for PromptAssistantView {
 +    fn handle_key_event(&mut self, key_event: KeyEvent) {
-+        let plain = matches!(
-+            key_event.modifiers,
-+            KeyModifiers::NONE | KeyModifiers::SHIFT
-+        );
-+        match key_event.code {
-+            KeyCode::Enter if plain => self.request_apply(),
-+            KeyCode::Char(ch) if plain && ch.eq_ignore_ascii_case(&'r') => {
-+                self.open_refinement();
++        if matches!(key_event.code, KeyCode::Esc) {
++            self.cancel_or_restore();
++            return;
++        }
++        if key_event.modifiers.contains(KeyModifiers::ALT) {
++            match key_event.code {
++                KeyCode::Char('c' | 'C') => {
++                    self.request_copy();
++                    return;
++                }
++                KeyCode::Up | KeyCode::PageUp => {
++                    self.scroll_preview(/*up*/ true);
++                    return;
++                }
++                KeyCode::Down | KeyCode::PageDown => {
++                    self.scroll_preview(/*up*/ false);
++                    return;
++                }
++                _ => {}
 +            }
-+            KeyCode::Char(ch) if plain && ch.eq_ignore_ascii_case(&'c') => self.request_copy(),
-+            KeyCode::Char(ch) if plain && ch.eq_ignore_ascii_case(&'v') => self.request_review(),
-+            KeyCode::Up
-+            | KeyCode::Down
-+            | KeyCode::PageUp
-+            | KeyCode::PageDown
-+            | KeyCode::Home
-+            | KeyCode::End
-+                if plain =>
-+            {
-+                self.scroll_preview(key_event.code);
-+            }
-+            KeyCode::Esc => self.cancel_or_restore(),
-+            _ => {}
++        }
++
++        let phase = lock_model(&self.model).phase;
++        if Self::input_is_editable(phase)
++            && key_event.code == KeyCode::Tab
++            && key_event.modifiers == KeyModifiers::NONE
++        {
++            self.composer.handle_paste("\t".to_string());
++            return;
++        }
++        if phase == PromptAssistantViewPhase::Ready
++            && matches!(key_event.code, KeyCode::Enter)
++            && matches!(
++                key_event.modifiers,
++                KeyModifiers::NONE | KeyModifiers::SHIFT
++            )
++            && self.composer.current_text_with_pending().trim().is_empty()
++        {
++            self.request_apply();
++            return;
++        }
++        if Self::input_is_editable(phase) {
++            let (result, _) = self.composer.handle_key_event(key_event);
++            self.handle_composer_result(result);
 +        }
 +    }
 +
@@ -871,17 +1003,17 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +    }
 +
 +    fn clear_dismiss_after_child_accept(&mut self) {
-+        let mut model = lock_model(&self.model);
-+        if model.phase == PromptAssistantViewPhase::EditingRefinement {
-+            model.phase = model
-+                .refinement_return_phase
-+                .take()
-+                .unwrap_or(PromptAssistantViewPhase::Ready);
++        let pending = {
++            let mut model = lock_model(&self.model);
++            if model.phase != PromptAssistantViewPhase::SelectingModel {
++                return;
++            }
++            model.phase = PromptAssistantViewPhase::EditingInitial;
++            model.pending_input.take()
++        };
++        if let Some(pending) = pending {
++            self.composer.apply_external_edit(pending);
 +        }
-+    }
-+
-+    fn take_pending_child_view(&mut self) -> Option<Box<dyn BottomPaneView>> {
-+        self.pending_child_view.take()
 +    }
 +
 +    fn view_id(&self) -> Option<&'static str> {
@@ -896,7 +1028,10 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +    fn terminal_title_requires_action(&self) -> bool {
 +        matches!(
 +            lock_model(&self.model).phase,
-+            PromptAssistantViewPhase::Ready | PromptAssistantViewPhase::Failed
++            PromptAssistantViewPhase::EditingInitial
++                | PromptAssistantViewPhase::SelectingModel
++                | PromptAssistantViewPhase::Ready
++                | PromptAssistantViewPhase::Failed
 +        )
 +    }
 +
@@ -904,16 +1039,46 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +        true
 +    }
 +
++    fn handle_paste(&mut self, pasted: String) -> bool {
++        Self::input_is_editable(lock_model(&self.model).phase) && self.composer.handle_paste(pasted)
++    }
++
++    fn flush_paste_burst_if_due(&mut self) -> bool {
++        self.composer.flush_paste_burst_if_due()
++    }
++
++    fn is_in_paste_burst(&self) -> bool {
++        self.composer.is_in_paste_burst()
++    }
++
++    fn external_editor_text(&self) -> Option<String> {
++        Self::input_is_editable(lock_model(&self.model).phase)
++            .then(|| self.composer.current_text_with_pending())
++    }
++
++    fn apply_external_editor_text(&mut self, text: String) -> bool {
++        if !Self::input_is_editable(lock_model(&self.model).phase) {
++            return false;
++        }
++        self.composer.apply_external_edit(text);
++        true
++    }
++
++    fn has_editable_composer(&self) -> bool {
++        Self::input_is_editable(lock_model(&self.model).phase)
++    }
++
 +    fn pre_draw_tick(&mut self, now: Instant) -> bool {
++        let restored = self.restore_pending_input();
 +        let mut model = lock_model(&self.model);
 +        model.observed_at = now;
-+        matches!(
-+            model.phase,
-+            PromptAssistantViewPhase::Running
-+                | PromptAssistantViewPhase::Applying
-+                | PromptAssistantViewPhase::Reviewing
-+                | PromptAssistantViewPhase::Cancelling
-+        )
++        restored
++            || matches!(
++                model.phase,
++                PromptAssistantViewPhase::Running
++                    | PromptAssistantViewPhase::Applying
++                    | PromptAssistantViewPhase::Cancelling
++            )
 +    }
 +
 +    fn next_frame_delay(&self) -> Option<Duration> {
@@ -921,7 +1086,6 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +            lock_model(&self.model).phase,
 +            PromptAssistantViewPhase::Running
 +                | PromptAssistantViewPhase::Applying
-+                | PromptAssistantViewPhase::Reviewing
 +                | PromptAssistantViewPhase::Cancelling
 +        )
 +        .then_some(ACTIVE_FRAME_INTERVAL)
@@ -934,13 +1098,13 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +            return 0;
 +        }
 +        let model = lock_model(&self.model).clone();
-+        if model.candidate.is_none() {
-+            return 3;
-+        }
++        let review_rows = self.review_lines(&model, width).len() as u16;
 +        let preview_width = width.saturating_sub(2).max(1);
 +        self.sync_preview(&model, preview_width, MAX_PREVIEW_ROWS);
-+        let preview_rows = self.preview.borrow().lines.len().clamp(1, MAX_PREVIEW_ROWS);
-+        3u16.saturating_add(preview_rows as u16)
++        let preview_rows = self.preview.borrow().lines.len().min(MAX_PREVIEW_ROWS) as u16;
++        2u16.saturating_add(review_rows)
++            .saturating_add(preview_rows)
++            .saturating_add(self.composer_height(width))
 +    }
 +
 +    fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -948,54 +1112,95 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +            return;
 +        }
 +        let model = lock_model(&self.model).clone();
-+        let candidate_rows = area.height.saturating_sub(3) as usize;
-+        let preview_width = area.width.saturating_sub(2).max(1);
-+        self.sync_preview(&model, preview_width, candidate_rows);
-+
 +        Paragraph::new(header_line(&model)).render(
 +            Rect::new(area.x, area.y, area.width, 1).intersection(area),
 +            buf,
 +        );
 +
-+        if area.height >= 2 {
-+            let preview = self.preview.borrow();
-+            Paragraph::new(status_line(&model, &preview)).render(
-+                Rect::new(area.x, area.y.saturating_add(1), area.width, 1).intersection(area),
-+                buf,
-+            );
-+
-+            if candidate_rows > 0 {
-+                let visible = preview
-+                    .lines
-+                    .iter()
-+                    .skip(preview.top)
-+                    .take(candidate_rows)
-+                    .cloned()
-+                    .collect::<Vec<_>>();
-+                Paragraph::new(visible).render(
-+                    Rect::new(
-+                        area.x.saturating_add(2),
-+                        area.y.saturating_add(2),
-+                        area.width.saturating_sub(2),
-+                        candidate_rows as u16,
-+                    )
++        let review_lines = self.review_lines(&model, area.width);
++        let review_height = review_lines.len() as u16;
++        if review_height > 0 {
++            Paragraph::new(review_lines).render(
++                Rect::new(area.x, area.y.saturating_add(1), area.width, review_height)
 +                    .intersection(area),
-+                    buf,
-+                );
-+            }
-+        }
-+
-+        if area.height >= 3 {
-+            Paragraph::new(footer_line(&model)).render(
-+                Rect::new(
-+                    area.x,
-+                    area.y.saturating_add(area.height.saturating_sub(1)),
-+                    area.width,
-+                    1,
-+                ),
 +                buf,
 +            );
 +        }
++
++        let composer_area = self.composer_area(area);
++        let footer_y = area.y.saturating_add(area.height.saturating_sub(1));
++        let candidate_y = area.y.saturating_add(1).saturating_add(review_height);
++        let candidate_height = composer_area.y.saturating_sub(candidate_y);
++        let preview_width = area.width.saturating_sub(2).max(1);
++        self.sync_preview(&model, preview_width, candidate_height as usize);
++        if candidate_height > 0 {
++            let preview = self.preview.borrow();
++            let visible = preview
++                .lines
++                .iter()
++                .skip(preview.top)
++                .take(candidate_height as usize)
++                .cloned()
++                .collect::<Vec<_>>();
++            Paragraph::new(visible).render(
++                Rect::new(
++                    area.x.saturating_add(2),
++                    candidate_y,
++                    area.width.saturating_sub(2),
++                    candidate_height,
++                )
++                .intersection(area),
++                buf,
++            );
++        }
++
++        self.composer.render(composer_area, buf);
++        Paragraph::new(self.footer_line(&model)).render(
++            Rect::new(area.x, footer_y, area.width, 1).intersection(area),
++            buf,
++        );
++    }
++
++    fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
++        Self::input_is_editable(lock_model(&self.model).phase)
++            .then(|| self.composer.cursor_pos(self.composer_area(area)))
++            .flatten()
++    }
++}
++
++impl PromptAssistantView {
++    fn footer_line(&self, model: &PromptAssistantViewModel) -> Line<'static> {
++        let has_input = !self.composer.current_text_with_pending().trim().is_empty();
++        let text = match model.phase {
++            PromptAssistantViewPhase::EditingInitial => {
++                "Enter send ▪ Ctrl+G external editor ▪ Esc restore"
++            }
++            PromptAssistantViewPhase::SelectingModel => "Choose model ▪ Esc back",
++            PromptAssistantViewPhase::Running => "Esc cancel",
++            PromptAssistantViewPhase::Applying => "Applying",
++            PromptAssistantViewPhase::Cancelling => "Cancelling",
++            PromptAssistantViewPhase::Ready if has_input => {
++                "Enter refine ▪ Alt+C copy ▪ Ctrl+G external editor ▪ Esc restore"
++            }
++            PromptAssistantViewPhase::Ready
++                if model
++                    .candidate
++                    .as_ref()
++                    .is_some_and(|candidate| candidate.apply_allowed) =>
++            {
++                "Enter apply ▪ type to refine ▪ Alt+C copy ▪ Ctrl+G external editor ▪ Esc restore"
++            }
++            PromptAssistantViewPhase::Ready => {
++                "Revise the blocked prompt ▪ Alt+C copy ▪ Ctrl+G external editor ▪ Esc restore"
++            }
++            PromptAssistantViewPhase::Failed => {
++                "Edit and Enter retry ▪ Ctrl+G external editor ▪ Esc restore"
++            }
++        };
++        Line::from(vec![
++            "  ".into(),
++            Span::styled(text, Style::default().dim()),
++        ])
 +    }
 +}
 +
@@ -1026,6 +1231,16 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +    lines
 +}
 +
++fn wrapped_review_field(label: &str, value: &str, width: u16) -> Vec<Line<'static>> {
++    word_wrap_lines(
++        std::iter::once(Line::from(format!("  {label}: {value}"))),
++        RtOptions::new(width.max(1) as usize),
++    )
++    .into_iter()
++    .take(MAX_REVIEW_FIELD_ROWS)
++    .collect()
++}
++
 +fn header_line(model: &PromptAssistantViewModel) -> Line<'static> {
 +    let mut spans = vec!["Prompt Assistant".bold(), " ▪ ".dim()];
 +    spans.push(model.operation_label.clone().cyan());
@@ -1042,83 +1257,40 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +
 +fn phase_label(phase: PromptAssistantViewPhase) -> Span<'static> {
 +    match phase {
++        PromptAssistantViewPhase::EditingInitial => "Editing".yellow(),
++        PromptAssistantViewPhase::SelectingModel => "Selecting model".yellow(),
 +        PromptAssistantViewPhase::Running => "Running".cyan(),
 +        PromptAssistantViewPhase::Ready => "Ready".green(),
 +        PromptAssistantViewPhase::Applying => "Applying".cyan(),
-+        PromptAssistantViewPhase::EditingRefinement => "Editing refinement".yellow(),
-+        PromptAssistantViewPhase::Reviewing => "Reviewing".cyan(),
 +        PromptAssistantViewPhase::Cancelling => "Cancelling".yellow(),
 +        PromptAssistantViewPhase::Failed => "Failed".red(),
 +    }
 +}
 +
-+fn status_line(model: &PromptAssistantViewModel, preview: &PreviewViewport) -> Line<'static> {
-+    if let Some(error) = &model.error {
-+        return Line::from(vec!["  ".into(), error.clone().red()]);
++fn review_status_label(status: PromptAssistantReviewStatus) -> Span<'static> {
++    match status {
++        PromptAssistantReviewStatus::Pass => "Pass".green(),
++        PromptAssistantReviewStatus::Revised => "Revised".yellow(),
++        PromptAssistantReviewStatus::Blocked => "Blocked".red(),
 +    }
-+    if model.phase == PromptAssistantViewPhase::Applying {
-+        return Line::from(vec!["  ".into(), "Applying prompt candidate".dim()]);
-+    }
-+    let mut spans: Vec<Span<'static>> = vec!["  ".into()];
-+    if let Some(candidate) = &model.candidate {
-+        spans.push(
-+            candidate
-+                .review_summary
-+                .clone()
-+                .unwrap_or_else(|| "Candidate ready".to_string())
-+                .dim(),
-+        );
-+        if !candidate.apply_allowed {
-+            spans.push(" ▪ blocked".red());
-+        }
-+        if preview.lines.len() > preview.visible_rows && preview.visible_rows > 0 {
-+            let first = preview.top.saturating_add(1);
-+            let last = preview
-+                .top
-+                .saturating_add(preview.visible_rows)
-+                .min(preview.lines.len());
-+            spans.push(format!(" ▪ rows {first}-{last}/{}", preview.lines.len()).dim());
-+        }
-+    } else {
-+        spans.push(
-+            match model.phase {
-+                PromptAssistantViewPhase::Running => "Generating prompt candidate",
-+                PromptAssistantViewPhase::Applying => "Applying prompt candidate",
-+                PromptAssistantViewPhase::Reviewing => "Reviewing prompt candidate",
-+                PromptAssistantViewPhase::Cancelling => "Waiting for cancellation",
-+                PromptAssistantViewPhase::Failed => "Prompt Assistant failed",
-+                PromptAssistantViewPhase::Ready => "Candidate ready",
-+                PromptAssistantViewPhase::EditingRefinement => "Refinement input open",
-+            }
-+            .dim(),
-+        );
-+    }
-+    Line::from(spans)
 +}
 +
-+fn footer_line(model: &PromptAssistantViewModel) -> Line<'static> {
-+    let text = match model.phase {
-+        PromptAssistantViewPhase::Running | PromptAssistantViewPhase::Reviewing => "Esc cancel",
-+        PromptAssistantViewPhase::Applying => "Applying",
-+        PromptAssistantViewPhase::Cancelling => "Cancelling",
-+        PromptAssistantViewPhase::Ready => match model.candidate.as_ref() {
-+            Some(candidate) if candidate.apply_allowed && !model.apply_requested => {
-+                "Enter apply ▪ r refine ▪ v review ▪ c copy ▪ Esc restore"
-+            }
-+            Some(candidate) if !candidate.apply_allowed => "r refine ▪ c copy ▪ Esc restore",
-+            Some(_) => "Applying",
-+            None => "Esc restore",
-+        },
-+        PromptAssistantViewPhase::EditingRefinement => "Refinement input open",
-+        PromptAssistantViewPhase::Failed if model.candidate.is_some() => {
-+            "r refine ▪ c copy ▪ Esc restore"
-+        }
-+        PromptAssistantViewPhase::Failed => "Esc restore",
-+    };
-+    Line::from(vec![
-+        "  ".into(),
-+        Span::styled(text, Style::default().dim()),
-+    ])
++fn risk_label(risk: GuardianRiskLevel) -> Span<'static> {
++    match risk {
++        GuardianRiskLevel::Low => "low".green(),
++        GuardianRiskLevel::Medium => "medium".yellow(),
++        GuardianRiskLevel::High => "high".light_red(),
++        GuardianRiskLevel::Critical => "critical".red(),
++    }
++}
++
++fn authorization_label(authorization: GuardianUserAuthorization) -> Span<'static> {
++    match authorization {
++        GuardianUserAuthorization::Unknown => "unknown".dim(),
++        GuardianUserAuthorization::Low => "low".red(),
++        GuardianUserAuthorization::Medium => "medium".yellow(),
++        GuardianUserAuthorization::High => "high".green(),
++    }
 +}
 +
 +fn format_elapsed(model: &PromptAssistantViewModel) -> String {
@@ -1137,9 +1309,15 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +
 +#[cfg(test)]
 +mod tests {
-+    use super::*;
-+    use pretty_assertions::assert_eq;
 +    use std::sync::mpsc;
++
++    use pretty_assertions::assert_eq;
++    use tokio::sync::mpsc::unbounded_channel;
++
++    use super::*;
++    use crate::app_event::AppEvent;
++    use crate::app_event_sender::AppEventSender;
++    use crate::bottom_pane::ChatComposerConfig;
 +
 +    fn context(generation: u64) -> PromptAssistantActionContext {
 +        PromptAssistantActionContext {
@@ -1153,415 +1331,250 @@ index 0000000000000000000000000000000000000000..4e9eea0b0aaabbcda672dff49e758ed3
 +            text: text.into(),
 +            hash: "sha256:candidate".to_string(),
 +            apply_allowed: true,
-+            review_summary: Some("Review passed".to_string()),
++            review: Some(PromptAssistantReview {
++                intent_summary: "Preserve the requested task.".to_string(),
++                risk_level: GuardianRiskLevel::Low,
++                user_authorization: GuardianUserAuthorization::High,
++                status: PromptAssistantReviewStatus::Pass,
++                rationale: "Intent preserved.".to_string(),
++            }),
 +        }
 +    }
 +
-+    fn complete_same(
-+        handle: &PromptAssistantViewHandle,
-+        context: &PromptAssistantActionContext,
-+        candidate: PromptAssistantCandidate,
-+    ) -> bool {
-+        handle.complete_operation(context, context.clone(), candidate)
++    fn composer(initial: &str) -> ChatComposer {
++        let (tx, _rx) = unbounded_channel::<AppEvent>();
++        let mut composer = ChatComposer::new_with_config(
++            true,
++            AppEventSender::new(tx),
++            false,
++            "Write or refine the prompt".to_string(),
++            true,
++            ChatComposerConfig::plain_text(),
++        );
++        composer.set_footer_hint_override(Some(Vec::new()));
++        composer.apply_external_edit(initial.to_string());
++        composer
 +    }
 +
 +    fn view(
-+        original: &str,
++        initial: &str,
 +    ) -> (
 +        PromptAssistantView,
 +        PromptAssistantViewHandle,
 +        mpsc::Receiver<PromptAssistantViewAction>,
 +    ) {
 +        let (tx, rx) = mpsc::channel();
-+        let view = PromptAssistantView::new(
-+            original.to_string(),
-+            context(1),
-+            "translate",
-+            move |action| tx.send(action).expect("receive Prompt Assistant action"),
-+        );
++        let view = PromptAssistantView::new(composer(initial), context(0), "translate", move |a| {
++            tx.send(a).expect("receive Prompt Assistant action")
++        });
 +        let handle = view.handle();
 +        (view, handle, rx)
 +    }
 +
 +    #[test]
-+    fn apply_is_local_and_waits_for_backend_confirmation() {
-+        let (mut view, handle, rx) = view("original composer draft");
-+        assert!(complete_same(
-+            &handle,
-+            &context(1),
-+            candidate("candidate text")
-+        ));
-+
-+        view.handle_key_event(KeyEvent::from(KeyCode::Enter));
++    fn embedded_composer_edits_initial_input_before_model_selection() {
++        let (mut view, handle, rx) = view("draft");
++        view.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
++        for ch in "t revised".chars() {
++            view.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
++        }
++        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 +
 +        assert_eq!(
-+            rx.recv().expect("apply action"),
++            rx.recv().expect("choose model"),
++            PromptAssistantViewAction::ChooseModel {
++                context: context(0),
++                input: "draft revised".to_string(),
++            }
++        );
++        assert_eq!(handle.phase(), PromptAssistantViewPhase::SelectingModel);
++    }
++
++    #[test]
++    fn ready_input_refines_and_empty_enter_applies_after_backend_confirmation() {
++        let (mut view, handle, rx) = view("initial");
++        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        let _ = rx.recv().expect("choose model");
++        assert!(handle.begin_initial_operation(&context(0), "translate (hidden)"));
++        assert!(handle.complete_operation(&context(0), context(1), candidate("candidate")));
++
++        for ch in "add a constraint".chars() {
++            view.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
++        }
++        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        assert_eq!(
++            rx.recv().expect("refine"),
++            PromptAssistantViewAction::Refine {
++                context: context(1),
++                instruction: "add a constraint".to_string(),
++            }
++        );
++        assert!(handle.complete_operation(&context(1), context(2), candidate("refined")));
++
++        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        assert_eq!(
++            rx.recv().expect("apply"),
 +            PromptAssistantViewAction::Apply {
-+                context: context(1),
-+                candidate_hash: "sha256:candidate".to_string(),
-+                candidate: "candidate text".to_string(),
-+            }
-+        );
-+        assert!(!view.is_complete(), "local apply must not submit or close");
-+        assert_eq!(handle.phase(), PromptAssistantViewPhase::Applying);
-+        assert!(rx.try_recv().is_err());
-+
-+        view.handle_key_event(KeyEvent::from(KeyCode::Esc));
-+        assert_eq!(handle.phase(), PromptAssistantViewPhase::Applying);
-+        assert!(
-+            !view.is_complete(),
-+            "Esc cannot restore while apply is in flight"
-+        );
-+        assert!(rx.try_recv().is_err());
-+
-+        assert!(handle.finish_applied(&context(1)));
-+        assert_eq!(view.completion(), Some(ViewCompletion::Accepted));
-+    }
-+
-+    #[test]
-+    fn escape_restores_exact_bytes_and_running_escape_waits_for_cancel() {
-+        let original = "  原始 draft\nwith trailing bytes  \n";
-+        let (mut ready, ready_handle, ready_rx) = view(original);
-+        assert!(complete_same(
-+            &ready_handle,
-+            &context(1),
-+            candidate("candidate")
-+        ));
-+
-+        ready.on_ctrl_c();
-+
-+        let PromptAssistantViewAction::Restore { original_draft } =
-+            ready_rx.recv().expect("restore action")
-+        else {
-+            panic!("expected restore action");
-+        };
-+        assert_eq!(original_draft.as_bytes(), original.as_bytes());
-+        assert_eq!(ready.completion(), Some(ViewCompletion::Cancelled));
-+
-+        let (mut running, running_handle, running_rx) = view(original);
-+        running.on_ctrl_c();
-+        assert_eq!(
-+            running_rx.recv().expect("cancel action"),
-+            PromptAssistantViewAction::Cancel {
-+                context: context(1),
-+            }
-+        );
-+        assert_eq!(running_handle.phase(), PromptAssistantViewPhase::Cancelling);
-+        assert!(!running.is_complete());
-+        assert!(running_handle.finish_cancelled(&context(1)));
-+        assert_eq!(running.completion(), Some(ViewCompletion::Cancelled));
-+    }
-+
-+    #[test]
-+    fn nested_custom_prompt_refines_and_cancel_restores_parent_state() {
-+        let (mut view, handle, rx) = view("original");
-+        assert!(complete_same(&handle, &context(1), candidate("candidate")));
-+
-+        view.handle_key_event(KeyEvent::from(KeyCode::Char('r')));
-+        assert_eq!(handle.phase(), PromptAssistantViewPhase::EditingRefinement);
-+        let mut child = view.take_pending_child_view().expect("refinement child");
-+        assert!(child.handle_paste("make it concise".to_string()));
-+        child.handle_key_event(KeyEvent::from(KeyCode::Enter));
-+        assert_eq!(child.completion(), Some(ViewCompletion::Accepted));
-+        assert_eq!(
-+            rx.recv().expect("refine action"),
-+            PromptAssistantViewAction::Refine {
-+                context: context(1),
-+                instruction: "make it concise".to_string(),
-+            }
-+        );
-+        assert_eq!(handle.phase(), PromptAssistantViewPhase::Running);
-+
-+        assert!(complete_same(
-+            &handle,
-+            &context(1),
-+            candidate("refined candidate")
-+        ));
-+        view.handle_key_event(KeyEvent::from(KeyCode::Char('r')));
-+        let mut child = view.take_pending_child_view().expect("second child");
-+        assert_eq!(child.on_ctrl_c(), CancellationEvent::Handled);
-+        assert_eq!(child.completion(), Some(ViewCompletion::Cancelled));
-+        view.clear_dismiss_after_child_accept();
-+        assert_eq!(handle.phase(), PromptAssistantViewPhase::Ready);
-+        assert!(rx.try_recv().is_err());
-+    }
-+
-+    #[test]
-+    fn preview_scroll_is_bounded_tail_following_and_copy_is_raw() {
-+        let raw = (0..20)
-+            .map(|index| format!("candidate line {index}"))
-+            .collect::<Vec<_>>()
-+            .join("\n");
-+        let (mut view, handle, rx) = view("original");
-+        assert!(complete_same(&handle, &context(1), candidate(raw.clone())));
-+        let area = Rect::new(0, 0, 40, view.desired_height(40));
-+        view.render(area, &mut Buffer::empty(area));
-+        let initial_top = view.preview.borrow().top;
-+        assert!(
-+            initial_top > 0,
-+            "tail following should show the newest rows"
-+        );
-+        assert_eq!(view.preview.borrow().visible_rows, MAX_PREVIEW_ROWS);
-+
-+        view.handle_key_event(KeyEvent::from(KeyCode::Up));
-+        assert_eq!(view.preview.borrow().top, initial_top - 1);
-+        assert!(!view.preview.borrow().follow_tail);
-+        view.handle_key_event(KeyEvent::from(KeyCode::End));
-+        assert!(view.preview.borrow().follow_tail);
-+
-+        view.handle_key_event(KeyEvent::from(KeyCode::Char('c')));
-+        assert_eq!(
-+            rx.recv().expect("copy action"),
-+            PromptAssistantViewAction::Copy { candidate: raw }
-+        );
-+    }
-+
-+    #[test]
-+    fn state_updates_survive_a_higher_priority_view() {
-+        let (view, handle, _rx) = view("original");
-+        let mut stack: Vec<Box<dyn BottomPaneView>> = vec![Box::new(view)];
-+        stack.push(Box::new(CustomPromptView::new(
-+            "Approval-shaped overlay".to_string(),
-+            "temporary".to_string(),
-+            String::new(),
-+            None,
-+            Box::new(|_| {}),
-+        )));
-+
-+        assert!(complete_same(
-+            &handle,
-+            &context(1),
-+            candidate("preserved candidate")
-+        ));
-+        stack.pop();
-+
-+        assert_eq!(
-+            stack.last().and_then(|view| view.view_id()),
-+            Some(PROMPT_ASSISTANT_VIEW_ID)
-+        );
-+        assert_eq!(handle.phase(), PromptAssistantViewPhase::Ready);
-+    }
-+
-+    #[test]
-+    fn operation_completion_atomically_advances_generation_and_rejects_prior_response() {
-+        let (mut view, handle, rx) = view("original");
-+        let provisional = context(1);
-+        let first_server_generation = context(2);
-+        let second_server_generation = context(3);
-+
-+        assert!(handle.complete_operation(
-+            &provisional,
-+            first_server_generation.clone(),
-+            candidate("first candidate")
-+        ));
-+        assert_eq!(handle.context(), first_server_generation);
-+        view.handle_key_event(KeyEvent::from(KeyCode::Char('r')));
-+        let mut refinement = view.take_pending_child_view().expect("refinement editor");
-+        assert!(refinement.handle_paste("make it shorter".to_string()));
-+        refinement.handle_key_event(KeyEvent::from(KeyCode::Enter));
-+        assert_eq!(
-+            rx.recv().expect("refine action"),
-+            PromptAssistantViewAction::Refine {
 +                context: context(2),
-+                instruction: "make it shorter".to_string(),
-+            }
-+        );
-+        assert_eq!(handle.phase(), PromptAssistantViewPhase::Running);
-+
-+        assert!(!handle.complete_operation(
-+            &provisional,
-+            context(2),
-+            candidate("late first candidate")
-+        ));
-+        assert!(!handle.set_response_bytes(&provisional, 999));
-+        assert!(handle.complete_operation(
-+            &context(2),
-+            second_server_generation.clone(),
-+            candidate("second candidate")
-+        ));
-+        assert_eq!(handle.context(), second_server_generation);
-+        assert_eq!(handle.candidate_text().as_deref(), Some("second candidate"));
-+        assert_eq!(handle.phase(), PromptAssistantViewPhase::Ready);
-+    }
-+
-+    #[test]
-+    fn cancelling_rejects_late_updates_and_cancel_failure_becomes_restorable() {
-+        let (mut view, handle, rx) = view("original");
-+        let active = context(1);
-+        view.on_ctrl_c();
-+        assert_eq!(
-+            rx.recv().expect("cancel action"),
-+            PromptAssistantViewAction::Cancel {
-+                context: active.clone(),
-+            }
-+        );
-+
-+        assert!(!handle.complete_operation(&active, context(2), candidate("late candidate")));
-+        assert!(handle.set_failed(&active, "cancel failed"));
-+        assert!(!handle.set_response_bytes(&active, 999));
-+        view.handle_key_event(KeyEvent::from(KeyCode::Char('v')));
-+        assert!(rx.try_recv().is_err());
-+        assert_eq!(handle.phase(), PromptAssistantViewPhase::Failed);
-+
-+        view.on_ctrl_c();
-+        assert_eq!(
-+            rx.recv().expect("restore action"),
-+            PromptAssistantViewAction::Restore {
-+                original_draft: "original".to_string(),
-+            }
-+        );
-+        assert_eq!(view.completion(), Some(ViewCompletion::Cancelled));
-+    }
-+
-+    #[test]
-+    fn printable_preview_shortcuts_are_plain_text_inside_prompt_editors() {
-+        let submitted = Arc::new(Mutex::new(None));
-+        let submitted_clone = Arc::clone(&submitted);
-+        let mut intent = CustomPromptView::new(
-+            "Generate a prompt".to_string(),
-+            "Describe intent".to_string(),
-+            String::new(),
-+            None,
-+            Box::new(move |text| {
-+                *submitted_clone
-+                    .lock()
-+                    .unwrap_or_else(|error| error.into_inner()) = Some(text);
-+            }),
-+        );
-+        intent.handle_key_event(KeyEvent::from(KeyCode::Char('r')));
-+        intent.handle_key_event(KeyEvent::from(KeyCode::Char('c')));
-+        assert!(!intent.is_complete());
-+        // End the paste-burst window without changing the entered text. Enter
-+        // can then exercise submission rather than paste-newline handling.
-+        intent.handle_key_event(KeyEvent::from(KeyCode::Right));
-+        intent.handle_key_event(KeyEvent::from(KeyCode::Enter));
-+        assert_eq!(
-+            submitted
-+                .lock()
-+                .unwrap_or_else(|error| error.into_inner())
-+                .as_deref(),
-+            Some("rc")
-+        );
-+
-+        let (mut view, handle, rx) = view("original");
-+        assert!(complete_same(&handle, &context(1), candidate("candidate")));
-+        view.handle_key_event(KeyEvent::from(KeyCode::Char('r')));
-+        let mut refinement = view.take_pending_child_view().expect("refinement editor");
-+        refinement.handle_key_event(KeyEvent::from(KeyCode::Char('r')));
-+        refinement.handle_key_event(KeyEvent::from(KeyCode::Char('c')));
-+        assert!(
-+            rx.try_recv().is_err(),
-+            "editor text cannot fire preview actions"
-+        );
-+        refinement.handle_key_event(KeyEvent::from(KeyCode::Right));
-+        refinement.handle_key_event(KeyEvent::from(KeyCode::Enter));
-+        assert_eq!(
-+            rx.recv().expect("refine action"),
-+            PromptAssistantViewAction::Refine {
-+                context: context(1),
-+                instruction: "rc".to_string(),
-+            }
-+        );
-+    }
-+
-+    #[test]
-+    fn running_ready_reviewing_and_failed_render_compactly() {
-+        let started_at = Instant::now();
-+        let (tx, rx) = mpsc::channel();
-+        let mut view = PromptAssistantView::new_at(
-+            "original".to_string(),
-+            context(1),
-+            "translate",
-+            move |action| tx.send(action).expect("send action"),
-+            started_at,
-+        );
-+        let handle = view.handle();
-+        handle.observe_at(started_at + Duration::from_millis(1500));
-+        assert!(handle.set_response_bytes(&context(1), 2048));
-+        let running = render_lines(&view, 72);
-+
-+        assert!(handle.complete_operation_at(
-+            &context(1),
-+            context(1),
-+            candidate("first line\nsecond line"),
-+            started_at + Duration::from_millis(1500),
-+        ));
-+        let ready = render_lines(&view, 72);
-+
-+        view.handle_key_event(KeyEvent::from(KeyCode::Char('v')));
-+        assert_eq!(
-+            rx.recv().expect("review action"),
-+            PromptAssistantViewAction::Review {
-+                context: context(1),
 +                candidate_hash: "sha256:candidate".to_string(),
++                candidate: "refined".to_string(),
 +            }
 +        );
-+        assert_eq!(handle.phase(), PromptAssistantViewPhase::Reviewing);
-+        let reviewing = render_lines(&view, 72);
++        assert!(!view.is_complete());
++        assert_eq!(handle.phase(), PromptAssistantViewPhase::Applying);
++    }
 +
-+        assert!(handle.set_failed(&context(1), "review service unavailable"));
-+        let failed = render_lines(&view, 72);
++    #[test]
++    fn failed_apply_returns_to_ready_and_can_retry_the_same_candidate() {
++        let (mut view, handle, rx) = view("initial");
++        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        let _ = rx.recv().expect("choose model");
++        assert!(handle.begin_initial_operation(&context(0), "translate (hidden)"));
++        assert!(handle.complete_operation(&context(0), context(1), candidate("candidate")));
 +
-+        insta::assert_snapshot!(
-+            [
-+                "RUNNING",
-+                &running,
-+                "READY",
-+                &ready,
-+                "REVIEWING",
-+                &reviewing,
-+                "FAILED",
-+                &failed,
-+            ]
-+            .join("\n---\n"),
-+            @r###"
-+        RUNNING
-+        ---
-+        Prompt Assistant ▪ translate ▪ Running ▪ 1.5s ▪ ~2048 bytes
-+          Generating prompt candidate
-+          Esc cancel
-+        ---
-+        READY
-+        ---
-+        Prompt Assistant ▪ translate ▪ Ready ▪ 1.5s ▪ ~2048 bytes
-+          Review passed
-+          first line
-+          second line
-+          Enter apply ▪ r refine ▪ v review ▪ c copy ▪ Esc restore
-+        ---
-+        REVIEWING
-+        ---
-+        Prompt Assistant ▪ review ▪ Reviewing ▪ 0.0s
-+          Review passed
-+          first line
-+          second line
-+          Esc cancel
-+        ---
-+        FAILED
-+        ---
-+        Prompt Assistant ▪ review ▪ Failed ▪ 0.0s
-+          review service unavailable
-+          first line
-+          second line
-+          r refine ▪ c copy ▪ Esc restore
-+        "###
++        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        let apply = rx.recv().expect("initial apply");
++        assert!(handle.set_failed(&context(1), "temporary apply failure"));
++        assert_eq!(handle.phase(), PromptAssistantViewPhase::Ready);
++
++        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        assert_eq!(rx.recv().expect("retried apply"), apply);
++        assert_eq!(handle.phase(), PromptAssistantViewPhase::Applying);
++    }
++
++    #[test]
++    fn blocked_review_restores_input_and_cannot_apply() {
++        let (mut view, handle, rx) = view("unsafe draft");
++        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        let _ = rx.recv().expect("choose model");
++        assert!(handle.begin_initial_operation(&context(0), "translate (hidden)"));
++        let mut blocked = candidate("");
++        blocked.apply_allowed = false;
++        blocked.review.as_mut().expect("review").status = PromptAssistantReviewStatus::Blocked;
++        assert!(handle.complete_operation(&context(0), context(1), blocked));
++        assert!(view.pre_draw_tick(Instant::now()));
++        assert_eq!(view.external_editor_text().as_deref(), Some("unsafe draft"));
++
++        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        assert!(matches!(
++            rx.recv().expect("corrective refine"),
++            PromptAssistantViewAction::Refine { .. }
++        ));
++    }
++
++    #[test]
++    fn failed_refine_restores_the_submitted_instruction_with_an_existing_candidate() {
++        let (mut view, handle, rx) = view("initial");
++        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        let _ = rx.recv().expect("choose model");
++        assert!(handle.begin_initial_operation(&context(0), "translate (hidden)"));
++        assert!(handle.complete_operation(&context(0), context(1), candidate("candidate")));
++        view.handle_paste("retain this refinement".to_string());
++        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        let _ = rx.recv().expect("refine");
++
++        assert!(handle.set_failed(&context(1), "refine failed"));
++        assert!(view.pre_draw_tick(Instant::now()));
++        assert_eq!(
++            view.external_editor_text().as_deref(),
++            Some("retain this refinement")
 +        );
 +    }
 +
-+    fn render_lines(view: &PromptAssistantView, width: u16) -> String {
++    #[test]
++    fn plain_shortcuts_tab_alt_navigation_and_external_edit_stay_in_the_embedded_composer() {
++        let (mut view, _handle, rx) = view("");
++        for ch in ['r', 'c', 'v'] {
++            view.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
++        }
++        assert_eq!(view.external_editor_text().as_deref(), Some("rcv"));
++        view.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
++        assert_eq!(view.external_editor_text().as_deref(), Some("rcv\t"));
++        view.handle_paste("alpha beta".to_string());
++        let cursor_before = view.composer.cursor();
++        view.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
++        assert!(view.composer.cursor() < cursor_before);
++        assert!(view.apply_external_editor_text("edited by helper".to_string()));
++        assert_eq!(
++            view.external_editor_text().as_deref(),
++            Some("edited by helper")
++        );
++        assert!(rx.try_recv().is_err());
++    }
++
++    #[test]
++    fn structured_review_and_candidate_render_with_the_input_composer() {
++        let (view, handle, _rx) = view("draft");
++        {
++            let mut model = lock_model(&handle.model);
++            model.phase = PromptAssistantViewPhase::Running;
++        }
++        assert!(handle.complete_operation(&context(0), context(1), candidate("candidate")));
++        let width = 160;
 +        let height = view.desired_height(width);
 +        let area = Rect::new(0, 0, width, height);
 +        let mut buffer = Buffer::empty(area);
 +        view.render(area, &mut buffer);
-+        (0..area.height)
-+            .map(|row| {
-+                (0..area.width)
-+                    .map(|column| buffer[(column, row)].symbol())
++        let rendered = (0..height)
++            .map(|y| {
++                (0..width)
++                    .map(|x| buffer[(x, y)].symbol())
 +                    .collect::<String>()
-+                    .trim_end()
-+                    .to_string()
 +            })
 +            .collect::<Vec<_>>()
-+            .join("\n")
++            .join("\n");
++        assert!(rendered.contains("Review: Pass"));
++        assert!(rendered.contains("risk low"));
++        assert!(rendered.contains("authorization high"));
++        assert!(rendered.contains("Intent: Preserve the requested task."));
++        assert!(rendered.contains("Rationale: Intent preserved."));
++        assert!(rendered.contains("candidate"));
++        assert!(rendered.contains("Enter refine"));
++    }
++
++    #[test]
++    fn selection_cancel_restores_the_submitted_input() {
++        let (mut view, handle, rx) = view("draft");
++        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        let _ = rx.recv().expect("choose model");
++        view.clear_dismiss_after_child_accept();
++        assert_eq!(handle.phase(), PromptAssistantViewPhase::EditingInitial);
++        assert_eq!(view.external_editor_text().as_deref(), Some("draft"));
++    }
++
++    #[test]
++    fn stale_completion_and_progress_do_not_replace_newer_context() {
++        let (mut view, handle, rx) = view("draft");
++        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        let _ = rx.recv().expect("choose model");
++        assert!(handle.begin_initial_operation(&context(0), "translate (hidden)"));
++        assert!(handle.complete_operation(&context(0), context(2), candidate("new")));
++        assert!(!handle.complete_operation(&context(0), context(1), candidate("stale")));
++        assert!(!handle.set_response_bytes(&context(0), 99));
++        assert_eq!(handle.context(), context(2));
++    }
++
++    #[test]
++    fn active_elapsed_time_uses_the_current_operation_start() {
++        let started = Instant::now();
++        let (tx, _rx) = mpsc::channel();
++        let view = PromptAssistantView::new_at(
++            composer("draft"),
++            context(0),
++            "translate",
++            move |action| tx.send(action).expect("send action"),
++            started,
++        );
++        let handle = view.handle();
++        {
++            let mut model = lock_model(&handle.model);
++            model.phase = PromptAssistantViewPhase::Running;
++        }
++        handle.observe_at(started + Duration::from_millis(1_500));
++        assert!(
++            header_line(&lock_model(&handle.model))
++                .to_string()
++                .contains("1.5s")
++        );
 +    }
 +}
