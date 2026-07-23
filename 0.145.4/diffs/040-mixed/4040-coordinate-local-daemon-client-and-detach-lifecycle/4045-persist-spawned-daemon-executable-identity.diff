@@ -1,5 +1,17 @@
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index 993b8b6019..abdd8a06d5 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -1985,6 +1985,7 @@ dependencies = [
+  "codex-hooks",
+  "codex-http-client",
+  "codex-image-generation-extension",
++ "codex-install-context",
+  "codex-login",
+  "codex-mcp",
+  "codex-mcp-extension",
 diff --git a/codex-rs/app-server-daemon/src/backend/pid.rs b/codex-rs/app-server-daemon/src/backend/pid.rs
-index aa05e1db8e..242f90f6fd 100644
+index aa05e1db8e..f47bda2740 100644
 --- a/codex-rs/app-server-daemon/src/backend/pid.rs
 +++ b/codex-rs/app-server-daemon/src/backend/pid.rs
 @@ -19,6 +19,13 @@ use tokio::io::AsyncSeekExt;
@@ -26,29 +38,50 @@ index aa05e1db8e..242f90f6fd 100644
  }
  
  #[derive(Debug, Clone, PartialEq, Eq)]
-@@ -153,6 +163,21 @@ impl PidBackend {
+@@ -117,6 +127,16 @@ impl PidBackend {
+ 
+     #[cfg(unix)]
+     pub(crate) async fn start(&self) -> Result<Option<u32>> {
++        self.start_inner(/*verify_executable_identity*/ true).await
++    }
++
++    #[cfg(target_os = "linux")]
++    pub(crate) async fn start_for_implicit_local(&self) -> Result<Option<u32>> {
++        self.start_inner(/*verify_executable_identity*/ false).await
++    }
++
++    #[cfg(unix)]
++    async fn start_inner(&self, verify_executable_identity: bool) -> Result<Option<u32>> {
+         if let Some(parent) = self.pid_file.parent() {
+             fs::create_dir_all(parent)
+                 .await
+@@ -153,6 +173,25 @@ impl PidBackend {
                  }
              }
          };
 +        #[cfg(target_os = "linux")]
-+        let executable_identity_before_spawn = match executable_identity(&self.codex_bin).await {
-+            Ok(identity) => Some(identity),
-+            Err(err) => {
-+                let _ = fs::remove_file(&self.pid_file).await;
-+                return Err(err).with_context(|| {
-+                    format!(
-+                        "failed to spawn detached app-server process using {}",
-+                        self.codex_bin.display()
-+                    )
-+                });
++        let executable_identity_before_spawn = if verify_executable_identity {
++            match executable_identity(&self.codex_bin).await {
++                Ok(identity) => Some(identity),
++                Err(err) => {
++                    let _ = fs::remove_file(&self.pid_file).await;
++                    return Err(err).with_context(|| {
++                        format!(
++                            "failed to spawn detached app-server process using {}",
++                            self.codex_bin.display()
++                        )
++                    });
++                }
 +            }
++        } else {
++            None
 +        };
 +        #[cfg(not(target_os = "linux"))]
 +        let executable_identity_before_spawn = None;
          let mut command = Command::new(&self.codex_bin);
          let stderr_log = match self.open_stderr_log().await {
              Ok(stderr_log) => stderr_log,
-@@ -182,7 +207,7 @@ impl PidBackend {
+@@ -182,7 +221,7 @@ impl PidBackend {
              }
          }
  
@@ -57,11 +90,11 @@ index aa05e1db8e..242f90f6fd 100644
              Ok(child) => child,
              Err(err) => {
                  let _ = fs::remove_file(&self.pid_file).await;
-@@ -197,10 +222,30 @@ impl PidBackend {
+@@ -197,10 +236,33 @@ impl PidBackend {
          let pid = child
              .id()
              .context("spawned app-server process has no pid")?;
-+        let executable_identity_after_spawn =
++        let executable_identity_after_spawn = if verify_executable_identity {
 +            match spawned_executable_identity(pid, &self.codex_bin).await {
 +                Ok(identity) => identity,
 +                Err(err) => {
@@ -72,7 +105,10 @@ index aa05e1db8e..242f90f6fd 100644
 +                    return Err(err)
 +                        .context("failed to identify pid-managed executable after spawn");
 +                }
-+            };
++            }
++        } else {
++            None
++        };
 +        if executable_identity_before_spawn != executable_identity_after_spawn {
 +            terminate_spawned_child(&mut child).await.with_context(|| {
 +                format!("failed to terminate pid-managed app-server process {pid}")
@@ -88,7 +124,7 @@ index aa05e1db8e..242f90f6fd 100644
              },
              Err(err) => {
                  let _ = self.terminate_process(pid);
-@@ -454,6 +499,22 @@ impl PidBackend {
+@@ -454,6 +516,22 @@ impl PidBackend {
      }
  }
  
@@ -167,6 +203,82 @@ index de67fa4e3d..9b210f8fff 100644
      };
      tokio::fs::write(
          &pid_file,
+diff --git a/codex-rs/app-server-daemon/src/client.rs b/codex-rs/app-server-daemon/src/client.rs
+index b11f81f185..b0e023e7b2 100644
+--- a/codex-rs/app-server-daemon/src/client.rs
++++ b/codex-rs/app-server-daemon/src/client.rs
+@@ -33,6 +33,7 @@ const STATUS_REQUEST_ID: RequestId = RequestId::Integer(2);
+ pub(crate) struct ProbeInfo {
+     pub(crate) app_server_version: String,
+     pub(crate) active_client_count: Option<usize>,
++    pub(crate) build_identity: Option<String>,
+     pub(crate) running_assistant_turn_count: Option<usize>,
+ }
+ 
+@@ -67,6 +68,9 @@ async fn probe_inner(socket_path: &Path, deadline: Instant) -> Result<ProbeInfo>
+         active_client_count: status
+             .as_ref()
+             .and_then(|status| status.active_client_count),
++        build_identity: status
++            .as_ref()
++            .and_then(|status| status.build_identity.clone()),
+         running_assistant_turn_count: status.and_then(|status| status.running_assistant_turn_count),
+     })
+ }
+@@ -75,6 +79,7 @@ async fn probe_inner(socket_path: &Path, deadline: Instant) -> Result<ProbeInfo>
+ #[serde(rename_all = "camelCase")]
+ struct DaemonStatus {
+     active_client_count: Option<usize>,
++    build_identity: Option<String>,
+     running_assistant_turn_count: Option<usize>,
+ }
+ 
+@@ -261,6 +266,7 @@ mod tests {
+             ProbeInfo {
+                 app_server_version: "1.2.3".to_string(),
+                 active_client_count: None,
++                build_identity: None,
+                 running_assistant_turn_count: None,
+             }
+         );
+@@ -269,19 +275,27 @@ mod tests {
+ 
+     #[tokio::test]
+     async fn probe_preserves_complete_and_partial_status_counts() -> Result<()> {
+-        for (result, expected_active, expected_running) in [
++        for (result, expected_active, expected_build_identity, expected_running) in [
+             (
+                 serde_json::json!({
+                     "activeClientCount": 0,
++                    "buildIdentity": "build-1",
+                     "runningAssistantTurnCount": 2,
+                 }),
+                 Some(0),
++                Some("build-1"),
+                 Some(2),
+             ),
+-            (serde_json::json!({ "activeClientCount": 3 }), Some(3), None),
++            (
++                serde_json::json!({ "activeClientCount": 3 }),
++                Some(3),
++                None,
++                None,
++            ),
+             (
+                 serde_json::json!({ "runningAssistantTurnCount": 4 }),
+                 None,
++                None,
+                 Some(4),
+             ),
+         ] {
+@@ -291,6 +305,7 @@ mod tests {
+             }))
+             .await?;
+             assert_eq!(probe.active_client_count, expected_active);
++            assert_eq!(probe.build_identity.as_deref(), expected_build_identity);
+             assert_eq!(probe.running_assistant_turn_count, expected_running);
+         }
+         Ok(())
 diff --git a/codex-rs/app-server-daemon/src/managed_install.rs b/codex-rs/app-server-daemon/src/managed_install.rs
 index d5ad85b986..7c8e648e71 100644
 --- a/codex-rs/app-server-daemon/src/managed_install.rs
@@ -282,3 +394,135 @@ index 93caa468e4..e408407f30 100644
 +    assert_eq!(spawned, expected);
 +    assert_ne!(spawned, current);
 +}
+diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
+index ef18d17b87..546d1acdc1 100644
+--- a/codex-rs/app-server/Cargo.toml
++++ b/codex-rs/app-server/Cargo.toml
+@@ -53,6 +53,7 @@ codex-git-utils = { workspace = true }
+ codex-file-watcher = { workspace = true }
+ codex-hooks = { workspace = true }
+ codex-http-client = { workspace = true }
++codex-install-context = { workspace = true }
+ codex-otel = { workspace = true }
+ codex-plugin = { workspace = true }
+ codex-shell-command = { workspace = true }
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 4ee0c53f36..2d435f4fe4 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -690,6 +690,7 @@ impl MessageProcessor {
+                 request_id,
+                 serde_json::json!({
+                     "activeClientCount": self.active_client_count.load(Ordering::Acquire),
++                    "buildIdentity": codex_install_context::build_identity(),
+                     "runningAssistantTurnCount": running_assistant_turn_count,
+                 }),
+             )
+diff --git a/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs b/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs
+index 63cc92498f..28724e97bb 100644
+--- a/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs
++++ b/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs
+@@ -68,6 +68,7 @@ type HmacSha256 = Hmac<Sha256>;
+ #[serde(rename_all = "camelCase")]
+ struct DaemonStatusResponse {
+     active_client_count: usize,
++    build_identity: String,
+     running_assistant_turn_count: usize,
+ }
+ 
+@@ -129,6 +130,10 @@ async fn daemon_status_reports_only_initialized_active_clients() -> Result<()> {
+     send_daemon_status_request(&mut daemon, /*id*/ 101).await?;
+     let status = read_daemon_status_response(&mut daemon, /*id*/ 101).await?;
+     assert_eq!(status.active_client_count, 0);
++    assert_eq!(
++        status.build_identity,
++        codex_install_context::build_identity()
++    );
+     assert_eq!(status.running_assistant_turn_count, 0);
+ 
+     let mut backend_probe = connect_websocket(bind_addr).await?;
+diff --git a/codex-rs/cli/build.rs b/codex-rs/cli/build.rs
+index abccc48bb6..1f0fd2d3e7 100644
+--- a/codex-rs/cli/build.rs
++++ b/codex-rs/cli/build.rs
+@@ -1,4 +1,17 @@
+ fn main() {
++    println!("cargo:rerun-if-env-changed=CODEX_BUILD_ID");
++    let build_identity = std::env::var("CODEX_BUILD_ID")
++        .ok()
++        .filter(|value| !value.trim().is_empty())
++        .unwrap_or_else(|| {
++            let nanos = std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .unwrap_or_default()
++                .as_nanos();
++            format!("{nanos:032x}-{:08x}", std::process::id())
++        });
++    println!("cargo:rustc-env=CODEX_BUILD_ID={build_identity}");
++
+     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+         println!("cargo:rustc-link-arg=-ObjC");
+     }
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+index 69adbfa20a..e1149c3bde 100644
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -954,6 +954,7 @@ fn stage_str(stage: Stage) -> &'static str {
+ }
+ 
+ fn main() -> anyhow::Result<()> {
++    codex_install_context::initialize_build_identity(env!("CODEX_BUILD_ID"));
+     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
+     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {
+         cli_main(arg0_paths, remote_control_disabled).await?;
+diff --git a/codex-rs/install-context/src/lib.rs b/codex-rs/install-context/src/lib.rs
+index 61dabb0e02..6e756446bc 100644
+--- a/codex-rs/install-context/src/lib.rs
++++ b/codex-rs/install-context/src/lib.rs
+@@ -12,8 +12,31 @@ const RELEASES_DIRNAME: &str = "releases";
+ const RESOURCES_DIRNAME: &str = "codex-resources";
+ const STANDALONE_PACKAGES_DIRNAME: &str = "standalone";
+ const ZSH_DIRNAME: &str = "zsh";
++const DEVELOPMENT_BUILD_IDENTITY: &str = "development";
++static BUILD_IDENTITY: OnceLock<&'static str> = OnceLock::new();
+ static INSTALL_CONTEXT: OnceLock<InstallContext> = OnceLock::new();
+ 
++pub fn initialize_build_identity(build_identity: &'static str) {
++    assert!(
++        !build_identity.trim().is_empty(),
++        "build identity must not be empty"
++    );
++    if let Err(build_identity) = BUILD_IDENTITY.set(build_identity) {
++        assert_eq!(
++            BUILD_IDENTITY.get().copied(),
++            Some(build_identity),
++            "build identity was initialized with a different value"
++        );
++    }
++}
++
++pub fn build_identity() -> &'static str {
++    BUILD_IDENTITY
++        .get()
++        .copied()
++        .unwrap_or(DEVELOPMENT_BUILD_IDENTITY)
++}
++
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub enum StandalonePlatform {
+     Unix,
+@@ -291,6 +314,14 @@ mod tests {
+ 
+     const TEST_RESOURCE_NAME: &str = "codex-test-helper";
+ 
++    #[test]
++    fn build_identity_is_initialized_once_by_the_final_entrypoint() {
++        assert_eq!(build_identity(), DEVELOPMENT_BUILD_IDENTITY);
++        initialize_build_identity("build-1");
++        initialize_build_identity("build-1");
++        assert_eq!(build_identity(), "build-1");
++    }
++
+     #[test]
+     fn detects_standalone_install_from_release_layout() -> std::io::Result<()> {
+         let codex_home = tempfile::tempdir()?;

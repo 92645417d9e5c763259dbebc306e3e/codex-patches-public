@@ -60,29 +60,177 @@ index 3d1812d1f7..02a72662f6 100644
  
  ▪ Explored
    └ Search Change Approved
+diff --git a/codex-rs/tui/src/chatwidget/streaming.rs b/codex-rs/tui/src/chatwidget/streaming.rs
+index 4b9b770d3f..046344cf96 100644
+--- a/codex-rs/tui/src/chatwidget/streaming.rs
++++ b/codex-rs/tui/src/chatwidget/streaming.rs
+@@ -36,44 +36,29 @@ impl ChatWidget {
+         let had_stream_controller = self.stream_controller.is_some();
+         if let Some(mut controller) = self.stream_controller.take() {
+             let channel = controller.channel();
+-            let had_live_tail = controller.has_live_tail();
+             self.clear_active_stream_tail();
+-            let (cell, streamed_source) = controller.finalize();
+-            // Match newline-committed streaming behavior: once assistant output is ready to be
+-            // committed into history, hide the inline status row so transcript content replaces it.
+-            if cell.is_some() {
+-                self.bottom_pane.hide_status_indicator();
+-            }
+-            let deferred_history_cell = if had_live_tail {
+-                cell
+-            } else {
+-                if let Some(cell) = cell {
+-                    self.add_boxed_history(cell);
+-                }
+-                None
+-            };
+-            // Consolidate the run of streaming AgentMessageCells into a single AgentMarkdownCell
+-            // that can re-render from source on resize.
++            let streamed_source = controller.finalize_buffered_source();
+             let source = completed_message.map(str::to_owned).or_else(|| {
+                 streamed_source.map(|source| {
+                     parse_assistant_markdown(&source, self.config.cwd.as_path()).visible_markdown
+                 })
+             });
+-            if let Some(source) = source {
++            if let Some(source) = source.filter(|source| !source.is_empty()) {
+                 let inline_visualization_context = self.thread_id.and_then(|thread_id| {
+                     crate::inline_visualization::InlineVisualizationContext::from_config(
+                         &self.config,
+                         thread_id,
+                     )
+                 });
+-                self.note_stream_consolidation_queued();
+-                self.app_event_tx.send(AppEvent::ConsolidateAgentMessage {
+-                    source,
+-                    cwd: self.config.cwd.to_path_buf(),
+-                    inline_visualization_context,
+-                    channel,
+-                    deferred_history_cell,
+-                });
++                self.bottom_pane.hide_status_indicator();
++                self.add_boxed_history(Box::new(
++                    history_cell::AgentMarkdownCell::new_with_channel_and_inline_visualizations(
++                        source,
++                        &self.config.cwd,
++                        channel,
++                        inline_visualization_context,
++                    ),
++                ));
+             }
+         }
+         self.adaptive_chunking.reset();
+@@ -575,15 +560,11 @@ impl ChatWidget {
+                 ),
+             );
+         }
+-        if let Some(controller) = self.stream_controller.as_mut()
+-            && controller.push(&delta)
+-        {
+-            self.app_event_tx.send(AppEvent::StartCommitAnimation);
+-            self.run_catch_up_commit_tick();
+-        }
+-        // Unterminated source is buffered by the controller and cannot change the visible tail.
+-        if delta.contains('\n') && self.sync_active_stream_tail() {
+-            self.request_redraw();
++        if let Some(controller) = self.stream_controller.as_mut() {
++            // The Working row already exposes live transport progress through Received bytes.
++            // Keep assistant markdown out of scrollback until its canonical item completes so a
++            // framed commentary/final block is inserted atomically with one background style.
++            controller.buffer(&delta);
+         }
+     }
+ 
 diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
-index d89ff92d9f..42d6179fea 100644
+index d89ff92d9f..4f689b0c33 100644
 --- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
 +++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
-@@ -1328,13 +1328,11 @@ async fn live_app_server_turn_completion_repairs_dropped_message_deltas() {
-     let consolidations = std::iter::from_fn(|| rx.try_recv().ok())
+@@ -1273,20 +1273,23 @@ async fn live_app_server_failed_turn_consolidates_streamed_answer() {
+         /*codex_error_info*/ None,
+     );
+ 
+-    let mut saw_consolidate = false;
++    let mut saw_atomic_message = false;
+     while let Ok(event) = rx.try_recv() {
+-        if let AppEvent::ConsolidateAgentMessage { source, .. } = event {
+-            saw_consolidate = true;
++        if let AppEvent::InsertHistoryCell(cell) = event
++            && cell.as_any().is::<crate::history_cell::AgentMarkdownCell>()
++        {
++            saw_atomic_message = true;
++            let source = lines_to_single_string(&cell.raw_lines());
+             assert!(
+                 source.contains("streamed patch"),
+-                "expected partial stream source to be consolidated, got {source:?}"
++                "expected partial stream source to be committed, got {source:?}"
+             );
+         }
+     }
+ 
+     assert!(
+-        saw_consolidate,
+-        "failed turn should consolidate streamed cells before clearing the stream controller"
++        saw_atomic_message,
++        "failed turn should commit one source-backed message before clearing the stream controller"
+     );
+ }
+ 
+@@ -1325,17 +1328,12 @@ async fn live_app_server_turn_completion_repairs_dropped_message_deltas() {
+         /*replay_kind*/ None,
+     );
+ 
+-    let consolidations = std::iter::from_fn(|| rx.try_recv().ok())
++    let committed = std::iter::from_fn(|| rx.try_recv().ok())
          .filter_map(|event| match event {
-             AppEvent::ConsolidateAgentMessage {
+-            AppEvent::ConsolidateAgentMessage {
 -                source,
 -                scrollback_reflow,
 -                ..
-+                source, channel, ..
-             } => {
-                 assert_eq!(
+-            } => {
+-                assert_eq!(
 -                    scrollback_reflow,
 -                    crate::app_event::ConsolidationScrollbackReflow::Required
-+                    channel,
-+                    crate::history_cell::AgentMessageChannel::FinalAnswer
-                 );
+-                );
++            AppEvent::InsertHistoryCell(cell)
++                if cell.as_any().is::<crate::history_cell::AgentMarkdownCell>() =>
++            {
++                let source = lines_to_single_string(&cell.raw_lines());
                  assert_chatwidget_snapshot!(
                      "live_app_server_turn_completion_repairs_dropped_message_deltas",
+                     source,
+@@ -1345,22 +1343,23 @@ async fn live_app_server_turn_completion_repairs_dropped_message_deltas() {
+             _ => None,
+         })
+         .collect::<Vec<_>>();
+-    assert_eq!(consolidations.len(), 1);
++    assert_eq!(committed.len(), 1);
+ }
+ 
+ #[tokio::test]
+-async fn interrupted_turn_stops_commit_animation() {
++async fn assistant_stream_waits_for_completion_without_arming_commit_animation() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+ 
+     handle_turn_started(&mut chat, "turn-1");
+     while rx.try_recv().is_ok() {}
+ 
+     handle_agent_message_delta(&mut chat, "streamed response\n");
+-    assert!(
+-        std::iter::from_fn(|| rx.try_recv().ok())
+-            .any(|event| matches!(event, AppEvent::StartCommitAnimation)),
+-        "streaming should arm the commit animation"
+-    );
++    let delta_events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
++    assert!(!delta_events.iter().any(|event| matches!(
++        event,
++        AppEvent::StartCommitAnimation | AppEvent::InsertHistoryCell(_)
++    )));
++    assert!(!chat.has_active_stream_tail());
+ 
+     handle_turn_interrupted(&mut chat, "turn-1");
+     assert!(
 diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
-index 89c72e6585..5a51c44235 100644
+index 89c72e6585..54cd5a0370 100644
 --- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
 +++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
 @@ -2,6 +2,7 @@ use super::*;
@@ -93,11 +241,77 @@ index 89c72e6585..5a51c44235 100644
  use codex_app_server_protocol::SpendControlLimitSnapshot;
  use pretty_assertions::assert_eq;
  use ratatui::backend::TestBackend;
-@@ -369,6 +370,92 @@ async fn live_agent_message_uses_the_started_item_phase() {
-     assert_eq!(commentary[0].spans[0].style.fg, Some(Color::Cyan));
+@@ -289,7 +290,7 @@ async fn raw_output_mode_can_change_without_inserting_notice() {
  }
  
-+#[tokio::test]
+ #[tokio::test]
+-async fn flush_answer_stream_reflows_plain_text_to_add_the_closing_rule() {
++async fn flush_answer_stream_inserts_one_closed_source_backed_cell() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+     let cwd = chat.config.cwd.to_path_buf();
+ 
+@@ -305,30 +306,21 @@ async fn flush_answer_stream_reflows_plain_text_to_add_the_closing_rule() {
+ 
+     chat.flush_answer_stream_with_separator();
+ 
+-    let mut saw_consolidate = false;
+-    let mut saw_insert_history = false;
++    let mut inserted = Vec::new();
+     while let Ok(event) = rx.try_recv() {
+-        match event {
+-            AppEvent::InsertHistoryCell(_) => saw_insert_history = true,
+-            AppEvent::ConsolidateAgentMessage {
+-                deferred_history_cell,
+-                ..
+-            } => {
+-                saw_consolidate = true;
+-                assert!(deferred_history_cell.is_none());
+-            }
+-            _ => {}
++        if let AppEvent::InsertHistoryCell(cell) = event {
++            inserted.push(cell);
+         }
+     }
+ 
+-    assert!(
+-        saw_consolidate,
+-        "expected stream finalization to consolidate"
+-    );
+-    assert!(
+-        saw_insert_history,
+-        "plain text should enter provisional history before canonical reflow"
+-    );
++    assert_eq!(inserted.len(), 1);
++    assert!(inserted[0].as_any().is::<history_cell::AgentMarkdownCell>());
++    let lines = inserted[0].display_lines(/*width*/ 40);
++    assert!(lines.last().is_some_and(|line| {
++        line.spans.iter().any(|span| {
++            !span.content.is_empty() && span.content.chars().all(|character| character == '─')
++        })
++    }));
+ }
+ 
+ #[tokio::test]
+@@ -359,7 +351,13 @@ async fn live_agent_message_uses_the_started_item_phase() {
+         ),
+         /*replay_kind*/ None,
+     );
+-    chat.on_commit_tick();
++    assert!(drain_insert_history(&mut rx).is_empty());
++    complete_assistant_message(
++        &mut chat,
++        "commentary-1",
++        "Live commentary\n",
++        Some(MessagePhase::Commentary),
++    );
+ 
+     let cells = drain_insert_history(&mut rx);
+     let commentary = cells
+@@ -370,7 +368,81 @@ async fn live_agent_message_uses_the_started_item_phase() {
+ }
+ 
+ #[tokio::test]
+-async fn flush_answer_stream_requests_scrollback_reflow_for_live_table_tail() {
 +async fn live_assistant_channels_fill_one_open_surface_until_completion() {
 +    for (phase, expected_channel) in [
 +        (
@@ -130,27 +344,11 @@ index 89c72e6585..5a51c44235 100644
 +            chat.on_commit_tick();
 +        }
 +
-+        let mut provisional_cells = 0;
-+        while let Ok(event) = rx.try_recv() {
-+            if let AppEvent::InsertHistoryCell(cell) = event
-+                && cell.as_any().is::<history_cell::AgentMessageCell>()
-+            {
-+                provisional_cells += 1;
-+                assert_eq!(cell.fill_background_style(), Some(user_input_style()));
-+                let lines = cell.display_lines(/*width*/ 40);
-+                assert_eq!(lines.last().map(Line::width), Some(40));
-+                assert!(!lines.last().is_some_and(|line| {
-+                    line.spans.iter().any(|span| {
-+                        !span.content.is_empty()
-+                            && span.content.chars().all(|character| character == '─')
-+                    })
-+                }));
-+            }
-+        }
-+        assert!(provisional_cells > 0, "no provisional {phase:?} cells");
-+        if let Some(active) = chat.transcript.active_cell.as_ref() {
-+            assert_eq!(active.fill_background_style(), Some(user_input_style()));
-+        }
++        assert!(
++            drain_insert_history(&mut rx).is_empty(),
++            "{phase:?} rendered before canonical completion"
++        );
++        assert!(chat.transcript.active_cell.is_none());
 +
 +        complete_assistant_message(
 +            &mut chat,
@@ -158,34 +356,88 @@ index 89c72e6585..5a51c44235 100644
 +            "first paragraph\n\nsecond paragraph\n",
 +            Some(phase.clone()),
 +        );
-+        let mut finalized = false;
++        let mut finalized = Vec::new();
 +        while let Ok(event) = rx.try_recv() {
-+            if let AppEvent::ConsolidateAgentMessage {
-+                source,
-+                cwd,
-+                channel,
-+                ..
-+            } = event
++            if let AppEvent::InsertHistoryCell(cell) = event
++                && cell.as_any().is::<history_cell::AgentMarkdownCell>()
 +            {
-+                assert_eq!(channel, expected_channel);
-+                let cell = history_cell::AgentMarkdownCell::new_with_channel(source, &cwd, channel);
-+                let lines = cell.display_lines(/*width*/ 40);
-+                assert!(lines.last().is_some_and(|line| {
-+                    line.spans.iter().any(|span| {
-+                        !span.content.is_empty()
-+                            && span.content.chars().all(|character| character == '─')
-+                    })
-+                }));
-+                finalized = true;
++                finalized.push(cell);
 +            }
 +        }
-+        assert!(finalized, "{phase:?} stream was not consolidated");
++        assert_eq!(finalized.len(), 1, "{phase:?} was not inserted atomically");
++        assert_eq!(
++            finalized[0].fill_background_style(),
++            Some(user_input_style())
++        );
++        let lines = finalized[0].display_lines(/*width*/ 40);
++        assert_eq!(
++            lines[0].spans[0].style.fg,
++            Some(match expected_channel {
++                history_cell::AgentMessageChannel::Commentary => Color::Cyan,
++                history_cell::AgentMessageChannel::FinalAnswer => Color::Green,
++            })
++        );
++        assert!(lines.last().is_some_and(|line| {
++            line.spans.iter().any(|span| {
++                !span.content.is_empty() && span.content.chars().all(|character| character == '─')
++            })
++        }));
 +    }
 +}
 +
- #[tokio::test]
- async fn flush_answer_stream_requests_scrollback_reflow_for_live_table_tail() {
++#[tokio::test]
++async fn flush_answer_stream_commits_live_table_as_one_closed_cell() {
      let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+     let cwd = chat.config.cwd.to_path_buf();
+ 
+@@ -392,33 +464,15 @@ async fn flush_answer_stream_requests_scrollback_reflow_for_live_table_tail() {
+ 
+     chat.flush_answer_stream_with_separator();
+ 
+-    let mut saw_consolidate = false;
+-    let mut saw_insert_history = false;
++    let mut inserted = Vec::new();
+     while let Ok(event) = rx.try_recv() {
+-        match event {
+-            AppEvent::InsertHistoryCell(_) => saw_insert_history = true,
+-            AppEvent::ConsolidateAgentMessage {
+-                deferred_history_cell,
+-                ..
+-            } => {
+-                saw_consolidate = true;
+-                assert!(
+-                    deferred_history_cell.is_some(),
+-                    "live table tail should be staged for consolidation",
+-                );
+-            }
+-            _ => {}
++        if let AppEvent::InsertHistoryCell(cell) = event {
++            inserted.push(cell);
+         }
+     }
+ 
+-    assert!(
+-        saw_consolidate,
+-        "expected stream finalization to consolidate"
+-    );
+-    assert!(
+-        !saw_insert_history,
+-        "live table tail should not be inserted before canonical reflow"
+-    );
++    assert_eq!(inserted.len(), 1);
++    assert!(inserted[0].as_any().is::<history_cell::AgentMarkdownCell>());
+ }
+ 
+ #[tokio::test]
+@@ -2308,7 +2362,7 @@ async fn commentary_completion_restores_status_indicator_before_exec_begin() {
+     chat.on_commit_tick();
+     drain_insert_history(&mut rx);
+ 
+-    assert_eq!(chat.bottom_pane.status_indicator_visible(), false);
++    assert_eq!(chat.bottom_pane.status_indicator_visible(), true);
+ 
+     complete_assistant_message(
+         &mut chat,
 diff --git a/codex-rs/tui/src/history_cell/messages.rs b/codex-rs/tui/src/history_cell/messages.rs
 index ef9657f840..cb8b326c1f 100644
 --- a/codex-rs/tui/src/history_cell/messages.rs
@@ -707,3 +959,73 @@ index 6583adeed4..9482a76cf1 100644
      #[test]
      fn writes_bold_then_regular_spans() {
          use ratatui::style::Stylize;
+diff --git a/codex-rs/tui/src/streaming/controller.rs b/codex-rs/tui/src/streaming/controller.rs
+index 96b553e13f..a516bdd3b9 100644
+--- a/codex-rs/tui/src/streaming/controller.rs
++++ b/codex-rs/tui/src/streaming/controller.rs
+@@ -157,6 +157,13 @@ impl StreamCore {
+         enqueued
+     }
+ 
++    fn buffer_delta(&mut self, delta: &str) {
++        if !delta.is_empty() {
++            self.state.has_seen_delta = true;
++            self.state.collector.push_delta(delta);
++        }
++    }
++
+     /// Drain the collector, render the final source snapshot, and return lines not yet emitted.
+     ///
+     /// This intentionally re-renders from the full raw source instead of
+@@ -177,6 +184,12 @@ impl StreamCore {
+         (remaining, source)
+     }
+ 
++    fn finalize_buffered_source(&mut self) -> String {
++        let source = self.state.collector.finalize_and_take_source();
++        self.reset();
++        source
++    }
++
+     /// Step animation: dequeue one line, update the emitted count.
+     fn tick(&mut self) -> Vec<HyperlinkLine> {
+         let step = self.state.step();
+@@ -527,6 +540,15 @@ impl StreamController {
+         self.core.push_delta(delta)
+     }
+ 
++    pub(crate) fn buffer(&mut self, delta: &str) {
++        self.core.buffer_delta(delta);
++    }
++
++    pub(crate) fn finalize_buffered_source(&mut self) -> Option<String> {
++        let source = self.core.finalize_buffered_source();
++        (!source.is_empty()).then_some(source)
++    }
++
+     /// Finalize the active stream. Returns the final cell (if any remaining lines) and the raw
+     /// markdown source for consolidation.
+     pub(crate) fn finalize(&mut self) -> (Option<Box<dyn HistoryCell>>, Option<String>) {
+@@ -799,6 +821,22 @@ mod tests {
+         StreamController::new(width, &test_cwd(), HistoryRenderMode::Rich)
+     }
+ 
++    #[test]
++    fn buffered_agent_stream_renders_only_when_finalized() {
++        let mut controller = stream_controller(Some(80));
++        controller.buffer("first line\n\n");
++        controller.buffer("second line");
++
++        assert_eq!(controller.queued_lines(), 0);
++        assert!(controller.current_tail_lines().is_empty());
++        assert!(!controller.has_live_tail());
++
++        assert_eq!(
++            controller.finalize_buffered_source().as_deref(),
++            Some("first line\n\nsecond line\n")
++        );
++    }
++
+     fn plan_stream_controller(width: Option<usize>) -> PlanStreamController {
+         PlanStreamController::new(width, &test_cwd(), HistoryRenderMode::Rich)
+     }

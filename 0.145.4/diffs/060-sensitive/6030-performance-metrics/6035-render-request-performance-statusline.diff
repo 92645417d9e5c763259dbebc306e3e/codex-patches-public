@@ -294,10 +294,10 @@ index 29d7f01aea..e2b79fb142 100644
          self.refresh_plan_mode_nudge();
          self.turn_lifecycle.reset_thread();
 diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
-index 9525d30263..5c3fcb40bf 100644
+index 9525d30263..17406c4603 100644
 --- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
 +++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
-@@ -229,10 +229,49 @@ impl ChatWidget {
+@@ -229,10 +229,43 @@ impl ChatWidget {
              StatusLineItem::WeeklyLimit => {
                  self.status_line_limit_display_line(weekly_status_window)
              }
@@ -319,13 +319,7 @@ index 9525d30263..5c3fcb40bf 100644
 +            _ => return None,
 +        }?;
 +        let text = match item {
-+            StatusLineItem::RequestTtfb => {
-+                if metric.value > 0.0 && metric.value < 0.001 {
-+                    format!("TTFB {:.6}s", metric.value)
-+                } else {
-+                    format!("TTFB {:.3}s", metric.value)
-+                }
-+            }
++            StatusLineItem::RequestTtfb => format_request_ttfb(metric.value)?,
 +            StatusLineItem::RequestTps if metric.value.is_finite() && metric.value > 0.0 => {
 +                format!("TPS {:.1}", metric.value)
 +            }
@@ -347,14 +341,14 @@ index 9525d30263..5c3fcb40bf 100644
      fn status_line_limit_display_line(
          &self,
          select_window: fn(&RateLimitSnapshotDisplay) -> Option<(&RateLimitWindowDisplay, bool)>,
-@@ -791,6 +830,16 @@ impl ChatWidget {
+@@ -791,6 +824,16 @@ impl ChatWidget {
                  .status_line_total_usage()
                  .cache_hit_rate_percent()
                  .map(|rate| format!("{rate:.1}% hit")),
 +            StatusLineItem::RequestTtfb => self
 +                .request_performance
 +                .ttfb
-+                .map(|metric| format!("TTFB {:.3}s", metric.value)),
++                .and_then(|metric| format_request_ttfb(metric.value)),
 +            StatusLineItem::RequestTps => self
 +                .request_performance
 +                .tps
@@ -364,7 +358,7 @@ index 9525d30263..5c3fcb40bf 100644
              StatusLineItem::SessionId => self.thread_id.map(|id| id.to_string()),
              StatusLineItem::FastMode => Some(
                  if self.current_service_tier() == Some(ServiceTier::Fast.request_value()) {
-@@ -850,6 +899,8 @@ impl ChatWidget {
+@@ -850,6 +893,8 @@ impl ChatWidget {
              StatusSurfacePreviewItem::TotalInputTokens => StatusLineItem::TotalInputTokens,
              StatusSurfacePreviewItem::TotalOutputTokens => StatusLineItem::TotalOutputTokens,
              StatusSurfacePreviewItem::CacheHitRate => StatusLineItem::CacheHitRate,
@@ -373,8 +367,19 @@ index 9525d30263..5c3fcb40bf 100644
              StatusSurfacePreviewItem::SessionId => StatusLineItem::SessionId,
              StatusSurfacePreviewItem::FastMode => StatusLineItem::FastMode,
              StatusSurfacePreviewItem::RawOutput => StatusLineItem::RawOutput,
+@@ -1214,6 +1259,10 @@ impl ChatWidget {
+     }
+ }
+ 
++fn format_request_ttfb(value: f64) -> Option<String> {
++    (value.is_finite() && value >= 0.0).then(|| format!("TTFB {:.3}s", value.max(0.001)))
++}
++
+ fn five_hour_status_window(
+     snapshot: &RateLimitSnapshotDisplay,
+ ) -> Option<(&RateLimitWindowDisplay, bool)> {
 diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
-index 9c1ae9ea38..e6f0179536 100644
+index 95c2e089ef..f76e1b32b7 100644
 --- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
 +++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
 @@ -33,6 +33,8 @@ async fn response_output_bytes_follow_the_active_request_lifecycle_without_histo
@@ -422,7 +427,7 @@ index 9c1ae9ea38..e6f0179536 100644
              },
          ),
          /*replay_kind*/ None,
-@@ -175,6 +185,38 @@ async fn response_output_bytes_follow_the_active_request_lifecycle_without_histo
+@@ -175,6 +185,55 @@ async fn response_output_bytes_follow_the_active_request_lifecycle_without_histo
      assert!(drain_insert_history(&mut rx).is_empty());
  }
  
@@ -456,6 +461,23 @@ index 9c1ae9ea38..e6f0179536 100644
 +        .expect("TPS should be fresh on its own lifecycle");
 +    assert_eq!(stale_ttfb.spans[0].style.fg, Some(Color::DarkGray));
 +    assert_ne!(fresh_tps.spans[0].style.fg, Some(Color::DarkGray));
++}
++
++#[tokio::test]
++async fn request_ttfb_display_clamps_to_one_millisecond() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    let observed_at = Instant::now();
++    assert!(chat.merge_request_performance_at(Some(0.000_873), None, observed_at));
++
++    let line = chat
++        .request_performance_line_at(StatusLineItem::RequestTtfb, observed_at)
++        .expect("TTFB line");
++    assert_eq!(line.spans[0].content, "TTFB 0.001s");
++    assert_eq!(
++        chat.status_line_value_for_item(StatusLineItem::RequestTtfb)
++            .as_deref(),
++        Some("TTFB 0.001s")
++    );
 +}
 +
  fn thread_settings_for_test(
