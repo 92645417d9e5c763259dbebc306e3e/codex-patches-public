@@ -1,0 +1,1188 @@
+diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
+index 546d1acdc1..4667958df0 100644
+--- a/codex-rs/app-server/Cargo.toml
++++ b/codex-rs/app-server/Cargo.toml
+@@ -91,6 +91,7 @@ clap = { workspace = true, features = ["derive"] }
+ futures = { workspace = true }
+ serde = { workspace = true, features = ["derive"] }
+ serde_json = { workspace = true }
++sha2 = { workspace = true }
+ tempfile = { workspace = true }
+ thiserror = { workspace = true }
+ time = { workspace = true }
+@@ -134,7 +135,6 @@ rmcp = { workspace = true, default-features = false, features = [
+     "transport-streamable-http-server",
+ ] }
+ serial_test = { workspace = true }
+-sha2 = { workspace = true }
+ shlex = { workspace = true }
+ tar = { workspace = true }
+ tokio-tungstenite = { workspace = true }
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index a60527b64c..72b5ef6f54 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -35,6 +35,7 @@ use crate::request_processors::MarketplaceRequestProcessor;
+ use crate::request_processors::McpRequestProcessor;
+ use crate::request_processors::PluginRequestProcessor;
+ use crate::request_processors::ProcessExecRequestProcessor;
++use crate::request_processors::PromptAssistantRequestProcessor;
+ use crate::request_processors::RemoteControlRequestProcessor;
+ use crate::request_processors::SearchRequestProcessor;
+ use crate::request_processors::ThreadGoalRequestProcessor;
+@@ -195,6 +196,7 @@ pub(crate) struct MessageProcessor {
+     marketplace_processor: MarketplaceRequestProcessor,
+     mcp_processor: McpRequestProcessor,
+     plugin_processor: PluginRequestProcessor,
++    prompt_assistant_processor: PromptAssistantRequestProcessor,
+     remote_control_processor: RemoteControlRequestProcessor,
+     search_processor: SearchRequestProcessor,
+     thread_goal_processor: ThreadGoalRequestProcessor,
+@@ -497,6 +499,8 @@ impl MessageProcessor {
+             on_effective_plugins_changed,
+         );
+         let remote_control_processor = RemoteControlRequestProcessor::new(remote_control_handle);
++        let prompt_assistant_processor =
++            PromptAssistantRequestProcessor::new(Arc::clone(&thread_manager), outgoing.clone());
+         let search_processor = SearchRequestProcessor::new(outgoing.clone());
+         let thread_goal_processor = ThreadGoalRequestProcessor::new(
+             Arc::clone(&thread_manager),
+@@ -594,6 +598,7 @@ impl MessageProcessor {
+             marketplace_processor,
+             mcp_processor,
+             plugin_processor,
++            prompt_assistant_processor,
+             remote_control_processor,
+             search_processor,
+             thread_goal_processor,
+@@ -935,6 +940,9 @@ impl MessageProcessor {
+         self.process_exec_processor
+             .connection_closed(connection_id)
+             .await;
++        self.prompt_assistant_processor
++            .connection_closed(connection_id)
++            .await;
+         self.thread_processor.connection_closed(connection_id).await;
+         let counts_as_active_client = session_state.counts_as_active_client();
+         let snapshot = {
+@@ -1241,6 +1249,36 @@ impl MessageProcessor {
+                 .model_provider_capabilities_read()
+                 .await
+                 .map(|response| Some(response.into())),
++            ClientRequest::PromptAssistantOpen { params, .. } => self
++                .prompt_assistant_processor
++                .open(connection_id, params)
++                .await
++                .map(|response| Some(response.into())),
++            ClientRequest::PromptAssistantCompose { params, .. } => self
++                .prompt_assistant_processor
++                .compose(connection_id, params)
++                .await
++                .map(|response| Some(response.into())),
++            ClientRequest::PromptAssistantRevise { params, .. } => self
++                .prompt_assistant_processor
++                .revise(connection_id, params)
++                .await
++                .map(|response| Some(response.into())),
++            ClientRequest::PromptAssistantApply { params, .. } => self
++                .prompt_assistant_processor
++                .apply(connection_id, params)
++                .await
++                .map(|response| Some(response.into())),
++            ClientRequest::PromptAssistantInterrupt { params, .. } => self
++                .prompt_assistant_processor
++                .interrupt(connection_id, params)
++                .await
++                .map(|response| Some(response.into())),
++            ClientRequest::PromptAssistantCancel { params, .. } => self
++                .prompt_assistant_processor
++                .cancel(connection_id, params)
++                .await
++                .map(|response| Some(response.into())),
+             ClientRequest::ThreadStart { params, .. } => {
+                 self.thread_processor
+                     .thread_start(
+@@ -1497,6 +1535,11 @@ impl MessageProcessor {
+                     .await
+             }
+             ClientRequest::TurnStart { params, .. } => {
++                if let Ok(thread_id) = ThreadId::from_string(&params.thread_id) {
++                    self.prompt_assistant_processor
++                        .parent_turn_started(thread_id)
++                        .await;
++                }
+                 self.turn_processor
+                     .turn_start(
+                         request_id.clone(),
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+index 9cbfe12272..08d84b2ce6 100644
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -541,6 +541,7 @@ mod marketplace_processor;
+ mod mcp_processor;
+ mod plugins;
+ mod process_exec_processor;
++mod prompt_assistant_processor;
+ mod remote_control_processor;
+ mod search;
+ mod thread_fork_goal;
+@@ -563,6 +564,7 @@ pub(crate) use marketplace_processor::MarketplaceRequestProcessor;
+ pub(crate) use mcp_processor::McpRequestProcessor;
+ pub(crate) use plugins::PluginRequestProcessor;
+ pub(crate) use process_exec_processor::ProcessExecRequestProcessor;
++pub(crate) use prompt_assistant_processor::PromptAssistantRequestProcessor;
+ pub(crate) use remote_control_processor::RemoteControlRequestProcessor;
+ pub(crate) use search::SearchRequestProcessor;
+ pub(crate) use thread_goal_processor::ThreadGoalRequestProcessor;
+diff --git a/codex-rs/app-server/src/request_processors/prompt_assistant_processor.rs b/codex-rs/app-server/src/request_processors/prompt_assistant_processor.rs
+new file mode 100644
+index 0000000000..63fe6a2900
+--- /dev/null
++++ b/codex-rs/app-server/src/request_processors/prompt_assistant_processor.rs
+@@ -0,0 +1,1046 @@
++use std::collections::HashMap;
++use std::sync::Arc;
++use std::time::Duration;
++
++use codex_app_server_protocol::JSONRPCErrorError;
++use codex_app_server_protocol::PromptAssistantApplyParams;
++use codex_app_server_protocol::PromptAssistantApplyResponse;
++use codex_app_server_protocol::PromptAssistantCancelParams;
++use codex_app_server_protocol::PromptAssistantCancelResponse;
++use codex_app_server_protocol::PromptAssistantComposeParams;
++use codex_app_server_protocol::PromptAssistantComposeResponse;
++use codex_app_server_protocol::PromptAssistantInterruptParams;
++use codex_app_server_protocol::PromptAssistantInterruptResponse;
++use codex_app_server_protocol::PromptAssistantModelOption;
++use codex_app_server_protocol::PromptAssistantOpenParams;
++use codex_app_server_protocol::PromptAssistantOpenResponse;
++use codex_app_server_protocol::PromptAssistantOperationKind;
++use codex_app_server_protocol::PromptAssistantOutcome;
++use codex_app_server_protocol::PromptAssistantPhase;
++use codex_app_server_protocol::PromptAssistantProgressNotification;
++use codex_app_server_protocol::PromptAssistantReviseParams;
++use codex_app_server_protocol::PromptAssistantReviseResponse;
++use codex_app_server_protocol::PromptAssistantWorkspace;
++use codex_app_server_protocol::PromptAssistantWorkspaceUpdatedNotification;
++use codex_app_server_protocol::ServerNotification;
++use codex_core::CodexThread;
++use codex_core::PromptAssistantFrozenContext;
++use codex_core::PromptAssistantOutputStatus;
++use codex_core::ThreadManager;
++use codex_core::load_or_seed_prompt_assistant_instructions;
++use codex_core::parse_prompt_assistant_output;
++use codex_core::prompt_assistant_output_schema;
++use codex_protocol::ThreadId;
++use codex_protocol::openai_models::ModelInfo;
++use codex_protocol::openai_models::ModelVisibility;
++use codex_protocol::openai_models::ReasoningEffort;
++use codex_protocol::protocol::AgentStatus;
++use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::Op;
++use codex_protocol::protocol::ThreadSettingsOverrides;
++use codex_protocol::user_input::UserInput;
++use serde::Serialize;
++use sha2::Digest;
++use sha2::Sha256;
++use tokio::sync::Mutex;
++use tokio::sync::Notify;
++use tokio::time::timeout;
++use tokio_util::sync::CancellationToken;
++
++use crate::error_code::invalid_params;
++use crate::outgoing_message::ConnectionId;
++use crate::outgoing_message::OutgoingMessageSender;
++
++const OPERATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
++const INTERRUPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
++
++#[derive(Clone)]
++pub(crate) struct PromptAssistantRequestProcessor {
++    inner: Arc<Inner>,
++}
++
++struct Inner {
++    thread_manager: Arc<ThreadManager>,
++    outgoing: Arc<OutgoingMessageSender>,
++    workspaces: Mutex<HashMap<WorkspaceKey, Workspace>>,
++}
++
++#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
++struct WorkspaceKey {
++    connection_id: ConnectionId,
++    thread_id: ThreadId,
++}
++
++struct Workspace {
++    workspace_id: String,
++    generation: u64,
++    candidate_generation: u64,
++    candidate_hash: Option<String>,
++    phase: PromptAssistantPhase,
++    active_operation: Option<ActiveOperation>,
++    selected_model: String,
++    selected_reasoning_effort: ReasoningEffort,
++    candidate: Option<String>,
++    outcome: Option<PromptAssistantOutcome>,
++    message: Option<String>,
++    received_bytes: u64,
++    frozen_context: PromptAssistantFrozenContext,
++    instructions: String,
++    models: Vec<ModelInfo>,
++    child: Option<Arc<CodexThread>>,
++}
++
++struct ActiveOperation {
++    kind: PromptAssistantOperationKind,
++    generation: u64,
++    cancellation: CancellationToken,
++    completion: Arc<Notify>,
++}
++
++struct OperationTask {
++    key: WorkspaceKey,
++    workspace_id: String,
++    generation: u64,
++    kind: PromptAssistantOperationKind,
++    input: String,
++    model: String,
++    reasoning_effort: ReasoningEffort,
++    frozen_context: PromptAssistantFrozenContext,
++    instructions: String,
++    current_candidate: Option<String>,
++    existing_child: Option<Arc<CodexThread>>,
++    cancellation: CancellationToken,
++    completion: Arc<Notify>,
++}
++
++#[derive(Serialize)]
++#[serde(rename_all = "snake_case")]
++enum ModelOperation {
++    Compose,
++    Revise,
++}
++
++#[derive(Serialize)]
++struct ModelInput<'a> {
++    operation: ModelOperation,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    background: Option<&'a PromptAssistantFrozenContext>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    current_candidate: Option<&'a str>,
++    input: &'a str,
++}
++
++enum OperationResult {
++    Completed(String),
++    Interrupted,
++    Failed { message: String, retire_child: bool },
++}
++
++impl PromptAssistantRequestProcessor {
++    pub(crate) fn new(
++        thread_manager: Arc<ThreadManager>,
++        outgoing: Arc<OutgoingMessageSender>,
++    ) -> Self {
++        Self {
++            inner: Arc::new(Inner {
++                thread_manager,
++                outgoing,
++                workspaces: Mutex::new(HashMap::new()),
++            }),
++        }
++    }
++
++    pub(crate) async fn open(
++        &self,
++        connection_id: ConnectionId,
++        params: PromptAssistantOpenParams,
++    ) -> Result<PromptAssistantOpenResponse, JSONRPCErrorError> {
++        let thread_id = parse_thread_id(&params.thread_id)?;
++        let parent = self
++            .inner
++            .thread_manager
++            .get_thread(thread_id)
++            .await
++            .map_err(|err| invalid_params(err.to_string()))?;
++        let config = parent.config().await;
++        let config_snapshot = parent.config_snapshot().await;
++        if config_snapshot.session_source.is_non_root_agent() {
++            return Err(invalid_params(
++                "Prompt Assistant is available only from the root session",
++            ));
++        }
++        if matches!(
++            parent.agent_status().await,
++            AgentStatus::PendingInit | AgentStatus::Running
++        ) {
++            return Err(invalid_params(
++                "Prompt Assistant cannot open while the parent turn is active",
++            ));
++        }
++
++        let instructions = load_or_seed_prompt_assistant_instructions(config.codex_home.as_path())
++            .await
++            .map_err(|err| invalid_params(err.to_string()))?;
++        let frozen_context = parent.prompt_assistant_context_snapshot().await;
++        let guardian_model = parent.guardian_review_model_id().await;
++        let models = eligible_models(
++            self.inner
++                .thread_manager
++                .get_models_manager()
++                .get_remote_models()
++                .await,
++            &guardian_model,
++        );
++        let current_model = config_snapshot.model.as_str();
++        let selected = select_default_model(&models, current_model).ok_or_else(|| {
++            invalid_params("Prompt Assistant has no eligible model after Guardian exclusion")
++        })?;
++        let selected_model = selected.slug.clone();
++        let selected_reasoning_effort = selected
++            .default_reasoning_level
++            .clone()
++            .unwrap_or(ReasoningEffort::Medium);
++        let model_options = models.iter().map(model_option).collect();
++        let key = WorkspaceKey {
++            connection_id,
++            thread_id,
++        };
++        let workspace = Workspace {
++            workspace_id: uuid::Uuid::now_v7().to_string(),
++            generation: 0,
++            candidate_generation: 0,
++            candidate_hash: None,
++            phase: PromptAssistantPhase::Editing,
++            active_operation: None,
++            selected_model,
++            selected_reasoning_effort,
++            candidate: None,
++            outcome: None,
++            message: None,
++            received_bytes: 0,
++            frozen_context,
++            instructions,
++            models,
++            child: None,
++        };
++        let snapshot = workspace.snapshot(thread_id);
++        if let Some(previous) = self.inner.workspaces.lock().await.insert(key, workspace) {
++            retire_workspace(previous).await;
++        }
++        Ok(PromptAssistantOpenResponse {
++            workspace: snapshot,
++            models: model_options,
++        })
++    }
++
++    pub(crate) async fn compose(
++        &self,
++        connection_id: ConnectionId,
++        params: PromptAssistantComposeParams,
++    ) -> Result<PromptAssistantComposeResponse, JSONRPCErrorError> {
++        let key = WorkspaceKey {
++            connection_id,
++            thread_id: parse_thread_id(&params.thread_id)?,
++        };
++        let (workspace, task) = self
++            .start_operation(
++                key,
++                &params.workspace_id,
++                params.expected_generation,
++                PromptAssistantOperationKind::Compose,
++                params.input,
++                params.model,
++                params.reasoning_effort,
++                None,
++            )
++            .await?;
++        self.spawn_operation(task);
++        Ok(PromptAssistantComposeResponse { workspace })
++    }
++
++    pub(crate) async fn revise(
++        &self,
++        connection_id: ConnectionId,
++        params: PromptAssistantReviseParams,
++    ) -> Result<PromptAssistantReviseResponse, JSONRPCErrorError> {
++        let key = WorkspaceKey {
++            connection_id,
++            thread_id: parse_thread_id(&params.thread_id)?,
++        };
++        let (workspace, task) = self
++            .start_operation(
++                key,
++                &params.workspace_id,
++                params.expected_generation,
++                PromptAssistantOperationKind::Revise,
++                params.input,
++                params.model,
++                params.reasoning_effort,
++                Some((
++                    params.expected_candidate_generation,
++                    params.expected_candidate_hash,
++                )),
++            )
++            .await?;
++        self.spawn_operation(task);
++        Ok(PromptAssistantReviseResponse { workspace })
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    async fn start_operation(
++        &self,
++        key: WorkspaceKey,
++        workspace_id: &str,
++        expected_generation: u64,
++        kind: PromptAssistantOperationKind,
++        input: String,
++        model: String,
++        reasoning_effort: ReasoningEffort,
++        expected_candidate: Option<(u64, String)>,
++    ) -> Result<(PromptAssistantWorkspace, OperationTask), JSONRPCErrorError> {
++        if input.trim().is_empty() {
++            return Err(invalid_params("Prompt Assistant input must not be empty"));
++        }
++        let mut workspaces = self.inner.workspaces.lock().await;
++        let workspace = checked_workspace_mut(&mut workspaces, key, workspace_id)?;
++        if workspace.generation != expected_generation {
++            return Err(invalid_params(
++                "stale Prompt Assistant workspace generation",
++            ));
++        }
++        if workspace.active_operation.is_some() {
++            return Err(invalid_params(
++                "Prompt Assistant operation is already active",
++            ));
++        }
++        if kind == PromptAssistantOperationKind::Compose && workspace.candidate.is_some() {
++            return Err(invalid_params(
++                "Prompt Assistant Compose is unavailable after Ready",
++            ));
++        }
++        if kind == PromptAssistantOperationKind::Revise && workspace.candidate.is_none() {
++            return Err(invalid_params(
++                "Prompt Assistant Revise requires a ready candidate",
++            ));
++        }
++        if let Some((generation, hash)) = expected_candidate
++            && (workspace.candidate_generation != generation
++                || workspace.candidate_hash.as_deref() != Some(hash.as_str()))
++        {
++            return Err(invalid_params("stale Prompt Assistant candidate"));
++        }
++        let selected = workspace
++            .models
++            .iter()
++            .find(|candidate| candidate.slug == model)
++            .ok_or_else(|| invalid_params("Prompt Assistant model is not eligible"))?;
++        if !selected
++            .supported_reasoning_levels
++            .iter()
++            .any(|preset| preset.effort == reasoning_effort)
++            && selected.default_reasoning_level != Some(reasoning_effort.clone())
++        {
++            return Err(invalid_params(
++                "Prompt Assistant reasoning effort is unsupported",
++            ));
++        }
++
++        workspace.generation += 1;
++        workspace.phase = match kind {
++            PromptAssistantOperationKind::Compose => PromptAssistantPhase::Preparing,
++            PromptAssistantOperationKind::Revise => PromptAssistantPhase::Revising,
++        };
++        workspace.selected_model = model.clone();
++        workspace.selected_reasoning_effort = reasoning_effort.clone();
++        workspace.outcome = None;
++        workspace.message = None;
++        workspace.received_bytes = 0;
++        let cancellation = CancellationToken::new();
++        let completion = Arc::new(Notify::new());
++        workspace.active_operation = Some(ActiveOperation {
++            kind,
++            generation: workspace.generation,
++            cancellation: cancellation.clone(),
++            completion: Arc::clone(&completion),
++        });
++        let task = OperationTask {
++            key,
++            workspace_id: workspace.workspace_id.clone(),
++            generation: workspace.generation,
++            kind,
++            input,
++            model,
++            reasoning_effort,
++            frozen_context: workspace.frozen_context.clone(),
++            instructions: workspace.instructions.clone(),
++            current_candidate: workspace.candidate.clone(),
++            existing_child: workspace.child.clone(),
++            cancellation,
++            completion,
++        };
++        Ok((workspace.snapshot(key.thread_id), task))
++    }
++
++    fn spawn_operation(&self, task: OperationTask) {
++        let inner = Arc::clone(&self.inner);
++        drop(tokio::spawn(async move {
++            inner.run_operation(task).await;
++        }));
++    }
++
++    pub(crate) async fn apply(
++        &self,
++        connection_id: ConnectionId,
++        params: PromptAssistantApplyParams,
++    ) -> Result<PromptAssistantApplyResponse, JSONRPCErrorError> {
++        let key = WorkspaceKey {
++            connection_id,
++            thread_id: parse_thread_id(&params.thread_id)?,
++        };
++        let workspace = {
++            let mut workspaces = self.inner.workspaces.lock().await;
++            let workspace = checked_workspace(&workspaces, key, &params.workspace_id)?;
++            if workspace.generation != params.expected_generation
++                || workspace.candidate_generation != params.expected_candidate_generation
++                || workspace.candidate_hash.as_deref()
++                    != Some(params.expected_candidate_hash.as_str())
++                || workspace.phase != PromptAssistantPhase::Ready
++            {
++                return Err(invalid_params("stale Prompt Assistant candidate"));
++            }
++            workspaces.remove(&key).expect("checked workspace exists")
++        };
++        let candidate = workspace
++            .candidate
++            .clone()
++            .ok_or_else(|| invalid_params("Prompt Assistant candidate is unavailable"))?;
++        retire_workspace(workspace).await;
++        Ok(PromptAssistantApplyResponse { candidate })
++    }
++
++    pub(crate) async fn interrupt(
++        &self,
++        connection_id: ConnectionId,
++        params: PromptAssistantInterruptParams,
++    ) -> Result<PromptAssistantInterruptResponse, JSONRPCErrorError> {
++        let key = WorkspaceKey {
++            connection_id,
++            thread_id: parse_thread_id(&params.thread_id)?,
++        };
++        let completion = {
++            let workspaces = self.inner.workspaces.lock().await;
++            let workspace = checked_workspace(&workspaces, key, &params.workspace_id)?;
++            if workspace.generation != params.expected_generation {
++                return Err(invalid_params(
++                    "stale Prompt Assistant workspace generation",
++                ));
++            }
++            let active = workspace
++                .active_operation
++                .as_ref()
++                .ok_or_else(|| invalid_params("Prompt Assistant has no active operation"))?;
++            if active.generation != params.active_operation_generation {
++                return Err(invalid_params(
++                    "stale Prompt Assistant operation generation",
++                ));
++            }
++            active.cancellation.cancel();
++            Arc::clone(&active.completion)
++        };
++        let _ = timeout(INTERRUPT_DRAIN_TIMEOUT, completion.notified()).await;
++        let workspaces = self.inner.workspaces.lock().await;
++        let workspace = checked_workspace(&workspaces, key, &params.workspace_id)?;
++        Ok(PromptAssistantInterruptResponse {
++            workspace: workspace.snapshot(key.thread_id),
++        })
++    }
++
++    pub(crate) async fn cancel(
++        &self,
++        connection_id: ConnectionId,
++        params: PromptAssistantCancelParams,
++    ) -> Result<PromptAssistantCancelResponse, JSONRPCErrorError> {
++        let key = WorkspaceKey {
++            connection_id,
++            thread_id: parse_thread_id(&params.thread_id)?,
++        };
++        let workspace = {
++            let mut workspaces = self.inner.workspaces.lock().await;
++            checked_workspace(&workspaces, key, &params.workspace_id)?;
++            workspaces.remove(&key).expect("checked workspace exists")
++        };
++        retire_workspace(workspace).await;
++        Ok(PromptAssistantCancelResponse::default())
++    }
++
++    pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
++        let removed = self
++            .remove_matching(|key| key.connection_id == connection_id)
++            .await;
++        for (_, workspace) in removed {
++            retire_workspace(workspace).await;
++        }
++    }
++
++    pub(crate) async fn parent_turn_started(&self, thread_id: ThreadId) {
++        let removed = self.remove_matching(|key| key.thread_id == thread_id).await;
++        for (key, mut workspace) in removed {
++            if let Some(active) = &workspace.active_operation {
++                active.cancellation.cancel();
++            }
++            workspace.phase = stable_phase(&workspace);
++            workspace.outcome = Some(PromptAssistantOutcome::Cancelled);
++            workspace.message =
++                Some("Prompt Assistant closed because the parent turn started".to_string());
++            self.inner
++                .send_workspace_update(key.connection_id, workspace.snapshot(thread_id))
++                .await;
++            retire_workspace(workspace).await;
++        }
++    }
++
++    async fn remove_matching(
++        &self,
++        predicate: impl Fn(&WorkspaceKey) -> bool,
++    ) -> Vec<(WorkspaceKey, Workspace)> {
++        let mut workspaces = self.inner.workspaces.lock().await;
++        let keys = workspaces
++            .keys()
++            .filter(|key| predicate(key))
++            .copied()
++            .collect::<Vec<_>>();
++        keys.into_iter()
++            .filter_map(|key| workspaces.remove(&key).map(|workspace| (key, workspace)))
++            .collect()
++    }
++}
++
++impl Inner {
++    async fn run_operation(self: Arc<Self>, task: OperationTask) {
++        let child = match self.child_for(&task).await {
++            Ok(child) => child,
++            Err(message) => {
++                self.finish_terminal(&task, PromptAssistantOutcome::Failed, Some(message), true)
++                    .await;
++                return;
++            }
++        };
++        let input = ModelInput {
++            operation: match task.kind {
++                PromptAssistantOperationKind::Compose => ModelOperation::Compose,
++                PromptAssistantOperationKind::Revise => ModelOperation::Revise,
++            },
++            background: task
++                .existing_child
++                .is_none()
++                .then_some(&task.frozen_context),
++            current_candidate: task.current_candidate.as_deref(),
++            input: &task.input,
++        };
++        let input = match serde_json::to_string(&input) {
++            Ok(input) => input,
++            Err(err) => {
++                self.finish_terminal(
++                    &task,
++                    PromptAssistantOutcome::Failed,
++                    Some(err.to_string()),
++                    false,
++                )
++                .await;
++                return;
++            }
++        };
++        let child_config = child.config_snapshot().await;
++        if (child_config.model != task.model
++            || child_config.reasoning_effort.as_ref() != Some(&task.reasoning_effort))
++            && let Err(err) = child
++                .submit(Op::ThreadSettings {
++                    thread_settings: ThreadSettingsOverrides {
++                        model: Some(task.model.clone()),
++                        effort: Some(Some(task.reasoning_effort.clone())),
++                        ..Default::default()
++                    },
++                })
++                .await
++        {
++            self.finish_terminal(
++                &task,
++                PromptAssistantOutcome::Failed,
++                Some(err.to_string()),
++                true,
++            )
++            .await;
++            return;
++        }
++        if let Err(err) = child
++            .submit(Op::UserInput {
++                items: vec![UserInput::Text {
++                    text: input,
++                    text_elements: Vec::new(),
++                }],
++                final_output_json_schema: Some(prompt_assistant_output_schema()),
++                responsesapi_client_metadata: None,
++                additional_context: Default::default(),
++                thread_settings: Default::default(),
++            })
++            .await
++        {
++            self.finish_terminal(
++                &task,
++                PromptAssistantOutcome::Failed,
++                Some(err.to_string()),
++                true,
++            )
++            .await;
++            return;
++        }
++
++        let result = timeout(OPERATION_TIMEOUT, self.consume_events(&task, &child))
++            .await
++            .unwrap_or_else(|_| OperationResult::Failed {
++                message: "Prompt Assistant operation timed out".to_string(),
++                retire_child: true,
++            });
++        match result {
++            OperationResult::Completed(output) => self.finish_completed(&task, output).await,
++            OperationResult::Interrupted => {
++                self.finish_terminal(&task, PromptAssistantOutcome::Interrupted, None, true)
++                    .await;
++            }
++            OperationResult::Failed {
++                message,
++                retire_child,
++            } => {
++                self.finish_terminal(
++                    &task,
++                    PromptAssistantOutcome::Failed,
++                    Some(message),
++                    retire_child,
++                )
++                .await;
++            }
++        }
++    }
++
++    async fn child_for(&self, task: &OperationTask) -> Result<Arc<CodexThread>, String> {
++        if let Some(child) = &task.existing_child {
++            return Ok(Arc::clone(child));
++        }
++        let child = self
++            .thread_manager
++            .start_prompt_assistant_child(
++                task.key.thread_id,
++                &task.model,
++                Some(task.reasoning_effort.clone()),
++                &task.instructions,
++            )
++            .await
++            .map_err(|err| err.to_string())?
++            .thread;
++        let mut workspaces = self.workspaces.lock().await;
++        let Some(workspace) = workspaces.get_mut(&task.key).filter(|workspace| {
++            workspace.workspace_id == task.workspace_id && workspace.generation == task.generation
++        }) else {
++            drop(workspaces);
++            let _ = child.shutdown_and_wait().await;
++            return Err("Prompt Assistant workspace closed before child start".to_string());
++        };
++        workspace.child = Some(Arc::clone(&child));
++        Ok(child)
++    }
++
++    async fn consume_events(
++        &self,
++        task: &OperationTask,
++        child: &Arc<CodexThread>,
++    ) -> OperationResult {
++        loop {
++            tokio::select! {
++                () = task.cancellation.cancelled() => {
++                    let _ = child.submit(Op::Interrupt).await;
++                    return OperationResult::Interrupted;
++                }
++                event = child.next_event() => {
++                    let event = match event {
++                        Ok(event) => event,
++                        Err(err) => return OperationResult::Failed {
++                            message: err.to_string(),
++                            retire_child: true,
++                        },
++                    };
++                    match event.msg {
++                        EventMsg::ResponseOutputBytesDelta(delta) if delta.byte_count > 0 => {
++                            self.send_progress(task, delta.byte_count).await;
++                        }
++                        EventMsg::TurnComplete(complete) => {
++                            if let Some(error) = complete.error {
++                                return OperationResult::Failed {
++                                    message: error.message,
++                                    retire_child: false,
++                                };
++                            }
++                            return complete.last_agent_message.map_or_else(
++                                || OperationResult::Failed {
++                                    message: "Prompt Assistant completed without output".to_string(),
++                                    retire_child: false,
++                                },
++                                OperationResult::Completed,
++                            );
++                        }
++                        EventMsg::TurnAborted(_) => return OperationResult::Interrupted,
++                        EventMsg::ExecApprovalRequest(_)
++                        | EventMsg::ApplyPatchApprovalRequest(_)
++                        | EventMsg::McpToolCallBegin(_)
++                        | EventMsg::McpToolCallEnd(_) => {
++                            let _ = child.submit(Op::Interrupt).await;
++                            return OperationResult::Failed {
++                                message: "Prompt Assistant isolation violation".to_string(),
++                                retire_child: true,
++                            };
++                        }
++                        _ => {}
++                    }
++                }
++            }
++        }
++    }
++
++    async fn send_progress(&self, task: &OperationTask, byte_count: u64) {
++        let received_bytes = {
++            let mut workspaces = self.workspaces.lock().await;
++            let Some(workspace) = workspaces.get_mut(&task.key) else {
++                return;
++            };
++            if workspace.workspace_id != task.workspace_id
++                || workspace.generation != task.generation
++            {
++                return;
++            }
++            workspace.received_bytes = workspace.received_bytes.saturating_add(byte_count);
++            workspace.received_bytes
++        };
++        self.outgoing
++            .send_server_notification_to_connections(
++                &[task.key.connection_id],
++                ServerNotification::PromptAssistantProgress(PromptAssistantProgressNotification {
++                    thread_id: task.key.thread_id.to_string(),
++                    workspace_id: task.workspace_id.clone(),
++                    generation: task.generation,
++                    operation: task.kind,
++                    received_bytes,
++                }),
++            )
++            .await;
++    }
++
++    async fn finish_completed(&self, task: &OperationTask, output: String) {
++        let parsed = parse_prompt_assistant_output(&output);
++        let snapshot = {
++            let mut workspaces = self.workspaces.lock().await;
++            let Some(workspace) = current_workspace(&mut workspaces, task) else {
++                task.completion.notify_waiters();
++                return;
++            };
++            workspace.active_operation = None;
++            match parsed {
++                Ok(output) if output.status == PromptAssistantOutputStatus::Ready => {
++                    let candidate = output.candidate.expect("validated ready candidate");
++                    workspace.candidate_generation += 1;
++                    workspace.candidate_hash = Some(candidate_hash(&candidate));
++                    workspace.candidate = Some(candidate);
++                    workspace.phase = PromptAssistantPhase::Ready;
++                    workspace.outcome = Some(PromptAssistantOutcome::Ready);
++                    workspace.message = None;
++                }
++                Ok(output) => {
++                    workspace.phase = stable_phase(workspace);
++                    workspace.outcome = Some(PromptAssistantOutcome::Blocked);
++                    workspace.message = output.reason;
++                }
++                Err(err) => {
++                    workspace.phase = stable_phase(workspace);
++                    workspace.outcome = Some(PromptAssistantOutcome::Failed);
++                    workspace.message = Some(err.to_string());
++                }
++            }
++            workspace.snapshot(task.key.thread_id)
++        };
++        self.send_workspace_update(task.key.connection_id, snapshot)
++            .await;
++        task.completion.notify_waiters();
++    }
++
++    async fn finish_terminal(
++        &self,
++        task: &OperationTask,
++        outcome: PromptAssistantOutcome,
++        message: Option<String>,
++        retire_child: bool,
++    ) {
++        let (child, snapshot) = {
++            let mut workspaces = self.workspaces.lock().await;
++            let Some(workspace) = current_workspace(&mut workspaces, task) else {
++                task.completion.notify_waiters();
++                return;
++            };
++            workspace.active_operation = None;
++            workspace.phase = stable_phase(workspace);
++            workspace.outcome = Some(outcome);
++            workspace.message = message;
++            let child = if retire_child {
++                workspace.child.take()
++            } else {
++                None
++            };
++            (child, workspace.snapshot(task.key.thread_id))
++        };
++        if let Some(child) = child {
++            let _ = child.shutdown_and_wait().await;
++        }
++        self.send_workspace_update(task.key.connection_id, snapshot)
++            .await;
++        task.completion.notify_waiters();
++    }
++
++    async fn send_workspace_update(
++        &self,
++        connection_id: ConnectionId,
++        workspace: PromptAssistantWorkspace,
++    ) {
++        self.outgoing
++            .send_server_notification_to_connections(
++                &[connection_id],
++                ServerNotification::PromptAssistantWorkspaceUpdated(
++                    PromptAssistantWorkspaceUpdatedNotification { workspace },
++                ),
++            )
++            .await;
++    }
++}
++
++impl Workspace {
++    fn snapshot(&self, thread_id: ThreadId) -> PromptAssistantWorkspace {
++        PromptAssistantWorkspace {
++            thread_id: thread_id.to_string(),
++            workspace_id: self.workspace_id.clone(),
++            generation: self.generation,
++            candidate_generation: self.candidate_generation,
++            candidate_hash: self.candidate_hash.clone(),
++            phase: self.phase,
++            active_operation: self.active_operation.as_ref().map(|active| active.kind),
++            selected_model: self.selected_model.clone(),
++            selected_reasoning_effort: self.selected_reasoning_effort.clone(),
++            candidate: self.candidate.clone(),
++            outcome: self.outcome,
++            message: self.message.clone(),
++        }
++    }
++}
++
++fn current_workspace<'a>(
++    workspaces: &'a mut HashMap<WorkspaceKey, Workspace>,
++    task: &OperationTask,
++) -> Option<&'a mut Workspace> {
++    workspaces.get_mut(&task.key).filter(|workspace| {
++        workspace.workspace_id == task.workspace_id && workspace.generation == task.generation
++    })
++}
++
++fn stable_phase(workspace: &Workspace) -> PromptAssistantPhase {
++    if workspace.candidate.is_some() {
++        PromptAssistantPhase::Ready
++    } else {
++        PromptAssistantPhase::Editing
++    }
++}
++
++fn checked_workspace<'a>(
++    workspaces: &'a HashMap<WorkspaceKey, Workspace>,
++    key: WorkspaceKey,
++    workspace_id: &str,
++) -> Result<&'a Workspace, JSONRPCErrorError> {
++    let workspace = workspaces
++        .get(&key)
++        .ok_or_else(|| invalid_params("Prompt Assistant workspace not found"))?;
++    if workspace.workspace_id != workspace_id {
++        return Err(invalid_params(
++            "Prompt Assistant workspace does not match connection",
++        ));
++    }
++    Ok(workspace)
++}
++
++fn checked_workspace_mut<'a>(
++    workspaces: &'a mut HashMap<WorkspaceKey, Workspace>,
++    key: WorkspaceKey,
++    workspace_id: &str,
++) -> Result<&'a mut Workspace, JSONRPCErrorError> {
++    let workspace = workspaces
++        .get_mut(&key)
++        .ok_or_else(|| invalid_params("Prompt Assistant workspace not found"))?;
++    if workspace.workspace_id != workspace_id {
++        return Err(invalid_params(
++            "Prompt Assistant workspace does not match connection",
++        ));
++    }
++    Ok(workspace)
++}
++
++fn parse_thread_id(value: &str) -> Result<ThreadId, JSONRPCErrorError> {
++    ThreadId::from_string(value).map_err(|err| invalid_params(err.to_string()))
++}
++
++fn eligible_models(mut models: Vec<ModelInfo>, guardian_model: &str) -> Vec<ModelInfo> {
++    models
++        .retain(|model| model.visibility != ModelVisibility::None && model.slug != guardian_model);
++    models.sort_by_key(|model| {
++        (
++            match model.visibility {
++                ModelVisibility::Hide => 0,
++                ModelVisibility::List => 1,
++                ModelVisibility::None => 2,
++            },
++            model.priority,
++        )
++    });
++    models
++}
++
++fn select_default_model<'a>(models: &'a [ModelInfo], current_model: &str) -> Option<&'a ModelInfo> {
++    models
++        .iter()
++        .find(|model| model.visibility == ModelVisibility::Hide)
++        .or_else(|| models.iter().find(|model| model.slug == current_model))
++}
++
++fn model_option(model: &ModelInfo) -> PromptAssistantModelOption {
++    PromptAssistantModelOption {
++        model: model.slug.clone(),
++        display_name: model.display_name.clone(),
++        default_reasoning_effort: model
++            .default_reasoning_level
++            .clone()
++            .unwrap_or(ReasoningEffort::Medium),
++        supported_reasoning_efforts: model
++            .supported_reasoning_levels
++            .iter()
++            .map(|preset| preset.effort.clone())
++            .collect(),
++    }
++}
++
++fn candidate_hash(candidate: &str) -> String {
++    format!("{:x}", Sha256::digest(candidate.as_bytes()))
++}
++
++async fn retire_workspace(workspace: Workspace) {
++    if let Some(active) = workspace.active_operation {
++        active.cancellation.cancel();
++    }
++    if let Some(child) = workspace.child {
++        let _ = child.shutdown_and_wait().await;
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use codex_protocol::openai_models::ConfigShellToolType;
++    use codex_protocol::openai_models::ReasoningEffortPreset;
++    use codex_protocol::openai_models::TruncationPolicyConfig;
++    use codex_protocol::openai_models::WebSearchToolType;
++
++    use super::*;
++
++    fn model(slug: &str, visibility: ModelVisibility, priority: i32) -> ModelInfo {
++        ModelInfo {
++            slug: slug.to_string(),
++            display_name: slug.to_string(),
++            description: None,
++            default_reasoning_level: Some(ReasoningEffort::Low),
++            supported_reasoning_levels: vec![ReasoningEffortPreset {
++                effort: ReasoningEffort::Low,
++                description: String::new(),
++            }],
++            shell_type: ConfigShellToolType::Default,
++            visibility,
++            supported_in_api: true,
++            priority,
++            additional_speed_tiers: Vec::new(),
++            service_tiers: Vec::new(),
++            default_service_tier: None,
++            availability_nux: None,
++            upgrade: None,
++            base_instructions: String::new(),
++            model_messages: None,
++            include_skills_usage_instructions: false,
++            supports_reasoning_summary_parameter: true,
++            automatic_limit_retry: true,
++            default_reasoning_summary: Default::default(),
++            support_verbosity: false,
++            default_verbosity: None,
++            apply_patch_tool_type: None,
++            web_search_tool_type: WebSearchToolType::default(),
++            truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
++            supports_parallel_tool_calls: false,
++            supports_image_detail_original: false,
++            context_window: Some(100_000),
++            max_context_window: None,
++            auto_compact_token_limit: None,
++            comp_hash: None,
++            effective_context_window_percent: 95,
++            experimental_supported_tools: Vec::new(),
++            input_modalities: Default::default(),
++            used_fallback_model_metadata: false,
++            supports_search_tool: false,
++            use_responses_lite: false,
++            auto_review_model_override: None,
++            tool_mode: None,
++            multi_agent_version: None,
++        }
++    }
++
++    #[test]
++    fn model_pool_excludes_guardian_and_none_then_prefers_hide() {
++        let models = eligible_models(
++            vec![
++                model("listed", ModelVisibility::List, 0),
++                model("guardian", ModelVisibility::Hide, 1),
++                model("hidden", ModelVisibility::Hide, 2),
++                model("none", ModelVisibility::None, 3),
++            ],
++            "guardian",
++        );
++        assert_eq!(
++            models
++                .iter()
++                .map(|model| model.slug.as_str())
++                .collect::<Vec<_>>(),
++            vec!["hidden", "listed"]
++        );
++        assert_eq!(
++            select_default_model(&models, "listed").map(|model| model.slug.as_str()),
++            Some("hidden")
++        );
++    }
++
++    #[test]
++    fn model_pool_falls_back_to_current_list_model_without_hide() {
++        let models = eligible_models(
++            vec![
++                model("other", ModelVisibility::List, 0),
++                model("current", ModelVisibility::List, 1),
++            ],
++            "guardian",
++        );
++        assert_eq!(
++            select_default_model(&models, "current").map(|model| model.slug.as_str()),
++            Some("current")
++        );
++    }
++
++    #[test]
++    fn candidate_hash_uses_exact_utf8_bytes() {
++        assert_ne!(candidate_hash("candidate"), candidate_hash("candidate\n"));
++        assert_eq!(candidate_hash("candidate"), candidate_hash("candidate"));
++    }
++}

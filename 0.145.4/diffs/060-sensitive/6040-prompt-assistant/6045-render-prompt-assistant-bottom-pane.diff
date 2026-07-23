@@ -1,0 +1,323 @@
+diff --git a/codex-rs/tui/src/bottom_pane/prompt_assistant_result_view.rs b/codex-rs/tui/src/bottom_pane/prompt_assistant_result_view.rs
+new file mode 100644
+index 0000000000..ce15b100ee
+--- /dev/null
++++ b/codex-rs/tui/src/bottom_pane/prompt_assistant_result_view.rs
+@@ -0,0 +1,317 @@
++use std::sync::Arc;
++
++use codex_protocol::openai_models::ReasoningEffort;
++use crossterm::event::KeyCode;
++use crossterm::event::KeyEvent;
++use crossterm::event::KeyModifiers;
++use ratatui::buffer::Buffer;
++use ratatui::layout::Constraint;
++use ratatui::layout::Layout;
++use ratatui::layout::Rect;
++use ratatui::style::Modifier;
++use ratatui::style::Stylize;
++use ratatui::text::Line;
++use ratatui::text::Span;
++use ratatui::widgets::Paragraph;
++use ratatui::widgets::Widget;
++use ratatui::widgets::Wrap;
++
++use crate::bottom_pane::CancellationEvent;
++use crate::bottom_pane::bottom_pane_view::BottomPaneView;
++use crate::bottom_pane::bottom_pane_view::ViewCompletion;
++use crate::bottom_pane::selection_popup_common::render_menu_surface;
++use crate::model_color::model_style;
++use crate::model_color::reasoning_effort_style;
++use crate::render::renderable::Renderable;
++
++pub(crate) const PROMPT_ASSISTANT_RESULT_VIEW_ID: &str = "prompt_assistant_result";
++
++const MIN_CANDIDATE_ROWS: u16 = 4;
++const MAX_CANDIDATE_ROWS: u16 = 12;
++const CANDIDATE_PAGE_ROWS: u16 = 8;
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(crate) enum PromptAssistantResultAction {
++    Apply,
++    Revise,
++    Copy,
++    Discard,
++}
++
++impl PromptAssistantResultAction {
++    const ALL: [Self; 4] = [Self::Apply, Self::Revise, Self::Copy, Self::Discard];
++
++    fn label(self) -> &'static str {
++        match self {
++            Self::Apply => "Apply",
++            Self::Revise => "Revise",
++            Self::Copy => "Copy",
++            Self::Discard => "Discard",
++        }
++    }
++}
++
++type ActionCallback = Arc<dyn Fn(PromptAssistantResultAction) + Send + Sync>;
++
++pub(crate) struct PromptAssistantResultView {
++    candidate: String,
++    model: String,
++    reasoning_effort: ReasoningEffort,
++    selected_action: usize,
++    scroll: u16,
++    completion: Option<ViewCompletion>,
++    on_action: ActionCallback,
++}
++
++impl PromptAssistantResultView {
++    pub(crate) fn new(
++        candidate: String,
++        model: String,
++        reasoning_effort: ReasoningEffort,
++        on_action: impl Fn(PromptAssistantResultAction) + Send + Sync + 'static,
++    ) -> Self {
++        Self {
++            candidate,
++            model,
++            reasoning_effort,
++            selected_action: 0,
++            scroll: 0,
++            completion: None,
++            on_action: Arc::new(on_action),
++        }
++    }
++
++    fn selected_action(&self) -> PromptAssistantResultAction {
++        PromptAssistantResultAction::ALL[self.selected_action]
++    }
++
++    fn move_selection(&mut self, delta: isize) {
++        self.selected_action = self
++            .selected_action
++            .saturating_add_signed(delta)
++            .min(PromptAssistantResultAction::ALL.len() - 1);
++    }
++
++    fn select(&mut self, action: PromptAssistantResultAction) {
++        (self.on_action)(action);
++        if action != PromptAssistantResultAction::Copy {
++            self.completion = Some(match action {
++                PromptAssistantResultAction::Apply | PromptAssistantResultAction::Revise => {
++                    ViewCompletion::Accepted
++                }
++                PromptAssistantResultAction::Discard => ViewCompletion::Cancelled,
++                PromptAssistantResultAction::Copy => unreachable!("copy keeps the result open"),
++            });
++        }
++    }
++
++    fn status_line(&self) -> Line<'static> {
++        Line::from(vec![
++            Span::from("Prompt Assistant").bold(),
++            Span::from(" ▪ ").dim(),
++            Span::styled(self.model.clone(), model_style(&self.model)),
++            Span::from(" ▪ ").dim(),
++            Span::styled(
++                self.reasoning_effort.to_string(),
++                reasoning_effort_style(&self.reasoning_effort),
++            ),
++        ])
++    }
++
++    fn candidate_rows(&self, width: u16) -> u16 {
++        let content_width = width.saturating_sub(4).max(1) as usize;
++        let rows = self
++            .candidate
++            .lines()
++            .map(|line| line.chars().count().max(1).div_ceil(content_width))
++            .sum::<usize>()
++            .max(1);
++        u16::try_from(rows).unwrap_or(u16::MAX)
++    }
++
++    fn candidate_height(&self, width: u16) -> u16 {
++        self.candidate_rows(width)
++            .clamp(MIN_CANDIDATE_ROWS, MAX_CANDIDATE_ROWS)
++    }
++
++    fn action_lines(&self) -> Vec<Line<'static>> {
++        PromptAssistantResultAction::ALL
++            .iter()
++            .enumerate()
++            .map(|(index, action)| {
++                let selected = index == self.selected_action;
++                let marker = if selected { "› " } else { "  " };
++                let mut span = Span::from(format!("{marker}{}", action.label()));
++                if selected {
++                    span.style = span.style.add_modifier(Modifier::BOLD).cyan();
++                }
++                Line::from(span)
++            })
++            .collect()
++    }
++}
++
++impl BottomPaneView for PromptAssistantResultView {
++    fn handle_key_event(&mut self, key_event: KeyEvent) {
++        match key_event {
++            KeyEvent {
++                code: KeyCode::Up,
++                modifiers: KeyModifiers::NONE,
++                ..
++            } => self.move_selection(-1),
++            KeyEvent {
++                code: KeyCode::Down,
++                modifiers: KeyModifiers::NONE,
++                ..
++            } => self.move_selection(1),
++            KeyEvent {
++                code: KeyCode::PageUp,
++                modifiers: KeyModifiers::NONE,
++                ..
++            } => self.scroll = self.scroll.saturating_sub(CANDIDATE_PAGE_ROWS),
++            KeyEvent {
++                code: KeyCode::PageDown,
++                modifiers: KeyModifiers::NONE,
++                ..
++            } => self.scroll = self.scroll.saturating_add(CANDIDATE_PAGE_ROWS),
++            KeyEvent {
++                code: KeyCode::Enter,
++                modifiers: KeyModifiers::NONE,
++                ..
++            } => self.select(self.selected_action()),
++            KeyEvent {
++                code: KeyCode::Char('c'),
++                modifiers,
++                ..
++            } if modifiers.contains(KeyModifiers::ALT) => {
++                self.select(PromptAssistantResultAction::Copy);
++            }
++            KeyEvent {
++                code: KeyCode::Esc, ..
++            } => self.select(PromptAssistantResultAction::Discard),
++            _ => {}
++        }
++    }
++
++    fn is_complete(&self) -> bool {
++        self.completion.is_some()
++    }
++
++    fn completion(&self) -> Option<ViewCompletion> {
++        self.completion
++    }
++
++    fn on_ctrl_c(&mut self) -> CancellationEvent {
++        self.select(PromptAssistantResultAction::Discard);
++        CancellationEvent::Handled
++    }
++
++    fn prefer_esc_to_handle_key_event(&self) -> bool {
++        true
++    }
++
++    fn view_id(&self) -> Option<&'static str> {
++        Some(PROMPT_ASSISTANT_RESULT_VIEW_ID)
++    }
++}
++
++impl Renderable for PromptAssistantResultView {
++    fn desired_height(&self, width: u16) -> u16 {
++        self.candidate_height(width).saturating_add(8)
++    }
++
++    fn render(&self, area: Rect, buf: &mut Buffer) {
++        if area.is_empty() {
++            return;
++        }
++        let content = render_menu_surface(area, buf);
++        let candidate_height = self.candidate_height(content.width);
++        let [
++            status_area,
++            candidate_area,
++            _spacer_area,
++            actions_area,
++            footer_area,
++        ] = Layout::vertical([
++            Constraint::Length(1),
++            Constraint::Length(candidate_height),
++            Constraint::Length(1),
++            Constraint::Length(PromptAssistantResultAction::ALL.len() as u16),
++            Constraint::Length(1),
++        ])
++        .areas(content);
++
++        Paragraph::new(self.status_line()).render(status_area, buf);
++        Paragraph::new(self.candidate.as_str())
++            .wrap(Wrap { trim: false })
++            .scroll((self.scroll, 0))
++            .render(candidate_area, buf);
++        Paragraph::new(self.action_lines()).render(actions_area, buf);
++        let total_rows = self.candidate_rows(content.width);
++        let first_row = self.scroll.saturating_add(1).min(total_rows);
++        let last_row = self
++            .scroll
++            .saturating_add(candidate_area.height)
++            .min(total_rows);
++        let continuation = (last_row < total_rows).then_some(" ▪ more");
++        Paragraph::new(Line::from(format!(
++            "Rows {first_row}-{last_row}/{total_rows}{} ▪ Enter select ▪ Alt+C copy ▪ PageUp/PageDown scroll ▪ Esc discard",
++            continuation.unwrap_or_default()
++        )).dim())
++        .render(footer_area, buf);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::sync::Mutex;
++
++    use super::*;
++
++    #[test]
++    fn copy_keeps_view_open_and_apply_completes() {
++        let actions = Arc::new(Mutex::new(Vec::new()));
++        let captured = Arc::clone(&actions);
++        let mut view = PromptAssistantResultView::new(
++            "candidate".to_string(),
++            "model".to_string(),
++            ReasoningEffort::Low,
++            move |action| captured.lock().expect("actions").push(action),
++        );
++
++        view.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT));
++        assert!(!view.is_complete());
++        view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
++        assert_eq!(view.completion(), Some(ViewCompletion::Accepted));
++        assert_eq!(
++            *actions.lock().expect("actions"),
++            vec![
++                PromptAssistantResultAction::Copy,
++                PromptAssistantResultAction::Apply
++            ]
++        );
++    }
++
++    #[test]
++    fn action_navigation_clamps_and_escape_discards() {
++        let actions = Arc::new(Mutex::new(Vec::new()));
++        let captured = Arc::clone(&actions);
++        let mut view = PromptAssistantResultView::new(
++            "candidate".to_string(),
++            "model".to_string(),
++            ReasoningEffort::Medium,
++            move |action| captured.lock().expect("actions").push(action),
++        );
++
++        for _ in 0..8 {
++            view.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
++        }
++        assert_eq!(view.selected_action(), PromptAssistantResultAction::Discard);
++        view.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
++        assert_eq!(view.completion(), Some(ViewCompletion::Cancelled));
++        assert_eq!(
++            *actions.lock().expect("actions"),
++            vec![PromptAssistantResultAction::Discard]
++        );
++    }
++}
