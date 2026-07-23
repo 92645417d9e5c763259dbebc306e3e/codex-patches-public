@@ -1,0 +1,652 @@
+diff --git a/codex-rs/tui/src/app/agent_navigation.rs b/codex-rs/tui/src/app/agent_navigation.rs
+index 00d4b966f7..a1740717a3 100644
+--- a/codex-rs/tui/src/app/agent_navigation.rs
++++ b/codex-rs/tui/src/app/agent_navigation.rs
+@@ -327,30 +327,40 @@ impl AgentNavigationState {
+ 
+         let thread_id = current_displayed_thread_id?;
+         let is_primary = primary_thread_id == Some(thread_id);
+-        Some(
+-            self.threads
+-                .get(&thread_id)
+-                .map(|entry| {
+-                    if !is_primary
+-                        && let Some(agent_path) = entry
++        let mut label = self
++            .threads
++            .get(&thread_id)
++            .map(|entry| {
++                format_agent_picker_item_name(
++                    entry.agent_nickname.as_deref(),
++                    entry.agent_role.as_deref(),
++                    is_primary,
++                )
++            })
++            .unwrap_or_else(|| {
++                format_agent_picker_item_name(
++                    /*agent_nickname*/ None, /*agent_role*/ None, is_primary,
++                )
++            });
++        if is_primary {
++            let running_subagents = self
++                .threads
++                .iter()
++                .filter(|(candidate_id, entry)| {
++                    Some(**candidate_id) != primary_thread_id
++                        && entry.is_running
++                        && !entry.is_closed
++                        && entry
+                             .agent_path
+                             .as_deref()
+-                            .filter(|agent_path| !agent_path.trim().is_empty())
+-                    {
+-                        return format!("`{agent_path}`");
+-                    }
+-                    format_agent_picker_item_name(
+-                        entry.agent_nickname.as_deref(),
+-                        entry.agent_role.as_deref(),
+-                        is_primary,
+-                    )
++                            .is_some_and(|path| !path.trim().is_empty())
+                 })
+-                .unwrap_or_else(|| {
+-                    format_agent_picker_item_name(
+-                        /*agent_nickname*/ None, /*agent_role*/ None, is_primary,
+-                    )
+-                }),
+-        )
++                .count();
++            if running_subagents > 0 {
++                label.push_str(&format!(" +{running_subagents}"));
++            }
++        }
++        Some(label)
+     }
+ 
+     /// Builds the `/agent` picker subtitle from the same canonical bindings used by key handling.
+@@ -480,6 +490,30 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn active_agent_label_uses_nickname_and_counts_only_running_v2_children() {
++        let (mut state, main_thread_id, first_agent_id, second_agent_id) = populated_state();
++        state.set_agent_path(first_agent_id, Some("/root/first".to_string()));
++        state.set_agent_path(second_agent_id, Some("/root/second".to_string()));
++        state.mark_running(first_agent_id);
++        state.mark_running(second_agent_id);
++
++        assert_eq!(
++            state.active_agent_label(Some(main_thread_id), Some(main_thread_id)),
++            Some("Main [default] +2".to_string())
++        );
++        assert_eq!(
++            state.active_agent_label(Some(first_agent_id), Some(main_thread_id)),
++            Some("Robie [explorer]".to_string())
++        );
++
++        state.mark_stopped(second_agent_id);
++        assert_eq!(
++            state.active_agent_label(Some(main_thread_id), Some(main_thread_id)),
++            Some("Main [default] +1".to_string())
++        );
++    }
++
+     #[test]
+     fn adjacent_thread_id_skips_closed_stopped_and_unrelated_threads() {
+         let (mut state, main_thread_id, first_agent_id, second_agent_id) = populated_state();
+diff --git a/codex-rs/tui/src/app/agent_status_feed.rs b/codex-rs/tui/src/app/agent_status_feed.rs
+index 7b5ecb74fe..9cb4e46ddf 100644
+--- a/codex-rs/tui/src/app/agent_status_feed.rs
++++ b/codex-rs/tui/src/app/agent_status_feed.rs
+@@ -64,21 +64,21 @@ impl HistoryCell for AgentStatusHistoryCell {
+ 
+ #[derive(Debug)]
+ pub(super) struct AgentStatusThreadPreview {
+-    agent_path: String,
++    agent_label: String,
+     activity: Vec<String>,
+ }
+ 
+ impl AgentStatusThreadPreview {
+-    pub(super) fn from_store(agent_path: String, store: &ThreadEventStore) -> Self {
+-        Self::from_events(agent_path, store.buffer.iter().rev())
++    pub(super) fn from_store(agent_label: String, store: &ThreadEventStore) -> Self {
++        Self::from_events(agent_label, store.buffer.iter().rev())
+     }
+ 
+-    pub(super) fn empty(agent_path: String) -> Self {
+-        Self::from_events(agent_path, std::iter::empty())
++    pub(super) fn empty(agent_label: String) -> Self {
++        Self::from_events(agent_label, std::iter::empty())
+     }
+ 
+     fn from_events<'a>(
+-        agent_path: String,
++        agent_label: String,
+         events: impl Iterator<Item = &'a ThreadBufferedEvent>,
+     ) -> Self {
+         let mut seen_item_ids = HashSet::new();
+@@ -108,13 +108,13 @@ impl AgentStatusThreadPreview {
+         }
+         activity.reverse();
+         Self {
+-            agent_path,
++            agent_label,
+             activity,
+         }
+     }
+ 
+     fn title_line(&self) -> Line<'static> {
+-        vec!["  ▪ ".dim(), format!("`{}`", self.agent_path).cyan()].into()
++        vec!["  ▪ ".dim(), self.agent_label.clone().cyan()].into()
+     }
+ 
+     fn preview_lines(&self, width: u16) -> Vec<Line<'static>> {
+diff --git a/codex-rs/tui/src/app/agent_status_feed_tests.rs b/codex-rs/tui/src/app/agent_status_feed_tests.rs
+index d8ca1b1f7d..210914c80a 100644
+--- a/codex-rs/tui/src/app/agent_status_feed_tests.rs
++++ b/codex-rs/tui/src/app/agent_status_feed_tests.rs
+@@ -42,7 +42,7 @@ fn agent_status_uses_bounded_buffered_activity() {
+         },
+     ));
+ 
+-    let preview = AgentStatusThreadPreview::from_store("/root/reviewer".to_string(), &store);
++    let preview = AgentStatusThreadPreview::from_store("Parfit [explorer]".to_string(), &store);
+     let cell = AgentStatusHistoryCell::new(vec![preview]);
+     let rendered = cell
+         .display_lines(/*width*/ 80)
+@@ -55,7 +55,7 @@ fn agent_status_uses_bounded_buffered_activity() {
+     /agent
+     Sub-agents running
+ 
+-      ▪ `/root/reviewer`
++      ▪ Parfit [explorer]
+         $ cargo test -p codex-tui
+         Finished checking the focused TUI tests.
+     "###);
+@@ -90,7 +90,7 @@ fn agent_status_uses_reasoning_summaries_only() {
+         },
+     ));
+ 
+-    let preview = AgentStatusThreadPreview::from_store("/root/reviewer".to_string(), &store);
++    let preview = AgentStatusThreadPreview::from_store("Parfit [explorer]".to_string(), &store);
+     let cell = AgentStatusHistoryCell::new(vec![preview]);
+     let rendered = cell
+         .display_lines(/*width*/ 80)
+@@ -103,7 +103,7 @@ fn agent_status_uses_reasoning_summaries_only() {
+     /agent
+     Sub-agents running
+ 
+-      ▪ `/root/reviewer`
++      ▪ Parfit [explorer]
+         safe summary
+     "###);
+     assert!(!rendered.contains("hidden raw reasoning"));
+diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
+index 35e6922045..2207ae5825 100644
+--- a/codex-rs/tui/src/app/session_lifecycle.rs
++++ b/codex-rs/tui/src/app/session_lifecycle.rs
+@@ -35,40 +35,8 @@ pub(super) struct ThreadSelectionHydration {
+ 
+ impl App {
+     pub(super) async fn open_agent_picker(&mut self, app_server: &mut AppServerSession) {
+-        let backfill = self.backfill_loaded_subagent_threads(app_server).await;
+-        // V2 subagents are identified by canonical paths observed from activity events or loaded
+-        // thread metadata. A buffered active turn is positive liveness evidence; a completed
+-        // snapshot is terminal evidence. An empty store does not clear a successful spawn hint.
+-        let path_backed_thread_ids: Vec<_> = self
+-            .agent_navigation
+-            .ordered_path_backed_subagent_threads(self.primary_thread_id)
+-            .into_iter()
+-            .map(|(thread_id, _)| thread_id)
+-            .collect();
+-        for thread_id in path_backed_thread_ids.iter().copied() {
+-            if let Some(channel) = self.thread_event_channels.get(&thread_id)
+-                && channel.attachment() == ThreadEventAttachment::Live
+-            {
+-                let (has_active_turn, has_terminal_snapshot) = {
+-                    let store = channel.store.lock().await;
+-                    (
+-                        store.active_turn_id().is_some(),
+-                        store
+-                            .turns
+-                            .last()
+-                            .is_some_and(|turn| !matches!(turn.status, TurnStatus::InProgress)),
+-                    )
+-                };
+-                if has_active_turn {
+-                    self.agent_navigation.mark_running(thread_id);
+-                } else if has_terminal_snapshot {
+-                    self.agent_navigation.mark_stopped(thread_id);
+-                }
+-            } else if !backfill.refreshed_thread_ids.contains(&thread_id) {
+-                self.refresh_agent_picker_thread_liveness(app_server, thread_id)
+-                    .await;
+-            }
+-        }
++        // Path-backed activity is the V2 protocol discriminator. V2 deliberately uses the
++        // transcript status summary instead of opening the legacy V1 thread picker.
+         let path_backed_threads = self
+             .agent_navigation
+             .ordered_path_backed_subagent_threads(self.primary_thread_id);
+@@ -79,18 +47,26 @@ impl App {
+                     if !entry.is_running || entry.is_closed {
+                         return None;
+                     }
+-                    Some((thread_id, entry.agent_path.as_deref()?.trim().to_string()))
++                    Some((
++                        thread_id,
++                        format_agent_picker_item_name(
++                            entry.agent_nickname.as_deref(),
++                            entry.agent_role.as_deref(),
++                            /*is_primary*/ false,
++                        ),
++                    ))
+                 })
+                 .collect();
+             let mut entries = Vec::new();
+-            for (thread_id, agent_path) in running_threads {
++            for (thread_id, agent_label) in running_threads {
+                 let preview = if let Some(channel) = self.thread_event_channels.get(&thread_id) {
+                     let store = channel.store.lock().await;
+                     super::agent_status_feed::AgentStatusThreadPreview::from_store(
+-                        agent_path, &store,
++                        agent_label,
++                        &store,
+                     )
+                 } else {
+-                    super::agent_status_feed::AgentStatusThreadPreview::empty(agent_path)
++                    super::agent_status_feed::AgentStatusThreadPreview::empty(agent_label)
+                 };
+                 entries.push(preview);
+             }
+@@ -99,8 +75,16 @@ impl App {
+                 .add_to_history(super::agent_status_feed::AgentStatusHistoryCell::new(
+                     entries,
+                 ));
++            return;
+         }
+ 
++        let backfill = self.backfill_loaded_subagent_threads(app_server).await;
++        let path_backed_thread_ids: Vec<_> = self
++            .agent_navigation
++            .ordered_path_backed_subagent_threads(self.primary_thread_id)
++            .into_iter()
++            .map(|(thread_id, _)| thread_id)
++            .collect();
+         let mut thread_ids = self.agent_navigation.tracked_thread_ids();
+         for thread_id in self.thread_event_channels.keys().copied() {
+             if !thread_ids.contains(&thread_id) {
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index 799bda89ae..70afcb3421 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -1489,6 +1489,12 @@ async fn open_agent_picker_preserves_running_hints_until_observed_completion() -
+     let thread_id = ThreadId::new();
+     app.thread_event_channels
+         .insert(thread_id, ThreadEventChannel::new(/*capacity*/ 4));
++    app.agent_navigation.upsert(
++        thread_id,
++        Some("Robie".to_string()),
++        Some("explorer".to_string()),
++        /*is_closed*/ false,
++    );
+     app.agent_navigation
+         .record_sub_agent_activity(SubAgentActivityDisplay {
+             thread_id,
+@@ -1499,8 +1505,8 @@ async fn open_agent_picker_preserves_running_hints_until_observed_completion() -
+     Box::pin(app.open_agent_picker(&mut app_server)).await;
+ 
+     let mut expected_entry = AgentPickerThreadEntry {
+-        agent_nickname: None,
+-        agent_role: None,
++        agent_nickname: Some("Robie".to_string()),
++        agent_role: Some("explorer".to_string()),
+         agent_path: Some("/root/child".to_string()),
+         is_running: true,
+         is_closed: false,
+@@ -1519,7 +1525,7 @@ async fn open_agent_picker_preserves_running_hints_until_observed_completion() -
+     /agent
+     Sub-agents running
+ 
+-      ▪ `/root/child`
++      ▪ Robie [explorer]
+         No recent activity yet.
+     "###);
+ 
+@@ -1566,7 +1572,7 @@ async fn open_agent_picker_preserves_running_hints_until_observed_completion() -
+ }
+ 
+ #[tokio::test]
+-async fn open_agent_picker_clears_running_hint_from_completed_snapshot() -> Result<()> {
++async fn v2_agent_status_does_not_recompute_liveness_from_a_cached_snapshot() -> Result<()> {
+     let mut app = Box::pin(make_test_app()).await;
+     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
+         app.chat_widget.config_ref(),
+@@ -1598,7 +1604,7 @@ async fn open_agent_picker_clears_running_hint_from_completed_snapshot() -> Resu
+             agent_nickname: None,
+             agent_role: None,
+             agent_path: Some("/root/child".to_string()),
+-            is_running: false,
++            is_running: true,
+             is_closed: false,
+         })
+     );
+@@ -1606,7 +1612,7 @@ async fn open_agent_picker_clears_running_hint_from_completed_snapshot() -> Resu
+ }
+ 
+ #[tokio::test]
+-async fn open_agent_picker_selects_path_backed_agent() -> Result<()> {
++async fn v2_agent_status_does_not_open_the_legacy_picker() -> Result<()> {
+     let (mut app, mut app_event_rx, _op_rx) = Box::pin(make_test_app_with_channels()).await;
+     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
+         app.chat_widget.config_ref(),
+@@ -1617,6 +1623,12 @@ async fn open_agent_picker_selects_path_backed_agent() -> Result<()> {
+         ThreadId::from_string("00000000-0000-0000-0000-000000000123").expect("valid thread id");
+     app.thread_event_channels
+         .insert(thread_id, ThreadEventChannel::new(/*capacity*/ 1));
++    app.agent_navigation.upsert(
++        thread_id,
++        Some("Parfit".to_string()),
++        Some("explorer".to_string()),
++        /*is_closed*/ false,
++    );
+     app.agent_navigation
+         .record_sub_agent_activity(SubAgentActivityDisplay {
+             thread_id,
+@@ -1626,22 +1638,23 @@ async fn open_agent_picker_selects_path_backed_agent() -> Result<()> {
+ 
+     Box::pin(app.open_agent_picker(&mut app_server)).await;
+ 
+-    assert_app_snapshot!(
+-        "path_backed_agent_picker",
+-        render_bottom_popup(&app.chat_widget, /*width*/ 80)
+-    );
+-    while app_event_rx.try_recv().is_ok() {}
+-    app.chat_widget
+-        .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+-    assert_matches!(
+-        app_event_rx.try_recv(),
+-        Ok(AppEvent::SelectAgentThread(selected_thread_id)) if selected_thread_id == thread_id
+-    );
++    assert!(app.chat_widget.no_modal_or_popup_active());
++    let rendered = std::iter::from_fn(|| app_event_rx.try_recv().ok())
++        .filter_map(|event| match event {
++            AppEvent::InsertHistoryCell(cell) => {
++                Some(lines_to_single_string(&cell.display_lines(/*width*/ 80)))
++            }
++            _ => None,
++        })
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert!(rendered.contains("Sub-agents running"), "{rendered}");
++    assert!(rendered.contains("Parfit [explorer]"), "{rendered}");
+     Ok(())
+ }
+ 
+ #[tokio::test]
+-async fn open_agent_picker_refreshes_replay_only_path_backed_liveness() -> Result<()> {
++async fn v2_agent_status_does_not_block_on_replay_only_liveness_refresh() -> Result<()> {
+     let mut app = Box::pin(make_test_app()).await;
+     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
+         app.chat_widget.config_ref(),
+@@ -1671,8 +1684,8 @@ async fn open_agent_picker_refreshes_replay_only_path_backed_liveness() -> Resul
+             agent_nickname: None,
+             agent_role: None,
+             agent_path: Some("/root/child".to_string()),
+-            is_running: false,
+-            is_closed: true,
++            is_running: true,
++            is_closed: false,
+         })
+     );
+     Ok(())
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 4907e03862..2145aafea1 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -617,6 +617,7 @@ pub(crate) struct ChatWidget {
+     running_commands: HashMap<String, RunningCommand>,
+     collab_agent_metadata: HashMap<ThreadId, AgentMetadata>,
+     pending_collab_spawn_requests: HashMap<String, multi_agents::SpawnRequestSummary>,
++    v2_activity_observed: bool,
+     suppressed_exec_calls: HashSet<String>,
+     skills_all: Vec<SkillMetadata>,
+     skills_initial_state: Option<HashMap<AbsolutePathBuf, bool>>,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index efe1f6b0f9..cd83fa5b1d 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -159,6 +159,7 @@ impl ChatWidget {
+             running_commands: HashMap::new(),
+             collab_agent_metadata: HashMap::new(),
+             pending_collab_spawn_requests: HashMap::new(),
++            v2_activity_observed: false,
+             suppressed_exec_calls: HashSet::new(),
+             last_unified_wait: None,
+             unified_exec_wait_streak: None,
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index b571367d48..61583f4246 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -1298,6 +1298,99 @@ async fn live_app_server_collab_wait_items_render_history() {
+     assert_chatwidget_snapshot!("app_server_collab_wait_items_render_history", combined);
+ }
+ 
++#[tokio::test]
++async fn v2_collab_wait_uses_working_status_without_history() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    let sender_thread_id = ThreadId::new();
++    let receiver_thread_id = ThreadId::new();
++    let other_receiver_thread_id = ThreadId::new();
++    chat.set_collab_agent_metadata(
++        receiver_thread_id,
++        Some("Robie".to_string()),
++        Some("explorer".to_string()),
++    );
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            completed_at_ms: 0,
++            item: AppServerThreadItem::SubAgentActivity {
++                id: "activity-1".to_string(),
++                kind: codex_app_server_protocol::SubAgentActivityKind::Started,
++                agent_thread_id: receiver_thread_id.to_string(),
++                agent_path: "/root/robie".to_string(),
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++    let activity = drain_insert_history(&mut rx)
++        .into_iter()
++        .map(|lines| lines_to_single_string(&lines))
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert!(activity.contains("Started Robie [explorer]"), "{activity}");
++    chat.handle_server_notification(
++        ServerNotification::TurnStarted(TurnStartedNotification {
++            thread_id: "thread-1".to_string(),
++            turn: AppServerTurn {
++                id: "turn-1".to_string(),
++                items_view: codex_app_server_protocol::TurnItemsView::Full,
++                items: Vec::new(),
++                status: AppServerTurnStatus::InProgress,
++                error: None,
++                started_at: Some(0),
++                completed_at: None,
++                duration_ms: None,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++    drain_insert_history(&mut rx);
++
++    let wait_item = |status| AppServerThreadItem::CollabAgentToolCall {
++        id: "wait-1".to_string(),
++        tool: AppServerCollabAgentTool::Wait,
++        status,
++        sender_thread_id: sender_thread_id.to_string(),
++        receiver_thread_ids: vec![
++            receiver_thread_id.to_string(),
++            other_receiver_thread_id.to_string(),
++        ],
++        prompt: None,
++        model: None,
++        reasoning_effort: None,
++        agents_states: HashMap::new(),
++    };
++    chat.handle_server_notification(
++        ServerNotification::ItemStarted(ItemStartedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            started_at_ms: 0,
++            item: wait_item(AppServerCollabAgentToolCallStatus::InProgress),
++        }),
++        /*replay_kind*/ None,
++    );
++
++    assert_eq!(
++        chat.current_status_header_for_test(),
++        "Waiting for 2 agents"
++    );
++    assert!(drain_insert_history(&mut rx).is_empty());
++
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            completed_at_ms: 0,
++            item: wait_item(AppServerCollabAgentToolCallStatus::Completed),
++        }),
++        /*replay_kind*/ None,
++    );
++
++    assert_eq!(chat.current_status_header_for_test(), "Working");
++    assert!(drain_insert_history(&mut rx).is_empty());
++}
++
+ #[tokio::test]
+ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effort() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+index f2f91d9123..f43f0e860b 100644
+--- a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
++++ b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+@@ -116,11 +116,32 @@ impl ChatWidget {
+ 
+     pub(super) fn on_collab_agent_tool_call(&mut self, item: ThreadItem) {
+         let ThreadItem::CollabAgentToolCall {
+-            id, tool, status, ..
++            id,
++            tool,
++            status,
++            receiver_thread_ids,
++            ..
+         } = &item
+         else {
+             return;
+         };
++        if self.v2_activity_observed && matches!(tool, CollabAgentTool::Wait) {
++            if self.bottom_pane.is_task_running() {
++                let header = if matches!(status, CollabAgentToolCallStatus::InProgress) {
++                    match receiver_thread_ids.len() {
++                        1 => "Waiting for 1 agent".to_string(),
++                        count if count > 1 => format!("Waiting for {count} agents"),
++                        _ => "Waiting for agents".to_string(),
++                    }
++                } else {
++                    "Working".to_string()
++                };
++                if self.set_status_header(header) {
++                    self.request_redraw();
++                }
++            }
++            return;
++        }
+         if matches!(tool, CollabAgentTool::SpawnAgent)
+             && let Some(spawn_request) = multi_agents::spawn_request_summary(&item)
+         {
+@@ -146,7 +167,10 @@ impl ChatWidget {
+     }
+ 
+     pub(super) fn on_sub_agent_activity(&mut self, item: ThreadItem) {
+-        if let Some(cell) = multi_agents::sub_agent_activity_history_cell(&item) {
++        self.v2_activity_observed = true;
++        if let Some(cell) = multi_agents::sub_agent_activity_history_cell(&item, |thread_id| {
++            self.collab_agent_metadata(thread_id)
++        }) {
+             self.on_collab_event(cell);
+         }
+     }
+diff --git a/codex-rs/tui/src/multi_agents.rs b/codex-rs/tui/src/multi_agents.rs
+index 67691a24c8..43709dd173 100644
+--- a/codex-rs/tui/src/multi_agents.rs
++++ b/codex-rs/tui/src/multi_agents.rs
+@@ -302,15 +302,21 @@ pub(crate) fn sub_agent_activity_display(item: &ThreadItem) -> Option<SubAgentAc
+     })
+ }
+ 
+-pub(crate) fn sub_agent_activity_history_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
++pub(crate) fn sub_agent_activity_history_cell(
++    item: &ThreadItem,
++    mut agent_metadata: impl FnMut(ThreadId) -> AgentMetadata,
++) -> Option<PlainHistoryCell> {
+     let ThreadItem::SubAgentActivity {
+-        kind, agent_path, ..
++        kind,
++        agent_thread_id,
++        ..
+     } = item
+     else {
+         return None;
+     };
++    let thread_id = parse_thread_id(agent_thread_id)?;
+     Some(collab_event(
+-        sub_agent_activity_title(*kind, agent_path),
++        sub_agent_activity_title(*kind, agent_label(thread_id, &agent_metadata(thread_id))),
+         Vec::new(),
+     ))
+ }
+@@ -323,16 +329,15 @@ pub(crate) fn sub_agent_activity_summary(kind: SubAgentActivityKind, agent_path:
+     }
+ }
+ 
+-fn sub_agent_activity_title(kind: SubAgentActivityKind, agent_path: &str) -> Line<'static> {
+-    let (prefix, path) = match kind {
+-        SubAgentActivityKind::Started => ("Started ", agent_path),
+-        SubAgentActivityKind::Interacted => ("Interacted with ", agent_path),
+-        SubAgentActivityKind::Interrupted => ("Interrupted ", agent_path),
++fn sub_agent_activity_title(kind: SubAgentActivityKind, agent: AgentLabel<'_>) -> Line<'static> {
++    let prefix = match kind {
++        SubAgentActivityKind::Started => "Started ",
++        SubAgentActivityKind::Interacted => "Interacted with ",
++        SubAgentActivityKind::Interrupted => "Interrupted ",
+     };
+-    title_spans_line(vec![
+-        Span::from(prefix).bold(),
+-        Span::from(format!("`{path}`")).cyan(),
+-    ])
++    let mut spans = vec![Span::from(prefix).bold()];
++    spans.extend(agent_label_spans(agent));
++    title_spans_line(spans)
+ }
+ 
+ fn spawn_end(
+diff --git a/codex-rs/tui/src/snapshots/codex_tui__app__tests__path_backed_agent_picker.snap b/codex-rs/tui/src/snapshots/codex_tui__app__tests__path_backed_agent_picker.snap
+deleted file mode 100644
+index a71cbc6662..0000000000
+--- a/codex-rs/tui/src/snapshots/codex_tui__app__tests__path_backed_agent_picker.snap
++++ /dev/null
+@@ -1,10 +0,0 @@
+----
+-source: tui/src/app/tests.rs
+-expression: "render_bottom_popup(&app.chat_widget, 80)"
+----
+-  Subagents
+-  Select an agent to watch. ⌥ + ← previous, ⌥ + → next.
+-
+-› 1. ▪ /root/worker  00000000-0000-0000-0000-000000000123
+-
+-  Press enter to confirm or esc to go back
