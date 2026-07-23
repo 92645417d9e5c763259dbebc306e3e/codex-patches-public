@@ -4,6 +4,7 @@ import unicodedata
 
 
 TUI_SOURCE = Path("codex-rs/tui/src")
+TUI_SHAPES = Path("codex-rs/tui/frames/shapes")
 
 
 def codepoint(value: str) -> str:
@@ -214,11 +215,22 @@ for path in TUI_SOURCE.rglob("*"):
     if new != old:
         path.write_text(new, encoding="utf-8")
 
+for path in TUI_SHAPES.glob("frame_*.txt"):
+    old = path.read_text(encoding="utf-8")
+    new = old.replace(LEGACY_PRIMARY_HEAD_INPUT, "▪")
+    if new != old:
+        path.write_text(new, encoding="utf-8")
+
 
 primary_head_survivors = []
-for path in TUI_SOURCE.rglob("*"):
-    if path.suffix not in {".rs", ".snap"}:
-        continue
+for path in [
+    *(
+        path
+        for path in TUI_SOURCE.rglob("*")
+        if path.suffix in {".rs", ".snap"}
+    ),
+    *TUI_SHAPES.glob("frame_*.txt"),
+]:
     posix = path.as_posix()
     if posix in UNICODE_SEMANTICS_FILES:
         continue

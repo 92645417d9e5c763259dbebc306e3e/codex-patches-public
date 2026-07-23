@@ -1,0 +1,75 @@
+diff --git a/codex-rs/protocol/src/protocol.rs b/codex-rs/protocol/src/protocol.rs
+index 3ce6680f47..0e811e8d84 100644
+--- a/codex-rs/protocol/src/protocol.rs
++++ b/codex-rs/protocol/src/protocol.rs
+@@ -67,6 +67,16 @@ use serde_json::Value;
+ use serde_with::serde_as;
+ use strum_macros::Display;
+ use tracing::error;
++
++fn deserialize_json_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
++where
++    D: Deserializer<'de>,
++{
++    serde_json::Number::deserialize(deserializer)?
++        .as_f64()
++        .ok_or_else(|| D::Error::custom("number is not representable as f64"))
++}
++
+ use ts_rs::TS;
+ 
+ pub use crate::approvals::ApplyPatchApprovalRequestEvent;
+@@ -2179,6 +2189,7 @@ impl FromStr for RateLimitReachedType {
+ #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, TS)]
+ pub struct RateLimitWindow {
+     /// Percentage (0-100) of the window that has been consumed.
++    #[serde(deserialize_with = "deserialize_json_f64")]
+     pub used_percent: f64,
+     /// Rolling window duration, in minutes.
+     #[ts(type = "number | null")]
+@@ -4474,6 +4485,45 @@ mod tests {
+     use tempfile::NamedTempFile;
+     use tempfile::TempDir;
+ 
++    #[test]
++    fn rollout_token_count_with_rate_limit_window_round_trips() -> Result<()> {
++        let line = RolloutLine {
++            timestamp: "2026-07-23T00:00:00Z".to_string(),
++            ordinal: Some(7),
++            item: RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
++                info: None,
++                rate_limits: Some(RateLimitSnapshot {
++                    limit_id: Some("codex".to_string()),
++                    limit_name: None,
++                    primary: Some(RateLimitWindow {
++                        used_percent: 62.5,
++                        window_minutes: Some(10_080),
++                        resets_at: Some(1_800_000_000),
++                    }),
++                    secondary: None,
++                    credits: None,
++                    individual_limit: None,
++                    spend_control_reached: None,
++                    plan_type: None,
++                    rate_limit_reached_type: None,
++                }),
++            })),
++        };
++
++        let encoded = serde_json::to_vec(&line)?;
++        let decoded = serde_json::from_slice::<RolloutLine>(&encoded)?;
++        let RolloutItem::EventMsg(EventMsg::TokenCount(event)) = decoded.item else {
++            anyhow::bail!("expected persisted token_count event");
++        };
++        let primary = event
++            .rate_limits
++            .and_then(|snapshot| snapshot.primary)
++            .ok_or_else(|| anyhow::anyhow!("expected primary rate-limit window"))?;
++        assert_eq!(primary.used_percent, 62.5);
++        assert_eq!(primary.window_minutes, Some(10_080));
++        Ok(())
++    }
++
+     #[test]
+     fn review_decision_denied_round_trip() -> Result<()> {
+         let decision = ReviewDecision::Denied {
