@@ -1,8 +1,68 @@
 diff --git a/codex-rs/tui/src/app/agent_navigation.rs b/codex-rs/tui/src/app/agent_navigation.rs
-index 00d4b966f7..a1740717a3 100644
+index 00d4b966f7..8c917dbf07 100644
 --- a/codex-rs/tui/src/app/agent_navigation.rs
 +++ b/codex-rs/tui/src/app/agent_navigation.rs
-@@ -327,30 +327,40 @@ impl AgentNavigationState {
+@@ -276,38 +276,33 @@ impl AgentNavigationState {
+         primary_thread_id: Option<ThreadId>,
+         direction: AgentNavigationDirection,
+     ) -> Option<ThreadId> {
+-        let ordered_threads = self
+-            .ordered_threads()
+-            .into_iter()
+-            .filter(|(thread_id, entry)| {
+-                Some(*thread_id) == primary_thread_id
+-                    || (entry.is_running
+-                        && !entry.is_closed
+-                        && entry
+-                            .agent_path
+-                            .as_deref()
+-                            .is_some_and(|path| !path.trim().is_empty()))
+-            })
+-            .collect::<Vec<_>>();
+-        if ordered_threads.len() < 2 {
+-            return None;
+-        }
+-
++        let ordered_threads = self.ordered_threads();
+         let current_thread_id = current_displayed_thread_id?;
+         let current_idx = ordered_threads
+             .iter()
+             .position(|(thread_id, _)| *thread_id == current_thread_id)?;
+-        let next_idx = match direction {
+-            AgentNavigationDirection::Next => (current_idx + 1) % ordered_threads.len(),
+-            AgentNavigationDirection::Previous => {
+-                if current_idx == 0 {
+-                    ordered_threads.len() - 1
+-                } else {
+-                    current_idx - 1
++        let is_navigation_target = |thread_id: ThreadId, entry: &AgentPickerThreadEntry| {
++            Some(thread_id) == primary_thread_id
++                || (entry.is_running
++                    && !entry.is_closed
++                    && entry
++                        .agent_path
++                        .as_deref()
++                        .is_some_and(|path| !path.trim().is_empty()))
++        };
++        for offset in 1..ordered_threads.len() {
++            let candidate_idx = match direction {
++                AgentNavigationDirection::Next => (current_idx + offset) % ordered_threads.len(),
++                AgentNavigationDirection::Previous => {
++                    (current_idx + ordered_threads.len() - offset) % ordered_threads.len()
+                 }
++            };
++            let (candidate_id, candidate) = ordered_threads[candidate_idx];
++            if is_navigation_target(candidate_id, candidate) {
++                return Some(candidate_id);
+             }
+-        };
+-        Some(ordered_threads[next_idx].0)
++        }
++        None
+     }
+ 
+     /// Derives the contextual footer label for the currently displayed thread.
+@@ -327,30 +322,40 @@ impl AgentNavigationState {
  
          let thread_id = current_displayed_thread_id?;
          let is_primary = primary_thread_id == Some(thread_id);
@@ -64,7 +124,7 @@ index 00d4b966f7..a1740717a3 100644
      }
  
      /// Builds the `/agent` picker subtitle from the same canonical bindings used by key handling.
-@@ -480,6 +490,30 @@ mod tests {
+@@ -480,6 +485,30 @@ mod tests {
          );
      }
  
@@ -95,6 +155,41 @@ index 00d4b966f7..a1740717a3 100644
      #[test]
      fn adjacent_thread_id_skips_closed_stopped_and_unrelated_threads() {
          let (mut state, main_thread_id, first_agent_id, second_agent_id) = populated_state();
+@@ -514,6 +543,34 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn adjacent_thread_id_returns_to_main_after_current_agent_stops() {
++        let (mut state, main_thread_id, first_agent_id, second_agent_id) = populated_state();
++        state.set_agent_path(first_agent_id, Some("/root/first".to_string()));
++        state.mark_running(first_agent_id);
++        state.set_agent_path(second_agent_id, Some("/root/second".to_string()));
++        state.mark_running(second_agent_id);
++        state.mark_stopped(first_agent_id);
++        state.mark_stopped(second_agent_id);
++
++        assert_eq!(
++            state.adjacent_thread_id(
++                Some(first_agent_id),
++                Some(main_thread_id),
++                AgentNavigationDirection::Next,
++            ),
++            Some(main_thread_id)
++        );
++        assert_eq!(
++            state.adjacent_thread_id(
++                Some(first_agent_id),
++                Some(main_thread_id),
++                AgentNavigationDirection::Previous,
++            ),
++            Some(main_thread_id)
++        );
++    }
++
+     #[test]
+     fn picker_subtitle_mentions_shortcuts() {
+         let previous: Span<'static> = previous_agent_shortcut().into();
 diff --git a/codex-rs/tui/src/app/agent_status_feed.rs b/codex-rs/tui/src/app/agent_status_feed.rs
 index 7b5ecb74fe..9cb4e46ddf 100644
 --- a/codex-rs/tui/src/app/agent_status_feed.rs
@@ -184,7 +279,7 @@ index d8ca1b1f7d..210914c80a 100644
      "###);
      assert!(!rendered.contains("hidden raw reasoning"));
 diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
-index 35e6922045..2207ae5825 100644
+index 35e6922045..0985fd0014 100644
 --- a/codex-rs/tui/src/app/session_lifecycle.rs
 +++ b/codex-rs/tui/src/app/session_lifecycle.rs
 @@ -35,40 +35,8 @@ pub(super) struct ThreadSelectionHydration {
@@ -278,8 +373,45 @@ index 35e6922045..2207ae5825 100644
          let mut thread_ids = self.agent_navigation.tracked_thread_ids();
          for thread_id in self.thread_event_channels.keys().copied() {
              if !thread_ids.contains(&thread_id) {
+@@ -218,11 +202,13 @@ impl App {
+         agent_role: Option<String>,
+         is_closed: bool,
+     ) {
+-        self.chat_widget.set_collab_agent_metadata(
+-            thread_id,
+-            agent_nickname.clone(),
+-            agent_role.clone(),
+-        );
++        let (display_nickname, display_role) = if self.primary_thread_id == Some(thread_id) {
++            (Some("Main".to_string()), Some("default".to_string()))
++        } else {
++            (agent_nickname.clone(), agent_role.clone())
++        };
++        self.chat_widget
++            .set_collab_agent_metadata(thread_id, display_nickname, display_role);
+         self.agent_navigation
+             .upsert(thread_id, agent_nickname, agent_role, is_closed);
+         self.sync_active_agent_label();
+@@ -439,11 +425,12 @@ impl App {
+             );
+         }
+         for (thread_id, entry) in self.agent_navigation.ordered_threads() {
+-            chat_widget.set_collab_agent_metadata(
+-                thread_id,
+-                entry.agent_nickname.clone(),
+-                entry.agent_role.clone(),
+-            );
++            let (agent_nickname, agent_role) = if self.primary_thread_id == Some(thread_id) {
++                (Some("Main".to_string()), Some("default".to_string()))
++            } else {
++                (entry.agent_nickname.clone(), entry.agent_role.clone())
++            };
++            chat_widget.set_collab_agent_metadata(thread_id, agent_nickname, agent_role);
+         }
+         let previous = std::mem::replace(&mut self.chat_widget, chat_widget);
+         self.sync_active_agent_label();
 diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
-index 799bda89ae..70afcb3421 100644
+index 799bda89ae..f2eeba489e 100644
 --- a/codex-rs/tui/src/app/tests.rs
 +++ b/codex-rs/tui/src/app/tests.rs
 @@ -1489,6 +1489,12 @@ async fn open_agent_picker_preserves_running_hints_until_observed_completion() -
@@ -402,35 +534,119 @@ index 799bda89ae..70afcb3421 100644
          })
      );
      Ok(())
+@@ -1734,6 +1747,49 @@ async fn open_agent_picker_marks_terminal_read_errors_closed() -> Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn primary_sub_agent_activity_uses_main_default_identity() {
++    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
++    let primary_thread_id = ThreadId::new();
++    app.primary_thread_id = Some(primary_thread_id);
++    app.upsert_agent_picker_thread(
++        primary_thread_id,
++        /*agent_nickname*/ None,
++        /*agent_role*/ None,
++        /*is_closed*/ false,
++    );
++
++    app.chat_widget.handle_server_notification(
++        ServerNotification::ItemCompleted(codex_app_server_protocol::ItemCompletedNotification {
++            thread_id: primary_thread_id.to_string(),
++            turn_id: "turn-1".to_string(),
++            completed_at_ms: 0,
++            item: ThreadItem::SubAgentActivity {
++                id: "activity-1".to_string(),
++                kind: codex_app_server_protocol::SubAgentActivityKind::Interacted,
++                agent_thread_id: primary_thread_id.to_string(),
++                agent_path: "/root".to_string(),
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++
++    let rendered = loop {
++        let event = app_event_rx.try_recv().expect("main activity history cell");
++        if let AppEvent::InsertHistoryCell(cell) = event {
++            break lines_to_single_string(&cell.display_lines(/*width*/ 80));
++        }
++    };
++    assert!(
++        rendered.contains("Interacted with Main [default]"),
++        "{rendered}"
++    );
++    assert!(
++        !rendered.contains(&primary_thread_id.to_string()),
++        "{rendered}"
++    );
++}
++
+ #[test]
+ fn open_agent_picker_marks_loaded_threads_open() -> Result<()> {
+     const WORKER_THREADS: usize = 1;
 diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
-index 4907e03862..2145aafea1 100644
+index 4907e03862..32df6c4a22 100644
 --- a/codex-rs/tui/src/chatwidget.rs
 +++ b/codex-rs/tui/src/chatwidget.rs
-@@ -617,6 +617,7 @@ pub(crate) struct ChatWidget {
+@@ -33,6 +33,7 @@
+ use std::collections::BTreeMap;
+ use std::collections::HashMap;
+ use std::collections::HashSet;
++use std::collections::VecDeque;
+ use std::path::Path;
+ use std::path::PathBuf;
+ use std::sync::Arc;
+@@ -616,7 +617,9 @@ pub(crate) struct ChatWidget {
+     copy_last_response_binding: Vec<KeyBinding>,
      running_commands: HashMap<String, RunningCommand>,
      collab_agent_metadata: HashMap<ThreadId, AgentMetadata>,
++    pending_sub_agent_activity: VecDeque<ThreadItem>,
      pending_collab_spawn_requests: HashMap<String, multi_agents::SpawnRequestSummary>,
 +    v2_activity_observed: bool,
      suppressed_exec_calls: HashSet<String>,
      skills_all: Vec<SkillMetadata>,
      skills_initial_state: Option<HashMap<AbsolutePathBuf, bool>>,
+@@ -997,6 +1000,7 @@ impl ChatWidget {
+                 agent_role,
+             },
+         );
++        self.flush_pending_sub_agent_activity();
+     }
+ 
+     /// Returns the cached metadata for a thread, defaulting to empty if none has been registered.
+@@ -1007,6 +1011,13 @@ impl ChatWidget {
+             .unwrap_or_default()
+     }
+ 
++    fn has_collab_agent_identity(&self, thread_id: ThreadId) -> bool {
++        self.collab_agent_metadata(thread_id)
++            .agent_nickname
++            .as_deref()
++            .is_some_and(|nickname| !nickname.trim().is_empty())
++    }
++
+     fn restore_retry_status_header_if_present(&mut self) {
+         if let Some(header) = self.status_state.take_retry_status_header() {
+             self.set_status_header(header);
 diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
-index efe1f6b0f9..cd83fa5b1d 100644
+index efe1f6b0f9..96c5c494f2 100644
 --- a/codex-rs/tui/src/chatwidget/constructor.rs
 +++ b/codex-rs/tui/src/chatwidget/constructor.rs
-@@ -159,6 +159,7 @@ impl ChatWidget {
+@@ -158,7 +158,9 @@ impl ChatWidget {
+             copy_last_response_binding,
              running_commands: HashMap::new(),
              collab_agent_metadata: HashMap::new(),
++            pending_sub_agent_activity: VecDeque::new(),
              pending_collab_spawn_requests: HashMap::new(),
 +            v2_activity_observed: false,
              suppressed_exec_calls: HashSet::new(),
              last_unified_wait: None,
              unified_exec_wait_streak: None,
 diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
-index b571367d48..61583f4246 100644
+index b571367d48..0b9473e5d1 100644
 --- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
 +++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
-@@ -1298,6 +1298,99 @@ async fn live_app_server_collab_wait_items_render_history() {
+@@ -1298,6 +1298,140 @@ async fn live_app_server_collab_wait_items_render_history() {
      assert_chatwidget_snapshot!("app_server_collab_wait_items_render_history", combined);
  }
  
@@ -527,11 +743,52 @@ index b571367d48..61583f4246 100644
 +    assert!(drain_insert_history(&mut rx).is_empty());
 +}
 +
++#[tokio::test]
++async fn v2_activity_waits_for_agent_identity_before_rendering() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    let receiver_thread_id = ThreadId::new();
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            completed_at_ms: 0,
++            item: AppServerThreadItem::SubAgentActivity {
++                id: "activity-1".to_string(),
++                kind: codex_app_server_protocol::SubAgentActivityKind::Started,
++                agent_thread_id: receiver_thread_id.to_string(),
++                agent_path: "/root/robie".to_string(),
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++
++    assert!(
++        drain_insert_history(&mut rx).is_empty(),
++        "activity must not commit a UUID while thread metadata is still in flight"
++    );
++
++    chat.set_collab_agent_metadata(
++        receiver_thread_id,
++        Some("Robie".to_string()),
++        Some("default".to_string()),
++    );
++    let rendered = drain_insert_history(&mut rx)
++        .into_iter()
++        .map(|lines| lines_to_single_string(&lines))
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert!(rendered.contains("Started Robie [default]"), "{rendered}");
++    assert!(
++        !rendered.contains(&receiver_thread_id.to_string()),
++        "{rendered}"
++    );
++}
++
  #[tokio::test]
  async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effort() {
      let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 diff --git a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
-index f2f91d9123..f43f0e860b 100644
+index f2f91d9123..e8201937cd 100644
 --- a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
 +++ b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
 @@ -116,11 +116,32 @@ impl ChatWidget {
@@ -568,40 +825,72 @@ index f2f91d9123..f43f0e860b 100644
          if matches!(tool, CollabAgentTool::SpawnAgent)
              && let Some(spawn_request) = multi_agents::spawn_request_summary(&item)
          {
-@@ -146,7 +167,10 @@ impl ChatWidget {
+@@ -146,8 +167,31 @@ impl ChatWidget {
      }
  
      pub(super) fn on_sub_agent_activity(&mut self, item: ThreadItem) {
 -        if let Some(cell) = multi_agents::sub_agent_activity_history_cell(&item) {
+-            self.on_collab_event(cell);
 +        self.v2_activity_observed = true;
-+        if let Some(cell) = multi_agents::sub_agent_activity_history_cell(&item, |thread_id| {
-+            self.collab_agent_metadata(thread_id)
-+        }) {
-             self.on_collab_event(cell);
++        self.pending_sub_agent_activity.push_back(item);
++        self.flush_pending_sub_agent_activity();
++    }
++
++    pub(super) fn flush_pending_sub_agent_activity(&mut self) {
++        loop {
++            let Some(thread_id) = self
++                .pending_sub_agent_activity
++                .front()
++                .and_then(multi_agents::sub_agent_activity_thread_id)
++            else {
++                return;
++            };
++            if !self.has_collab_agent_identity(thread_id) {
++                return;
++            }
++            let Some(item) = self.pending_sub_agent_activity.pop_front() else {
++                return;
++            };
++            if let Some(cell) = multi_agents::sub_agent_activity_history_cell(&item, |thread_id| {
++                self.collab_agent_metadata(thread_id)
++            }) {
++                self.on_collab_event(cell);
++            }
          }
      }
+ 
 diff --git a/codex-rs/tui/src/multi_agents.rs b/codex-rs/tui/src/multi_agents.rs
-index 67691a24c8..43709dd173 100644
+index 67691a24c8..3bca90e35c 100644
 --- a/codex-rs/tui/src/multi_agents.rs
 +++ b/codex-rs/tui/src/multi_agents.rs
-@@ -302,15 +302,21 @@ pub(crate) fn sub_agent_activity_display(item: &ThreadItem) -> Option<SubAgentAc
+@@ -302,15 +302,31 @@ pub(crate) fn sub_agent_activity_display(item: &ThreadItem) -> Option<SubAgentAc
      })
  }
  
 -pub(crate) fn sub_agent_activity_history_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
-+pub(crate) fn sub_agent_activity_history_cell(
-+    item: &ThreadItem,
-+    mut agent_metadata: impl FnMut(ThreadId) -> AgentMetadata,
-+) -> Option<PlainHistoryCell> {
++pub(crate) fn sub_agent_activity_thread_id(item: &ThreadItem) -> Option<ThreadId> {
      let ThreadItem::SubAgentActivity {
 -        kind, agent_path, ..
-+        kind,
-+        agent_thread_id,
-+        ..
++        agent_thread_id, ..
      } = item
      else {
          return None;
      };
++    parse_thread_id(agent_thread_id)
++}
++
++pub(crate) fn sub_agent_activity_history_cell(
++    item: &ThreadItem,
++    mut agent_metadata: impl FnMut(ThreadId) -> AgentMetadata,
++) -> Option<PlainHistoryCell> {
++    let ThreadItem::SubAgentActivity {
++        kind,
++        agent_thread_id,
++        ..
++    } = item
++    else {
++        return None;
++    };
 +    let thread_id = parse_thread_id(agent_thread_id)?;
      Some(collab_event(
 -        sub_agent_activity_title(*kind, agent_path),
@@ -609,7 +898,7 @@ index 67691a24c8..43709dd173 100644
          Vec::new(),
      ))
  }
-@@ -323,16 +329,15 @@ pub(crate) fn sub_agent_activity_summary(kind: SubAgentActivityKind, agent_path:
+@@ -323,16 +339,15 @@ pub(crate) fn sub_agent_activity_summary(kind: SubAgentActivityKind, agent_path:
      }
  }
  
