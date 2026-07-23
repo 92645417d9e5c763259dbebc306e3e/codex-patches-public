@@ -1,0 +1,882 @@
+diff --git a/codex-rs/codex-api/src/common.rs b/codex-rs/codex-api/src/common.rs
+index ef28c6ad74..53c36cda3b 100644
+--- a/codex-rs/codex-api/src/common.rs
++++ b/codex-rs/codex-api/src/common.rs
+@@ -16,8 +16,10 @@ use serde_json::value::RawValue;
+ use std::collections::HashMap;
+ use std::pin::Pin;
+ use std::sync::Arc;
++use std::sync::OnceLock;
+ use std::task::Context;
+ use std::task::Poll;
++use std::time::Instant;
+ use tokio::sync::mpsc;
+ 
+ pub const WS_REQUEST_HEADER_TRACEPARENT_CLIENT_METADATA_KEY: &str = "ws_request_header_traceparent";
+@@ -378,10 +380,37 @@ pub fn create_text_param_for_request(
+     })
+ }
+ 
++#[derive(Clone, Debug, Default)]
++pub struct ResponsePerformanceTiming {
++    request_started_at: Arc<OnceLock<Instant>>,
++    first_response_byte_at: Arc<OnceLock<Instant>>,
++}
++
++impl ResponsePerformanceTiming {
++    pub fn observe_request_started(&self) {
++        let _ = self.request_started_at.set(Instant::now());
++    }
++
++    pub fn observe_first_response_bytes(&self, byte_count: usize) {
++        if byte_count > 0 {
++            let _ = self.first_response_byte_at.set(Instant::now());
++        }
++    }
++
++    pub fn request_started_at(&self) -> Option<Instant> {
++        self.request_started_at.get().copied()
++    }
++
++    pub fn first_response_byte_at(&self) -> Option<Instant> {
++        self.first_response_byte_at.get().copied()
++    }
++}
++
+ pub struct ResponseStream {
+     pub rx_event: mpsc::Receiver<Result<ResponseEvent, ApiError>>,
+     /// Server-assigned `x-request-id` response header, when present.
+     pub upstream_request_id: Option<String>,
++    pub performance_timing: ResponsePerformanceTiming,
+ }
+ 
+ impl Stream for ResponseStream {
+diff --git a/codex-rs/codex-api/src/endpoint/responses.rs b/codex-rs/codex-api/src/endpoint/responses.rs
+index 804f0027ff..a6e7c9dcfb 100644
+--- a/codex-rs/codex-api/src/endpoint/responses.rs
++++ b/codex-rs/codex-api/src/endpoint/responses.rs
+@@ -1,4 +1,5 @@
+ use crate::auth::SharedAuthProvider;
++use crate::common::ResponsePerformanceTiming;
+ use crate::common::ResponseStream;
+ use crate::common::ResponsesApiRequest;
+ use crate::endpoint::session::EndpointSession;
+@@ -137,6 +138,8 @@ impl<T: HttpTransport> ResponsesClient<T> {
+             Compression::Zstd => RequestCompression::Zstd,
+         };
+ 
++        let performance_timing = ResponsePerformanceTiming::default();
++        performance_timing.observe_request_started();
+         let stream_response = self
+             .session
+             .stream_encoded_json_with(
+@@ -159,6 +162,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
+             self.session.provider().stream_idle_timeout,
+             self.sse_telemetry.clone(),
+             turn_state,
++            performance_timing,
+         ))
+     }
+ }
+diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+index 749026c793..fd65728153 100644
+--- a/codex-rs/codex-api/src/endpoint/responses_websocket.rs
++++ b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+@@ -1,5 +1,6 @@
+ use crate::auth::SharedAuthProvider;
+ use crate::common::ResponseEvent;
++use crate::common::ResponsePerformanceTiming;
+ use crate::common::ResponseStream;
+ use crate::common::ResponsesWsRequest;
+ use crate::common::SafetyBufferingTreatment;
+@@ -314,6 +315,8 @@ impl ResponsesWebsocketConnection {
+             connection_reused,
+         };
+         let request_text = serialize_websocket_request(&request)?;
++        let performance_timing = ResponsePerformanceTiming::default();
++        let performance_timing_for_stream = performance_timing.clone();
+ 
+         let current_span = Span::current();
+         tokio::spawn(
+@@ -352,6 +355,7 @@ impl ResponsesWebsocketConnection {
+                         telemetry,
+                         turn_state.as_deref(),
+                         &timing_log_context,
++                        &performance_timing_for_stream,
+                     )
+                     .await
+                 };
+@@ -371,6 +375,7 @@ impl ResponsesWebsocketConnection {
+         Ok(ResponseStream {
+             rx_event,
+             upstream_request_id: None,
++            performance_timing,
+         })
+     }
+ }
+@@ -737,9 +742,11 @@ async fn run_websocket_response_stream(
+     telemetry: Option<Arc<dyn WebsocketTelemetry>>,
+     turn_state: Option<&OnceLock<String>>,
+     timing_log_context: &ResponsesWebsocketTimingLogContext,
++    performance_timing: &ResponsePerformanceTiming,
+ ) -> Result<(), ApiError> {
+     let mut last_server_model: Option<String> = None;
+     let mut safety_buffering_treatment = SafetyBufferingTreatment::default();
++    performance_timing.observe_request_started();
+     send_websocket_request(
+         ws_stream,
+         request_text,
+@@ -774,6 +781,8 @@ async fn run_websocket_response_stream(
+             }
+         };
+ 
++        observe_response_data_frame(performance_timing, &message);
++
+         match message {
+             Message::Text(text) => {
+                 if let Some(wrapped_error) = parse_wrapped_websocket_error_event(&text)
+@@ -878,6 +887,14 @@ async fn run_websocket_response_stream(
+     Ok(())
+ }
+ 
++fn observe_response_data_frame(performance_timing: &ResponsePerformanceTiming, message: &Message) {
++    match message {
++        Message::Text(text) => performance_timing.observe_first_response_bytes(text.len()),
++        Message::Binary(bytes) => performance_timing.observe_first_response_bytes(bytes.len()),
++        Message::Close(_) | Message::Frame(_) | Message::Ping(_) | Message::Pong(_) => {}
++    }
++}
++
+ fn emit_responses_websocket_timing_event(
+     kind: &str,
+     payload: &str,
+@@ -1320,4 +1337,17 @@ mod tests {
+             }
+         );
+     }
++
++    #[test]
++    fn response_performance_timing_starts_on_data_frames_not_control_frames() {
++        let timing = ResponsePerformanceTiming::default();
++        timing.observe_request_started();
++
++        observe_response_data_frame(&timing, &Message::Ping(Vec::new().into()));
++        observe_response_data_frame(&timing, &Message::Text("".into()));
++        assert_eq!(timing.first_response_byte_at(), None);
++
++        observe_response_data_frame(&timing, &Message::Text("response.created".into()));
++        assert!(timing.first_response_byte_at().is_some());
++    }
+ }
+diff --git a/codex-rs/codex-api/src/lib.rs b/codex-rs/codex-api/src/lib.rs
+index 7df593c1fd..9007ff84aa 100644
+--- a/codex-rs/codex-api/src/lib.rs
++++ b/codex-rs/codex-api/src/lib.rs
+@@ -37,6 +37,7 @@ pub use crate::common::ReasoningContext;
+ pub use crate::common::ReasoningSummaryDelivery;
+ pub use crate::common::ResponseCreateWsRequest;
+ pub use crate::common::ResponseEvent;
++pub use crate::common::ResponsePerformanceTiming;
+ pub use crate::common::ResponseStream;
+ pub use crate::common::ResponsesApiRequest;
+ pub use crate::common::ResponsesApiTools;
+diff --git a/codex-rs/codex-api/src/sse/responses.rs b/codex-rs/codex-api/src/sse/responses.rs
+index 68c082185f..8dcafd708a 100644
+--- a/codex-rs/codex-api/src/sse/responses.rs
++++ b/codex-rs/codex-api/src/sse/responses.rs
+@@ -1,4 +1,5 @@
+ use crate::common::ResponseEvent;
++use crate::common::ResponsePerformanceTiming;
+ use crate::common::ResponseStream;
+ use crate::common::SafetyBuffering;
+ use crate::common::SafetyBufferingTreatment;
+@@ -36,6 +37,7 @@ pub fn spawn_response_stream(
+     idle_timeout: Duration,
+     telemetry: Option<Arc<dyn SseTelemetry>>,
+     turn_state: Option<Arc<OnceLock<String>>>,
++    performance_timing: ResponsePerformanceTiming,
+ ) -> ResponseStream {
+     let rate_limit_snapshots = parse_all_rate_limits(&stream_response.headers);
+     let models_etag = stream_response
+@@ -68,6 +70,7 @@ pub fn spawn_response_stream(
+         let _ = turn_state.set(header_value.to_string());
+     }
+     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
++    let performance_timing_for_stream = performance_timing.clone();
+     tokio::spawn(async move {
+         if let Some(model) = server_model {
+             let _ = tx_event.send(Ok(ResponseEvent::ServerModel(model))).await;
+@@ -89,6 +92,7 @@ pub fn spawn_response_stream(
+             idle_timeout,
+             telemetry,
+             safety_buffering_treatment,
++            performance_timing_for_stream,
+         )
+         .await;
+     });
+@@ -96,6 +100,7 @@ pub fn spawn_response_stream(
+     ResponseStream {
+         rx_event,
+         upstream_request_id,
++        performance_timing,
+     }
+ }
+ 
+@@ -485,6 +490,7 @@ pub async fn process_sse(
+         idle_timeout,
+         telemetry,
+         SafetyBufferingTreatment::default(),
++        ResponsePerformanceTiming::default(),
+     )
+     .await;
+ }
+@@ -495,8 +501,15 @@ async fn process_sse_with_treatment(
+     idle_timeout: Duration,
+     telemetry: Option<Arc<dyn SseTelemetry>>,
+     safety_buffering_treatment: SafetyBufferingTreatment,
++    performance_timing: ResponsePerformanceTiming,
+ ) {
+-    let mut stream = stream.eventsource();
++    let mut stream = stream
++        .inspect(move |chunk| {
++            if let Ok(bytes) = chunk {
++                performance_timing.observe_first_response_bytes(bytes.len());
++            }
++        })
++        .eventsource();
+     let mut response_error: Option<ApiError> = None;
+     let mut last_server_model: Option<String> = None;
+ 
+@@ -1245,6 +1258,7 @@ mod tests {
+             idle_timeout(),
+             /*telemetry*/ None,
+             /*turn_state*/ None,
++            ResponsePerformanceTiming::default(),
+         );
+         assert_eq!(stream.upstream_request_id.as_deref(), Some("req-1"));
+         let event = stream
+@@ -1280,11 +1294,14 @@ mod tests {
+             bytes: Box::pin(bytes),
+         };
+ 
++        let performance_timing = ResponsePerformanceTiming::default();
++        performance_timing.observe_request_started();
+         let mut stream = spawn_response_stream(
+             stream_response,
+             idle_timeout(),
+             /*telemetry*/ None,
+             /*turn_state*/ None,
++            performance_timing.clone(),
+         );
+         let mut events = Vec::new();
+         while let Some(event) = stream.rx_event.recv().await {
+@@ -1296,6 +1313,7 @@ mod tests {
+                 .iter()
+                 .any(|event| matches!(event, ResponseEvent::ModelVerifications(_)))
+         );
++        assert!(performance_timing.first_response_byte_at().is_some());
+     }
+ 
+     #[tokio::test]
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index c5aff93b0f..f39b962d00 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -48,6 +48,7 @@ use codex_api::ReasoningContext;
+ use codex_api::RequestTelemetry;
+ use codex_api::ReqwestTransport;
+ use codex_api::ResponseCreateWsRequest;
++use codex_api::ResponsePerformanceTiming;
+ use codex_api::ResponsesApiRequest;
+ use codex_api::ResponsesClient as ApiResponsesClient;
+ use codex_api::ResponsesOptions as ApiResponsesOptions;
+@@ -1537,6 +1538,8 @@ impl ModelClientSession {
+                         request_session_telemetry,
+                         inference_trace_attempt,
+                         Arc::clone(&self.client.state.provider),
++                        "responses_http",
++                        true,
+                     );
+                     return Ok(stream);
+                 }
+@@ -1767,6 +1770,8 @@ impl ModelClientSession {
+                 request_session_telemetry,
+                 inference_trace_attempt,
+                 Arc::clone(&self.client.state.provider),
++                "responses_websocket",
++                !warmup,
+             );
+             self.websocket_session.last_response_rx = Some(last_request_rx);
+             return Ok(WebsocketStreamOutcome::Stream(stream));
+@@ -2033,24 +2038,30 @@ fn map_response_stream(
+     session_telemetry: SessionTelemetry,
+     inference_trace_attempt: InferenceTraceAttempt,
+     provider: SharedModelProvider,
++    transport: &'static str,
++    record_performance: bool,
+ ) -> (ResponseStream, oneshot::Receiver<LastResponse>) {
+     let codex_api::ResponseStream {
+         rx_event,
+         upstream_request_id,
++        performance_timing,
+     } = api_stream;
+     let api_stream = codex_api::ResponseStream {
+         rx_event,
+         upstream_request_id: None,
++        performance_timing: performance_timing.clone(),
+     };
+-    map_response_events(
++    map_response_events_with_timing(
+         upstream_request_id,
+         api_stream,
+         session_telemetry,
+         inference_trace_attempt,
+         provider,
++        record_performance.then_some((performance_timing, transport)),
+     )
+ }
+ 
++#[cfg(test)]
+ fn map_response_events<S>(
+     upstream_request_id: Option<String>,
+     api_stream: S,
+@@ -2058,6 +2069,30 @@ fn map_response_events<S>(
+     inference_trace_attempt: InferenceTraceAttempt,
+     provider: SharedModelProvider,
+ ) -> (ResponseStream, oneshot::Receiver<LastResponse>)
++where
++    S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
++        + Unpin
++        + Send
++        + 'static,
++{
++    map_response_events_with_timing(
++        upstream_request_id,
++        api_stream,
++        session_telemetry,
++        inference_trace_attempt,
++        provider,
++        None,
++    )
++}
++
++fn map_response_events_with_timing<S>(
++    upstream_request_id: Option<String>,
++    api_stream: S,
++    session_telemetry: SessionTelemetry,
++    inference_trace_attempt: InferenceTraceAttempt,
++    provider: SharedModelProvider,
++    performance: Option<(ResponsePerformanceTiming, &'static str)>,
++) -> (ResponseStream, oneshot::Receiver<LastResponse>)
+ where
+     S: futures::Stream<Item = std::result::Result<ResponseEvent, ApiError>>
+         + Unpin
+@@ -2075,7 +2110,7 @@ where
+         let mut logged_error = false;
+         let mut tx_last_response = Some(tx_last_response);
+         let mut items_added: Vec<ResponseItem> = Vec::new();
+-        let (request_start, mut ttft_ms) = (Instant::now(), None);
++        let mut performance_recorded = false;
+         let mut api_stream = api_stream;
+         let upstream_request_id = upstream_request_id.as_deref();
+         if let Some(upstream_request_id) = upstream_request_id {
+@@ -2084,6 +2119,16 @@ where
+         loop {
+             let event = tokio::select! {
+                 _ = consumer_dropped.cancelled() => {
++                    if let Some((timing, transport)) = performance.as_ref()
++                        && !performance_recorded
++                    {
++                        record_incomplete_model_request_performance(
++                            &session_telemetry,
++                            timing,
++                            transport,
++                            "cancelled",
++                        );
++                    }
+                     inference_trace_attempt.record_cancelled(
+                         STREAM_DROPPED_REASON,
+                         upstream_request_id,
+@@ -2104,6 +2149,16 @@ where
+                         .await
+                         .is_err()
+                     {
++                        if let Some((timing, transport)) = performance.as_ref()
++                            && !performance_recorded
++                        {
++                            record_incomplete_model_request_performance(
++                                &session_telemetry,
++                                timing,
++                                transport,
++                                "cancelled",
++                            );
++                        }
+                         inference_trace_attempt.record_cancelled(
+                             STREAM_DROPPED_REASON,
+                             upstream_request_id,
+@@ -2119,7 +2174,18 @@ where
+                 }) => {
+                     feedback_tags!(last_model_response_id = &response_id);
+                     if let Some(usage) = &token_usage {
+-                        session_telemetry.sse_event_completed(usage, ttft_ms);
++                        session_telemetry.sse_event_completed(usage);
++                    }
++                    if let Some((timing, transport)) = performance.as_ref()
++                        && !performance_recorded
++                    {
++                        record_completed_model_request_performance(
++                            &session_telemetry,
++                            timing,
++                            transport,
++                            token_usage.as_ref(),
++                        );
++                        performance_recorded = true;
+                     }
+                     inference_trace_attempt.record_completed(
+                         &response_id,
+@@ -2146,12 +2212,17 @@ where
+                     }
+                 }
+                 Ok(event) => {
+-                    if matches!(&event, ResponseEvent::OutputItemAdded(_)) && ttft_ms.is_none() {
+-                        ttft_ms = Some(
+-                            i64::try_from(request_start.elapsed().as_millis()).unwrap_or(i64::MAX),
+-                        );
+-                    }
+                     if tx_event.send(Ok(event)).await.is_err() {
++                        if let Some((timing, transport)) = performance.as_ref()
++                            && !performance_recorded
++                        {
++                            record_incomplete_model_request_performance(
++                                &session_telemetry,
++                                timing,
++                                transport,
++                                "cancelled",
++                            );
++                        }
+                         inference_trace_attempt.record_cancelled(
+                             STREAM_DROPPED_REASON,
+                             upstream_request_id,
+@@ -2161,6 +2232,23 @@ where
+                     }
+                 }
+                 Err(err) => {
++                    if let Some((timing, transport)) = performance.as_ref()
++                        && !performance_recorded
++                    {
++                        let outcome = if matches!(&err, ApiError::ResponseStreamDisconnected { .. })
++                        {
++                            "stream_dropped"
++                        } else {
++                            "failed"
++                        };
++                        record_incomplete_model_request_performance(
++                            &session_telemetry,
++                            timing,
++                            transport,
++                            outcome,
++                        );
++                        performance_recorded = true;
++                    }
+                     let response_debug_context =
+                         extract_response_debug_context_from_api_error(&err);
+                     let upstream_request_id =
+@@ -2184,6 +2272,16 @@ where
+                 }
+             }
+         }
++        if let Some((timing, transport)) = performance.as_ref()
++            && !performance_recorded
++        {
++            record_incomplete_model_request_performance(
++                &session_telemetry,
++                timing,
++                transport,
++                "stream_dropped",
++            );
++        }
+         inference_trace_attempt.record_failed(
+             "stream closed before response.completed",
+             upstream_request_id,
+@@ -2205,6 +2303,82 @@ where
+     )
+ }
+ 
++fn response_performance_durations(
++    timing: &ResponsePerformanceTiming,
++    completed_at: Instant,
++) -> (Option<Duration>, Option<Duration>) {
++    response_performance_durations_from_instants(
++        timing.request_started_at(),
++        timing.first_response_byte_at(),
++        completed_at,
++    )
++}
++
++fn response_performance_durations_from_instants(
++    request_started_at: Option<Instant>,
++    first_response_byte_at: Option<Instant>,
++    completed_at: Instant,
++) -> (Option<Duration>, Option<Duration>) {
++    let ttfb = request_started_at.zip(first_response_byte_at).map(
++        |(request_started_at, first_response_byte_at)| {
++            first_response_byte_at.saturating_duration_since(request_started_at)
++        },
++    );
++    let generation_duration = first_response_byte_at.map(|first_response_byte_at| {
++        completed_at.saturating_duration_since(first_response_byte_at)
++    });
++    (ttfb, generation_duration)
++}
++
++fn record_completed_model_request_performance(
++    session_telemetry: &SessionTelemetry,
++    timing: &ResponsePerformanceTiming,
++    transport: &str,
++    usage: Option<&codex_protocol::protocol::TokenUsage>,
++) {
++    let (ttfb, generation_duration) = response_performance_durations(timing, Instant::now());
++    let output_token_count = usage.map(|usage| usage.output_tokens);
++    let output_tokens_per_second = output_token_count.and_then(|output_token_count| {
++        billed_output_tokens_per_second(output_token_count, generation_duration?)
++    });
++    let outcome = if usage.is_some() {
++        "completed"
++    } else {
++        "missing_usage"
++    };
++    session_telemetry.model_request_performance(
++        transport,
++        outcome,
++        ttfb,
++        generation_duration,
++        output_token_count,
++        output_tokens_per_second,
++    );
++}
++
++fn billed_output_tokens_per_second(
++    output_token_count: i64,
++    generation_duration: Duration,
++) -> Option<f64> {
++    let seconds = generation_duration.as_secs_f64();
++    (output_token_count > 0 && seconds > 0.0).then_some(output_token_count as f64 / seconds)
++}
++
++fn record_incomplete_model_request_performance(
++    session_telemetry: &SessionTelemetry,
++    timing: &ResponsePerformanceTiming,
++    transport: &str,
++    outcome: &str,
++) {
++    let ttfb = timing
++        .request_started_at()
++        .zip(timing.first_response_byte_at())
++        .map(|(request_started_at, first_response_byte_at)| {
++            first_response_byte_at.saturating_duration_since(request_started_at)
++        });
++    session_telemetry.model_request_performance(transport, outcome, ttfb, None, None, None);
++}
++
+ /// Handles a 401 response by optionally refreshing ChatGPT tokens once.
+ ///
+ /// When refresh succeeds, the caller should retry the API call; otherwise
+diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.rs
+index eadd1904c2..ad241db204 100644
+--- a/codex-rs/core/src/client_tests.rs
++++ b/codex-rs/core/src/client_tests.rs
+@@ -49,6 +49,7 @@ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::InternalSessionSource;
+ use codex_protocol::protocol::SessionSource;
+ use codex_protocol::protocol::SubAgentSource;
++use codex_protocol::protocol::TokenUsage;
+ use codex_rollout_trace::CompactionTraceContext;
+ use codex_rollout_trace::ExecutionStatus;
+ use codex_rollout_trace::InferenceTraceAttempt;
+@@ -70,6 +71,7 @@ use std::sync::atomic::Ordering;
+ use std::task::Context;
+ use std::task::Poll;
+ use std::time::Duration;
++use std::time::Instant;
+ use tempfile::TempDir;
+ use tokio::sync::Notify;
+ use tracing::Event;
+@@ -980,3 +982,78 @@ async fn non_chatgpt_codex_endpoints_omit_attestation_generation() {
+     );
+     assert_eq!(attestation_calls.load(Ordering::Relaxed), 0);
+ }
++
++#[test]
++fn model_request_performance_uses_first_byte_and_all_billed_output_tokens() {
++    let request_started_at = Instant::now();
++    let first_response_byte_at = request_started_at + Duration::from_millis(250);
++    let completed_at = first_response_byte_at + Duration::from_secs(2);
++
++    let (ttfb, generation_duration) = super::response_performance_durations_from_instants(
++        Some(request_started_at),
++        Some(first_response_byte_at),
++        completed_at,
++    );
++
++    assert_eq!(ttfb, Some(Duration::from_millis(250)));
++    assert_eq!(generation_duration, Some(Duration::from_secs(2)));
++    assert_eq!(
++        super::billed_output_tokens_per_second(300, generation_duration.expect("duration")),
++        Some(150.0),
++    );
++}
++
++#[test]
++fn billed_tps_is_equivalent_for_tool_only_hidden_reasoning_and_final_output() {
++    let generation_duration = Duration::from_secs(2);
++    let output_shapes = [
++        (
++            "tool-only",
++            TokenUsage {
++                output_tokens: 300,
++                ..TokenUsage::default()
++            },
++        ),
++        (
++            "hidden reasoning",
++            TokenUsage {
++                output_tokens: 300,
++                reasoning_output_tokens: 300,
++                ..TokenUsage::default()
++            },
++        ),
++        (
++            "final answer",
++            TokenUsage {
++                output_tokens: 300,
++                ..TokenUsage::default()
++            },
++        ),
++    ];
++
++    for (label, usage) in output_shapes {
++        assert_eq!(
++            super::billed_output_tokens_per_second(usage.output_tokens, generation_duration),
++            Some(150.0),
++            "{label} must use the same billed-output-token formula"
++        );
++    }
++}
++
++#[test]
++fn model_request_performance_omits_invalid_or_incomplete_tps() {
++    assert_eq!(
++        super::billed_output_tokens_per_second(0, Duration::from_secs(1)),
++        None,
++    );
++    assert_eq!(
++        super::billed_output_tokens_per_second(10, Duration::ZERO),
++        None,
++    );
++
++    let completed_at = Instant::now();
++    assert_eq!(
++        super::response_performance_durations_from_instants(None, None, completed_at),
++        (None, None),
++    );
++}
+diff --git a/codex-rs/core/tests/suite/otel.rs b/codex-rs/core/tests/suite/otel.rs
+index 1051d32805..a8dc168883 100644
+--- a/codex-rs/core/tests/suite/otel.rs
++++ b/codex-rs/core/tests/suite/otel.rs
+@@ -618,14 +618,29 @@ async fn process_sse_emits_completed_telemetry() {
+                     && line.contains("cached_token_count=1")
+                     && line.contains("cache_write_token_count=2")
+                     && line.contains("reasoning_token_count=2")
+-                    && line.contains("tool_token_count=9")
+-                    && extract_log_field(line, "ttft_ms")
+-                        .and_then(|ttft_ms| ttft_ms.parse::<i64>().ok())
+-                        .is_some()
++                    && line.contains("total_token_count=9")
+             })
+             .map(|_| Ok(()))
+             .unwrap_or(Err("missing response.completed telemetry".to_string()))
+     });
++
++    logs_assert(|lines: &[&str]| {
++        lines
++            .iter()
++            .find(|line| {
++                line.contains("codex.model_request.performance")
++                    && extract_log_field(line, "transport").as_deref() == Some("responses_http")
++                    && extract_log_field(line, "outcome").as_deref() == Some("completed")
++                    && line.contains("output_token_count=5")
++                    && extract_log_field(line, "ttfb_ms").is_some()
++                    && extract_log_field(line, "generation_duration_ms").is_some()
++                    && extract_log_field(line, "output_tokens_per_second").is_some()
++            })
++            .map(|_| Ok(()))
++            .unwrap_or(Err(
++                "missing model request performance telemetry".to_string()
++            ))
++    });
+ }
+ 
+ #[tokio::test(flavor = "current_thread")]
+diff --git a/codex-rs/otel/src/events/session_telemetry.rs b/codex-rs/otel/src/events/session_telemetry.rs
+index c74f29008b..be188145ac 100644
+--- a/codex-rs/otel/src/events/session_telemetry.rs
++++ b/codex-rs/otel/src/events/session_telemetry.rs
+@@ -5,6 +5,10 @@ use crate::events::shared::log_event;
+ use crate::events::shared::trace_event;
+ use crate::metrics::API_CALL_COUNT_METRIC;
+ use crate::metrics::API_CALL_DURATION_METRIC;
++use crate::metrics::MODEL_REQUEST_GENERATION_DURATION_METRIC;
++use crate::metrics::MODEL_REQUEST_OUTPUT_TOKEN_COUNT_METRIC;
++use crate::metrics::MODEL_REQUEST_OUTPUT_TOKENS_PER_SECOND_METRIC;
++use crate::metrics::MODEL_REQUEST_TTFB_METRIC;
+ use crate::metrics::MetricsClient;
+ use crate::metrics::MetricsConfig;
+ use crate::metrics::MetricsError;
+@@ -191,6 +195,20 @@ impl SessionTelemetry {
+         }
+     }
+ 
++    pub fn histogram_f64(&self, name: &str, value: f64, tags: &[(&str, &str)]) {
++        let res: MetricsResult<()> = (|| {
++            let Some(metrics) = &self.metrics else {
++                return Ok(());
++            };
++            let tags = self.tags_with_metadata(tags)?;
++            metrics.histogram_f64(name, value, &tags)
++        })();
++
++        if let Err(e) = res {
++            tracing::warn!("metrics histogram [{name}] failed: {e}");
++        }
++    }
++
+     pub fn record_duration(&self, name: &str, duration: Duration, tags: &[(&str, &str)]) {
+         let res: MetricsResult<()> = (|| {
+             let Some(metrics) = &self.metrics else {
+@@ -923,7 +941,7 @@ impl SessionTelemetry {
+         );
+     }
+ 
+-    pub fn sse_event_completed(&self, usage: &TokenUsage, ttft_ms: Option<i64>) {
++    pub fn sse_event_completed(&self, usage: &TokenUsage) {
+         log_and_trace_event!(
+             self,
+             common: {
+@@ -934,8 +952,63 @@ impl SessionTelemetry {
+                 cached_token_count = usage.cached_input_tokens,
+                 cache_write_token_count = usage.cache_write_input_tokens,
+                 reasoning_token_count = usage.reasoning_output_tokens,
+-                tool_token_count = %usage.total_tokens,
+-                ttft_ms = ttft_ms,
++                total_token_count = %usage.total_tokens,
++                service_tier = self.metadata.service_tier.as_deref(),
++                model_reasoning_effort = self.metadata.model_reasoning_effort.as_deref(),
++            },
++            log: {},
++            trace: {},
++        );
++    }
++
++    pub fn model_request_performance(
++        &self,
++        transport: &str,
++        outcome: &str,
++        ttfb: Option<Duration>,
++        generation_duration: Option<Duration>,
++        output_token_count: Option<i64>,
++        output_tokens_per_second: Option<f64>,
++    ) {
++        let tags = [("transport", transport), ("outcome", outcome)];
++        if let Some(ttfb) = ttfb {
++            self.histogram_f64(MODEL_REQUEST_TTFB_METRIC, ttfb.as_secs_f64(), &tags);
++        }
++        if let Some(generation_duration) = generation_duration {
++            self.record_duration(
++                MODEL_REQUEST_GENERATION_DURATION_METRIC,
++                generation_duration,
++                &tags,
++            );
++        }
++        if let Some(output_token_count) = output_token_count {
++            self.histogram(
++                MODEL_REQUEST_OUTPUT_TOKEN_COUNT_METRIC,
++                output_token_count,
++                &tags,
++            );
++        }
++        if let Some(output_tokens_per_second) = output_tokens_per_second {
++            self.histogram_f64(
++                MODEL_REQUEST_OUTPUT_TOKENS_PER_SECOND_METRIC,
++                output_tokens_per_second,
++                &tags,
++            );
++        }
++
++        let ttfb = ttfb.map(|duration| duration.as_secs_f64());
++        let generation_duration_ms = generation_duration
++            .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX));
++        log_and_trace_event!(
++            self,
++            common: {
++                event.name = "codex.model_request.performance",
++                transport = transport,
++                outcome = outcome,
++                ttfb = ttfb,
++                generation_duration_ms = generation_duration_ms,
++                output_token_count = output_token_count,
++                output_tokens_per_second = output_tokens_per_second,
+                 service_tier = self.metadata.service_tier.as_deref(),
+                 model_reasoning_effort = self.metadata.model_reasoning_effort.as_deref(),
+             },
+diff --git a/codex-rs/otel/src/metrics/client.rs b/codex-rs/otel/src/metrics/client.rs
+index b0ba57a23f..0c89e1d1f7 100644
+--- a/codex-rs/otel/src/metrics/client.rs
++++ b/codex-rs/otel/src/metrics/client.rs
+@@ -146,7 +146,7 @@ impl MetricsClientInner {
+         Ok(())
+     }
+ 
+-    fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)]) -> Result<()> {
++    fn histogram(&self, name: &str, value: f64, tags: &[(&str, &str)]) -> Result<()> {
+         validate_metric_name(name)?;
+         let attributes = self.attributes(tags)?;
+ 
+@@ -157,7 +157,7 @@ impl MetricsClientInner {
+         let histogram = histograms
+             .entry(name.to_string())
+             .or_insert_with(|| self.meter.f64_histogram(name.to_string()).build());
+-        histogram.record(value as f64, &attributes);
++        histogram.record(value, &attributes);
+         Ok(())
+     }
+ 
+@@ -356,6 +356,11 @@ impl MetricsClient {
+ 
+     /// Send a single histogram sample.
+     pub fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)]) -> Result<()> {
++        self.0.histogram(name, value as f64, tags)
++    }
++
++    /// Send one floating-point histogram sample.
++    pub fn histogram_f64(&self, name: &str, value: f64, tags: &[(&str, &str)]) -> Result<()> {
+         self.0.histogram(name, value, tags)
+     }
+ 
+diff --git a/codex-rs/otel/src/metrics/names.rs b/codex-rs/otel/src/metrics/names.rs
+index d2093ed3f7..c4bd6991a8 100644
+--- a/codex-rs/otel/src/metrics/names.rs
++++ b/codex-rs/otel/src/metrics/names.rs
+@@ -24,6 +24,12 @@ pub const RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC: &str =
+ pub const TURN_E2E_DURATION_METRIC: &str = "codex.turn.e2e_duration_ms";
+ pub const TURN_TTFT_DURATION_METRIC: &str = "codex.turn.ttft.duration_ms";
+ pub const TURN_TTFM_DURATION_METRIC: &str = "codex.turn.ttfm.duration_ms";
++pub const MODEL_REQUEST_TTFB_METRIC: &str = "codex.model_request.ttfb";
++pub const MODEL_REQUEST_GENERATION_DURATION_METRIC: &str =
++    "codex.model_request.generation_duration_ms";
++pub const MODEL_REQUEST_OUTPUT_TOKEN_COUNT_METRIC: &str = "codex.model_request.output_token_count";
++pub const MODEL_REQUEST_OUTPUT_TOKENS_PER_SECOND_METRIC: &str =
++    "codex.model_request.output_tokens_per_second";
+ pub const TURN_NETWORK_PROXY_METRIC: &str = "codex.turn.network_proxy";
+ pub const TURN_MEMORY_METRIC: &str = "codex.turn.memory";
+ pub const TURN_TOOL_CALL_METRIC: &str = "codex.turn.tool.call";
