@@ -1,0 +1,337 @@
+diff --git a/codex-rs/tui/src/app/app_server_events.rs b/codex-rs/tui/src/app/app_server_events.rs
+index 82bb194c5e..47dfd51a5d 100644
+--- a/codex-rs/tui/src/app/app_server_events.rs
++++ b/codex-rs/tui/src/app/app_server_events.rs
+@@ -12,6 +12,7 @@ use crate::app_info::app_info_from_api;
+ use crate::app_server_session::AppServerSession;
+ use crate::app_server_session::status_account_display_from_auth_mode;
+ use crate::codex_socket::CompletionRequest;
++use crate::codex_socket::stable_turn_id;
+ use codex_app_server_client::AppServerEvent;
+ use codex_app_server_protocol::AuthMode;
+ use codex_app_server_protocol::RateLimitReachedType;
+@@ -19,9 +20,6 @@ use codex_app_server_protocol::ServerNotification;
+ use codex_app_server_protocol::ServerRequest;
+ use codex_app_server_protocol::TurnStatus;
+ use codex_protocol::ThreadId;
+-use std::collections::hash_map::DefaultHasher;
+-use std::hash::Hash;
+-use std::hash::Hasher;
+ use std::path::Path;
+ use uuid::Uuid;
+ 
+@@ -311,35 +309,6 @@ fn completion_request_for_notification(
+     ))
+ }
+ 
+-fn stable_turn_id(turn_id: &str) -> u64 {
+-    if let Some(turn_id) = trailing_positive_number(turn_id) {
+-        return turn_id;
+-    }
+-
+-    let mut hasher = DefaultHasher::new();
+-    turn_id.hash(&mut hasher);
+-    (hasher.finish() % (i64::MAX as u64)).max(1)
+-}
+-
+-fn trailing_positive_number(value: &str) -> Option<u64> {
+-    let digits = value
+-        .chars()
+-        .rev()
+-        .take_while(|character| character.is_ascii_digit())
+-        .collect::<Vec<_>>();
+-    if digits.is_empty() {
+-        return None;
+-    }
+-
+-    digits
+-        .into_iter()
+-        .rev()
+-        .collect::<String>()
+-        .parse::<u64>()
+-        .ok()
+-        .filter(|number| *number > 0)
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -454,14 +423,4 @@ mod tests {
+             .is_none()
+         );
+     }
+-
+-    #[test]
+-    fn stable_turn_id_uses_numeric_suffix_or_stable_fallback() {
+-        assert_eq!(stable_turn_id("42"), 42);
+-        assert_eq!(stable_turn_id("turn-9"), 9);
+-        assert_eq!(
+-            stable_turn_id("turn-without-number"),
+-            stable_turn_id("turn-without-number")
+-        );
+-    }
+ }
+diff --git a/codex-rs/tui/src/chatwidget/model_popups.rs b/codex-rs/tui/src/chatwidget/model_popups.rs
+index fec2657a0d..618e70ed16 100644
+--- a/codex-rs/tui/src/chatwidget/model_popups.rs
++++ b/codex-rs/tui/src/chatwidget/model_popups.rs
+@@ -391,6 +391,10 @@ impl ChatWidget {
+         self.notify(Notification::PlanModePrompt {
+             title: PLAN_MODE_REASONING_SCOPE_TITLE.to_string(),
+         });
++        self.notify_helper_action_required(
++            "Plan mode needs input",
++            "Codex is waiting for your plan mode reasoning scope choice.",
++        );
+     }
+ 
+     /// Open a popup to choose the standard reasoning effort for the given model.
+diff --git a/codex-rs/tui/src/chatwidget/notifications.rs b/codex-rs/tui/src/chatwidget/notifications.rs
+index 2084956b2c..2bf31c5a3d 100644
+--- a/codex-rs/tui/src/chatwidget/notifications.rs
++++ b/codex-rs/tui/src/chatwidget/notifications.rs
+@@ -21,6 +21,19 @@ impl ChatWidget {
+             tui.notify(notif.display());
+         }
+     }
++
++    pub(super) fn notify_helper_action_required(&self, title: &str, body: &str) {
++        let Some(thread_id) = self.thread_id else {
++            return;
++        };
++        crate::codex_socket::notify_action_required(
++            &thread_id.to_string(),
++            self.turn_lifecycle.last_turn_id.as_deref(),
++            self.config.cwd.as_path(),
++            title,
++            body,
++        );
++    }
+ }
+ 
+ #[derive(Debug)]
+diff --git a/codex-rs/tui/src/chatwidget/tool_requests.rs b/codex-rs/tui/src/chatwidget/tool_requests.rs
+index b9ba8108f3..035f62045c 100644
+--- a/codex-rs/tui/src/chatwidget/tool_requests.rs
++++ b/codex-rs/tui/src/chatwidget/tool_requests.rs
+@@ -284,6 +284,10 @@ impl ChatWidget {
+         let command = shlex::try_join(ev.command.iter().map(String::as_str))
+             .unwrap_or_else(|_| ev.command.join(" "));
+         self.notify(Notification::ExecApprovalRequested { command });
++        self.notify_helper_action_required(
++            "Approval requested",
++            "Codex needs command approval to continue.",
++        );
+ 
+         let available_decisions = ev.effective_available_decisions();
+         let request = ApprovalRequest::Exec(ExecApprovalRequest {
+@@ -329,6 +333,10 @@ impl ChatWidget {
+             cwd: self.config.cwd.to_path_buf(),
+             changes: changed_paths,
+         });
++        self.notify_helper_action_required(
++            "Approval requested",
++            "Codex needs edit approval to continue.",
++        );
+     }
+ 
+     pub(crate) fn handle_elicitation_request_now(
+@@ -341,6 +349,10 @@ impl ChatWidget {
+         self.notify(Notification::ElicitationRequested {
+             server_name: params.server_name.clone(),
+         });
++        self.notify_helper_action_required(
++            "Approval requested",
++            "Codex needs an external approval response to continue.",
++        );
+ 
+         let thread_id = ThreadId::from_string(&params.thread_id)
+             .unwrap_or_else(|_| self.thread_id.unwrap_or_default());
+@@ -424,6 +436,10 @@ impl ChatWidget {
+             (count, _) => format!("{count} questions requested"),
+         };
+         self.notify(Notification::PlanModePrompt { title });
++        self.notify_helper_action_required(
++            "Plan mode needs input",
++            "Codex is waiting for your plan mode response.",
++        );
+         self.bottom_pane.push_user_input_request(ev);
+         self.set_ambient_pet_notification(
+             crate::pets::PetNotificationKind::Waiting,
+@@ -444,6 +460,10 @@ impl ChatWidget {
+         });
+         self.bottom_pane
+             .push_approval_request(request, &self.config.features);
++        self.notify_helper_action_required(
++            "Approval requested",
++            "Codex needs permissions approval to continue.",
++        );
+         self.set_ambient_pet_notification(
+             crate::pets::PetNotificationKind::Waiting,
+             /*body*/ None,
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+index 28665c0d69..6006ac64bf 100644
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -260,6 +260,10 @@ impl ChatWidget {
+         self.notify(Notification::PlanModePrompt {
+             title: PLAN_IMPLEMENTATION_TITLE.to_string(),
+         });
++        self.notify_helper_action_required(
++            "Plan mode needs input",
++            "Codex is waiting for your plan mode response.",
++        );
+     }
+ 
+     /// Returns a context-used label for the plan implementation prompt.
+diff --git a/codex-rs/tui/src/codex_socket.rs b/codex-rs/tui/src/codex_socket.rs
+index f101e08b29..7d5af0c35a 100644
+--- a/codex-rs/tui/src/codex_socket.rs
++++ b/codex-rs/tui/src/codex_socket.rs
+@@ -5,10 +5,14 @@
+ 
+ use serde::Deserialize;
+ use serde::Serialize;
++use std::collections::hash_map::DefaultHasher;
++use std::hash::Hash;
++use std::hash::Hasher;
+ use std::path::Path;
+ use std::path::PathBuf;
+ use std::time::Duration;
+ use thiserror::Error;
++use uuid::Uuid;
+ 
+ #[cfg(unix)]
+ use std::io::Read;
+@@ -161,6 +165,75 @@ pub(crate) fn notify_completion(request: CompletionRequest) {
+     }));
+ }
+ 
++pub(crate) fn notify_action_required(
++    session_id: &str,
++    turn_id: Option<&str>,
++    working_dir: &Path,
++    title: &str,
++    body: &str,
++) {
++    let Some(request) = action_required_request(
++        session_id,
++        turn_id,
++        working_dir,
++        title,
++        body,
++        chrono::Utc::now(),
++    ) else {
++        return;
++    };
++    notify_completion(request);
++}
++
++fn action_required_request(
++    session_id: &str,
++    turn_id: Option<&str>,
++    working_dir: &Path,
++    title: &str,
++    body: &str,
++    created_at: chrono::DateTime<chrono::Utc>,
++) -> Option<CompletionRequest> {
++    Some(CompletionRequest::new(
++        Uuid::parse_str(session_id).ok()?.to_string(),
++        turn_id.map(stable_turn_id).unwrap_or(1),
++        "NeedsInput".to_string(),
++        0,
++        working_dir.display().to_string(),
++        title.to_string(),
++        body.to_string(),
++        created_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
++    ))
++}
++
++pub(crate) fn stable_turn_id(turn_id: &str) -> u64 {
++    if let Some(turn_id) = trailing_positive_number(turn_id) {
++        return turn_id;
++    }
++
++    let mut hasher = DefaultHasher::new();
++    turn_id.hash(&mut hasher);
++    (hasher.finish() % (i64::MAX as u64)).max(1)
++}
++
++fn trailing_positive_number(value: &str) -> Option<u64> {
++    let digits = value
++        .chars()
++        .rev()
++        .take_while(|character| character.is_ascii_digit())
++        .collect::<Vec<_>>();
++    if digits.is_empty() {
++        return None;
++    }
++
++    digits
++        .into_iter()
++        .rev()
++        .collect::<String>()
++        .parse::<u64>()
++        .ok()
++        .filter(|number| *number > 0)
++}
++
+ /// Ask CXU to edit text, waiting for its response without the notification read deadline.
+ pub(crate) async fn edit_with_helper(
+     seed: &str,
+@@ -321,6 +394,55 @@ mod tests {
+         assert_eq!(json["CreatedAt"], "2026-06-12T10:11:12Z");
+     }
+ 
++    #[test]
++    fn action_required_request_reuses_completion_schema() {
++        let created_at = chrono::DateTime::parse_from_rfc3339("2026-06-12T10:11:12Z")
++            .expect("timestamp")
++            .with_timezone(&chrono::Utc);
++        let request = action_required_request(
++            "123e4567-e89b-12d3-a456-426614174000",
++            Some("turn-9"),
++            Path::new("/repo"),
++            "Approval requested",
++            "Codex needs approval to continue.",
++            created_at,
++        )
++        .expect("request");
++
++        let json = serde_json::to_value(request).expect("serialize");
++        assert_eq!(json["Type"], "Completion");
++        assert_eq!(json["Source"], "codex");
++        assert_eq!(json["SessionID"], "123e4567-e89b-12d3-a456-426614174000");
++        assert_eq!(json["TurnID"], 9);
++        assert_eq!(json["Status"], "NeedsInput");
++        assert_eq!(json["DurationMS"], 0);
++        assert_eq!(json["WorkingDir"], "/repo");
++        assert_eq!(json["Title"], "Approval requested");
++        assert_eq!(json["Body"], "Codex needs approval to continue.");
++        assert_eq!(json["CreatedAt"], "2026-06-12T10:11:12Z");
++        assert!(
++            action_required_request(
++                "invalid-session",
++                None,
++                Path::new("/repo"),
++                "title",
++                "body",
++                chrono::Utc::now(),
++            )
++            .is_none()
++        );
++    }
++
++    #[test]
++    fn stable_turn_id_uses_numeric_suffix_or_stable_fallback() {
++        assert_eq!(stable_turn_id("42"), 42);
++        assert_eq!(stable_turn_id("turn-9"), 9);
++        assert_eq!(
++            stable_turn_id("turn-without-number"),
++            stable_turn_id("turn-without-number")
++        );
++    }
++
+     #[test]
+     fn editor_request_serializes_helper_schema() {
+         let json =

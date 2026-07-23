@@ -1,0 +1,913 @@
+diff --git a/codex-rs/tui/src/app/agent_navigation.rs b/codex-rs/tui/src/app/agent_navigation.rs
+index 00d4b966f7..5040c9466c 100644
+--- a/codex-rs/tui/src/app/agent_navigation.rs
++++ b/codex-rs/tui/src/app/agent_navigation.rs
+@@ -48,6 +48,14 @@ pub(crate) struct AgentNavigationState {
+     stopped_threads: HashSet<ThreadId>,
+     /// Spawned child threads whose instructions are owned by their parent agent.
+     parent_owned_threads: HashSet<ThreadId>,
++    /// Parent edges learned from `thread/started` notifications.
++    parent_threads: HashMap<ThreadId, ThreadId>,
++    /// The primary tree currently shown by the TUI, including its root.
++    current_primary_thread_id: Option<ThreadId>,
++    /// Explicit membership for the current primary tree. Paths are display metadata, not lineage.
++    current_primary_tree_threads: HashSet<ThreadId>,
++    /// Descendants directly referenced by collaboration events emitted by the current primary.
++    current_primary_collab_threads: HashSet<ThreadId>,
+ }
+ 
+ /// Direction of keyboard traversal through the stable picker order.
+@@ -102,18 +110,61 @@ impl AgentNavigationState {
+         if !self.threads.contains_key(&thread_id) {
+             self.order.push(thread_id);
+         }
+-        let (previous_agent_path, previous_is_running) = self
++        let previous = self
+             .threads
+             .get(&thread_id)
+-            .map(|entry| (entry.agent_path.clone(), entry.is_running))
+-            .unwrap_or((None, false));
++            .cloned()
++            .unwrap_or(AgentPickerThreadEntry {
++                agent_nickname: None,
++                agent_role: None,
++                agent_path: None,
++                is_running: false,
++                is_closed: false,
++            });
++        let is_closed = previous.is_closed || is_closed;
++        self.insert_merged_entry(thread_id, previous, agent_nickname, agent_role, is_closed);
++    }
++
++    /// Applies an app-server lifecycle read, which may authoritatively reopen a cached thread.
++    pub(crate) fn upsert_authoritative(
++        &mut self,
++        thread_id: ThreadId,
++        agent_nickname: Option<String>,
++        agent_role: Option<String>,
++        is_closed: bool,
++    ) {
++        if !self.threads.contains_key(&thread_id) {
++            self.order.push(thread_id);
++        }
++        let previous = self
++            .threads
++            .get(&thread_id)
++            .cloned()
++            .unwrap_or(AgentPickerThreadEntry {
++                agent_nickname: None,
++                agent_role: None,
++                agent_path: None,
++                is_running: false,
++                is_closed: false,
++            });
++        self.insert_merged_entry(thread_id, previous, agent_nickname, agent_role, is_closed);
++    }
++
++    fn insert_merged_entry(
++        &mut self,
++        thread_id: ThreadId,
++        previous: AgentPickerThreadEntry,
++        agent_nickname: Option<String>,
++        agent_role: Option<String>,
++        is_closed: bool,
++    ) {
+         self.threads.insert(
+             thread_id,
+             AgentPickerThreadEntry {
+-                agent_nickname,
+-                agent_role,
+-                agent_path: previous_agent_path,
+-                is_running: previous_is_running && !is_closed,
++                agent_nickname: agent_nickname.or(previous.agent_nickname),
++                agent_role: agent_role.or(previous.agent_role),
++                agent_path: previous.agent_path,
++                is_running: previous.is_running && !is_closed,
+                 is_closed,
+             },
+         );
+@@ -176,6 +227,58 @@ impl AgentNavigationState {
+         }
+     }
+ 
++    /// Rebuilds explicit membership for a newly selected primary thread.
++    pub(crate) fn set_current_primary_thread(&mut self, thread_id: ThreadId) {
++        self.current_primary_thread_id = Some(thread_id);
++        self.current_primary_collab_threads.clear();
++        self.rebuild_current_primary_tree();
++    }
++
++    /// Records a server-authored child-to-parent edge and re-evaluates current-tree membership.
++    pub(crate) fn record_thread_parent(&mut self, thread_id: ThreadId, parent_thread_id: ThreadId) {
++        self.parent_threads.insert(thread_id, parent_thread_id);
++        self.rebuild_current_primary_tree();
++    }
++
++    /// Marks a thread directly referenced by current-primary collaboration state as a descendant.
++    pub(crate) fn mark_current_primary_tree_member(&mut self, thread_id: ThreadId) {
++        if self.current_primary_thread_id.is_some() {
++            self.current_primary_collab_threads.insert(thread_id);
++            self.rebuild_current_primary_tree();
++        }
++    }
++
++    fn rebuild_current_primary_tree(&mut self) {
++        self.current_primary_tree_threads.clear();
++        let Some(primary_thread_id) = self.current_primary_thread_id else {
++            return;
++        };
++        self.current_primary_tree_threads.insert(primary_thread_id);
++        self.current_primary_tree_threads
++            .extend(self.current_primary_collab_threads.iter().copied());
++        loop {
++            let before = self.current_primary_tree_threads.len();
++            let children = self
++                .parent_threads
++                .iter()
++                .filter_map(|(thread_id, parent_thread_id)| {
++                    self.current_primary_tree_threads
++                        .contains(parent_thread_id)
++                        .then_some(*thread_id)
++                })
++                .collect::<Vec<_>>();
++            self.current_primary_tree_threads.extend(children);
++            if self.current_primary_tree_threads.len() == before {
++                return;
++            }
++        }
++    }
++
++    fn belongs_to_current_primary_tree(&self, thread_id: ThreadId) -> bool {
++        self.current_primary_thread_id
++            .is_none_or(|_| self.current_primary_tree_threads.contains(&thread_id))
++    }
++
+     /// Marks a thread as closed without removing it from the traversal cache.
+     ///
+     /// Closed threads stay in the picker and in spawn order so users can still review them and so
+@@ -203,6 +306,10 @@ impl AgentNavigationState {
+         self.order.clear();
+         self.stopped_threads.clear();
+         self.parent_owned_threads.clear();
++        self.parent_threads.clear();
++        self.current_primary_thread_id = None;
++        self.current_primary_tree_threads.clear();
++        self.current_primary_collab_threads.clear();
+     }
+ 
+     /// Removes a tracked thread entirely from picker metadata and traversal order.
+@@ -215,6 +322,10 @@ impl AgentNavigationState {
+         self.order.retain(|candidate| *candidate != thread_id);
+         self.stopped_threads.remove(&thread_id);
+         self.parent_owned_threads.remove(&thread_id);
++        self.parent_threads.remove(&thread_id);
++        self.parent_threads.retain(|_, parent| *parent != thread_id);
++        self.current_primary_tree_threads.remove(&thread_id);
++        self.current_primary_collab_threads.remove(&thread_id);
+     }
+ 
+     /// Returns whether there is at least one tracked thread other than the primary one.
+@@ -223,9 +334,10 @@ impl AgentNavigationState {
+     /// feature flag is currently disabled, because already-existing sub-agent threads should remain
+     /// inspectable.
+     pub(crate) fn has_non_primary_thread(&self, primary_thread_id: Option<ThreadId>) -> bool {
+-        self.threads
+-            .keys()
+-            .any(|thread_id| Some(*thread_id) != primary_thread_id)
++        self.threads.keys().any(|thread_id| {
++            Some(*thread_id) != primary_thread_id
++                && self.belongs_to_current_primary_tree(*thread_id)
++        })
+     }
+ 
+     /// Returns live picker rows in the same order users cycle through them.
+@@ -240,6 +352,16 @@ impl AgentNavigationState {
+             .collect()
+     }
+ 
++    /// Returns the entries explicitly associated with the current primary tree in picker order.
++    pub(crate) fn ordered_current_primary_tree_threads(
++        &self,
++    ) -> Vec<(ThreadId, &AgentPickerThreadEntry)> {
++        self.ordered_threads()
++            .into_iter()
++            .filter(|(thread_id, _)| self.belongs_to_current_primary_tree(*thread_id))
++            .collect()
++    }
++
+     pub(crate) fn ordered_path_backed_subagent_threads(
+         &self,
+         primary_thread_id: Option<ThreadId>,
+@@ -248,6 +370,7 @@ impl AgentNavigationState {
+             .into_iter()
+             .filter(|(thread_id, entry)| {
+                 Some(*thread_id) != primary_thread_id
++                    && self.belongs_to_current_primary_tree(*thread_id)
+                     && entry
+                         .agent_path
+                         .as_deref()
+@@ -256,6 +379,17 @@ impl AgentNavigationState {
+             .collect()
+     }
+ 
++    /// Returns the only descendants eligible for live multi-agent surfaces.
++    pub(crate) fn ordered_running_current_primary_descendants(
++        &self,
++        primary_thread_id: Option<ThreadId>,
++    ) -> Vec<(ThreadId, &AgentPickerThreadEntry)> {
++        self.ordered_path_backed_subagent_threads(primary_thread_id)
++            .into_iter()
++            .filter(|(_, entry)| entry.is_running && !entry.is_closed)
++            .collect()
++    }
++
+     /// Returns tracked thread ids in the same stable order used by the picker.
+     pub(crate) fn tracked_thread_ids(&self) -> Vec<ThreadId> {
+         self.ordered_threads()
+@@ -276,17 +410,16 @@ impl AgentNavigationState {
+         primary_thread_id: Option<ThreadId>,
+         direction: AgentNavigationDirection,
+     ) -> Option<ThreadId> {
++        let running_descendant_ids = self
++            .ordered_running_current_primary_descendants(primary_thread_id)
++            .into_iter()
++            .map(|(thread_id, _)| thread_id)
++            .collect::<HashSet<_>>();
+         let ordered_threads = self
+             .ordered_threads()
+             .into_iter()
+-            .filter(|(thread_id, entry)| {
+-                Some(*thread_id) == primary_thread_id
+-                    || (entry.is_running
+-                        && !entry.is_closed
+-                        && entry
+-                            .agent_path
+-                            .as_deref()
+-                            .is_some_and(|path| !path.trim().is_empty()))
++            .filter(|(thread_id, _)| {
++                Some(*thread_id) == primary_thread_id || running_descendant_ids.contains(thread_id)
+             })
+             .collect::<Vec<_>>();
+         if ordered_threads.len() < 2 {
+@@ -321,11 +454,20 @@ impl AgentNavigationState {
+         current_displayed_thread_id: Option<ThreadId>,
+         primary_thread_id: Option<ThreadId>,
+     ) -> Option<String> {
+-        if self.threads.len() <= 1 {
++        if self
++            .ordered_threads()
++            .into_iter()
++            .filter(|(thread_id, _)| self.belongs_to_current_primary_tree(*thread_id))
++            .count()
++            <= 1
++        {
+             return None;
+         }
+ 
+         let thread_id = current_displayed_thread_id?;
++        if !self.belongs_to_current_primary_tree(thread_id) {
++            return None;
++        }
+         let is_primary = primary_thread_id == Some(thread_id);
+         Some(
+             self.threads
+@@ -537,4 +679,113 @@ mod tests {
+             Some("Main [default]".to_string())
+         );
+     }
++
++    #[test]
++    fn metadata_merge_keeps_late_activity_and_terminal_liveness_from_erasing_identity() {
++        let mut state = AgentNavigationState::default();
++        let thread_id = ThreadId::new();
++        state.upsert(
++            thread_id,
++            Some("Robie".to_string()),
++            Some("explorer".to_string()),
++            /*is_closed*/ false,
++        );
++        state.record_sub_agent_activity(SubAgentActivityDisplay {
++            thread_id,
++            agent_path: "/root/robie".to_string(),
++            is_running_hint: true,
++        });
++        state.upsert(
++            thread_id, /*agent_nickname*/ None, /*agent_role*/ None,
++            /*is_closed*/ false,
++        );
++        state.mark_closed(thread_id);
++        state.record_sub_agent_activity(SubAgentActivityDisplay {
++            thread_id,
++            agent_path: "/root/robie".to_string(),
++            is_running_hint: true,
++        });
++
++        assert_eq!(
++            state.get(&thread_id),
++            Some(&AgentPickerThreadEntry {
++                agent_nickname: Some("Robie".to_string()),
++                agent_role: Some("explorer".to_string()),
++                agent_path: Some("/root/robie".to_string()),
++                is_running: false,
++                is_closed: true,
++            })
++        );
++    }
++
++    #[test]
++    fn authoritative_lifecycle_refresh_reopens_closed_entry_without_losing_identity() {
++        let mut state = AgentNavigationState::default();
++        let thread_id = ThreadId::new();
++        state.upsert(
++            thread_id,
++            Some("Robie".to_string()),
++            Some("explorer".to_string()),
++            /*is_closed*/ false,
++        );
++        state.mark_closed(thread_id);
++        state.record_sub_agent_activity(SubAgentActivityDisplay {
++            thread_id,
++            agent_path: "/root/robie".to_string(),
++            is_running_hint: true,
++        });
++        assert!(state.get(&thread_id).is_some_and(|entry| entry.is_closed));
++        state.upsert_authoritative(
++            thread_id, /*agent_nickname*/ None, /*agent_role*/ None,
++            /*is_closed*/ false,
++        );
++
++        assert_eq!(
++            state.get(&thread_id),
++            Some(&AgentPickerThreadEntry {
++                agent_nickname: Some("Robie".to_string()),
++                agent_role: Some("explorer".to_string()),
++                agent_path: Some("/root/robie".to_string()),
++                is_running: false,
++                is_closed: false,
++            })
++        );
++    }
++
++    #[test]
++    fn running_navigation_uses_explicit_current_primary_tree_membership() {
++        let mut state = AgentNavigationState::default();
++        let primary_thread_id = ThreadId::new();
++        let descendant_thread_id = ThreadId::new();
++        let unrelated_thread_id = ThreadId::new();
++        state.set_current_primary_thread(primary_thread_id);
++        for thread_id in [primary_thread_id, descendant_thread_id, unrelated_thread_id] {
++            state.upsert(
++                thread_id, /*agent_nickname*/ None, /*agent_role*/ None,
++                /*is_closed*/ false,
++            );
++        }
++        state.record_thread_parent(descendant_thread_id, primary_thread_id);
++        for thread_id in [descendant_thread_id, unrelated_thread_id] {
++            state.set_agent_path(thread_id, Some(format!("/root/{thread_id}")));
++            state.mark_running(thread_id);
++        }
++
++        assert_eq!(
++            state.adjacent_thread_id(
++                Some(primary_thread_id),
++                Some(primary_thread_id),
++                AgentNavigationDirection::Next,
++            ),
++            Some(descendant_thread_id)
++        );
++        assert_eq!(
++            state
++                .ordered_path_backed_subagent_threads(Some(primary_thread_id))
++                .into_iter()
++                .map(|(thread_id, _)| thread_id)
++                .collect::<Vec<_>>(),
++            vec![descendant_thread_id]
++        );
++    }
+ }
+diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
+index cb251de82d..497744d461 100644
+--- a/codex-rs/tui/src/app/session_lifecycle.rs
++++ b/codex-rs/tui/src/app/session_lifecycle.rs
+@@ -60,16 +60,13 @@ impl App {
+                     .await;
+             }
+         }
+-        let path_backed_threads = self
++        let running_descendant_threads = self
+             .agent_navigation
+-            .ordered_path_backed_subagent_threads(self.primary_thread_id);
+-        if !path_backed_threads.is_empty() {
+-            let running_threads: Vec<_> = path_backed_threads
++            .ordered_running_current_primary_descendants(self.primary_thread_id);
++        if !running_descendant_threads.is_empty() {
++            let running_threads: Vec<_> = running_descendant_threads
+                 .into_iter()
+                 .filter_map(|(thread_id, entry)| {
+-                    if !entry.is_running || entry.is_closed {
+-                        return None;
+-                    }
+                     Some((thread_id, entry.agent_path.as_deref()?.trim().to_string()))
+                 })
+                 .collect();
+@@ -130,7 +127,7 @@ impl App {
+         let mut initial_selected_idx = None;
+         let items: Vec<SelectionItem> = self
+             .agent_navigation
+-            .ordered_threads()
++            .ordered_current_primary_tree_threads()
+             .into_iter()
+             .enumerate()
+             .map(|(idx, (thread_id, entry))| {
+@@ -209,13 +206,36 @@ impl App {
+         agent_role: Option<String>,
+         is_closed: bool,
+     ) {
+-        self.chat_widget.set_collab_agent_metadata(
+-            thread_id,
+-            agent_nickname.clone(),
+-            agent_role.clone(),
+-        );
+         self.agent_navigation
+             .upsert(thread_id, agent_nickname, agent_role, is_closed);
++        self.sync_collab_agent_metadata(thread_id);
++    }
++
++    /// Applies app-server lifecycle metadata, which may supersede a stale locally closed cache.
++    pub(super) fn upsert_authoritative_agent_picker_thread(
++        &mut self,
++        thread_id: ThreadId,
++        agent_nickname: Option<String>,
++        agent_role: Option<String>,
++        is_closed: bool,
++    ) {
++        self.agent_navigation.upsert_authoritative(
++            thread_id,
++            agent_nickname,
++            agent_role,
++            is_closed,
++        );
++        self.sync_collab_agent_metadata(thread_id);
++    }
++
++    fn sync_collab_agent_metadata(&mut self, thread_id: ThreadId) {
++        if let Some(entry) = self.agent_navigation.get(&thread_id) {
++            self.chat_widget.set_collab_agent_metadata(
++                thread_id,
++                entry.agent_nickname.clone(),
++                entry.agent_role.clone(),
++            );
++        }
+         self.sync_active_agent_label();
+     }
+ 
+@@ -256,7 +276,7 @@ impl App {
+                     thread.status,
+                     codex_app_server_protocol::ThreadStatus::NotLoaded
+                 );
+-                self.upsert_agent_picker_thread(
++                self.upsert_authoritative_agent_picker_thread(
+                     thread_id,
+                     thread.agent_nickname.or_else(|| {
+                         existing_entry
+@@ -292,14 +312,14 @@ impl App {
+                     existing_entry.as_ref().map(|entry| entry.is_closed),
+                 );
+                 if let Some(entry) = existing_entry {
+-                    self.upsert_agent_picker_thread(
++                    self.upsert_authoritative_agent_picker_thread(
+                         thread_id,
+                         entry.agent_nickname,
+                         entry.agent_role,
+                         is_closed,
+                     );
+                 } else {
+-                    self.upsert_agent_picker_thread(
++                    self.upsert_authoritative_agent_picker_thread(
+                         thread_id, /*agent_nickname*/ None, /*agent_role*/ None,
+                         is_closed,
+                     );
+@@ -931,12 +951,14 @@ impl App {
+             if thread.blocks_direct_input {
+                 self.agent_navigation.mark_parent_owned(thread.thread_id);
+             }
+-            self.upsert_agent_picker_thread(
++            self.upsert_authoritative_agent_picker_thread(
+                 thread.thread_id,
+                 thread.agent_nickname,
+                 thread.agent_role,
+                 is_closed,
+             );
++            self.agent_navigation
++                .mark_current_primary_tree_member(thread.thread_id);
+             self.agent_navigation
+                 .set_agent_path(thread.thread_id, agent_path);
+             // A live channel can have an empty store after a successful spawn. Only apply server
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index f9afabfe17..babda4b2d8 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -1542,6 +1542,236 @@ async fn collab_receiver_notification_does_not_cache_not_found_thread() {
+     assert_eq!(app.agent_navigation.get(&receiver_thread_id), None);
+ }
+ 
++#[tokio::test]
++async fn primary_thread_started_lineage_limits_navigation_after_primary_switch() -> Result<()> {
++    let mut app = make_test_app().await;
++    let primary_one = ThreadId::new();
++    let child = ThreadId::new();
++    let grandchild = ThreadId::new();
++    let unrelated = ThreadId::new();
++    app.enqueue_primary_thread_session(
++        test_thread_session(primary_one, test_path_buf("/tmp/project")),
++        Vec::new(),
++    )
++    .await?;
++    for (thread_id, parent_thread_id, nickname) in [
++        (child, Some(primary_one), "child"),
++        (grandchild, Some(child), "grandchild"),
++        (unrelated, None, "unrelated"),
++    ] {
++        app.enqueue_thread_notification(
++            thread_id,
++            thread_started_with_identity(thread_id, parent_thread_id, nickname, "worker"),
++        )
++        .await?;
++        app.agent_navigation
++            .record_sub_agent_activity(SubAgentActivityDisplay {
++                thread_id,
++                agent_path: format!("/root/{nickname}"),
++                is_running_hint: true,
++            });
++    }
++
++    assert_eq!(
++        app.agent_navigation.adjacent_thread_id(
++            Some(primary_one),
++            Some(primary_one),
++            AgentNavigationDirection::Next,
++        ),
++        Some(child)
++    );
++    assert_eq!(
++        app.agent_navigation.adjacent_thread_id(
++            Some(child),
++            Some(primary_one),
++            AgentNavigationDirection::Next,
++        ),
++        Some(grandchild)
++    );
++
++    app.store_active_thread_receiver().await;
++    app.active_thread_id = None;
++    let primary_two = ThreadId::new();
++    let second_child = ThreadId::new();
++    app.enqueue_primary_thread_session(
++        test_thread_session(primary_two, test_path_buf("/tmp/project")),
++        Vec::new(),
++    )
++    .await?;
++    app.enqueue_thread_notification(
++        second_child,
++        thread_started_with_identity(second_child, Some(primary_two), "second-child", "worker"),
++    )
++    .await?;
++    app.agent_navigation
++        .record_sub_agent_activity(SubAgentActivityDisplay {
++            thread_id: second_child,
++            agent_path: "/root/second-child".to_string(),
++            is_running_hint: true,
++        });
++
++    assert_eq!(
++        app.agent_navigation
++            .ordered_current_primary_tree_threads()
++            .into_iter()
++            .map(|(thread_id, _)| thread_id)
++            .collect::<Vec<_>>(),
++        vec![primary_two, second_child]
++    );
++    assert_eq!(
++        app.agent_navigation.adjacent_thread_id(
++            Some(primary_two),
++            Some(primary_two),
++            AgentNavigationDirection::Next,
++        ),
++        Some(second_child)
++    );
++    Ok(())
++}
++
++#[tokio::test]
++async fn agent_picker_only_lists_current_primary_lineage_and_receivers() -> Result<()> {
++    let mut app = Box::pin(make_test_app()).await;
++    let primary = ThreadId::new();
++    let child = ThreadId::new();
++    let grandchild = ThreadId::new();
++    let current_receiver = ThreadId::new();
++    let unrelated_sender = ThreadId::new();
++    let unrelated_receiver = ThreadId::new();
++    app.enqueue_primary_thread_session(
++        test_thread_session(primary, test_path_buf("/tmp/project")),
++        Vec::new(),
++    )
++    .await?;
++    for (thread_id, parent_thread_id, nickname) in [
++        (child, Some(primary), "Child"),
++        (grandchild, Some(child), "Grandchild"),
++        (current_receiver, None, "Current receiver"),
++        (unrelated_sender, None, "Unrelated sender"),
++        (unrelated_receiver, None, "Unrelated receiver"),
++    ] {
++        app.enqueue_thread_notification(
++            thread_id,
++            thread_started_with_identity(thread_id, parent_thread_id, nickname, "worker"),
++        )
++        .await?;
++    }
++    route_active_notification(
++        &mut app,
++        primary,
++        ServerNotification::ItemStarted(ItemStartedNotification {
++            thread_id: primary.to_string(),
++            turn_id: "turn-primary".to_string(),
++            started_at_ms: 0,
++            item: ThreadItem::SubAgentActivity {
++                id: "activity-child".to_string(),
++                kind: codex_app_server_protocol::SubAgentActivityKind::Started,
++                agent_thread_id: child.to_string(),
++                agent_path: "/root/child".to_string(),
++            },
++        }),
++    )
++    .await?;
++    route_active_notification(
++        &mut app,
++        primary,
++        v2_wait_notification(
++            primary,
++            "turn-primary",
++            v2_wait_item_for_receiver("wait-current", primary, current_receiver),
++            /*completed*/ false,
++        ),
++    )
++    .await?;
++
++    app.store_active_thread_receiver().await;
++    app.active_thread_id = None;
++    app.activate_thread_channel(unrelated_sender).await;
++    route_active_notification(
++        &mut app,
++        unrelated_sender,
++        v2_wait_notification(
++            unrelated_sender,
++            "turn-unrelated",
++            v2_wait_item_for_receiver("wait-unrelated", unrelated_sender, unrelated_receiver),
++            /*completed*/ false,
++        ),
++    )
++    .await?;
++    app.store_active_thread_receiver().await;
++    app.active_thread_id = None;
++    app.activate_thread_channel(primary).await;
++
++    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
++        app.chat_widget.config_ref(),
++    ))
++    .await
++    .expect("embedded app server");
++    Box::pin(app.open_agent_picker(&mut app_server)).await;
++    let picker = render_bottom_popup(&app.chat_widget, /*width*/ 100);
++    for expected in ["/root/child", "Grandchild", "Current receiver"] {
++        assert!(
++            picker.contains(expected),
++            "picker should include {expected}: {picker}"
++        );
++    }
++    for unexpected in ["Unrelated sender", "Unrelated receiver"] {
++        assert!(
++            !picker.contains(unexpected),
++            "picker should omit {unexpected}: {picker}"
++        );
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn v1_collab_history_keeps_thread_started_identity_after_absent_refresh() -> Result<()> {
++    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
++    let primary = ThreadId::new();
++    let child = ThreadId::new();
++    let mut primary_session = test_thread_session(primary, test_path_buf("/tmp/project"));
++    primary_session.multi_agent_version = Some(MultiAgentVersion::V1);
++    app.enqueue_primary_thread_session(primary_session, Vec::new())
++        .await?;
++    app.enqueue_thread_notification(
++        child,
++        thread_started_with_identity(child, Some(primary), "Robie", "explorer"),
++    )
++    .await?;
++    app.upsert_authoritative_agent_picker_thread(
++        child, /*agent_nickname*/ None, /*agent_role*/ None, /*is_closed*/ false,
++    );
++    while app_event_rx.try_recv().is_ok() {}
++
++    route_active_notification(
++        &mut app,
++        primary,
++        v2_wait_notification(
++            primary,
++            "turn-1",
++            v2_wait_item_for_receiver("wait-1", primary, child),
++            /*completed*/ false,
++        ),
++    )
++    .await?;
++
++    let history = std::iter::from_fn(|| app_event_rx.try_recv().ok())
++        .filter_map(|event| match event {
++            AppEvent::InsertHistoryCell(cell) => {
++                Some(lines_to_single_string(&cell.transcript_lines(/*width*/ 80)))
++            }
++            _ => None,
++        })
++        .collect::<Vec<_>>();
++    assert!(history.iter().any(|line| line.contains("Robie [explorer]")));
++    assert!(
++        history
++            .iter()
++            .all(|line| !line.contains(&child.to_string()))
++    );
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn open_agent_picker_keeps_missing_threads_for_replay() -> Result<()> {
+     let mut app = Box::pin(make_test_app()).await;
+@@ -5557,6 +5787,70 @@ fn test_turn(turn_id: &str, status: TurnStatus, items: Vec<ThreadItem>) -> Turn
+     }
+ }
+ 
++fn thread_started_with_identity(
++    thread_id: ThreadId,
++    parent_thread_id: Option<ThreadId>,
++    nickname: &str,
++    role: &str,
++) -> ServerNotification {
++    let source = parent_thread_id.map_or(RolloutSessionSource::Unknown, |parent_thread_id| {
++        RolloutSessionSource::SubAgent(SubAgentSource::ThreadSpawn {
++            parent_thread_id,
++            depth: 1,
++            agent_path: None,
++            agent_nickname: None,
++            agent_role: None,
++        })
++    });
++    ServerNotification::ThreadStarted(ThreadStartedNotification {
++        thread: Thread {
++            id: thread_id.to_string(),
++            extra: None,
++            session_id: thread_id.to_string(),
++            forked_from_id: None,
++            parent_thread_id: None,
++            preview: String::new(),
++            ephemeral: false,
++            is_pinned: false,
++            history_mode: Default::default(),
++            model_provider: "test-provider".to_string(),
++            created_at: 0,
++            updated_at: 0,
++            recency_at: None,
++            status: codex_app_server_protocol::ThreadStatus::Idle,
++            path: None,
++            cwd: test_path_buf("/tmp/project").abs(),
++            cli_version: "0.0.0".to_string(),
++            source: source.into(),
++            multi_agent_version: None,
++            can_accept_direct_input: None,
++            thread_source: None,
++            agent_nickname: Some(nickname.to_string()),
++            agent_role: Some(role.to_string()),
++            git_info: None,
++            name: None,
++            turns: Vec::new(),
++        },
++    })
++}
++
++async fn route_active_notification(
++    app: &mut App,
++    thread_id: ThreadId,
++    notification: ServerNotification,
++) -> Result<()> {
++    app.enqueue_thread_notification(thread_id, notification)
++        .await?;
++    let event = app
++        .active_thread_rx
++        .as_mut()
++        .expect("active thread receiver")
++        .try_recv()
++        .expect("routed active notification");
++    app.handle_thread_event_now(event);
++    Ok(())
++}
++
+ fn v2_wait_item(
+     id: &str,
+     status: codex_app_server_protocol::CollabAgentToolCallStatus,
+@@ -5577,6 +5871,24 @@ fn v2_wait_item(
+     }
+ }
+ 
++fn v2_wait_item_for_receiver(
++    id: &str,
++    sender_thread_id: ThreadId,
++    receiver_thread_id: ThreadId,
++) -> ThreadItem {
++    ThreadItem::CollabAgentToolCall {
++        id: id.to_string(),
++        tool: codex_app_server_protocol::CollabAgentTool::Wait,
++        status: codex_app_server_protocol::CollabAgentToolCallStatus::InProgress,
++        sender_thread_id: sender_thread_id.to_string(),
++        receiver_thread_ids: vec![receiver_thread_id.to_string()],
++        prompt: None,
++        model: None,
++        reasoning_effort: None,
++        agents_states: HashMap::new(),
++    }
++}
++
+ fn v2_wait_notification(
+     thread_id: ThreadId,
+     turn_id: &str,
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+index 3feeaa8db1..71ae2250a0 100644
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -1250,9 +1250,22 @@ impl App {
+         &mut self,
+         notification: &ServerNotification,
+     ) {
++        let notification_is_for_current_primary = match notification {
++            ServerNotification::ItemStarted(notification) => {
++                ThreadId::from_string(&notification.thread_id).ok() == self.primary_thread_id
++            }
++            ServerNotification::ItemCompleted(notification) => {
++                ThreadId::from_string(&notification.thread_id).ok() == self.primary_thread_id
++            }
++            _ => false,
++        };
+         if let Some(activity) =
+             sub_agent_activity_item(notification).and_then(sub_agent_activity_display)
+         {
++            if notification_is_for_current_primary {
++                self.agent_navigation
++                    .mark_current_primary_tree_member(activity.thread_id);
++            }
+             self.agent_navigation.record_sub_agent_activity(activity);
+             self.sync_active_agent_label();
+             return;
+@@ -1274,6 +1287,10 @@ impl App {
+                 );
+                 continue;
+             };
++            if notification_is_for_current_primary {
++                self.agent_navigation
++                    .mark_current_primary_tree_member(thread_id);
++            }
+             if self.agent_navigation.get(&thread_id).is_some() {
+                 continue;
+             }
+@@ -1293,6 +1310,15 @@ impl App {
+         let ServerNotification::ThreadStarted(notification) = notification else {
+             return None;
+         };
++        if let codex_app_server_protocol::SessionSource::SubAgent(
++            codex_protocol::protocol::SubAgentSource::ThreadSpawn {
++                parent_thread_id, ..
++            },
++        ) = &notification.thread.source
++        {
++            self.agent_navigation
++                .record_thread_parent(thread_id, *parent_thread_id);
++        }
+         let mut session = self.primary_session_configured.clone()?;
+         session.thread_id = thread_id;
+         session.thread_name = notification.thread.name.clone();
+@@ -1309,7 +1335,7 @@ impl App {
+         }
+         session.message_history = None;
+         session.rollout_path = rollout_path;
+-        self.upsert_agent_picker_thread(
++        self.upsert_authoritative_agent_picker_thread(
+             thread_id,
+             notification.thread.agent_nickname.clone(),
+             notification.thread.agent_role.clone(),
+@@ -1461,6 +1487,7 @@ impl App {
+     ) -> Result<()> {
+         let thread_id = session.thread_id;
+         self.primary_thread_id = Some(thread_id);
++        self.agent_navigation.set_current_primary_thread(thread_id);
+         self.primary_session_configured = Some(session.clone());
+         self.upsert_agent_picker_thread(
+             thread_id, /*agent_nickname*/ None, /*agent_role*/ None,

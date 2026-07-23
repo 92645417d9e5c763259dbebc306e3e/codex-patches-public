@@ -1,0 +1,1042 @@
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+index fd8b716823..f5ef955348 100644
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -238,6 +238,7 @@ pub(crate) struct BottomPane {
+ 
+     /// Inline status indicator shown above the composer while a task is running.
+     status: Option<StatusIndicatorWidget>,
++    status_timer_started_at: Option<Instant>,
+     /// Unified exec session summary source.
+     ///
+     /// When a status row exists, this summary is mirrored inline in that row;
+@@ -299,6 +300,7 @@ impl BottomPane {
+             disable_paste_burst,
+             is_task_running: false,
+             status: None,
++            status_timer_started_at: None,
+             unified_exec_footer: UnifiedExecFooter::new(),
+             pending_input_preview: PendingInputPreview::new(),
+             pending_thread_approvals: PendingThreadApprovals::new(),
+@@ -1043,11 +1045,15 @@ impl BottomPane {
+         if running {
+             if !was_running {
+                 if self.status.is_none() {
+-                    self.status = Some(StatusIndicatorWidget::new(
++                    let mut status = StatusIndicatorWidget::new(
+                         self.app_event_tx.clone(),
+                         self.frame_requester.clone(),
+                         self.animations_enabled,
+-                    ));
++                    );
++                    if let Some(started_at) = self.status_timer_started_at {
++                        status.set_timer_started_at(started_at);
++                    }
++                    self.status = Some(status);
+                 }
+                 if let Some(status) = self.status.as_mut() {
+                     status.set_interrupt_hint_visible(/*visible*/ true);
+@@ -1057,6 +1063,7 @@ impl BottomPane {
+                 self.request_redraw();
+             }
+         } else {
++            self.status_timer_started_at = None;
+             // Hide the status indicator when a task completes, but keep other modal views.
+             self.hide_status_indicator();
+         }
+@@ -1075,11 +1082,15 @@ impl BottomPane {
+ 
+     pub(crate) fn ensure_status_indicator(&mut self) {
+         if self.status.is_none() {
+-            self.status = Some(StatusIndicatorWidget::new(
++            let mut status = StatusIndicatorWidget::new(
+                 self.app_event_tx.clone(),
+                 self.frame_requester.clone(),
+                 self.animations_enabled,
+-            ));
++            );
++            if let Some(started_at) = self.status_timer_started_at {
++                status.set_timer_started_at(started_at);
++            }
++            self.status = Some(status);
+             if let Some(status) = self.status.as_mut() {
+                 status.set_interrupt_binding(primary_binding(&self.keymap.chat.interrupt_turn));
+             }
+@@ -1088,6 +1099,14 @@ impl BottomPane {
+         }
+     }
+ 
++    pub(crate) fn set_status_timer_started_at(&mut self, started_at: Instant) {
++        self.status_timer_started_at = Some(started_at);
++        if let Some(status) = self.status.as_mut() {
++            status.set_timer_started_at(started_at);
++            self.request_redraw();
++        }
++    }
++
+     pub(crate) fn set_interrupt_hint_visible(&mut self, visible: bool) {
+         if let Some(status) = self.status.as_mut() {
+             status.set_interrupt_hint_visible(visible);
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index e0bbdfdeae..29b362ea9a 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -40,6 +40,8 @@ use std::sync::atomic::AtomicBool;
+ use std::sync::atomic::Ordering;
+ use std::time::Duration;
+ use std::time::Instant;
++use std::time::SystemTime;
++use std::time::UNIX_EPOCH;
+ 
+ use crate::app::app_server_requests::ResolvedAppServerRequest;
+ use crate::app_command::AppCommand;
+@@ -847,6 +849,23 @@ fn contains_plan_keyword(text: &str) -> bool {
+         .any(|word| word.eq_ignore_ascii_case("plan"))
+ }
+ 
++fn instant_from_unix_timestamp_secs(started_at: i64) -> Option<Instant> {
++    let started_at = u64::try_from(started_at).ok()?;
++    let started_at = UNIX_EPOCH.checked_add(Duration::from_secs(started_at))?;
++    let now_system = SystemTime::now();
++    let now_instant = Instant::now();
++    match now_system.duration_since(started_at) {
++        Ok(age) => now_instant.checked_sub(age).or(Some(now_instant)),
++        Err(_) => Some(now_instant),
++    }
++}
++
++fn elapsed_seconds_from_duration_ms(duration_ms: Option<i64>) -> Option<u64> {
++    duration_ms
++        .and_then(|duration_ms| u64::try_from(duration_ms).ok())
++        .map(|duration_ms| duration_ms / 1_000)
++}
++
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ enum ThreadItemRenderSource {
+     Live,
+diff --git a/codex-rs/tui/src/chatwidget/input_restore.rs b/codex-rs/tui/src/chatwidget/input_restore.rs
+index 576107dbe8..6114656489 100644
+--- a/codex-rs/tui/src/chatwidget/input_restore.rs
++++ b/codex-rs/tui/src/chatwidget/input_restore.rs
+@@ -369,6 +369,7 @@ impl ChatWidget {
+             active_collaboration_mask: self.active_collaboration_mask.clone(),
+             task_running: self.bottom_pane.is_task_running(),
+             agent_turn_running: self.turn_lifecycle.agent_turn_running,
++            active_turn_started_at: self.turn_lifecycle.active_turn_started_at,
+         })
+     }
+ 
+@@ -386,7 +387,9 @@ impl ChatWidget {
+             self.safety_buffering_prompt = input_state.safety_buffering_prompt;
+             self.turn_lifecycle.restore_running(
+                 preserve_in_flight_turn && input_state.agent_turn_running,
+-                Instant::now(),
++                preserve_in_flight_turn
++                    .then_some(input_state.active_turn_started_at)
++                    .flatten(),
+             );
+             self.input_queue.user_turn_pending_start =
+                 preserve_in_flight_turn && input_state.user_turn_pending_start;
+@@ -451,7 +454,7 @@ impl ChatWidget {
+             );
+         } else {
+             self.turn_lifecycle
+-                .restore_running(/*running*/ false, Instant::now());
++                .restore_running(/*running*/ false, /*started_at*/ None);
+             self.safety_buffering_prompt = None;
+             self.input_queue.clear();
+             self.restore_composer_state(Default::default());
+@@ -459,13 +462,14 @@ impl ChatWidget {
+         let effort = self.effective_reasoning_effort();
+         self.bottom_pane
+             .set_active_reasoning_effort_baseline(effort.as_ref());
+-        self.turn_lifecycle
+-            .restore_running(self.turn_lifecycle.agent_turn_running, Instant::now());
+         self.update_task_running_state();
+         if restored_task_running && !self.bottom_pane.is_task_running() {
+             self.bottom_pane.set_task_running(/*running*/ true);
+             self.refresh_status_surfaces();
+         }
++        if let Some(started_at) = self.turn_lifecycle.active_turn_started_at {
++            self.bottom_pane.set_status_timer_started_at(started_at);
++        }
+         self.refresh_pending_input_preview();
+         self.request_redraw();
+     }
+diff --git a/codex-rs/tui/src/chatwidget/input_submission.rs b/codex-rs/tui/src/chatwidget/input_submission.rs
+index 9b933a79f4..974d3f1831 100644
+--- a/codex-rs/tui/src/chatwidget/input_submission.rs
++++ b/codex-rs/tui/src/chatwidget/input_submission.rs
+@@ -409,6 +409,7 @@ impl ChatWidget {
+             return (false, None);
+         }
+         if render_in_history {
++            self.turn_lifecycle.submit(std::time::Instant::now());
+             self.input_queue.user_turn_pending_start = true;
+             self.input_queue.submitted_turn_context = Some(SubmittedTurnContext {
+                 model: submitted_model,
+@@ -460,6 +461,9 @@ impl ChatWidget {
+                     None,
+                 );
+             }
++            self.add_to_history(history_cell::PromptSubmittedAtSeparator::new(
++                chrono::Local::now().format("%m-%d %H:%M:%S").to_string(),
++            ));
+         }
+ 
+         self.transcript.needs_final_message_separator = false;
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index ea0adf5331..fcc1fcb89b 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -58,10 +58,31 @@ impl ChatWidget {
+                 self.on_thread_settings_updated(notification);
+             }
+             ServerNotification::TurnStarted(notification) => {
+-                self.turn_lifecycle.last_turn_id = Some(notification.turn.id);
++                let started_at = notification
++                    .turn
++                    .started_at
++                    .and_then(instant_from_unix_timestamp_secs);
++                let turn_id = notification.turn.id;
++                let duplicate_active_turn = self.turn_lifecycle.agent_turn_running
++                    && self.turn_lifecycle.last_turn_id.as_deref() == Some(turn_id.as_str());
++                let pending_local_started_at = self
++                    .input_queue
++                    .user_turn_pending_start
++                    .then_some(self.turn_lifecycle.active_turn_started_at)
++                    .flatten();
++                self.turn_lifecycle.last_turn_id = Some(turn_id);
+                 self.last_non_retry_error = None;
+-                if !matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages)) {
+-                    self.on_task_started();
++                if matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages)) {
++                    // Historical replay must not reset an already hydrated live timer.
++                } else if duplicate_active_turn {
++                    if self.turn_lifecycle.active_turn_started_at.is_none()
++                        && let Some(started_at) = started_at
++                    {
++                        self.turn_lifecycle.active_turn_started_at = Some(started_at);
++                        self.bottom_pane.set_status_timer_started_at(started_at);
++                    }
++                } else {
++                    self.on_task_started_at(pending_local_started_at.or(started_at));
+                 }
+             }
+             ServerNotification::TurnCompleted(notification) => {
+diff --git a/codex-rs/tui/src/chatwidget/replay.rs b/codex-rs/tui/src/chatwidget/replay.rs
+index 50414f63ce..d97ba1c8fa 100644
+--- a/codex-rs/tui/src/chatwidget/replay.rs
++++ b/codex-rs/tui/src/chatwidget/replay.rs
+@@ -31,7 +31,7 @@ impl ChatWidget {
+             if matches!(status, TurnStatus::InProgress) {
+                 self.turn_lifecycle.last_turn_id = Some(turn_id.clone());
+                 self.last_non_retry_error = None;
+-                self.on_task_started();
++                self.on_task_started_at(started_at.and_then(instant_from_unix_timestamp_secs));
+             }
+             for item in items {
+                 if hidden_nested_review_turn && matches!(item, ThreadItem::UserMessage { .. }) {
+diff --git a/codex-rs/tui/src/chatwidget/streaming.rs b/codex-rs/tui/src/chatwidget/streaming.rs
+index aa663bb229..6f4a9b65d7 100644
+--- a/codex-rs/tui/src/chatwidget/streaming.rs
++++ b/codex-rs/tui/src/chatwidget/streaming.rs
+@@ -521,7 +521,8 @@ impl ChatWidget {
+             // calls), render a separator before starting the next streamed assistant message.
+             if self.transcript.needs_final_message_separator && self.transcript.had_work_activity {
+                 self.add_to_history(history_cell::FinalMessageSeparator::new(
+-                    /*elapsed_seconds*/ None, /*runtime_metrics*/ None,
++                    /*elapsed_seconds*/ None, /*finished_at*/ None,
++                    /*runtime_metrics*/ None,
+                 ));
+                 self.transcript.needs_final_message_separator = false;
+             } else if self.transcript.needs_final_message_separator {
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index 382d43635b..d89ff92d9f 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -709,6 +709,78 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
+     );
+ }
+ 
++#[tokio::test]
++async fn duplicate_live_turn_started_preserves_active_timer_origin() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    let original_started_at = std::time::Instant::now() - std::time::Duration::from_secs(125);
++    chat.turn_lifecycle.start(original_started_at);
++    chat.turn_lifecycle.last_turn_id = Some("turn-1".to_string());
++    let server_started_at = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .expect("system time after Unix epoch")
++        .as_secs() as i64;
++
++    chat.handle_server_notification(
++        ServerNotification::TurnStarted(TurnStartedNotification {
++            thread_id: "thread-1".to_string(),
++            turn: AppServerTurn {
++                id: "turn-1".to_string(),
++                items_view: codex_app_server_protocol::TurnItemsView::Full,
++                items: Vec::new(),
++                status: AppServerTurnStatus::InProgress,
++                error: None,
++                started_at: Some(server_started_at),
++                completed_at: None,
++                duration_ms: None,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++
++    assert_eq!(
++        chat.turn_lifecycle.active_turn_started_at,
++        Some(original_started_at)
++    );
++    assert!(
++        chat.active_turn_elapsed_seconds()
++            .is_some_and(|secs| secs >= 125)
++    );
++}
++
++#[tokio::test]
++async fn different_live_turn_started_uses_server_timer_origin() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.turn_lifecycle
++        .start(std::time::Instant::now() - std::time::Duration::from_secs(125));
++    chat.turn_lifecycle.last_turn_id = Some("turn-1".to_string());
++    let server_started_at = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .expect("system time after Unix epoch")
++        .as_secs() as i64;
++
++    chat.handle_server_notification(
++        ServerNotification::TurnStarted(TurnStartedNotification {
++            thread_id: "thread-1".to_string(),
++            turn: AppServerTurn {
++                id: "turn-2".to_string(),
++                items_view: codex_app_server_protocol::TurnItemsView::Full,
++                items: Vec::new(),
++                status: AppServerTurnStatus::InProgress,
++                error: None,
++                started_at: Some(server_started_at),
++                completed_at: None,
++                duration_ms: None,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++
++    assert!(
++        chat.active_turn_elapsed_seconds()
++            .is_some_and(|secs| secs <= 2)
++    );
++}
++
+ #[tokio::test]
+ async fn live_app_server_turn_started_sets_feedback_turn_id() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/chatwidget/tests/composer_submission.rs b/codex-rs/tui/src/chatwidget/tests/composer_submission.rs
+index bcb2c4752b..c81a3efcfa 100644
+--- a/codex-rs/tui/src/chatwidget/tests/composer_submission.rs
++++ b/codex-rs/tui/src/chatwidget/tests/composer_submission.rs
+@@ -1233,6 +1233,43 @@ async fn output_free_esc_interrupt_keeps_prompt_and_opens_blank_composer() {
+     assert!(chat.bottom_pane.composer_is_empty());
+ }
+ 
++#[tokio::test]
++async fn successful_submission_starts_elapsed_origin_and_labels_history_order() {
++    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.thread_id = Some(ThreadId::new());
++
++    chat.submit_user_message(UserMessage::from("measure this turn"));
++
++    assert_matches!(next_submit_op(&mut op_rx), Op::UserTurn { .. });
++    let submitted_at = chat
++        .turn_lifecycle
++        .active_turn_started_at
++        .expect("submission timer origin");
++    assert!(chat.input_queue.user_turn_pending_start);
++    assert!(!chat.turn_lifecycle.agent_turn_running);
++    let history = drain_insert_history(&mut rx)
++        .into_iter()
++        .map(|lines| lines_to_single_string(&lines))
++        .collect::<Vec<_>>();
++    let prompt_index = history
++        .iter()
++        .position(|rendered| rendered.contains("measure this turn"))
++        .expect("rendered prompt");
++    let submitted_index = history
++        .iter()
++        .position(|rendered| rendered.contains("Submitted at"))
++        .expect("submission timestamp");
++    assert!(prompt_index < submitted_index);
++
++    handle_turn_started(&mut chat, "turn-1");
++
++    assert!(chat.turn_lifecycle.agent_turn_running);
++    assert_eq!(
++        chat.turn_lifecycle.active_turn_started_at,
++        Some(submitted_at)
++    );
++}
++
+ #[tokio::test]
+ async fn output_free_ctrl_c_interrupt_keeps_prompt_and_opens_blank_composer() {
+     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+@@ -1328,6 +1365,7 @@ async fn restore_thread_input_state_applies_running_state_policy() {
+         text: "queued history".to_string(),
+         text_elements: Vec::new(),
+     });
++    let active_turn_started_at = std::time::Instant::now();
+     let input_state = ThreadInputState {
+         composer: Some(ThreadComposerState {
+             text: "composer draft".to_string(),
+@@ -1351,6 +1389,7 @@ async fn restore_thread_input_state_applies_running_state_policy() {
+         active_collaboration_mask: chat.active_collaboration_mask.clone(),
+         task_running: true,
+         agent_turn_running: true,
++        active_turn_started_at: Some(active_turn_started_at),
+     };
+     chat.restore_thread_input_state(
+         Some(input_state.clone()),
+@@ -1360,6 +1399,10 @@ async fn restore_thread_input_state_applies_running_state_policy() {
+     );
+ 
+     assert!(chat.turn_lifecycle.agent_turn_running);
++    assert_eq!(
++        chat.turn_lifecycle.active_turn_started_at,
++        Some(active_turn_started_at)
++    );
+     assert!(chat.turn_lifecycle.sleep_inhibitor.is_turn_running());
+     assert!(chat.bottom_pane.is_task_running());
+     assert!(chat.input_queue.user_turn_pending_start);
+@@ -1368,6 +1411,10 @@ async fn restore_thread_input_state_applies_running_state_policy() {
+         .capture_thread_input_state()
+         .expect("thread input state");
+     assert!(captured_input_state.submit_pending_steers_after_interrupt);
++    assert_eq!(
++        captured_input_state.active_turn_started_at,
++        Some(active_turn_started_at)
++    );
+     assert_eq!(
+         captured_input_state.submitted_turn_context,
+         input_state.submitted_turn_context
+@@ -1390,6 +1437,7 @@ async fn restore_thread_input_state_applies_running_state_policy() {
+     );
+ 
+     assert!(!chat.turn_lifecycle.agent_turn_running);
++    assert!(chat.turn_lifecycle.active_turn_started_at.is_none());
+     assert!(!chat.turn_lifecycle.sleep_inhibitor.is_turn_running());
+     assert!(!chat.bottom_pane.is_task_running());
+     assert!(!chat.input_queue.user_turn_pending_start);
+diff --git a/codex-rs/tui/src/chatwidget/tests/exec_flow.rs b/codex-rs/tui/src/chatwidget/tests/exec_flow.rs
+index b45b78fbaf..2e67dc6d4d 100644
+--- a/codex-rs/tui/src/chatwidget/tests/exec_flow.rs
++++ b/codex-rs/tui/src/chatwidget/tests/exec_flow.rs
+@@ -266,6 +266,23 @@ async fn unified_exec_begin_restores_status_indicator_after_preamble() {
+     assert_eq!(chat.bottom_pane.status_indicator_visible(), true);
+ }
+ 
++#[tokio::test]
++async fn recreated_status_indicator_preserves_active_turn_elapsed_origin() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.on_task_started_at(Some(
++        std::time::Instant::now() - std::time::Duration::from_secs(125),
++    ));
++    chat.bottom_pane.hide_status_indicator();
++
++    chat.bottom_pane.ensure_status_indicator();
++
++    assert!(
++        chat.bottom_pane
++            .status_widget()
++            .is_some_and(|status| status.elapsed_seconds() >= 125)
++    );
++}
++
+ #[tokio::test]
+ async fn unified_exec_begin_restores_working_status_snapshot() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+@@ -666,9 +683,13 @@ async fn unified_exec_wait_before_streamed_agent_message_snapshot() {
+ }
+ 
+ #[tokio::test]
+-async fn final_worked_for_uses_cumulative_turn_duration_snapshot() {
++async fn final_worked_for_prefers_local_elapsed_over_protocol_duration() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+     handle_turn_started(&mut chat, "turn-1");
++    let local_started_at = std::time::Instant::now() - std::time::Duration::from_secs(125);
++    chat.turn_lifecycle.active_turn_started_at = Some(local_started_at);
++    chat.bottom_pane
++        .set_status_timer_started_at(local_started_at);
+ 
+     let exec = begin_exec_with_source(
+         &mut chat,
+@@ -684,7 +705,7 @@ async fn final_worked_for_uses_cumulative_turn_duration_snapshot() {
+         "Final response.",
+         Some(MessagePhase::FinalAnswer),
+     );
+-    handle_turn_completed(&mut chat, "turn-1", Some(125_000));
++    handle_turn_completed(&mut chat, "turn-1", Some(597_000));
+ 
+     let cells = drain_insert_history(&mut rx);
+     let combined = cells
+@@ -693,9 +714,21 @@ async fn final_worked_for_uses_cumulative_turn_duration_snapshot() {
+         .collect::<String>();
+     assert!(
+         combined.contains("Worked for 2m 05s"),
+-        "expected final separator to use cumulative turn duration, got:\n{combined}"
+-    );
+-    assert_chatwidget_snapshot!("final_worked_for_uses_cumulative_turn_duration", combined);
++        "expected final separator to prefer local elapsed time, got:\n{combined}"
++    );
++    assert!(!combined.contains("Worked for 9m 57s"));
++    let normalized = combined
++        .lines()
++        .map(|line| {
++            if line.contains("Worked for 2m 05s at ") {
++                let prefix = "─ Worked for 2m 05s ";
++                return format!("{prefix}{}", "─".repeat(80 - prefix.chars().count()));
++            }
++            line.to_string()
++        })
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert_chatwidget_snapshot!("final_worked_for_uses_cumulative_turn_duration", normalized);
+ }
+ 
+ #[tokio::test]
+diff --git a/codex-rs/tui/src/chatwidget/tests/history_replay.rs b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
+index 98dad7da55..e83ac8b856 100644
+--- a/codex-rs/tui/src/chatwidget/tests/history_replay.rs
++++ b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
+@@ -1196,6 +1196,36 @@ async fn deferred_mcp_lifecycle_events_keep_fifo_after_stream_finishes() {
+     assert!(rendered.contains("deferred result"), "{rendered}");
+ }
+ 
++#[tokio::test]
++async fn replayed_in_progress_turn_restores_server_elapsed_origin() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    let started_at = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .expect("system time after Unix epoch")
++        .as_secs()
++        .saturating_sub(125) as i64;
++
++    chat.replay_thread_turns(
++        vec![AppServerTurn {
++            id: "turn-1".to_string(),
++            items_view: codex_app_server_protocol::TurnItemsView::Full,
++            items: Vec::new(),
++            status: AppServerTurnStatus::InProgress,
++            error: None,
++            started_at: Some(started_at),
++            completed_at: None,
++            duration_ms: None,
++        }],
++        ReplayKind::ThreadSnapshot,
++    );
++
++    assert!(chat.turn_lifecycle.agent_turn_running);
++    assert!(
++        chat.active_turn_elapsed_seconds()
++            .is_some_and(|seconds| seconds >= 125)
++    );
++}
++
+ #[tokio::test]
+ async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/chatwidget/tests/review_mode.rs b/codex-rs/tui/src/chatwidget/tests/review_mode.rs
+index f1a025c729..18d830af02 100644
+--- a/codex-rs/tui/src/chatwidget/tests/review_mode.rs
++++ b/codex-rs/tui/src/chatwidget/tests/review_mode.rs
+@@ -391,6 +391,7 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
+             active_collaboration_mask: chat.active_collaboration_mask.clone(),
+             task_running: false,
+             agent_turn_running: false,
++            active_turn_started_at: None,
+         }),
+         ThreadInputStateRestoreMode {
+             preserve_in_flight_turn: true,
+diff --git a/codex-rs/tui/src/chatwidget/turn_lifecycle.rs b/codex-rs/tui/src/chatwidget/turn_lifecycle.rs
+index 13145ca41f..72d431b00f 100644
+--- a/codex-rs/tui/src/chatwidget/turn_lifecycle.rs
++++ b/codex-rs/tui/src/chatwidget/turn_lifecycle.rs
+@@ -13,6 +13,8 @@ pub(super) struct TurnLifecycleState {
+     pub(super) last_turn_id: Option<String>,
+     pub(super) canonical_user_prompt_turn_ids: HashSet<String>,
+     pub(super) budget_limited_turn_ids: HashSet<String>,
++    /// Monotonic origin for the active turn's user-visible elapsed time.
++    pub(super) active_turn_started_at: Option<Instant>,
+     pub(super) goal_status_active_turn_started_at: Option<Instant>,
+ }
+ 
+@@ -24,26 +26,34 @@ impl TurnLifecycleState {
+             last_turn_id: None,
+             canonical_user_prompt_turn_ids: HashSet::new(),
+             budget_limited_turn_ids: HashSet::new(),
++            active_turn_started_at: None,
+             goal_status_active_turn_started_at: None,
+         }
+     }
+ 
+     pub(super) fn start(&mut self, now: Instant) {
+         self.agent_turn_running = true;
++        self.active_turn_started_at = Some(now);
+         self.goal_status_active_turn_started_at = Some(now);
+         self.sleep_inhibitor.set_turn_running(/*turn_running*/ true);
+     }
+ 
++    pub(super) fn submit(&mut self, now: Instant) {
++        self.active_turn_started_at = Some(now);
++    }
++
+     pub(super) fn finish(&mut self) {
+         self.agent_turn_running = false;
++        self.active_turn_started_at = None;
+         self.goal_status_active_turn_started_at = None;
+         self.sleep_inhibitor
+             .set_turn_running(/*turn_running*/ false);
+     }
+ 
+-    pub(super) fn restore_running(&mut self, running: bool, now: Instant) {
++    pub(super) fn restore_running(&mut self, running: bool, started_at: Option<Instant>) {
+         self.agent_turn_running = running;
+-        self.goal_status_active_turn_started_at = running.then_some(now);
++        self.active_turn_started_at = running.then_some(started_at).flatten();
++        self.goal_status_active_turn_started_at = self.active_turn_started_at;
+         self.sleep_inhibitor.set_turn_running(running);
+     }
+ 
+@@ -80,18 +90,46 @@ mod tests {
+     #[test]
+     fn start_and_finish_update_running_state() {
+         let mut state = TurnLifecycleState::new(/*prevent_idle_sleep*/ false);
++        let started_at = Instant::now();
+ 
+-        state.start(Instant::now());
++        state.start(started_at);
+         assert!(state.agent_turn_running);
++        assert_eq!(state.active_turn_started_at, Some(started_at));
+         assert!(state.goal_status_active_turn_started_at.is_some());
+         assert!(state.sleep_inhibitor.is_turn_running());
+ 
+         state.finish();
+         assert!(!state.agent_turn_running);
++        assert!(state.active_turn_started_at.is_none());
+         assert!(state.goal_status_active_turn_started_at.is_none());
+         assert!(!state.sleep_inhibitor.is_turn_running());
+     }
+ 
++    #[test]
++    fn restore_running_preserves_supplied_timer_origin() {
++        let mut state = TurnLifecycleState::new(/*prevent_idle_sleep*/ false);
++        let started_at = Instant::now();
++
++        state.restore_running(/*running*/ true, Some(started_at));
++
++        assert!(state.agent_turn_running);
++        assert_eq!(state.active_turn_started_at, Some(started_at));
++        assert_eq!(state.goal_status_active_turn_started_at, Some(started_at));
++        assert!(state.sleep_inhibitor.is_turn_running());
++    }
++
++    #[test]
++    fn submit_starts_timer_without_marking_agent_running() {
++        let mut state = TurnLifecycleState::new(/*prevent_idle_sleep*/ false);
++        let submitted_at = Instant::now();
++
++        state.submit(submitted_at);
++
++        assert!(!state.agent_turn_running);
++        assert_eq!(state.active_turn_started_at, Some(submitted_at));
++        assert!(!state.sleep_inhibitor.is_turn_running());
++    }
++
+     #[test]
+     fn budget_limited_turn_ids_are_consumed() {
+         let mut state = TurnLifecycleState::new(/*prevent_idle_sleep*/ false);
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+index 32e9aff0dd..afffd98b95 100644
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -67,9 +67,14 @@ impl ChatWidget {
+     // Raw reasoning uses the same flow as summarized reasoning
+ 
+     pub(super) fn on_task_started(&mut self) {
++        self.on_task_started_at(/*started_at*/ None);
++    }
++
++    pub(super) fn on_task_started_at(&mut self, started_at: Option<Instant>) {
+         self.input_queue.user_turn_pending_start = false;
+         self.reset_safety_buffering_for_turn_start();
+-        self.turn_lifecycle.start(Instant::now());
++        let started_at = started_at.unwrap_or_else(Instant::now);
++        self.turn_lifecycle.start(started_at);
+         self.transcript.reset_turn_flags();
+         self.adaptive_chunking.reset();
+         if self.plan_stream_controller.take().is_some() {
+@@ -81,6 +86,7 @@ impl ChatWidget {
+         self.quit_shortcut_expires_at = None;
+         self.quit_shortcut_key = None;
+         self.update_task_running_state();
++        self.bottom_pane.set_status_timer_started_at(started_at);
+         self.status_state.retry_status_header = None;
+         self.clear_active_hook_cell();
+         self.status_state.pending_status_indicator_restore = false;
+@@ -155,19 +161,15 @@ impl ChatWidget {
+                 && (self.transcript.needs_final_message_separator || runtime_metrics.is_some());
+             if show_work_separator || runtime_metrics.is_some() {
+                 let elapsed_seconds = if show_work_separator {
+-                    duration_ms
+-                        .and_then(|duration_ms| u64::try_from(duration_ms).ok())
+-                        .map(|duration_ms| duration_ms / 1_000)
+-                        .or_else(|| {
+-                            self.bottom_pane
+-                                .status_widget()
+-                                .map(crate::status_indicator_widget::StatusIndicatorWidget::elapsed_seconds)
+-                        })
++                    self.completed_turn_elapsed_seconds(duration_ms)
+                 } else {
+                     None
+                 };
++                let finished_at = elapsed_seconds
++                    .map(|_| chrono::Local::now().format("%m-%d %H:%M:%S").to_string());
+                 self.add_to_history(history_cell::FinalMessageSeparator::new(
+                     elapsed_seconds,
++                    finished_at,
+                     runtime_metrics,
+                 ));
+             }
+@@ -253,6 +255,25 @@ impl ChatWidget {
+         self.open_plan_implementation_prompt();
+     }
+ 
++    pub(super) fn active_turn_elapsed_seconds(&self) -> Option<u64> {
++        self.turn_lifecycle
++            .active_turn_started_at
++            .map(|started_at| started_at.elapsed().as_secs())
++            .or_else(|| {
++                self.bottom_pane
++                    .status_widget()
++                    .map(crate::status_indicator_widget::StatusIndicatorWidget::elapsed_seconds)
++            })
++    }
++
++    fn completed_turn_elapsed_seconds(&self, duration_ms: Option<i64>) -> Option<u64> {
++        self.active_turn_elapsed_seconds()
++            .filter(|seconds| *seconds > 0)
++            .or_else(|| {
++                elapsed_seconds_from_duration_ms(duration_ms).filter(|seconds| *seconds > 0)
++            })
++    }
++
+     pub(super) fn open_plan_implementation_prompt(&mut self) {
+         let default_mask = collaboration_modes::default_mode_mask(self.model_catalog.as_ref());
+         let context_usage_label = self.plan_implementation_context_usage_label();
+diff --git a/codex-rs/tui/src/chatwidget/user_messages.rs b/codex-rs/tui/src/chatwidget/user_messages.rs
+index 623a56910a..17f43e2f39 100644
+--- a/codex-rs/tui/src/chatwidget/user_messages.rs
++++ b/codex-rs/tui/src/chatwidget/user_messages.rs
+@@ -145,6 +145,7 @@ pub(crate) struct ThreadInputState {
+     pub(super) active_collaboration_mask: Option<CollaborationModeMask>,
+     pub(super) task_running: bool,
+     pub(super) agent_turn_running: bool,
++    pub(super) active_turn_started_at: Option<std::time::Instant>,
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+diff --git a/codex-rs/tui/src/history_cell/separators.rs b/codex-rs/tui/src/history_cell/separators.rs
+index 12eda0ba4d..8762a8f25f 100644
+--- a/codex-rs/tui/src/history_cell/separators.rs
++++ b/codex-rs/tui/src/history_cell/separators.rs
+@@ -10,21 +10,35 @@ use super::*;
+ /// divider.
+ pub struct FinalMessageSeparator {
+     elapsed_seconds: Option<u64>,
++    finished_at: Option<String>,
+     runtime_metrics: Option<RuntimeMetricsSummary>,
+ }
+ impl FinalMessageSeparator {
+     /// Creates a separator; completed turns should pass protocol turn duration when available.
+     pub(crate) fn new(
+         elapsed_seconds: Option<u64>,
++        finished_at: Option<String>,
+         runtime_metrics: Option<RuntimeMetricsSummary>,
+     ) -> Self {
+         Self {
+             elapsed_seconds,
++            finished_at,
+             runtime_metrics,
+         }
+     }
+ }
+ 
++#[derive(Debug)]
++pub struct PromptSubmittedAtSeparator {
++    submitted_at: String,
++}
++
++impl PromptSubmittedAtSeparator {
++    pub(crate) fn new(submitted_at: String) -> Self {
++        Self { submitted_at }
++    }
++}
++
+ #[derive(Debug)]
+ pub struct ResumeHistoryLoadedSeparator {
+     messages: u64,
+@@ -110,41 +124,79 @@ impl HistoryCell for ResumeHistoryLoadedSeparator {
+ 
+ impl HistoryCell for FinalMessageSeparator {
+     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+-        let mut label_parts = Vec::new();
++        let mut label_text_parts = Vec::new();
++        let mut label_spans = Vec::<Span<'static>>::new();
+         if let Some(elapsed_seconds) = self
+             .elapsed_seconds
+-            .filter(|seconds| *seconds > 60)
++            .filter(|seconds| *seconds > 0)
+             .map(crate::status_indicator_widget::fmt_elapsed_compact)
+         {
+-            label_parts.push(format!("Worked for {elapsed_seconds}"));
++            let mut label = format!("Worked for {elapsed_seconds}");
++            label_spans.push("Worked for ".dim());
++            label_spans.push(elapsed_seconds.fg(Color::Cyan).add_modifier(Modifier::BOLD));
++            if let Some(finished_at) = &self.finished_at {
++                label.push_str(" at ");
++                label.push_str(finished_at);
++                label_spans.push(" at ".dim());
++                label_spans.push(
++                    finished_at
++                        .clone()
++                        .fg(Color::Yellow)
++                        .add_modifier(Modifier::BOLD),
++                );
++            }
++            label_text_parts.push(label);
+         }
+         if let Some(metrics_label) = self.runtime_metrics.and_then(runtime_metrics_label) {
+-            label_parts.push(metrics_label);
++            if !label_spans.is_empty() {
++                label_spans.push(" ▪ ".dim());
++            }
++            label_spans.push(metrics_label.clone().dim());
++            label_text_parts.push(metrics_label);
+         }
+ 
+-        if label_parts.is_empty() {
++        if label_text_parts.is_empty() {
+             return vec![Line::from_iter(["─".repeat(width as usize).dim()])];
+         }
+ 
+-        let label = format!("─ {} ─", label_parts.join(" ▪ "));
+-        let (label, _suffix, label_width) = take_prefix_by_width(&label, width as usize);
+-        vec![
+-            Line::from_iter([
+-                label,
+-                "─".repeat((width as usize).saturating_sub(label_width)),
+-            ])
+-            .dim(),
+-        ]
++        let label_text = label_text_parts.join(" ▪ ");
++        let label = format!("─ {label_text} ─");
++        let label_width = UnicodeWidthStr::width(label.as_str());
++        if label_width > width as usize {
++            let (label, _suffix, label_width) = take_prefix_by_width(&label, width as usize);
++            return vec![
++                Line::from_iter([
++                    label,
++                    "─".repeat((width as usize).saturating_sub(label_width)),
++                ])
++                .dim(),
++            ];
++        }
++
++        let mut spans = vec!["─ ".dim()];
++        spans.extend(label_spans);
++        spans.push(" ─".dim());
++        spans.push(
++            "─"
++                .repeat((width as usize).saturating_sub(label_width))
++                .dim(),
++        );
++        vec![Line::from(spans)]
+     }
+ 
+     fn raw_lines(&self) -> Vec<Line<'static>> {
+         let mut label_parts = Vec::new();
+         if let Some(elapsed_seconds) = self
+             .elapsed_seconds
+-            .filter(|seconds| *seconds > 60)
++            .filter(|seconds| *seconds > 0)
+             .map(crate::status_indicator_widget::fmt_elapsed_compact)
+         {
+-            label_parts.push(format!("Worked for {elapsed_seconds}"));
++            let mut label = format!("Worked for {elapsed_seconds}");
++            if let Some(finished_at) = &self.finished_at {
++                label.push_str(" at ");
++                label.push_str(finished_at);
++            }
++            label_parts.push(label);
+         }
+         if let Some(metrics_label) = self.runtime_metrics.and_then(runtime_metrics_label) {
+             label_parts.push(metrics_label);
+@@ -157,6 +209,41 @@ impl HistoryCell for FinalMessageSeparator {
+     }
+ }
+ 
++impl HistoryCell for PromptSubmittedAtSeparator {
++    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
++        let label_text = format!("Submitted at {}", self.submitted_at);
++        let label = format!("─ {label_text} ─");
++        let label_width = UnicodeWidthStr::width(label.as_str());
++        if label_width > width as usize {
++            let (label, _suffix, label_width) = take_prefix_by_width(&label, width as usize);
++            return vec![
++                Line::from_iter([
++                    label,
++                    "─".repeat((width as usize).saturating_sub(label_width)),
++                ])
++                .dim(),
++            ];
++        }
++
++        vec![Line::from(vec![
++            "─ ".dim(),
++            "Submitted at ".dim(),
++            self.submitted_at
++                .clone()
++                .fg(Color::Yellow)
++                .add_modifier(Modifier::BOLD),
++            " ─".dim(),
++            "─"
++                .repeat((width as usize).saturating_sub(label_width))
++                .dim(),
++        ])]
++    }
++
++    fn raw_lines(&self) -> Vec<Line<'static>> {
++        vec![Line::from(format!("Submitted at {}", self.submitted_at))]
++    }
++}
++
+ pub(crate) fn runtime_metrics_label(summary: RuntimeMetricsSummary) -> Option<String> {
+     let mut parts = Vec::new();
+     if summary.tool_calls.count > 0 {
+diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
+index 366bf2ec8d..4ef2d6c51c 100644
+--- a/codex-rs/tui/src/history_cell/tests.rs
++++ b/codex-rs/tui/src/history_cell/tests.rs
+@@ -541,7 +541,7 @@ fn unified_exec_interaction_cell_renders_wait() {
+ }
+ 
+ #[test]
+-fn final_message_separator_hides_short_worked_label_and_includes_runtime_metrics() {
++fn final_message_separator_includes_short_worked_label_and_runtime_metrics() {
+     let summary = RuntimeMetricsSummary {
+         tool_calls: RuntimeMetricTotals {
+             count: 3,
+@@ -572,11 +572,11 @@ fn final_message_separator_hides_short_worked_label_and_includes_runtime_metrics
+         turn_ttft_ms: 0,
+         turn_ttfm_ms: 0,
+     };
+-    let cell = FinalMessageSeparator::new(Some(12), Some(summary));
++    let cell = FinalMessageSeparator::new(Some(12), /*finished_at*/ None, Some(summary));
+     let rendered = render_lines(&cell.display_lines(/*width*/ 600));
+ 
+     assert_eq!(rendered.len(), 1);
+-    assert!(!rendered[0].contains("Worked for"));
++    assert!(rendered[0].contains("Worked for 12s"));
+     assert!(rendered[0].contains("Local tools: 3 calls (2.5s)"));
+     assert!(rendered[0].contains("Inference: 2 calls (1.2s)"));
+     assert!(rendered[0].contains("WebSocket: 1 events send (700ms)"));
+@@ -601,11 +601,28 @@ fn runtime_metrics_label_rounds_fractional_tbt_milliseconds() {
+ 
+ #[test]
+ fn final_message_separator_includes_worked_label_after_one_minute() {
+-    let cell = FinalMessageSeparator::new(Some(61), /*runtime_metrics*/ None);
++    let cell = FinalMessageSeparator::new(
++        Some(61),
++        /*finished_at*/ Some("07-22 12:34:56".to_string()),
++        /*runtime_metrics*/ None,
++    );
+     let rendered = render_lines(&cell.display_lines(/*width*/ 200));
+ 
+     assert_eq!(rendered.len(), 1);
+-    assert!(rendered[0].contains("Worked for"));
++    assert!(rendered[0].contains("Worked for 1m 01s at 07-22 12:34:56"));
++}
++
++#[test]
++fn prompt_submitted_at_separator_labels_submission_time() {
++    let cell = PromptSubmittedAtSeparator::new("07-22 12:34:56".to_string());
++
++    assert_eq!(
++        render_lines(&cell.raw_lines()),
++        vec!["Submitted at 07-22 12:34:56"]
++    );
++    assert!(
++        render_lines(&cell.display_lines(/*width*/ 80))[0].contains("Submitted at 07-22 12:34:56")
++    );
+ }
+ 
+ #[test]
+diff --git a/codex-rs/tui/src/status_indicator_widget.rs b/codex-rs/tui/src/status_indicator_widget.rs
+index fa7d983d41..79ecaa0a76 100644
+--- a/codex-rs/tui/src/status_indicator_widget.rs
++++ b/codex-rs/tui/src/status_indicator_widget.rs
+@@ -168,6 +168,13 @@ impl StatusIndicatorWidget {
+         self.show_interrupt_hint = visible;
+     }
+ 
++    pub(crate) fn set_timer_started_at(&mut self, started_at: Instant) {
++        self.elapsed_running = Duration::ZERO;
++        self.last_resume_at = started_at;
++        self.is_paused = false;
++        self.frame_requester.schedule_frame();
++    }
++
+     pub(crate) fn set_interrupt_binding(&mut self, binding: Option<KeyBinding>) {
+         self.interrupt_binding = binding;
+     }
+@@ -260,6 +267,11 @@ impl Renderable for StatusIndicatorWidget {
+             // Schedule next animation frame.
+             self.frame_requester
+                 .schedule_frame_in(Duration::from_millis(32));
++        } else {
++            let elapsed = self.elapsed_duration_at(Instant::now());
++            let until_next_second = Duration::from_secs(1)
++                .saturating_sub(Duration::from_nanos(u64::from(elapsed.subsec_nanos())));
++            self.frame_requester.schedule_frame_in(until_next_second);
+         }
+         let now = Instant::now();
+         let elapsed_duration = self.elapsed_duration_at(now);
+@@ -367,6 +379,27 @@ mod tests {
+         insta::assert_snapshot!(terminal.backend());
+     }
+ 
++    #[test]
++    fn reduced_motion_render_schedules_next_elapsed_second() {
++        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
++        let tx = AppEventSender::new(tx_raw);
++        let (frame_requester, mut frame_requests) = crate::tui::FrameRequester::test_channel();
++        let mut widget =
++            StatusIndicatorWidget::new(tx, frame_requester, /*animations_enabled*/ false);
++        widget.set_timer_started_at(Instant::now() - Duration::from_millis(250));
++        let _ = frame_requests.try_recv();
++        let before_render = Instant::now();
++        let mut terminal = Terminal::new(TestBackend::new(80, 2)).expect("terminal");
++
++        terminal
++            .draw(|frame| widget.render(frame.area(), frame.buffer_mut()))
++            .expect("draw");
++
++        let scheduled_at = frame_requests.try_recv().expect("scheduled elapsed redraw");
++        assert!(scheduled_at > before_render);
++        assert!(scheduled_at <= before_render + Duration::from_secs(1));
++    }
++
+     #[test]
+     fn animated_header_colors_whole_label() {
+         let first = animated_header_span("Working", Duration::from_millis(0));

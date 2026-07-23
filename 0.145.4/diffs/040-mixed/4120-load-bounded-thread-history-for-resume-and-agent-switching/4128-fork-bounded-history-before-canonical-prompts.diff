@@ -1,0 +1,610 @@
+diff --git a/codex-rs/app-server-protocol/src/protocol/common.rs b/codex-rs/app-server-protocol/src/protocol/common.rs
+index 4465025162..3085a5bbc5 100644
+--- a/codex-rs/app-server-protocol/src/protocol/common.rs
++++ b/codex-rs/app-server-protocol/src/protocol/common.rs
+@@ -139,6 +139,11 @@ macro_rules! serialization_scope_expr {
+             thread_id: $actual_params.$field.clone(),
+         })
+     };
++    ($actual_params:ident, thread_id($params:ident . $outer:ident . $field:ident)) => {
++        Some(ClientRequestSerializationScope::Thread {
++            thread_id: $actual_params.$outer.$field.clone(),
++        })
++    };
+     ($actual_params:ident, optional_thread_id($params:ident . $field:ident)) => {
+         $actual_params
+             .$field
+@@ -506,6 +511,12 @@ client_request_definitions! {
+         serialization: thread_or_path(params.thread_id, params.path),
+         response: v2::ThreadForkResponse,
+     },
++    #[experimental("thread/forkBeforePrompt")]
++    ThreadForkBeforePrompt => "thread/forkBeforePrompt" {
++        params: v2::ThreadForkBeforePromptParams,
++        serialization: thread_id(params.fork.thread_id),
++        response: v2::ThreadForkBeforePromptResponse,
++    },
+     ThreadArchive => "thread/archive" {
+         params: v2::ThreadArchiveParams,
+         serialization: thread_id(params.thread_id),
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/tests.rs b/codex-rs/app-server-protocol/src/protocol/v2/tests.rs
+index 57bd49d927..871ca5f7ca 100644
+--- a/codex-rs/app-server-protocol/src/protocol/v2/tests.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/tests.rs
+@@ -1030,6 +1030,56 @@ fn thread_fork_last_turn_id_round_trips() {
+     );
+ }
+ 
++#[test]
++fn thread_fork_before_prompt_preserves_canonical_occurrence_identity() {
++    let params = ThreadForkBeforePromptParams {
++        fork: ThreadForkParams {
++            thread_id: "thread-1".to_string(),
++            ..Default::default()
++        },
++        turn_id: "turn-2".to_string(),
++        item_id: "item-2".to_string(),
++    };
++
++    assert_eq!(
++        serde_json::to_value(&params).expect("params should serialize"),
++        json!({
++            "threadId": "thread-1",
++            "lastTurnId": null,
++            "beforeTurnId": null,
++            "path": null,
++            "model": null,
++            "modelProvider": null,
++            "cwd": null,
++            "runtimeWorkspaceRoots": null,
++            "approvalPolicy": null,
++            "approvalsReviewer": null,
++            "sandbox": null,
++            "permissions": null,
++            "config": null,
++            "baseInstructions": null,
++            "developerInstructions": null,
++            "threadSource": null,
++            "turnId": "turn-2",
++            "itemId": "item-2",
++        })
++    );
++    let request = crate::ClientRequest::ThreadForkBeforePrompt {
++        request_id: crate::RequestId::Integer(1),
++        params,
++    };
++    assert_eq!(
++        crate::experimental_api::ExperimentalApi::experimental_reason(&request),
++        Some("thread/forkBeforePrompt")
++    );
++    assert_eq!(
++        request.serialization_scope(),
++        Some(crate::ClientRequestSerializationScope::Thread {
++            thread_id: "thread-1".to_string(),
++        })
++    );
++}
++
+ #[test]
+ fn fs_get_metadata_response_round_trips_minimal_fields() {
+     let response = FsGetMetadataResponse {
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
+index 5762ff3896..cce9ae778e 100644
+--- a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
+@@ -629,6 +629,16 @@ pub struct ThreadForkParams {
+     pub defer_goal_continuation: bool,
+ }
+ 
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ThreadForkBeforePromptParams {
++    #[serde(flatten)]
++    pub fork: ThreadForkParams,
++    pub turn_id: String,
++    pub item_id: String,
++}
++
+ #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
+ #[serde(rename_all = "camelCase")]
+ #[ts(export_to = "v2/")]
+@@ -665,6 +675,14 @@ pub struct ThreadForkResponse {
+     pub multi_agent_mode: MultiAgentMode,
+ }
+ 
++#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
++#[serde(rename_all = "camelCase")]
++#[ts(export_to = "v2/")]
++pub struct ThreadForkBeforePromptResponse {
++    #[serde(flatten)]
++    pub fork: ThreadForkResponse,
++}
++
+ impl ThreadForkResponse {
+     /// Parses valid absolute instruction source paths and omits malformed legacy values.
+     pub fn instruction_source_path_uris(&self) -> Vec<PathUri> {
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 92412d4709..bbabc7a45d 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -1281,6 +1281,18 @@ impl MessageProcessor {
+                     )
+                     .await
+             }
++            ClientRequest::ThreadForkBeforePrompt { params, .. } => {
++                self.thread_processor
++                    .thread_fork_before_prompt(
++                        request_id.clone(),
++                        params,
++                        app_server_client_name.clone(),
++                        client_version.clone(),
++                        /*supports_openai_form_elicitation*/
++                        supports_openai_form_elicitation,
++                    )
++                    .await
++            }
+             ClientRequest::ThreadArchive { params, .. } => {
+                 self.thread_processor
+                     .thread_archive(request_id.clone(), params)
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+index f8b6e1d5a8..9cbfe12272 100644
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -209,6 +209,7 @@ use codex_app_server_protocol::ThreadDecrementElicitationResponse;
+ use codex_app_server_protocol::ThreadDeleteParams;
+ use codex_app_server_protocol::ThreadDeleteResponse;
+ use codex_app_server_protocol::ThreadDeletedNotification;
++use codex_app_server_protocol::ThreadForkBeforePromptParams;
+ use codex_app_server_protocol::ThreadForkParams;
+ use codex_app_server_protocol::ThreadForkResponse;
+ use codex_app_server_protocol::ThreadGoal;
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+index 40fa4bb43d..518568c6da 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -505,6 +505,32 @@ impl ThreadRequestProcessor {
+         self.thread_fork_inner(
+             request_id,
+             params,
++            /*before_prompt*/ None,
++            app_server_client_name,
++            app_server_client_version,
++            supports_openai_form_elicitation,
++        )
++        .await
++        .map(|()| None)
++    }
++
++    pub(crate) async fn thread_fork_before_prompt(
++        &self,
++        request_id: ConnectionRequestId,
++        params: ThreadForkBeforePromptParams,
++        app_server_client_name: Option<String>,
++        app_server_client_version: Option<String>,
++        supports_openai_form_elicitation: bool,
++    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
++        let ThreadForkBeforePromptParams {
++            fork,
++            turn_id,
++            item_id,
++        } = params;
++        self.thread_fork_inner(
++            request_id,
++            fork,
++            Some(PromptForkBoundary { turn_id, item_id }),
+             app_server_client_name,
+             app_server_client_version,
+             supports_openai_form_elicitation,
+@@ -4095,6 +4121,7 @@ impl ThreadRequestProcessor {
+         &self,
+         request_id: ConnectionRequestId,
+         params: ThreadForkParams,
++        before_prompt: Option<PromptForkBoundary>,
+         app_server_client_name: Option<String>,
+         app_server_client_version: Option<String>,
+         supports_openai_form_elicitation: bool,
+@@ -4142,40 +4169,78 @@ impl ThreadRequestProcessor {
+                 "`beforeTurnId` cannot be combined with `lastTurnId`",
+             ));
+         }
++        if before_prompt.is_some()
++            && (last_turn_id.is_some() || before_turn_id.is_some() || path.is_some())
++        {
++            return Err(invalid_request(
++                "prompt-boundary forks cannot be combined with `lastTurnId`, `beforeTurnId`, or `path`",
++            ));
++        }
+         if ephemeral && defer_goal_continuation {
+             return Err(invalid_request(
+                 "`deferGoalContinuation` cannot be combined with `ephemeral`",
+             ));
+         }
+-        let mut source_thread = self
+-            .read_stored_thread_for_resume(&thread_id, path.as_ref(), /*include_history*/ true)
+-            .await?;
++        let mut source_thread = source_thread;
+         let source_thread_id = source_thread.thread_id;
+         let source_thread_name = source_thread
+             .name
+             .as_deref()
+             .and_then(codex_core::util::normalize_thread_name);
+-        let source_history_items = source_thread
+-            .history
+-            .take()
+-            .map(|history| history.items)
+-            .ok_or_else(|| {
+-                internal_error(format!(
+-                    "thread {source_thread_id} did not include persisted history"
+-                ))
+-            })?;
++        let source_history_items = if before_prompt.is_some() {
++            self.thread_store
++                .load_latest_model_context(StoreLoadThreadHistoryParams {
++                    thread_id: source_thread_id,
++                    include_archived: true,
++                })
++                .await
++                .map_err(|err| thread_read_history_load_error(source_thread_id, err))
++                .map_err(thread_read_view_error)?
++                .items
++        } else {
++            source_thread = self
++                .read_stored_thread_for_resume(
++                    &thread_id,
++                    path.as_ref(),
++                    /*include_history*/ true,
++                )
++                .await?;
++            source_thread
++                .history
++                .take()
++                .map(|history| history.items)
++                .ok_or_else(|| {
++                    internal_error(format!(
++                        "thread {source_thread_id} did not include persisted history"
++                    ))
++                })?
++        };
+         let source_history_items = Arc::new(source_history_items);
+-        let history_items = match (last_turn_id.as_deref(), before_turn_id.as_deref()) {
+-            (Some(last_turn_id), None) => Arc::new(
++        let prompt_turn_id = before_prompt
++            .as_ref()
++            .map(|boundary| validate_prompt_fork_boundary(&source_history_items, boundary))
++            .transpose()?;
++        let history_items = match (
++            last_turn_id.as_deref(),
++            before_turn_id.as_deref(),
++            prompt_turn_id.as_deref(),
++        ) {
++            (Some(last_turn_id), None, None) => Arc::new(
+                 truncate_rollout_after_turn_id(&source_history_items, last_turn_id)
+                     .map_err(|err| core_thread_write_error("truncate thread for fork", err))?,
+             ),
+-            (None, Some(before_turn_id)) => Arc::new(
++            (None, Some(before_turn_id), None) => Arc::new(
+                 truncate_rollout_before_turn_id(&source_history_items, before_turn_id)
+                     .map_err(|err| core_thread_write_error("truncate thread for fork", err))?,
+             ),
+-            (None, None) => Arc::clone(&source_history_items),
+-            (Some(_), Some(_)) => unreachable!("fork boundaries are mutually exclusive"),
++            (None, None, Some(before_prompt_turn_id)) => Arc::new(
++                truncate_rollout_before_turn_id(&source_history_items, before_prompt_turn_id)
++                    .map_err(|err| {
++                        core_thread_write_error("truncate thread for prompt edit", err)
++                    })?,
++            ),
++            (None, None, None) => Arc::clone(&source_history_items),
++            _ => unreachable!("fork boundaries are mutually exclusive"),
+         };
+         let history_cwd = Some(source_thread.cwd.clone());
+ 
+@@ -4905,6 +4970,11 @@ fn bounded_resume_history_window_metadata(
+     }
+ }
+ 
++struct PromptForkBoundary {
++    turn_id: String,
++    item_id: String,
++}
++
+ fn thread_read_view_error(err: ThreadReadViewError) -> JSONRPCErrorError {
+     match err {
+         ThreadReadViewError::InvalidRequest(message) => invalid_request(message),
+@@ -4915,6 +4985,52 @@ fn thread_read_view_error(err: ThreadReadViewError) -> JSONRPCErrorError {
+     }
+ }
+ 
++fn validate_prompt_fork_boundary(
++    items: &[RolloutItem],
++    boundary: &PromptForkBoundary,
++) -> Result<String, JSONRPCErrorError> {
++    let turns = build_legacy_api_turns_from_rollout_items(items);
++    let turn = turns
++        .iter()
++        .find(|turn| turn.id == boundary.turn_id)
++        .ok_or_else(|| {
++            invalid_request(format!(
++                "prompt turn '{}' was not found in the selected history window",
++                boundary.turn_id
++            ))
++        })?;
++    if matches!(turn.status, TurnStatus::InProgress) {
++        return Err(invalid_request(format!(
++            "prompt turn '{}' is still in progress",
++            boundary.turn_id
++        )));
++    }
++
++    let user_message_ids = turn.items.iter().filter_map(|item| match item {
++        ThreadItem::UserMessage { id, .. } => Some(id.as_str()),
++        _ => None,
++    });
++    let mut user_message_ids = user_message_ids.peekable();
++    let Some(first_item_id) = user_message_ids.next() else {
++        return Err(invalid_request(format!(
++            "prompt turn '{}' has no persisted canonical user prompt",
++            boundary.turn_id
++        )));
++    };
++    if first_item_id == boundary.item_id {
++        return Ok(turn.id.clone());
++    }
++    if user_message_ids.any(|item_id| item_id == boundary.item_id) {
++        return Err(invalid_request(
++            "the selected prompt is a steer and cannot be branched independently",
++        ));
++    }
++    Err(invalid_request(format!(
++        "prompt item '{}' was not found as the initial prompt of turn '{}'",
++        boundary.item_id, boundary.turn_id
++    )))
++}
++
+ fn paginated_history_list_error(err: ThreadStoreError) -> JSONRPCErrorError {
+     match err {
+         ThreadStoreError::InvalidRequest { message } => invalid_request(message),
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor_tests.rs b/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
+index aff8b47bcc..9ef24ace75 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
+@@ -99,6 +99,96 @@ mod bounded_resume_history_window_metadata_tests {
+     }
+ }
+ 
++mod prompt_fork_boundary_tests {
++    use super::super::validate_prompt_fork_boundary;
++    use codex_protocol::ThreadId;
++    use codex_protocol::items::TurnItem;
++    use codex_protocol::items::UserMessageItem;
++    use codex_protocol::protocol::EventMsg;
++    use codex_protocol::protocol::ItemCompletedEvent;
++    use codex_protocol::protocol::RolloutItem;
++    use codex_protocol::protocol::TurnCompleteEvent;
++    use codex_protocol::protocol::TurnStartedEvent;
++
++    fn completed_turn(turn_id: &str, item_ids: &[&str]) -> Vec<RolloutItem> {
++        let thread_id = ThreadId::new();
++        let mut items = vec![RolloutItem::EventMsg(EventMsg::TurnStarted(
++            TurnStartedEvent {
++                turn_id: turn_id.to_string(),
++                trace_id: None,
++                started_at: None,
++                model_context_window: None,
++                collaboration_mode_kind: Default::default(),
++            },
++        ))];
++        items.extend(item_ids.iter().map(|item_id| {
++            RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
++                thread_id,
++                turn_id: turn_id.to_string(),
++                item: TurnItem::UserMessage(UserMessageItem {
++                    id: (*item_id).to_string(),
++                    client_id: None,
++                    content: Vec::new(),
++                }),
++                completed_at_ms: 0,
++            }))
++        }));
++        items.push(RolloutItem::EventMsg(EventMsg::TurnComplete(
++            TurnCompleteEvent {
++                turn_id: turn_id.to_string(),
++                started_at: None,
++                last_agent_message: None,
++                error: None,
++                completed_at: None,
++                duration_ms: None,
++                time_to_first_token_ms: None,
++            },
++        )));
++        items
++    }
++
++    #[test]
++    fn accepts_only_the_initial_canonical_prompt_in_a_completed_turn() {
++        let items = completed_turn("turn-1", &["prompt-1", "steer-1"]);
++
++        assert_eq!(
++            validate_prompt_fork_boundary(
++                &items,
++                &super::super::PromptForkBoundary {
++                    turn_id: "turn-1".to_string(),
++                    item_id: "prompt-1".to_string(),
++                },
++            )
++            .expect("initial prompt should be editable"),
++            "turn-1"
++        );
++        let steer = validate_prompt_fork_boundary(
++            &items,
++            &super::super::PromptForkBoundary {
++                turn_id: "turn-1".to_string(),
++                item_id: "steer-1".to_string(),
++            },
++        )
++        .expect_err("steer should not be editable");
++        assert!(steer.message.contains("selected prompt is a steer"));
++    }
++
++    #[test]
++    fn rejects_a_prompt_identity_outside_the_selected_window() {
++        let items = completed_turn("turn-2", &["prompt-2"]);
++
++        let err = validate_prompt_fork_boundary(
++            &items,
++            &super::super::PromptForkBoundary {
++                turn_id: "turn-1".to_string(),
++                item_id: "prompt-1".to_string(),
++            },
++        )
++        .expect_err("omitted prompt should not be guessed");
++        assert!(err.message.contains("selected history window"));
++    }
++}
++
+ mod background_terminal_pagination_tests {
+     use super::super::paginate_background_terminals;
+     use codex_app_server_protocol::ThreadBackgroundTerminal;
+diff --git a/codex-rs/app-server/tests/common/test_app_server.rs b/codex-rs/app-server/tests/common/test_app_server.rs
+index b0245dc4a3..a45d393795 100644
+--- a/codex-rs/app-server/tests/common/test_app_server.rs
++++ b/codex-rs/app-server/tests/common/test_app_server.rs
+@@ -85,6 +85,7 @@ use codex_app_server_protocol::SkillsListParams;
+ use codex_app_server_protocol::ThreadArchiveParams;
+ use codex_app_server_protocol::ThreadCompactStartParams;
+ use codex_app_server_protocol::ThreadDeleteParams;
++use codex_app_server_protocol::ThreadForkBeforePromptParams;
+ use codex_app_server_protocol::ThreadForkParams;
+ use codex_app_server_protocol::ThreadInjectItemsParams;
+ use codex_app_server_protocol::ThreadItemsListParams;
+@@ -518,6 +519,15 @@ impl TestAppServer {
+         self.send_request("thread/fork", params).await
+     }
+ 
++    /// Send an experimental `thread/forkBeforePrompt` JSON-RPC request.
++    pub async fn send_thread_fork_before_prompt_request(
++        &mut self,
++        params: ThreadForkBeforePromptParams,
++    ) -> anyhow::Result<i64> {
++        let params = Some(serde_json::to_value(params)?);
++        self.send_request("thread/forkBeforePrompt", params).await
++    }
++
+     /// Send a `thread/archive` JSON-RPC request.
+     pub async fn send_thread_archive_request(
+         &mut self,
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_fork.rs b/codex-rs/app-server/tests/suite/v2/thread_fork.rs
+index d4b207e786..61fea2727e 100644
+--- a/codex-rs/app-server/tests/suite/v2/thread_fork.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_fork.rs
+@@ -16,6 +16,7 @@ use codex_app_server_protocol::JSONRPCResponse;
+ use codex_app_server_protocol::RequestId;
+ use codex_app_server_protocol::ServerNotification;
+ use codex_app_server_protocol::SessionSource;
++use codex_app_server_protocol::ThreadForkBeforePromptParams;
+ use codex_app_server_protocol::ThreadForkParams;
+ use codex_app_server_protocol::ThreadForkResponse;
+ use codex_app_server_protocol::ThreadItem;
+@@ -37,9 +38,13 @@ use codex_app_server_protocol::UserInput;
+ use codex_config::types::AuthCredentialsStoreMode;
+ use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
+ use codex_protocol::ThreadId;
++use codex_protocol::items::TurnItem;
++use codex_protocol::items::UserMessageItem;
+ use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::ItemCompletedEvent;
+ use codex_protocol::protocol::MultiAgentVersion;
+ use codex_protocol::protocol::RolloutItem;
++use codex_protocol::protocol::TurnCompleteEvent;
+ use codex_protocol::protocol::TurnStartedEvent;
+ use codex_protocol::protocol::UserMessageEvent;
+ use codex_rollout::append_rollout_item_to_path;
+@@ -94,6 +99,87 @@ async fn list_threads(mcp: &mut TestAppServer) -> Result<ThreadListResponse> {
+     to_response::<ThreadListResponse>(list_resp)
+ }
+ 
++#[tokio::test]
++async fn thread_fork_before_prompt_uses_canonical_identity_in_selected_history() -> Result<()> {
++    let server = create_mock_responses_server_repeating_assistant("Done").await;
++    let codex_home = TempDir::new()?;
++    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
++    let conversation_id = create_fake_rollout(
++        codex_home.path(),
++        "2025-01-05T12-00-00",
++        "2025-01-05T12:00:00Z",
++        "first prompt",
++        Some("mock_provider"),
++        /*git_info*/ None,
++    )?;
++    let original_path = rollout_path(codex_home.path(), "2025-01-05T12-00-00", &conversation_id);
++    let thread_id = ThreadId::from_string(&conversation_id)?;
++    let target_turn_id = "turn-target";
++    let target_item_id = "prompt-target";
++    for item in [
++        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
++            turn_id: target_turn_id.to_string(),
++            trace_id: None,
++            started_at: None,
++            model_context_window: None,
++            collaboration_mode_kind: Default::default(),
++        })),
++        RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
++            thread_id,
++            turn_id: target_turn_id.to_string(),
++            item: TurnItem::UserMessage(UserMessageItem {
++                id: target_item_id.to_string(),
++                client_id: Some("client-target".to_string()),
++                content: vec![codex_protocol::user_input::UserInput::Text {
++                    text: "target prompt".to_string(),
++                    text_elements: Vec::new(),
++                }],
++            }),
++            completed_at_ms: 0,
++        })),
++        RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++            turn_id: target_turn_id.to_string(),
++            started_at: None,
++            last_agent_message: None,
++            error: None,
++            completed_at: None,
++            duration_ms: None,
++            time_to_first_token_ms: None,
++        })),
++    ] {
++        append_rollout_item_to_path(&original_path, &item).await?;
++    }
++
++    let mut mcp = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .build()
++        .await?;
++    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
++    let fork_id = mcp
++        .send_thread_fork_before_prompt_request(ThreadForkBeforePromptParams {
++            fork: ThreadForkParams {
++                thread_id: conversation_id,
++                thread_source: Some(ThreadSource::User),
++                ..Default::default()
++            },
++            turn_id: target_turn_id.to_string(),
++            item_id: target_item_id.to_string(),
++        })
++        .await?;
++    let fork_resp: JSONRPCResponse = timeout(
++        DEFAULT_READ_TIMEOUT,
++        mcp.read_stream_until_response_message(RequestId::Integer(fork_id)),
++    )
++    .await??;
++    let ThreadForkResponse { thread, .. } = to_response::<ThreadForkResponse>(fork_resp)?;
++
++    assert!(
++        thread.turns.iter().all(|turn| turn.id != target_turn_id),
++        "target prompt turn must be excluded from the fork"
++    );
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
+     let server = create_mock_responses_server_repeating_assistant("Done").await;

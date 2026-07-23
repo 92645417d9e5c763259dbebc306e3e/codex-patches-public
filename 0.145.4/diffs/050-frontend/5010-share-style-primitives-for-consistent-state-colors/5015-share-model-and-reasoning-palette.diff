@@ -1,0 +1,177 @@
+diff --git a/codex-rs/tui/src/model_color.rs b/codex-rs/tui/src/model_color.rs
+index 6dc4d2476a..adb9289ce0 100644
+--- a/codex-rs/tui/src/model_color.rs
++++ b/codex-rs/tui/src/model_color.rs
+@@ -3,18 +3,37 @@
+ use ratatui::style::Color;
+ use ratatui::style::Style;
+ 
+-const MODEL_COLORS: [Color; 5] = [
+-    Color::Rgb(89, 169, 255),
+-    Color::Rgb(45, 212, 191),
++use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
++
++const MODEL_COLORS: [Color; 8] = [
++    Color::Rgb(248, 113, 113),
++    Color::Rgb(251, 146, 60),
++    Color::Rgb(250, 204, 21),
+     Color::Rgb(74, 222, 128),
++    Color::Rgb(45, 212, 191),
++    Color::Rgb(96, 165, 250),
+     Color::Rgb(167, 139, 250),
+-    Color::Rgb(148, 163, 184),
++    Color::Rgb(244, 114, 182),
+ ];
+ 
+ pub(crate) fn model_style(model: &str) -> Style {
+     Style::default().fg(model_color(model))
+ }
+ 
++pub(crate) fn reasoning_effort_style(effort: &ReasoningEffortConfig) -> Style {
++    match effort {
++        ReasoningEffortConfig::None => Style::default().fg(Color::Gray),
++        ReasoningEffortConfig::Minimal
++        | ReasoningEffortConfig::Low
++        | ReasoningEffortConfig::Custom(_) => Style::default().fg(Color::White),
++        ReasoningEffortConfig::Medium => Style::default().fg(Color::Yellow),
++        ReasoningEffortConfig::High => Style::default().fg(Color::Rgb(255, 128, 0)),
++        ReasoningEffortConfig::XHigh => Style::default().fg(Color::Red),
++        ReasoningEffortConfig::Max => Style::default().fg(Color::Rgb(244, 114, 182)),
++        ReasoningEffortConfig::Ultra => Style::default().fg(Color::Rgb(167, 139, 250)),
++    }
++}
++
+ fn model_color(model: &str) -> Color {
+     let index = model
+         .bytes()
+@@ -64,4 +83,56 @@ mod tests {
+     fn unknown_model_color_is_deterministic() {
+         assert_eq!(model_style("future-model"), model_style("future-model"));
+     }
++
++    #[test]
++    fn model_palette_uses_rainbow_hues_before_wrapping() {
++        assert_eq!(
++            MODEL_COLORS,
++            [
++                Color::Rgb(248, 113, 113),
++                Color::Rgb(251, 146, 60),
++                Color::Rgb(250, 204, 21),
++                Color::Rgb(74, 222, 128),
++                Color::Rgb(45, 212, 191),
++                Color::Rgb(96, 165, 250),
++                Color::Rgb(167, 139, 250),
++                Color::Rgb(244, 114, 182),
++            ]
++        );
++    }
++
++    #[test]
++    fn reasoning_effort_colors_follow_severity() {
++        assert_eq!(
++            reasoning_effort_style(&ReasoningEffortConfig::None).fg,
++            Some(Color::Gray)
++        );
++        for effort in [
++            ReasoningEffortConfig::Minimal,
++            ReasoningEffortConfig::Low,
++            ReasoningEffortConfig::Custom("provider-default".to_string()),
++        ] {
++            assert_eq!(reasoning_effort_style(&effort).fg, Some(Color::White));
++        }
++        assert_eq!(
++            reasoning_effort_style(&ReasoningEffortConfig::Medium).fg,
++            Some(Color::Yellow)
++        );
++        assert_eq!(
++            reasoning_effort_style(&ReasoningEffortConfig::High).fg,
++            Some(Color::Rgb(255, 128, 0))
++        );
++        assert_eq!(
++            reasoning_effort_style(&ReasoningEffortConfig::XHigh).fg,
++            Some(Color::Red)
++        );
++        assert_eq!(
++            reasoning_effort_style(&ReasoningEffortConfig::Max).fg,
++            Some(Color::Rgb(244, 114, 182))
++        );
++        assert_eq!(
++            reasoning_effort_style(&ReasoningEffortConfig::Ultra).fg,
++            Some(Color::Rgb(167, 139, 250))
++        );
++    }
+ }
+diff --git a/codex-rs/tui/src/multi_agents.rs b/codex-rs/tui/src/multi_agents.rs
+index 2955d14145..67691a24c8 100644
+--- a/codex-rs/tui/src/multi_agents.rs
++++ b/codex-rs/tui/src/multi_agents.rs
+@@ -5,6 +5,8 @@
+ //! which thread becomes active or when a thread closes, stays in [`crate::app::App`].
+ 
+ use crate::history_cell::PlainHistoryCell;
++use crate::model_color::model_style;
++use crate::model_color::reasoning_effort_style;
+ use crate::render::line_utils::prefix_lines;
+ use crate::text_formatting::truncate_text;
+ use codex_app_server_protocol::CollabAgentState;
+@@ -538,13 +540,23 @@ fn spawn_request_spans(spawn_request: Option<&SpawnRequestSummary>) -> Vec<Span<
+         return Vec::new();
+     }
+ 
+-    let details = if model.is_empty() {
+-        format!("({})", spawn_request.reasoning_effort)
++    let effort = spawn_request.reasoning_effort.clone();
++    let mut spans = vec![Span::from(" ").dim(), Span::from("(").magenta()];
++    if model.is_empty() {
++        spans.extend(reasoning_effort_spans(effort));
+     } else {
+-        format!("({model} {})", spawn_request.reasoning_effort)
+-    };
++        spans.push(Span::styled(model.to_string(), model_style(model)));
++        spans.push(Span::from(" ").magenta());
++        spans.extend(reasoning_effort_spans(effort));
++    }
++    spans.push(Span::from(")").magenta());
++
++    spans
++}
+ 
+-    vec![Span::from(" ").dim(), Span::from(details).magenta()]
++fn reasoning_effort_spans(effort: ReasoningEffortConfig) -> Vec<Span<'static>> {
++    let label = effort.to_string();
++    vec![Span::styled(label, reasoning_effort_style(&effort))]
+ }
+ 
+ fn prompt_line(prompt: &str) -> Option<Line<'static>> {
+@@ -895,8 +907,30 @@ mod tests {
+         assert_eq!(title.spans[4].content.as_ref(), "[explorer]");
+         assert_eq!(title.spans[4].style.fg, None);
+         assert!(!title.spans[4].style.add_modifier.contains(Modifier::DIM));
+-        assert_eq!(title.spans[6].content.as_ref(), "(gpt-5 high)");
++        assert_eq!(title.spans[6].content.as_ref(), "(");
+         assert_eq!(title.spans[6].style.fg, Some(Color::Magenta));
++        assert_eq!(title.spans[7].content.as_ref(), "gpt-5");
++        assert_eq!(title.spans[7].style, model_style("gpt-5"));
++        assert_eq!(title.spans[9].content.as_ref(), "high");
++        assert_eq!(title.spans[9].style.fg, Some(Color::Rgb(255, 128, 0)));
++        assert!(!title.spans[9].style.add_modifier.contains(Modifier::DIM));
++        assert!(!title.spans[9].style.sub_modifier.contains(Modifier::DIM));
++        assert_eq!(title.spans[10].content.as_ref(), ")");
++        assert_eq!(title.spans[10].style.fg, Some(Color::Magenta));
++    }
++
++    #[test]
++    fn spawn_request_xhigh_effort_is_red() {
++        let spans = spawn_request_spans(Some(&SpawnRequestSummary {
++            model: "gpt-5.5".to_string(),
++            reasoning_effort: ReasoningEffortConfig::XHigh,
++        }));
++        let effort = &spans[4];
++
++        assert_eq!(effort.content.as_ref(), "xhigh");
++        assert_eq!(effort.style.fg, Some(Color::Red));
++        assert!(!effort.style.add_modifier.contains(Modifier::DIM));
++        assert!(!effort.style.sub_modifier.contains(Modifier::DIM));
+     }
+ 
+     #[test]

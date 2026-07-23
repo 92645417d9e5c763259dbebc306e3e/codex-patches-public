@@ -1,0 +1,841 @@
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index 36f5b5ae0d..b1f794fb62 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -2219,6 +2219,7 @@ dependencies = [
+  "codex-utils-home-dir",
+  "codex-windows-sandbox",
+  "dotenvy",
++ "libc",
+  "pretty_assertions",
+  "tempfile",
+  "tokio",
+@@ -4320,6 +4321,7 @@ version = "0.0.0"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "dirs",
++ "libc",
+  "pretty_assertions",
+  "tempfile",
+ ]
+diff --git a/codex-rs/arg0/Cargo.toml b/codex-rs/arg0/Cargo.toml
+index bb45db4552..0e8895769c 100644
+--- a/codex-rs/arg0/Cargo.toml
++++ b/codex-rs/arg0/Cargo.toml
+@@ -26,6 +26,9 @@ dotenvy = { workspace = true }
+ tempfile = { workspace = true }
+ tokio = { workspace = true, features = ["rt-multi-thread"] }
+ 
++[target.'cfg(unix)'.dependencies]
++libc = { workspace = true }
++
+ [target.'cfg(windows)'.dependencies]
+ codex-windows-sandbox = { workspace = true }
+ 
+diff --git a/codex-rs/arg0/src/lib.rs b/codex-rs/arg0/src/lib.rs
+index 7951d2cb05..5910c2c697 100644
+--- a/codex-rs/arg0/src/lib.rs
++++ b/codex-rs/arg0/src/lib.rs
+@@ -11,6 +11,8 @@ use codex_exec_server::CODEX_FS_HELPER_ARG1;
+ use codex_install_context::InstallContext;
+ use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
+ use codex_utils_home_dir::find_codex_home;
++#[cfg(not(unix))]
++use codex_utils_home_dir::find_codex_tmp_root;
+ #[cfg(target_os = "windows")]
+ use codex_windows_sandbox::CODEX_WINDOWS_SANDBOX_ARG1;
+ #[cfg(unix)]
+@@ -303,6 +305,72 @@ fn load_dotenv() {
+     }
+ }
+ 
++#[cfg(unix)]
++struct PrivateArg0Root {
++    directory: codex_utils_home_dir::PrivateCodexTmpDir,
++}
++
++#[cfg(unix)]
++impl PrivateArg0Root {
++    fn prepare() -> std::io::Result<Self> {
++        let root = codex_utils_home_dir::prepare_private_codex_tmp_root()?;
++        Ok(Self {
++            directory: root.ensure_subdir("arg0")?,
++        })
++    }
++
++    fn path(&self) -> &Path {
++        self.directory.as_path()
++    }
++
++    fn prepare_session(
++        &self,
++        path: &Path,
++    ) -> std::io::Result<codex_utils_home_dir::PrivateCodexTmpDir> {
++        let name = path.file_name().ok_or_else(|| {
++            std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                format!("arg0 session directory has no name: {}", path.display()),
++            )
++        })?;
++        self.directory.ensure_subdir(name)
++    }
++
++    fn validate(&self) -> std::io::Result<()> {
++        self.directory.validate()
++    }
++}
++
++#[cfg(not(unix))]
++struct PrivateArg0Root {
++    path: PathBuf,
++}
++
++#[cfg(not(unix))]
++impl PrivateArg0Root {
++    fn prepare() -> std::io::Result<Self> {
++        let path = find_codex_tmp_root()?.join("arg0").into_path_buf();
++        std::fs::create_dir_all(&path)?;
++        Ok(Self { path })
++    }
++
++    fn path(&self) -> &Path {
++        &self.path
++    }
++
++    fn validate(&self) -> std::io::Result<()> {
++        let metadata = std::fs::symlink_metadata(&self.path)?;
++        if metadata.is_dir() {
++            Ok(())
++        } else {
++            Err(std::io::Error::new(
++                std::io::ErrorKind::PermissionDenied,
++                format!("arg0 temp path is not a directory: {}", self.path.display()),
++            ))
++        }
++    }
++}
++
+ /// Helper to set vars from a dotenvy iterator while filtering out `CODEX_` keys.
+ fn set_filtered<I>(iter: I)
+ where
+@@ -327,47 +395,25 @@ where
+ /// temporary directory so `apply_patch` can be on the PATH without requiring the
+ /// user to install a separate executable, simplifying the deployment of Codex
+ /// CLI.
+-/// Note: In debug builds the temp-dir guard is disabled to ease local testing.
+-///
+ /// IMPORTANT: Callers must update PATH before multiple threads are spawned.
+ fn prepare_path_entry_for_codex_aliases(
+     existing_path: Option<OsString>,
+ ) -> std::io::Result<(Arg0PathEntryGuard, OsString)> {
+-    let codex_home = find_codex_home()?;
+-    #[cfg(not(debug_assertions))]
+-    {
+-        // Guard against placing helpers in system temp directories outside debug builds.
+-        let temp_root = std::env::temp_dir();
+-        if codex_home.starts_with(&temp_root) {
+-            return Err(std::io::Error::new(
+-                std::io::ErrorKind::InvalidInput,
+-                format!(
+-                    "Refusing to create helper binaries under temporary dir {temp_root:?} (codex_home: {codex_home:?})"
+-                ),
+-            ));
+-        }
+-    }
+-
+-    std::fs::create_dir_all(&codex_home)?;
+-    // Use a CODEX_HOME-scoped temp root to avoid cluttering the top-level directory.
+-    let temp_root = codex_home.join("tmp").join("arg0");
+-    std::fs::create_dir_all(&temp_root)?;
+-    #[cfg(unix)]
+-    {
+-        use std::os::unix::fs::PermissionsExt;
+-
+-        // Ensure only the current user can access the temp directory.
+-        std::fs::set_permissions(&temp_root, std::fs::Permissions::from_mode(0o700))?;
+-    }
++    let private_root = PrivateArg0Root::prepare()?;
++    let temp_root = private_root.path();
+ 
+     // Best-effort cleanup of stale per-session dirs. Ignore failures so startup proceeds.
+-    if let Err(err) = janitor_cleanup(&temp_root) {
++    if let Err(err) = janitor_cleanup(temp_root) {
+         eprintln!("WARNING: failed to clean up stale arg0 temp dirs: {err}");
+     }
++    private_root.validate()?;
+ 
+     let temp_dir = tempfile::Builder::new()
+         .prefix("codex-arg0")
+-        .tempdir_in(&temp_root)?;
++        .tempdir_in(temp_root)?;
++    private_root.validate()?;
++    #[cfg(unix)]
++    let session_directory = private_root.prepare_session(temp_dir.path())?;
+     let path = temp_dir.path();
+ 
+     let lock_path = path.join(LOCK_FILENAME);
+@@ -387,6 +433,9 @@ fn prepare_path_entry_for_codex_aliases(
+         #[cfg(unix)]
+         EXECVE_WRAPPER_ARG0,
+     ] {
++        private_root.validate()?;
++        #[cfg(unix)]
++        session_directory.validate()?;
+         let exe = std::env::current_exe()?;
+ 
+         #[cfg(unix)]
+@@ -409,6 +458,9 @@ fn prepare_path_entry_for_codex_aliases(
+             )?;
+         }
+     }
++    private_root.validate()?;
++    #[cfg(unix)]
++    session_directory.validate()?;
+ 
+     let updated_path_env_var = path_env_with_entry(path, existing_path);
+ 
+@@ -481,10 +533,14 @@ fn janitor_cleanup(temp_root: &Path) -> std::io::Result<()> {
+     };
+ 
+     for entry in entries.flatten() {
+-        let path = entry.path();
+-        if !path.is_dir() {
++        let file_type = match entry.file_type() {
++            Ok(file_type) => file_type,
++            Err(_) => continue,
++        };
++        if !file_type.is_dir() {
+             continue;
+         }
++        let path = entry.path();
+ 
+         // Skip the directory if locking fails or the lock is currently held.
+         let Some(_lock_file) = try_lock_dir(&path)? else {
+@@ -504,7 +560,14 @@ fn janitor_cleanup(temp_root: &Path) -> std::io::Result<()> {
+ 
+ fn try_lock_dir(dir: &Path) -> std::io::Result<Option<File>> {
+     let lock_path = dir.join(LOCK_FILENAME);
+-    let lock_file = match File::options().read(true).write(true).open(&lock_path) {
++    let mut options = File::options();
++    options.read(true).write(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt;
++        options.custom_flags(libc::O_NOFOLLOW);
++    }
++    let lock_file = match options.open(&lock_path) {
+         Ok(file) => file,
+         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+         Err(err) => return Err(err),
+@@ -533,12 +596,22 @@ mod tests {
+     use codex_install_context::InstallMethod;
+     use codex_utils_absolute_path::AbsolutePathBuf;
+     use pretty_assertions::assert_eq;
++    #[cfg(unix)]
++    use std::ffi::OsString;
+     use std::fs;
+     use std::fs::File;
+     use std::path::Path;
+     use std::path::PathBuf;
++    use std::process::Command;
+     use tempfile::TempDir;
+ 
++    const ARG0_TMP_ROOT_SUBPROCESS_ENV: &str = "CODEX_ARG0_TMP_ROOT_SUBPROCESS";
++    const ARG0_TMP_ROOT_TEST: &str = "tests::arg0_aliases_use_codex_tmp_root";
++    #[cfg(unix)]
++    const ARG0_UNSAFE_TMP_SUBPROCESS_ENV: &str = "CODEX_ARG0_UNSAFE_TMP_SUBPROCESS";
++    #[cfg(unix)]
++    const ARG0_UNSAFE_TMP_TEST: &str = "tests::arg0_aliases_fail_closed_for_unsafe_tmp_parent";
++
+     struct PackagePathTestFixture {
+         _temp_dir: TempDir,
+         arg0_dir: PathBuf,
+@@ -748,4 +821,122 @@ mod tests {
+         assert!(!dir.exists());
+         Ok(())
+     }
++
++    #[test]
++    fn arg0_aliases_use_codex_tmp_root() -> anyhow::Result<()> {
++        if std::env::var_os(ARG0_TMP_ROOT_SUBPROCESS_ENV).is_none() {
++            let root = TempDir::new_in(std::env::current_dir()?)?;
++            let codex_home = root.path().join("codex-home");
++            let system_tmp = root.path().join("runtime-tmp");
++            let codex_tmp = system_tmp.join("codex");
++            fs::create_dir(&codex_home)?;
++            fs::create_dir(&system_tmp)?;
++
++            let output = Command::new(std::env::current_exe()?)
++                .arg("--exact")
++                .arg(ARG0_TMP_ROOT_TEST)
++                .env(ARG0_TMP_ROOT_SUBPROCESS_ENV, "1")
++                .env("CODEX_HOME", &codex_home)
++                .env("TMPDIR", &system_tmp)
++                .env("CODEX_TMP", &codex_tmp)
++                .output()?;
++            assert!(
++                output.status.success(),
++                "arg0 subprocess failed\nstdout:\n{}\nstderr:\n{}",
++                String::from_utf8_lossy(&output.stdout),
++                String::from_utf8_lossy(&output.stderr)
++            );
++            assert!(codex_tmp.join("arg0").is_dir());
++            assert!(!codex_home.join("tmp").exists());
++            return Ok(());
++        }
++
++        let codex_home = codex_utils_home_dir::find_codex_home()?;
++        let arg0_root = codex_utils_home_dir::find_codex_tmp_root()?.join("arg0");
++        let (guard, path) = super::prepare_path_entry_for_codex_aliases(std::env::var_os("PATH"))?;
++        let alias_dir = std::env::split_paths(&path)
++            .next()
++            .expect("arg0 PATH entry");
++
++        assert!(alias_dir.starts_with(arg0_root.as_path()));
++        assert_ne!(alias_dir, arg0_root.as_path());
++        assert!(!codex_home.join("tmp").exists());
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::MetadataExt;
++
++            let metadata = fs::symlink_metadata(arg0_root.as_path())?;
++            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
++            assert_eq!(metadata.mode() & 0o7777, 0o700);
++        }
++        drop(guard);
++        Ok(())
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn arg0_aliases_fail_closed_for_unsafe_tmp_parent() -> anyhow::Result<()> {
++        use std::os::unix::fs::PermissionsExt;
++
++        if std::env::var_os(ARG0_UNSAFE_TMP_SUBPROCESS_ENV).is_none() {
++            let root = TempDir::new_in(std::env::current_dir()?)?;
++            let codex_home = root.path().join("codex-home");
++            let unsafe_tmp = root.path().join("unsafe-tmp");
++            let codex_tmp = unsafe_tmp.join("codex");
++            fs::create_dir(&codex_home)?;
++            fs::create_dir(&unsafe_tmp)?;
++            fs::set_permissions(&unsafe_tmp, fs::Permissions::from_mode(0o777))?;
++
++            let output = Command::new(std::env::current_exe()?)
++                .arg("--exact")
++                .arg(ARG0_UNSAFE_TMP_TEST)
++                .env(ARG0_UNSAFE_TMP_SUBPROCESS_ENV, "1")
++                .env("CODEX_HOME", &codex_home)
++                .env("TMPDIR", &unsafe_tmp)
++                .env("CODEX_TMP", &codex_tmp)
++                .output()?;
++            assert!(
++                output.status.success(),
++                "unsafe-temp subprocess failed\nstdout:\n{}\nstderr:\n{}",
++                String::from_utf8_lossy(&output.stdout),
++                String::from_utf8_lossy(&output.stderr)
++            );
++            assert!(!codex_tmp.exists());
++            return Ok(());
++        }
++
++        let install_context = InstallContext {
++            method: InstallMethod::Other,
++            package_layout: None,
++        };
++        let unsafe_root = codex_utils_home_dir::find_codex_tmp_root()?;
++        let (guard, updated_path) = super::prepare_path_env_var_with_aliases(
++            &install_context,
++            Some(OsString::from("sentinel-path")),
++            super::prepare_path_entry_for_codex_aliases,
++        );
++
++        assert!(guard.is_none());
++        assert!(updated_path.is_none());
++        assert!(!unsafe_root.as_path().exists());
++        Ok(())
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn janitor_does_not_follow_directory_symlinks() -> std::io::Result<()> {
++        use std::os::unix::fs::symlink;
++
++        let root = tempfile::tempdir()?;
++        let target = tempfile::tempdir()?;
++        create_lock(target.path())?;
++        let link = root.path().join("linked-session");
++        symlink(target.path(), &link)?;
++
++        janitor_cleanup(root.path())?;
++
++        assert!(link.is_symlink());
++        assert!(target.path().exists());
++        Ok(())
++    }
+ }
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index ec98eb05af..fcc5bd506e 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -3861,7 +3861,6 @@ impl Config {
+             &network_permission_profile,
+         )?;
+         let mut helper_readable_roots = get_readable_roots_required_for_codex_runtime(
+-            &codex_home,
+             zsh_path.as_ref(),
+             main_execve_wrapper_exe.as_ref(),
+         );
+diff --git a/codex-rs/core/src/config/permissions.rs b/codex-rs/core/src/config/permissions.rs
+index 6b75ebef92..6ca7cec870 100644
+--- a/codex-rs/core/src/config/permissions.rs
++++ b/codex-rs/core/src/config/permissions.rs
+@@ -37,6 +37,7 @@ use codex_protocol::permissions::FileSystemSpecialPath;
+ use codex_protocol::permissions::NetworkSandboxPolicy;
+ use codex_protocol::permissions::project_roots_glob_pattern;
+ use codex_utils_absolute_path::AbsolutePathBuf;
++use codex_utils_home_dir::find_codex_tmp_root;
+ 
+ use super::ProjectConfig;
+ 
+@@ -477,11 +478,10 @@ pub(crate) fn reject_unknown_builtin_permission_profile(profile_name: &str) -> i
+ /// for Codex to function. These should always be added to the
+ /// `FileSystemSandboxPolicy` for a thread.
+ pub(crate) fn get_readable_roots_required_for_codex_runtime(
+-    codex_home: &Path,
+     zsh_path: Option<&PathBuf>,
+     main_execve_wrapper_exe: Option<&PathBuf>,
+ ) -> Vec<AbsolutePathBuf> {
+-    let arg0_root = AbsolutePathBuf::from_absolute_path(codex_home.join("tmp").join("arg0")).ok();
++    let arg0_root = find_codex_tmp_root().ok().map(|root| root.join("arg0"));
+     let zsh_path = zsh_path.and_then(|path| AbsolutePathBuf::from_absolute_path(path).ok());
+     let execve_wrapper_root = main_execve_wrapper_exe.and_then(|path| {
+         let path = AbsolutePathBuf::from_absolute_path(path).ok()?;
+diff --git a/codex-rs/core/src/config/permissions_tests.rs b/codex-rs/core/src/config/permissions_tests.rs
+index 130e9d7f06..332004bdc7 100644
+--- a/codex-rs/core/src/config/permissions_tests.rs
++++ b/codex-rs/core/src/config/permissions_tests.rs
+@@ -49,16 +49,18 @@ async fn restricted_read_implicitly_allows_helper_executables() -> std::io::Resu
+     let cwd = temp_dir.path().join("workspace");
+     let codex_home = temp_dir.path().join(".codex");
+     let zsh_path = temp_dir.path().join("runtime").join("zsh");
+-    let arg0_root = codex_home.join("tmp").join("arg0");
+-    let allowed_arg0_dir = arg0_root.join("codex-arg0-session");
+-    let sibling_arg0_dir = arg0_root.join("codex-arg0-other-session");
++    let arg0_root = codex_utils_home_dir::find_codex_tmp_root()?.join("arg0");
++    let test_name = temp_dir
++        .path()
++        .file_name()
++        .expect("temp dir name")
++        .to_string_lossy();
++    let allowed_arg0_dir = arg0_root.join(format!("codex-arg0-session-{test_name}"));
++    let sibling_arg0_dir = arg0_root.join(format!("codex-arg0-sibling-{test_name}"));
+     let execve_wrapper = allowed_arg0_dir.join("codex-execve-wrapper");
+     std::fs::create_dir_all(&cwd)?;
+     std::fs::create_dir_all(zsh_path.parent().expect("zsh path should have parent"))?;
+-    std::fs::create_dir_all(&allowed_arg0_dir)?;
+-    std::fs::create_dir_all(&sibling_arg0_dir)?;
+     std::fs::write(&zsh_path, "")?;
+-    std::fs::write(&execve_wrapper, "")?;
+ 
+     let config = Config::load_from_base_config_with_overrides(
+         ConfigToml {
+@@ -83,7 +85,7 @@ async fn restricted_read_implicitly_allows_helper_executables() -> std::io::Resu
+         ConfigOverrides {
+             cwd: Some(cwd.clone()),
+             default_zsh_path: Some(AbsolutePathBuf::try_from(zsh_path.clone())?),
+-            main_execve_wrapper_exe: Some(execve_wrapper),
++            main_execve_wrapper_exe: Some(execve_wrapper.to_path_buf()),
+             ..Default::default()
+         },
+         AbsolutePathBuf::from_absolute_path(&codex_home)?,
+@@ -91,8 +93,8 @@ async fn restricted_read_implicitly_allows_helper_executables() -> std::io::Resu
+     .await?;
+ 
+     let expected_zsh = AbsolutePathBuf::try_from(zsh_path)?;
+-    let expected_allowed_arg0_dir = AbsolutePathBuf::try_from(allowed_arg0_dir)?;
+-    let expected_sibling_arg0_dir = AbsolutePathBuf::try_from(sibling_arg0_dir)?;
++    let expected_allowed_arg0_dir = allowed_arg0_dir;
++    let expected_sibling_arg0_dir = sibling_arg0_dir;
+     let policy = config.permissions.file_system_sandbox_policy();
+ 
+     assert!(
+@@ -111,6 +113,19 @@ async fn restricted_read_implicitly_allows_helper_executables() -> std::io::Resu
+     Ok(())
+ }
+ 
++#[test]
++fn runtime_helper_roots_do_not_expand_an_external_wrapper_path() -> std::io::Result<()> {
++    let temp_dir = TempDir::new()?;
++    let wrapper = temp_dir
++        .path()
++        .join("external")
++        .join("codex-execve-wrapper");
++    let roots = get_readable_roots_required_for_codex_runtime(None, Some(&wrapper));
++
++    assert_eq!(roots, vec![AbsolutePathBuf::from_absolute_path(wrapper)?]);
++    Ok(())
++}
++
+ #[test]
+ fn network_toml_ignores_legacy_network_list_keys() {
+     let parsed = toml::from_str::<NetworkToml>(
+diff --git a/codex-rs/utils/home-dir/Cargo.toml b/codex-rs/utils/home-dir/Cargo.toml
+index 2d2de0230e..5585207466 100644
+--- a/codex-rs/utils/home-dir/Cargo.toml
++++ b/codex-rs/utils/home-dir/Cargo.toml
+@@ -11,6 +11,9 @@ workspace = true
+ codex-utils-absolute-path = { workspace = true }
+ dirs = { workspace = true }
+ 
++[target.'cfg(unix)'.dependencies]
++libc = { workspace = true }
++
+ [dev-dependencies]
+ pretty_assertions = { workspace = true }
+ tempfile = { workspace = true }
+diff --git a/codex-rs/utils/home-dir/src/lib.rs b/codex-rs/utils/home-dir/src/lib.rs
+index 26d8568ebd..b5b3d85b2a 100644
+--- a/codex-rs/utils/home-dir/src/lib.rs
++++ b/codex-rs/utils/home-dir/src/lib.rs
+@@ -4,6 +4,14 @@ use std::path::PathBuf;
+ 
+ mod runtime_paths;
+ 
++#[cfg(unix)]
++mod private_tmp;
++
++#[cfg(unix)]
++pub use private_tmp::PrivateCodexTmpDir;
++#[cfg(unix)]
++pub use private_tmp::prepare_private_codex_tmp_root;
++
+ pub use runtime_paths::CODEX_TMP_ENV;
+ pub use runtime_paths::PROJECT_NAME_ENV;
+ pub use runtime_paths::PROJECT_SCRATCH_ROOT_ENV;
+diff --git a/codex-rs/utils/home-dir/src/private_tmp.rs b/codex-rs/utils/home-dir/src/private_tmp.rs
+new file mode 100644
+index 0000000000..0a9c06402b
+--- /dev/null
++++ b/codex-rs/utils/home-dir/src/private_tmp.rs
+@@ -0,0 +1,321 @@
++use crate::find_codex_tmp_root;
++use codex_utils_absolute_path::AbsolutePathBuf;
++use std::ffi::OsStr;
++use std::io;
++use std::path::Component;
++use std::path::Path;
++use std::path::PathBuf;
++
++const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
++const PERMISSION_BITS: u32 = 0o7777;
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++struct DirectoryIdentity {
++    device: u64,
++    inode: u64,
++}
++
++#[derive(Debug, Eq, PartialEq)]
++struct SafeAncestorChain {
++    lexical: Vec<(PathBuf, DirectoryIdentity, DirectoryIdentity)>,
++    resolved: Vec<(PathBuf, DirectoryIdentity, DirectoryIdentity)>,
++}
++
++impl SafeAncestorChain {
++    fn capture(path: &Path) -> io::Result<Self> {
++        Ok(Self {
++            lexical: capture_ancestor_entries(path)?,
++            resolved: capture_ancestor_entries(&std::fs::canonicalize(path)?)?,
++        })
++    }
++
++    fn validate(&self) -> io::Result<()> {
++        let path = self
++            .lexical
++            .last()
++            .map(|(path, _, _)| path.as_path())
++            .ok_or_else(|| private_directory_error("temporary directory has no ancestors"))?;
++        if &Self::capture(path)? != self {
++            return Err(private_directory_error(format!(
++                "temporary directory ancestor was replaced: {}",
++                path.display()
++            )));
++        }
++        Ok(())
++    }
++}
++
++/// A current-user-private directory beneath the supplied `$CODEX_TMP` root.
++#[derive(Debug)]
++pub struct PrivateCodexTmpDir {
++    path: AbsolutePathBuf,
++    parent_chain: SafeAncestorChain,
++    identity: DirectoryIdentity,
++}
++
++impl PrivateCodexTmpDir {
++    fn prepare(path: AbsolutePathBuf) -> io::Result<Self> {
++        use std::os::unix::fs::DirBuilderExt;
++        use std::os::unix::fs::MetadataExt;
++        use std::os::unix::fs::PermissionsExt;
++
++        let parent = path.as_path().parent().ok_or_else(|| {
++            private_directory_error(format!(
++                "private directory has no parent: {}",
++                path.as_path().display()
++            ))
++        })?;
++        let parent_chain = SafeAncestorChain::capture(parent)?;
++        let mut builder = std::fs::DirBuilder::new();
++        builder.mode(PRIVATE_DIRECTORY_MODE);
++        match builder.create(path.as_path()) {
++            Ok(()) => {}
++            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
++            Err(error) => return Err(error),
++        }
++        parent_chain.validate()?;
++
++        let effective_uid = unsafe { libc::geteuid() };
++        let mut metadata = private_directory_metadata(path.as_path())?;
++        if metadata.uid() != effective_uid {
++            return Err(private_directory_error(format!(
++                "private temp directory is owned by uid {}, not current uid {effective_uid}: {}",
++                metadata.uid(),
++                path.as_path().display()
++            )));
++        }
++        if metadata.mode() & 0o022 != 0 {
++            return Err(private_directory_error(format!(
++                "private temp directory is writable by other users: {}",
++                path.as_path().display()
++            )));
++        }
++        if metadata.mode() & PERMISSION_BITS != PRIVATE_DIRECTORY_MODE {
++            std::fs::set_permissions(
++                path.as_path(),
++                std::fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
++            )?;
++            metadata = private_directory_metadata(path.as_path())?;
++        }
++        if metadata.uid() != effective_uid
++            || metadata.mode() & PERMISSION_BITS != PRIVATE_DIRECTORY_MODE
++        {
++            return Err(private_directory_error(format!(
++                "private temp directory could not be secured: {}",
++                path.as_path().display()
++            )));
++        }
++        parent_chain.validate()?;
++
++        Ok(Self {
++            path,
++            parent_chain,
++            identity: directory_identity(&metadata),
++        })
++    }
++
++    pub fn as_path(&self) -> &Path {
++        self.path.as_path()
++    }
++
++    pub fn ensure_subdir(&self, name: impl AsRef<OsStr>) -> io::Result<Self> {
++        self.validate()?;
++        let name = name.as_ref();
++        let mut components = Path::new(name).components();
++        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                format!(
++                    "private temp subdirectory must be one path component: {}",
++                    name.to_string_lossy()
++                ),
++            ));
++        }
++        Self::prepare(self.path.join(name))
++    }
++
++    pub fn validate(&self) -> io::Result<()> {
++        use std::os::unix::fs::MetadataExt;
++
++        self.parent_chain.validate()?;
++        let metadata = private_directory_metadata(self.path.as_path())?;
++        let effective_uid = unsafe { libc::geteuid() };
++        if directory_identity(&metadata) != self.identity
++            || metadata.uid() != effective_uid
++            || metadata.mode() & PERMISSION_BITS != PRIVATE_DIRECTORY_MODE
++        {
++            return Err(private_directory_error(format!(
++                "private temp directory was replaced or made unsafe: {}",
++                self.path.as_path().display()
++            )));
++        }
++        Ok(())
++    }
++}
++
++pub fn prepare_private_codex_tmp_root() -> io::Result<PrivateCodexTmpDir> {
++    PrivateCodexTmpDir::prepare(find_codex_tmp_root()?)
++}
++
++fn capture_ancestor_entries(
++    path: &Path,
++) -> io::Result<Vec<(PathBuf, DirectoryIdentity, DirectoryIdentity)>> {
++    use std::os::unix::fs::MetadataExt;
++
++    let effective_uid = unsafe { libc::geteuid() };
++    let mut entries = Vec::new();
++    for ancestor in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
++        let lexical_metadata = std::fs::symlink_metadata(ancestor)?;
++        if lexical_metadata.file_type().is_symlink() {
++            let owner = lexical_metadata.uid();
++            if owner != 0 && owner != effective_uid {
++                return Err(private_directory_error(format!(
++                    "temporary directory symlink is owned by uid {owner}: {}",
++                    ancestor.display()
++                )));
++            }
++        }
++        let metadata = std::fs::metadata(ancestor)?;
++        if !metadata.is_dir() {
++            return Err(private_directory_error(format!(
++                "temporary directory ancestor is not a directory: {}",
++                ancestor.display()
++            )));
++        }
++        let owner = metadata.uid();
++        if owner != 0 && owner != effective_uid {
++            return Err(private_directory_error(format!(
++                "temporary directory ancestor is owned by uid {owner}: {}",
++                ancestor.display()
++            )));
++        }
++        let mode = metadata.mode();
++        if mode & 0o022 != 0 && mode & 0o1000 == 0 {
++            return Err(private_directory_error(format!(
++                "temporary directory ancestor is writable without the sticky bit: {}",
++                ancestor.display()
++            )));
++        }
++        entries.push((
++            ancestor.to_path_buf(),
++            directory_identity(&lexical_metadata),
++            directory_identity(&metadata),
++        ));
++    }
++    Ok(entries)
++}
++
++fn private_directory_metadata(path: &Path) -> io::Result<std::fs::Metadata> {
++    let metadata = std::fs::symlink_metadata(path)?;
++    if !metadata.file_type().is_dir() {
++        return Err(private_directory_error(format!(
++            "private temp path is not a non-symlink directory: {}",
++            path.display()
++        )));
++    }
++    Ok(metadata)
++}
++
++fn directory_identity(metadata: &std::fs::Metadata) -> DirectoryIdentity {
++    use std::os::unix::fs::MetadataExt;
++
++    DirectoryIdentity {
++        device: metadata.dev(),
++        inode: metadata.ino(),
++    }
++}
++
++fn private_directory_error(message: impl Into<String>) -> io::Error {
++    io::Error::new(io::ErrorKind::PermissionDenied, message.into())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::fs;
++    use std::os::unix::fs::MetadataExt;
++    use std::os::unix::fs::PermissionsExt;
++    use std::os::unix::fs::symlink;
++    use tempfile::TempDir;
++
++    fn absolute(path: impl Into<PathBuf>) -> AbsolutePathBuf {
++        AbsolutePathBuf::from_absolute_path(path.into()).expect("absolute path")
++    }
++
++    fn local_temp() -> io::Result<TempDir> {
++        TempDir::new_in(std::env::current_dir()?)
++    }
++
++    #[test]
++    fn private_root_accepts_sticky_parent_and_uses_mode_0700() -> io::Result<()> {
++        let root = local_temp()?;
++        let parent = root.path().join("sticky");
++        fs::create_dir(&parent)?;
++        fs::set_permissions(&parent, fs::Permissions::from_mode(0o1777))?;
++
++        let private = PrivateCodexTmpDir::prepare(absolute(parent.join("codex")))?;
++        let metadata = fs::symlink_metadata(private.as_path())?;
++
++        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
++        assert_eq!(metadata.mode() & PERMISSION_BITS, PRIVATE_DIRECTORY_MODE);
++        Ok(())
++    }
++
++    #[test]
++    fn private_root_rejects_non_sticky_writable_parent() -> io::Result<()> {
++        let root = local_temp()?;
++        let parent = root.path().join("unsafe");
++        fs::create_dir(&parent)?;
++        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777))?;
++        let path = parent.join("codex");
++
++        let error = PrivateCodexTmpDir::prepare(absolute(&path)).expect_err("unsafe parent");
++
++        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
++        assert!(!path.exists());
++        Ok(())
++    }
++
++    #[test]
++    fn private_root_rejects_symlink_root() -> io::Result<()> {
++        let root = local_temp()?;
++        let target = root.path().join("target");
++        let path = root.path().join("codex");
++        fs::create_dir(&target)?;
++        symlink(&target, &path)?;
++
++        let error = PrivateCodexTmpDir::prepare(absolute(&path)).expect_err("symlink root");
++
++        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
++        assert_eq!(fs::read_link(path)?, target);
++        Ok(())
++    }
++
++    #[test]
++    fn private_root_detects_replacement() -> io::Result<()> {
++        let root = local_temp()?;
++        let path = root.path().join("codex");
++        let replacement = root.path().join("replacement");
++        let private = PrivateCodexTmpDir::prepare(absolute(&path))?;
++        fs::rename(&path, &replacement)?;
++        fs::create_dir(&path)?;
++
++        let error = private.validate().expect_err("replacement");
++
++        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
++        Ok(())
++    }
++
++    #[test]
++    fn private_subdir_requires_one_component() -> io::Result<()> {
++        let root = local_temp()?;
++        let private = PrivateCodexTmpDir::prepare(absolute(root.path().join("codex")))?;
++
++        let error = private
++            .ensure_subdir("nested/child")
++            .expect_err("nested child");
++
++        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
++        Ok(())
++    }
++}

@@ -1,0 +1,2435 @@
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index 368e696796..907f2a717d 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -505,6 +505,16 @@ struct InitialHistoryReplayBuffer {
+     render_from_transcript_tail: bool,
+ }
+ 
++struct CachedThreadPresentation {
++    chat_widget: ChatWidget,
++    transcript_cells: Vec<Arc<dyn HistoryCell>>,
++    deferred_history_lines: Vec<crate::terminal_hyperlinks::HyperlinkLine>,
++    has_emitted_history_lines: bool,
++    transcript_reflow: TranscriptReflowState,
++    initial_history_replay_buffer: Option<InitialHistoryReplayBuffer>,
++    event_sequence: u64,
++}
++
+ pub(crate) struct App {
+     model_catalog: Arc<ModelCatalog>,
+     pub(crate) session_telemetry: SessionTelemetry,
+@@ -572,6 +582,7 @@ pub(crate) struct App {
+     windows_sandbox: WindowsSandboxState,
+ 
+     thread_event_channels: HashMap<ThreadId, ThreadEventChannel>,
++    thread_presentations: HashMap<ThreadId, Box<CachedThreadPresentation>>,
+     thread_event_listener_tasks: HashMap<ThreadId, JoinHandle<()>>,
+     agent_navigation: AgentNavigationState,
+     side_threads: HashMap<ThreadId, SideThreadState>,
+@@ -1070,6 +1081,7 @@ See the Codex keymap documentation for supported actions and examples."
+             pending_shutdown_exit_thread_id: None,
+             windows_sandbox: WindowsSandboxState::default(),
+             thread_event_channels: HashMap::new(),
++            thread_presentations: HashMap::new(),
+             thread_event_listener_tasks: HashMap::new(),
+             agent_navigation: AgentNavigationState::default(),
+             side_threads: HashMap::new(),
+diff --git a/codex-rs/tui/src/app/agent_navigation.rs b/codex-rs/tui/src/app/agent_navigation.rs
+index cbd90480d6..00d4b966f7 100644
+--- a/codex-rs/tui/src/app/agent_navigation.rs
++++ b/codex-rs/tui/src/app/agent_navigation.rs
+@@ -273,9 +273,22 @@ impl AgentNavigationState {
+     pub(crate) fn adjacent_thread_id(
+         &self,
+         current_displayed_thread_id: Option<ThreadId>,
++        primary_thread_id: Option<ThreadId>,
+         direction: AgentNavigationDirection,
+     ) -> Option<ThreadId> {
+-        let ordered_threads = self.ordered_threads();
++        let ordered_threads = self
++            .ordered_threads()
++            .into_iter()
++            .filter(|(thread_id, entry)| {
++                Some(*thread_id) == primary_thread_id
++                    || (entry.is_running
++                        && !entry.is_closed
++                        && entry
++                            .agent_path
++                            .as_deref()
++                            .is_some_and(|path| !path.trim().is_empty()))
++            })
++            .collect::<Vec<_>>();
+         if ordered_threads.len() < 2 {
+             return None;
+         }
+@@ -435,22 +448,72 @@ mod tests {
+ 
+     #[test]
+     fn adjacent_thread_id_wraps_in_spawn_order() {
+-        let (state, main_thread_id, first_agent_id, second_agent_id) = populated_state();
++        let (mut state, main_thread_id, first_agent_id, second_agent_id) = populated_state();
++        state.set_agent_path(first_agent_id, Some("/root/first".to_string()));
++        state.set_agent_path(second_agent_id, Some("/root/second".to_string()));
++        state.mark_running(first_agent_id);
++        state.mark_running(second_agent_id);
+ 
+         assert_eq!(
+-            state.adjacent_thread_id(Some(second_agent_id), AgentNavigationDirection::Next),
++            state.adjacent_thread_id(
++                Some(second_agent_id),
++                Some(main_thread_id),
++                AgentNavigationDirection::Next,
++            ),
+             Some(main_thread_id)
+         );
+         assert_eq!(
+-            state.adjacent_thread_id(Some(second_agent_id), AgentNavigationDirection::Previous),
++            state.adjacent_thread_id(
++                Some(second_agent_id),
++                Some(main_thread_id),
++                AgentNavigationDirection::Previous,
++            ),
+             Some(first_agent_id)
+         );
+         assert_eq!(
+-            state.adjacent_thread_id(Some(main_thread_id), AgentNavigationDirection::Previous),
++            state.adjacent_thread_id(
++                Some(main_thread_id),
++                Some(main_thread_id),
++                AgentNavigationDirection::Previous,
++            ),
+             Some(second_agent_id)
+         );
+     }
+ 
++    #[test]
++    fn adjacent_thread_id_skips_closed_stopped_and_unrelated_threads() {
++        let (mut state, main_thread_id, first_agent_id, second_agent_id) = populated_state();
++        let unrelated_thread_id = ThreadId::new();
++        state.set_agent_path(first_agent_id, Some("/root/first".to_string()));
++        state.mark_running(first_agent_id);
++        state.set_agent_path(second_agent_id, Some("/root/second".to_string()));
++        state.mark_closed(second_agent_id);
++        state.upsert(
++            unrelated_thread_id,
++            Some("unrelated".to_string()),
++            None,
++            /*is_closed*/ false,
++        );
++        state.mark_running(unrelated_thread_id);
++
++        assert_eq!(
++            state.adjacent_thread_id(
++                Some(main_thread_id),
++                Some(main_thread_id),
++                AgentNavigationDirection::Next,
++            ),
++            Some(first_agent_id)
++        );
++        assert_eq!(
++            state.adjacent_thread_id(
++                Some(first_agent_id),
++                Some(main_thread_id),
++                AgentNavigationDirection::Next,
++            ),
++            Some(main_thread_id)
++        );
++    }
++
+     #[test]
+     fn picker_subtitle_mentions_shortcuts() {
+         let previous: Span<'static> = previous_agent_shortcut().into();
+diff --git a/codex-rs/tui/src/app/background_requests.rs b/codex-rs/tui/src/app/background_requests.rs
+index 21a136ece1..f6f2c0a8b5 100644
+--- a/codex-rs/tui/src/app/background_requests.rs
++++ b/codex-rs/tui/src/app/background_requests.rs
+@@ -624,17 +624,7 @@ impl App {
+ 
+         let should_send = {
+             let mut guard = store.lock().await;
+-            guard
+-                .buffer
+-                .push_back(ThreadBufferedEvent::FeedbackSubmission(event.clone()));
+-            if guard.buffer.len() > guard.capacity
+-                && let Some(removed) = guard.buffer.pop_front()
+-                && let ThreadBufferedEvent::Request(request) = &removed
+-            {
+-                guard
+-                    .pending_interactive_replay
+-                    .note_evicted_server_request(request);
+-            }
++            guard.push_buffered_event(ThreadBufferedEvent::FeedbackSubmission(event.clone()));
+             guard.active
+         };
+ 
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index 481d0808d1..5443df65e1 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -6,7 +6,6 @@
+ use super::resize_reflow::trailing_run_start;
+ use super::session_lifecycle::ThreadAttachPresentation;
+ use super::*;
+-use crate::app_server_session::ForkGoalContinuation;
+ use crate::config_update::format_config_error;
+ use crate::external_agent_config_migration_flow::ExternalAgentConfigMigrationFlowOutcome;
+ #[cfg(target_os = "windows")]
+@@ -233,8 +232,8 @@ impl App {
+             }
+             AppEvent::ForkSessionForPromptEdit {
+                 thread_id,
+-                nth_user_message,
+-                mut prompt,
++                persisted_prompt,
++                prompt,
+             } => {
+                 if self.chat_widget.thread_id() != Some(thread_id) {
+                     return Ok(AppRunControl::Continue);
+@@ -247,37 +246,14 @@ impl App {
+                 self.refresh_in_memory_config_from_disk_best_effort("forking the thread")
+                     .await;
+                 let config = self.fresh_session_config();
+-                let started = match app_server
+-                    .thread_read(thread_id, /*include_turns*/ true)
+-                    .await
+-                {
+-                    Ok(thread) => match crate::app_backtrack::backtrack_fork_before_turn_id(
+-                        &thread.turns,
+-                        nth_user_message,
+-                        &mut prompt,
+-                    ) {
+-                        Ok(Some(before_turn_id)) => {
+-                            app_server
+-                                .fork_thread_at(
+-                                    config.clone(),
+-                                    thread_id,
+-                                    /*last_turn_id*/ None,
+-                                    /*before_turn_id*/ Some(before_turn_id),
+-                                    ForkGoalContinuation::StartIfIdle,
+-                                )
+-                                .await
+-                        }
+-                        Ok(None) => {
+-                            app_server
+-                                .start_thread_with_session_start_source(
+-                                    &config, /*session_start_source*/ None,
+-                                )
+-                                .await
+-                        }
+-                        Err(err) => Err(err),
+-                    },
+-                    Err(err) => Err(err),
+-                };
++                let started = app_server
++                    .fork_thread_before_prompt(
++                        config.clone(),
++                        thread_id,
++                        persisted_prompt.turn_id,
++                        persisted_prompt.item_id,
++                    )
++                    .await;
+                 match started {
+                     Ok(forked) => {
+                         self.shutdown_current_thread(app_server).await;
+@@ -311,6 +287,9 @@ impl App {
+             AppEvent::InsertHistoryCell(cell) => {
+                 self.insert_history_cell(tui, cell);
+             }
++            AppEvent::BindPersistedUserPrompt(identity) => {
++                self.bind_persisted_user_prompt(identity);
++            }
+             AppEvent::EndInitialHistoryReplayBuffer => {
+                 self.finish_initial_history_replay_buffer(tui);
+             }
+diff --git a/codex-rs/tui/src/app/history_ui.rs b/codex-rs/tui/src/app/history_ui.rs
+index c707ef8d13..7c8ae2b197 100644
+--- a/codex-rs/tui/src/app/history_ui.rs
++++ b/codex-rs/tui/src/app/history_ui.rs
+@@ -8,6 +8,19 @@ use super::*;
+ const DESKTOP_THREAD_OPENED_MESSAGE: &str = "Opened this session in the Desktop app.";
+ 
+ impl App {
++    pub(super) fn bind_persisted_user_prompt(
++        &mut self,
++        identity: crate::history_cell::UserPromptIdentity,
++    ) {
++        if let Some(cell) = self.transcript_cells.iter().rev().find_map(|cell| {
++            cell.as_any()
++                .downcast_ref::<crate::history_cell::UserHistoryCell>()
++                .filter(|cell| cell.persisted_prompt().is_none())
++        }) {
++            let _ = cell.bind_persisted_prompt(identity);
++        }
++    }
++
+     pub(super) fn insert_history_cell(&mut self, tui: &mut tui::Tui, cell: Box<dyn HistoryCell>) {
+         let cell: Arc<dyn HistoryCell> = cell.into();
+         if let Some(Overlay::Transcript(t)) = &mut self.overlay {
+diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
+index 4267201ce6..ad1ab75b3d 100644
+--- a/codex-rs/tui/src/app/session_lifecycle.rs
++++ b/codex-rs/tui/src/app/session_lifecycle.rs
+@@ -388,10 +388,13 @@ impl App {
+     /// Replaces the chat widget and re-seeds the new widget's collab metadata from the navigation
+     /// cache.
+     ///
+-    /// Thread switches reconstruct the `ChatWidget`, which loses the `collab_agent_metadata` map.
+-    /// This helper copies every known nickname/role from `AgentNavigationState` into the
+-    /// replacement widget so that replayed collab items render agent names immediately.
+-    pub(super) fn replace_chat_widget(&mut self, mut chat_widget: ChatWidget) {
++    /// Cold thread attachment reconstructs the `ChatWidget`; hot switching restores its cached
++    /// presentation through the same state-transfer boundary.
++    pub(super) fn replace_chat_widget(&mut self, chat_widget: ChatWidget) {
++        drop(self.swap_chat_widget(chat_widget));
++    }
++
++    fn swap_chat_widget(&mut self, mut chat_widget: ChatWidget) -> ChatWidget {
+         // Transfer the last-written terminal title to the replacement widget
+         // so it knows what OSC title is currently displayed. Without this, the
+         // new widget would redundantly clear and rewrite the same title, causing
+@@ -423,8 +426,61 @@ impl App {
+                 entry.agent_role.clone(),
+             );
+         }
+-        self.chat_widget = chat_widget;
++        let previous = std::mem::replace(&mut self.chat_widget, chat_widget);
+         self.sync_active_agent_label();
++        previous
++    }
++
++    fn install_thread_presentation(
++        &mut self,
++        presentation: Box<CachedThreadPresentation>,
++        previous_event_sequence: u64,
++    ) -> Box<CachedThreadPresentation> {
++        let CachedThreadPresentation {
++            chat_widget,
++            transcript_cells,
++            deferred_history_lines,
++            has_emitted_history_lines,
++            transcript_reflow,
++            initial_history_replay_buffer,
++            event_sequence: _,
++        } = *presentation;
++        let previous_chat_widget = self.swap_chat_widget(chat_widget);
++        let previous_transcript_cells =
++            std::mem::replace(&mut self.transcript_cells, transcript_cells);
++        let previous_deferred_history_lines =
++            std::mem::replace(&mut self.deferred_history_lines, deferred_history_lines);
++        let previous_has_emitted_history_lines = std::mem::replace(
++            &mut self.has_emitted_history_lines,
++            has_emitted_history_lines,
++        );
++        let previous_transcript_reflow =
++            std::mem::replace(&mut self.transcript_reflow, transcript_reflow);
++        let previous_initial_history_replay_buffer = std::mem::replace(
++            &mut self.initial_history_replay_buffer,
++            initial_history_replay_buffer,
++        );
++        Box::new(CachedThreadPresentation {
++            chat_widget: previous_chat_widget,
++            transcript_cells: previous_transcript_cells,
++            deferred_history_lines: previous_deferred_history_lines,
++            has_emitted_history_lines: previous_has_emitted_history_lines,
++            transcript_reflow: previous_transcript_reflow,
++            initial_history_replay_buffer: previous_initial_history_replay_buffer,
++            event_sequence: previous_event_sequence,
++        })
++    }
++
++    fn empty_thread_presentation(chat_widget: ChatWidget) -> Box<CachedThreadPresentation> {
++        Box::new(CachedThreadPresentation {
++            chat_widget,
++            transcript_cells: Vec::new(),
++            deferred_history_lines: Vec::new(),
++            has_emitted_history_lines: false,
++            transcript_reflow: TranscriptReflowState::default(),
++            initial_history_replay_buffer: None,
++            event_sequence: 0,
++        })
+     }
+ 
+     pub(super) async fn select_agent_thread(
+@@ -478,41 +534,70 @@ impl App {
+             return Ok(());
+         }
+         let previous_thread_id = self.active_thread_id;
+-        self.store_active_thread_receiver().await;
++        self.drain_active_thread_events(tui).await?;
++        let previous_event_sequence = self.freeze_active_thread_presentation().await;
+         self.active_thread_id = None;
+-        let Some((receiver, mut snapshot)) = self.activate_thread_for_replay(thread_id).await
++        let cached_presentation = self.thread_presentations.remove(&thread_id);
++        let cached_event_sequence = cached_presentation
++            .as_ref()
++            .map(|presentation| presentation.event_sequence);
++        let Some((receiver, mut snapshot, reused_cached_presentation)) = self
++            .activate_thread_for_replay(thread_id, cached_event_sequence)
++            .await
+         else {
+             self.chat_widget
+                 .add_error_message(format!("Agent thread {thread_id} is already active."));
+             if let Some(previous_thread_id) = previous_thread_id {
+                 self.activate_thread_channel(previous_thread_id).await;
+             }
++            if let Some(cached_presentation) = cached_presentation {
++                self.thread_presentations
++                    .insert(thread_id, cached_presentation);
++            }
+             return Ok(());
+         };
+ 
+-        self.refresh_snapshot_session_if_needed(
+-            app_server,
+-            thread_id,
+-            is_replay_only,
+-            &mut snapshot,
+-        )
+-        .await;
++        if !reused_cached_presentation {
++            self.refresh_snapshot_session_if_needed(
++                app_server,
++                thread_id,
++                is_replay_only,
++                &mut snapshot,
++            )
++            .await;
++        }
+         let blocks_direct_input = self.agent_navigation.is_parent_owned(thread_id);
+ 
+         self.active_thread_id = Some(thread_id);
+         self.active_thread_rx = Some(receiver);
+ 
+-        let init = self.chatwidget_init_for_forked_or_resumed_thread(
+-            tui,
+-            self.config.clone(),
+-            /*initial_user_message*/ None,
+-        );
+-        self.replace_chat_widget(ChatWidget::new_with_app_event(init));
++        let presentation = match (cached_presentation, reused_cached_presentation) {
++            (Some(presentation), true) => presentation,
++            (_, _) => {
++                let init = self.chatwidget_init_for_forked_or_resumed_thread(
++                    tui,
++                    self.config.clone(),
++                    /*initial_user_message*/ None,
++                );
++                Self::empty_thread_presentation(ChatWidget::new_with_app_event(init))
++            }
++        };
++        let previous_presentation =
++            self.install_thread_presentation(presentation, previous_event_sequence);
++        if let Some(previous_thread_id) = previous_thread_id {
++            self.thread_presentations
++                .insert(previous_thread_id, previous_presentation);
++        }
+         if blocks_direct_input {
+             self.chat_widget.set_parent_owned_thread();
+         }
+ 
+-        self.reset_for_thread_switch(tui)?;
++        if reused_cached_presentation {
++            tui.clear_pending_history_lines();
++            Self::clear_terminal_for_thread_switch(&mut tui.terminal)?;
++        } else {
++            self.reset_for_thread_switch(tui)?;
++        }
+         self.replay_thread_snapshot(snapshot, !is_replay_only);
+         if is_replay_only {
+             let message = if attached_replay_only {
+@@ -563,6 +648,7 @@ impl App {
+     pub(super) fn reset_thread_event_state(&mut self) {
+         self.abort_all_thread_event_listeners();
+         self.thread_event_channels.clear();
++        self.thread_presentations.clear();
+         self.agent_navigation.clear();
+         self.side_threads.clear();
+         self.active_thread_id = None;
+@@ -868,10 +954,11 @@ impl App {
+         direction: AgentNavigationDirection,
+     ) -> Option<ThreadId> {
+         let current_thread = self.current_displayed_thread_id();
+-        if let Some(thread_id) = self
+-            .agent_navigation
+-            .adjacent_thread_id(current_thread, direction)
+-        {
++        if let Some(thread_id) = self.agent_navigation.adjacent_thread_id(
++            current_thread,
++            self.primary_thread_id,
++            direction,
++        ) {
+             return Some(thread_id);
+         }
+ 
+@@ -887,8 +974,11 @@ impl App {
+         {
+             self.last_subagent_backfill_attempt = Some(primary_thread_id);
+         }
+-        self.agent_navigation
+-            .adjacent_thread_id(self.current_displayed_thread_id(), direction)
++        self.agent_navigation.adjacent_thread_id(
++            self.current_displayed_thread_id(),
++            self.primary_thread_id,
++            direction,
++        )
+     }
+ 
+     pub(super) fn fresh_session_config(&self) -> Config {
+diff --git a/codex-rs/tui/src/app/side.rs b/codex-rs/tui/src/app/side.rs
+index 62e61139d4..7f90c5f0d5 100644
+--- a/codex-rs/tui/src/app/side.rs
++++ b/codex-rs/tui/src/app/side.rs
+@@ -389,6 +389,7 @@ impl App {
+     pub(super) async fn discard_thread_local_state(&mut self, thread_id: ThreadId) {
+         self.abort_thread_event_listener(thread_id);
+         self.thread_event_channels.remove(&thread_id);
++        self.thread_presentations.remove(&thread_id);
+         self.side_threads.remove(&thread_id);
+         self.agent_navigation.remove(thread_id);
+         if self.active_thread_id == Some(thread_id) {
+diff --git a/codex-rs/tui/src/app/test_support.rs b/codex-rs/tui/src/app/test_support.rs
+index a35c06724d..eabebce020 100644
+--- a/codex-rs/tui/src/app/test_support.rs
++++ b/codex-rs/tui/src/app/test_support.rs
+@@ -54,6 +54,7 @@ pub(super) async fn make_test_app() -> App {
+         pending_shutdown_exit_thread_id: None,
+         windows_sandbox: WindowsSandboxState::default(),
+         thread_event_channels: HashMap::new(),
++        thread_presentations: HashMap::new(),
+         thread_event_listener_tasks: HashMap::new(),
+         agent_navigation: AgentNavigationState::default(),
+         side_threads: HashMap::new(),
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index e668fa091a..4cadeb9083 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -100,12 +100,15 @@ use codex_protocol::config_types::Personality;
+ use codex_protocol::config_types::SandboxMode;
+ use codex_protocol::config_types::ServiceTier;
+ use codex_protocol::config_types::Settings;
++use codex_protocol::items::TurnItem;
++use codex_protocol::items::UserMessageItem;
+ use codex_protocol::models::ActivePermissionProfile;
+ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
+ use codex_protocol::models::FileSystemPermissions;
+ use codex_protocol::models::NetworkPermissions;
+ use codex_protocol::models::PermissionProfile;
+ use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::ItemCompletedEvent;
+ use codex_protocol::protocol::MAX_THREAD_GOAL_OBJECTIVE_CHARS;
+ use codex_protocol::protocol::MultiAgentVersion;
+ use codex_protocol::protocol::RolloutItem;
+@@ -114,7 +117,6 @@ use codex_protocol::protocol::SessionSource as RolloutSessionSource;
+ use codex_protocol::protocol::SubAgentSource;
+ use codex_protocol::protocol::TurnCompleteEvent;
+ use codex_protocol::protocol::TurnStartedEvent;
+-use codex_protocol::protocol::UserMessageEvent;
+ use codex_protocol::request_permissions::RequestPermissionProfile;
+ use codex_protocol::user_input::TextElement;
+ use codex_utils_absolute_path::AbsolutePathBuf;
+@@ -797,10 +799,11 @@ async fn activate_thread_for_replay_restores_working_and_independent_token_updat
+     }
+     app.thread_event_channels.insert(thread_id, channel);
+ 
+-    let (_receiver, snapshot) = app
+-        .activate_thread_for_replay(thread_id)
++    let (_receiver, snapshot, reused) = app
++        .activate_thread_for_replay(thread_id, None)
+         .await
+         .expect("thread should activate");
++    assert!(!reused);
+     assert!(
+         snapshot
+             .turns
+@@ -840,11 +843,12 @@ async fn activate_thread_for_replay_restores_active_turn_with_unrelated_in_progr
+     }
+     app.thread_event_channels.insert(thread_id, channel);
+ 
+-    let (_receiver, snapshot) = app
+-        .activate_thread_for_replay(thread_id)
++    let (_receiver, snapshot, reused) = app
++        .activate_thread_for_replay(thread_id, None)
+         .await
+         .expect("thread should activate");
+ 
++    assert!(!reused);
+     assert!(
+         snapshot.turns.iter().any(|turn| {
+             turn.id == "turn-other" && matches!(turn.status, TurnStatus::InProgress)
+@@ -873,11 +877,12 @@ async fn activate_thread_for_replay_does_not_duplicate_buffered_active_turn_star
+     }
+     app.thread_event_channels.insert(thread_id, channel);
+ 
+-    let (_receiver, snapshot) = app
+-        .activate_thread_for_replay(thread_id)
++    let (_receiver, snapshot, reused) = app
++        .activate_thread_for_replay(thread_id, None)
+         .await
+         .expect("thread should activate");
+ 
++    assert!(!reused);
+     assert_eq!(
+         snapshot
+             .events
+@@ -2013,6 +2018,14 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
+             std::iter::from_fn(|| app_event_rx.try_recv().ok())
+                 .any(|event| matches!(event, AppEvent::CodexOp(Op::UserTurn { .. })))
+         );
++        let cached_cell = Arc::new(UserHistoryCell {
++            message: "cached agent presentation".to_string(),
++            text_elements: Vec::new(),
++            local_image_paths: Vec::new(),
++            remote_image_urls: Vec::new(),
++            persisted_prompt: Default::default(),
++        }) as Arc<dyn HistoryCell>;
++        app.transcript_cells.push(Arc::clone(&cached_cell));
+ 
+         app.select_agent_thread(&mut tui, &mut app_server, child_thread_ids[1])
+             .await?;
+@@ -2028,6 +2041,14 @@ fn selected_and_resumed_threads_use_server_capability_for_v1_and_v2_children() -
+             !std::iter::from_fn(|| app_event_rx.try_recv().ok())
+                 .any(|event| matches!(event, AppEvent::CodexOp(Op::UserTurn { .. })))
+         );
++        app.select_agent_thread(&mut tui, &mut app_server, child_thread_ids[0])
++            .await?;
++        assert!(
++            app.transcript_cells
++                .iter()
++                .any(|cell| Arc::ptr_eq(cell, &cached_cell)),
++            "hot agent navigation should restore the rendered presentation"
++        );
+ 
+         let resumed = app_server
+             .resume_thread(
+@@ -4666,6 +4687,7 @@ async fn render_clear_ui_header_after_long_transcript_for_snapshot() -> String {
+             text_elements: Vec::new(),
+             local_image_paths: Vec::new(),
+             remote_image_urls: Vec::new(),
++            persisted_prompt: Default::default(),
+         }) as Arc<dyn HistoryCell>
+     };
+     let agent_cell = |text: &str| -> Arc<dyn HistoryCell> {
+@@ -4846,6 +4868,7 @@ async fn make_test_app() -> App {
+         pending_shutdown_exit_thread_id: None,
+         windows_sandbox: WindowsSandboxState::default(),
+         thread_event_channels: HashMap::new(),
++        thread_presentations: HashMap::new(),
+         thread_event_listener_tasks: HashMap::new(),
+         agent_navigation: AgentNavigationState::default(),
+         side_threads: HashMap::new(),
+@@ -4915,6 +4938,7 @@ async fn make_test_app_with_channels() -> (
+             pending_shutdown_exit_thread_id: None,
+             windows_sandbox: WindowsSandboxState::default(),
+             thread_event_channels: HashMap::new(),
++            thread_presentations: HashMap::new(),
+             thread_event_listener_tasks: HashMap::new(),
+             agent_navigation: AgentNavigationState::default(),
+             side_threads: HashMap::new(),
+@@ -5914,6 +5938,11 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
+             text_elements,
+             local_image_paths,
+             remote_image_urls,
++            persisted_prompt: std::sync::OnceLock::from(crate::history_cell::UserPromptIdentity {
++                turn_id: format!("turn-{text}"),
++                item_id: format!("item-{text}"),
++                mention_bindings: Vec::new(),
++            }),
+         }) as Arc<dyn HistoryCell>
+     };
+     let agent_cell = |text: &str| -> Arc<dyn HistoryCell> {
+@@ -6028,6 +6057,11 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
+     let expected = BacktrackSelection {
+         thread_id: base_id,
+         nth_user_message: 1,
++        persisted_prompt: crate::history_cell::UserPromptIdentity {
++            turn_id: format!("turn-{edited_text}"),
++            item_id: format!("item-{edited_text}"),
++            mention_bindings: Vec::new(),
++        },
+         prompt: crate::chatwidget::UserMessage {
+             text: edited_text,
+             local_images: vec![crate::bottom_pane::LocalImageAttachment {
+@@ -6049,10 +6083,10 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
+         event,
+         AppEvent::ForkSessionForPromptEdit {
+             thread_id,
+-            nth_user_message,
++            persisted_prompt,
+             prompt,
+         } if thread_id == expected.thread_id
+-            && nth_user_message == expected.nth_user_message
++            && persisted_prompt == expected.persisted_prompt
+             && prompt == expected.prompt
+     );
+ 
+@@ -6064,6 +6098,35 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
+     assert_eq!(transcript_after, transcript_before);
+ }
+ 
++#[tokio::test]
++async fn canonical_prompt_completion_binds_the_latest_optimistic_user_cell() {
++    let mut app = make_test_app().await;
++    app.transcript_cells.push(Arc::new(UserHistoryCell {
++        message: "same prompt".to_string(),
++        text_elements: Vec::new(),
++        local_image_paths: Vec::new(),
++        remote_image_urls: Vec::new(),
++        persisted_prompt: Default::default(),
++    }));
++    let identity = crate::history_cell::UserPromptIdentity {
++        turn_id: "turn-second".to_string(),
++        item_id: "item-second".to_string(),
++        mention_bindings: vec![crate::bottom_pane::MentionBinding {
++            sigil: '$',
++            mention: "skill".to_string(),
++            path: "/tmp/skills/skill/SKILL.md".to_string(),
++        }],
++    };
++
++    app.bind_persisted_user_prompt(identity.clone());
++
++    let cell = app.transcript_cells[0]
++        .as_any()
++        .downcast_ref::<UserHistoryCell>()
++        .expect("user history cell");
++    assert_eq!(cell.persisted_prompt(), Some(&identity));
++}
++
+ #[tokio::test]
+ async fn backtrack_branch_failure_restores_selected_prompt_snapshot() {
+     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+@@ -6549,6 +6612,21 @@ async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Resu
+             vec![PathBuf::from("/tmp/fake-image.png")],
+         ),
+     ] {
++        let mut content = vec![codex_protocol::user_input::UserInput::Text {
++            text: message.to_string(),
++            text_elements: Vec::new(),
++        }];
++        content.extend(images.unwrap_or_default().into_iter().map(|image_url| {
++            codex_protocol::user_input::UserInput::Image {
++                image_url,
++                detail: None,
++            }
++        }));
++        content.extend(
++            local_images.into_iter().map(|path| {
++                codex_protocol::user_input::UserInput::LocalImage { path, detail: None }
++            }),
++        );
+         for item in [
+             RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
+                 turn_id: turn_id.to_string(),
+@@ -6557,11 +6635,15 @@ async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Resu
+                 model_context_window: None,
+                 collaboration_mode_kind: ModeKind::default(),
+             })),
+-            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+-                message: message.to_string(),
+-                images,
+-                local_images,
+-                ..Default::default()
++            RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
++                thread_id: ThreadId::from_string(&source_thread_id)?,
++                turn_id: turn_id.to_string(),
++                item: TurnItem::UserMessage(UserMessageItem {
++                    id: format!("prompt-{turn_id}"),
++                    client_id: None,
++                    content,
++                }),
++                completed_at_ms: 0,
+             })),
+             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                 turn_id: turn_id.to_string(),
+@@ -6607,7 +6689,11 @@ async fn prompt_edit_forks_before_selected_prompt_and_preserves_source() -> Resu
+         &mut app_server,
+         AppEvent::ForkSessionForPromptEdit {
+             thread_id: source_thread_id,
+-            nth_user_message: 1,
++            persisted_prompt: crate::history_cell::UserPromptIdentity {
++                turn_id: "turn-2".to_string(),
++                item_id: "prompt-turn-2".to_string(),
++                mention_bindings: Vec::new(),
++            },
+             prompt: prompt.clone(),
+         },
+     ))
+@@ -6686,6 +6772,51 @@ async fn prompt_edit_before_first_prompt_starts_fresh_thread() -> Result<()> {
+         /*git_info*/ None,
+     )
+     .expect("materialized rollout should be created");
++    let source_path = app_test_support::rollout_path(
++        config.codex_home.as_path(),
++        "2025-01-05T12-00-00",
++        &source_thread_id,
++    );
++    let session_meta = std::fs::read_to_string(&source_path)?
++        .lines()
++        .next()
++        .expect("fake rollout should have session metadata")
++        .to_string();
++    std::fs::write(&source_path, format!("{session_meta}\n"))?;
++    let parsed_thread_id = ThreadId::from_string(&source_thread_id)?;
++    for item in [
++        RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
++            turn_id: "turn-1".to_string(),
++            trace_id: None,
++            started_at: None,
++            model_context_window: None,
++            collaboration_mode_kind: ModeKind::default(),
++        })),
++        RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
++            thread_id: parsed_thread_id,
++            turn_id: "turn-1".to_string(),
++            item: TurnItem::UserMessage(UserMessageItem {
++                id: "prompt-turn-1".to_string(),
++                client_id: None,
++                content: vec![codex_protocol::user_input::UserInput::Text {
++                    text: "first prompt".to_string(),
++                    text_elements: Vec::new(),
++                }],
++            }),
++            completed_at_ms: 0,
++        })),
++        RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
++            turn_id: "turn-1".to_string(),
++            last_agent_message: None,
++            error: None,
++            started_at: None,
++            completed_at: None,
++            duration_ms: None,
++            time_to_first_token_ms: None,
++        })),
++    ] {
++        codex_rollout::append_rollout_item_to_path(&source_path, &item).await?;
++    }
+     let source_thread_id = ThreadId::from_string(&source_thread_id)?;
+     let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&config)).await?;
+     let started = app_server
+@@ -6705,7 +6836,11 @@ async fn prompt_edit_before_first_prompt_starts_fresh_thread() -> Result<()> {
+         &mut app_server,
+         AppEvent::ForkSessionForPromptEdit {
+             thread_id: source_thread_id,
+-            nth_user_message: 0,
++            persisted_prompt: crate::history_cell::UserPromptIdentity {
++                turn_id: "turn-1".to_string(),
++                item_id: "prompt-turn-1".to_string(),
++                mention_bindings: Vec::new(),
++            },
+             prompt: crate::chatwidget::UserMessage::from("first prompt"),
+         },
+     ))
+@@ -6972,6 +7107,51 @@ async fn refreshed_snapshot_session_persists_resumed_turns() {
+     assert_eq!(store_snapshot.turns, snapshot.turns);
+ }
+ 
++#[tokio::test]
++async fn refreshed_snapshot_session_preserves_the_live_working_turn() {
++    let mut app = make_test_app().await;
++    let thread_id = ThreadId::new();
++    let session = test_thread_session(thread_id, test_path_buf("/tmp/project"));
++    let channel =
++        ThreadEventChannel::new_with_session(/*capacity*/ 1, session.clone(), Vec::new());
++    {
++        let mut store = channel.store.lock().await;
++        store.push_notification(turn_started_notification(thread_id, "turn-live"));
++        store.push_notification(token_usage_notification(
++            thread_id,
++            "turn-live",
++            Some(950_000),
++        ));
++    }
++    app.thread_event_channels.insert(thread_id, channel);
++    let (_receiver, mut snapshot, reused) = app
++        .activate_thread_for_replay(thread_id, None)
++        .await
++        .expect("thread should activate");
++
++    assert!(!reused);
++    app.apply_refreshed_snapshot_thread(
++        thread_id,
++        AppServerStartedThread {
++            session,
++            turns: Vec::new(),
++            blocks_direct_input: false,
++            history_window_metadata: Default::default(),
++        },
++        &mut snapshot,
++    )
++    .await;
++
++    assert!(
++        snapshot.turns.iter().any(|turn| {
++            turn.id == "turn-live" && matches!(turn.status, TurnStatus::InProgress)
++        })
++    );
++    app.replay_thread_snapshot(snapshot, /*resume_restored_queue*/ false);
++    assert!(app.chat_widget.is_task_running_for_test());
++    assert_eq!(app.chat_widget.current_status_header_for_test(), "Working");
++}
++
+ #[tokio::test]
+ async fn late_usage_result_can_follow_finalized_plan() {
+     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+@@ -7534,6 +7714,7 @@ async fn clear_only_ui_reset_preserves_chat_session_state() {
+         text_elements: Vec::new(),
+         local_image_paths: Vec::new(),
+         remote_image_urls: Vec::new(),
++        persisted_prompt: Default::default(),
+     }) as Arc<dyn HistoryCell>];
+     app.overlay = Some(Overlay::new_transcript(
+         app.transcript_cells.clone(),
+@@ -7596,6 +7777,7 @@ async fn retry_discards_only_trailing_provisional_agent_cells() {
+             text_elements: Vec::new(),
+             local_image_paths: Vec::new(),
+             remote_image_urls: Vec::new(),
++            persisted_prompt: Default::default(),
+         }) as Arc<dyn HistoryCell>,
+         Arc::new(AgentMessageCell::new(
+             vec![Line::from("partial one")],
+diff --git a/codex-rs/tui/src/app/thread_events.rs b/codex-rs/tui/src/app/thread_events.rs
+index f2e0682f57..773d820a1d 100644
+--- a/codex-rs/tui/src/app/thread_events.rs
++++ b/codex-rs/tui/src/app/thread_events.rs
+@@ -43,6 +43,8 @@ pub(super) struct ThreadEventStore {
+     pub(super) session: Option<ThreadSessionState>,
+     pub(super) turns: Vec<Turn>,
+     pub(super) buffer: VecDeque<ThreadBufferedEvent>,
++    buffer_sequences: VecDeque<u64>,
++    next_sequence: u64,
+     pub(super) pending_interactive_replay: PendingInteractiveReplayState,
+     pub(super) active_turn_id: Option<String>,
+     pub(super) input_state: Option<ThreadInputState>,
+@@ -67,6 +69,8 @@ impl ThreadEventStore {
+             session: None,
+             turns: Vec::new(),
+             buffer: VecDeque::new(),
++            buffer_sequences: VecDeque::new(),
++            next_sequence: 0,
+             pending_interactive_replay: PendingInteractiveReplayState::default(),
+             active_turn_id: None,
+             input_state: None,
+@@ -93,7 +97,16 @@ impl ThreadEventStore {
+     }
+ 
+     pub(super) fn rebase_buffer_after_session_refresh(&mut self) {
+-        self.buffer.retain(Self::event_survives_session_refresh);
++        let mut retained_events = VecDeque::new();
++        let mut retained_sequences = VecDeque::new();
++        for (sequence, event) in self.buffer_sequences.drain(..).zip(self.buffer.drain(..)) {
++            if Self::event_survives_session_refresh(&event) {
++                retained_sequences.push_back(sequence);
++                retained_events.push_back(event);
++            }
++        }
++        self.buffer = retained_events;
++        self.buffer_sequences = retained_sequences;
+     }
+ 
+     pub(super) fn set_turns(&mut self, turns: Vec<Turn>) {
+@@ -149,31 +162,46 @@ impl ThreadEventStore {
+                 | ServerNotification::ProcessOutputDelta(_)
+                 | ServerNotification::ProcessExited(_)
+         ) {
++            self.record_transient_event();
+             return;
+         }
+ 
+-        self.buffer
+-            .push_back(ThreadBufferedEvent::Notification(notification.into_owned()));
+-        if self.buffer.len() > self.capacity
+-            && let Some(removed) = self.buffer.pop_front()
+-            && let ThreadBufferedEvent::Request(request) = &removed
+-        {
+-            self.pending_interactive_replay
+-                .note_evicted_server_request(request);
+-        }
++        self.push_buffered_event(ThreadBufferedEvent::Notification(notification.into_owned()));
+     }
+ 
+     pub(super) fn push_request(&mut self, request: ServerRequest) {
+         self.pending_interactive_replay
+             .note_server_request(&request);
+-        self.buffer.push_back(ThreadBufferedEvent::Request(request));
+-        if self.buffer.len() > self.capacity
+-            && let Some(removed) = self.buffer.pop_front()
+-            && let ThreadBufferedEvent::Request(request) = &removed
+-        {
+-            self.pending_interactive_replay
+-                .note_evicted_server_request(request);
++        self.push_buffered_event(ThreadBufferedEvent::Request(request));
++    }
++
++    pub(super) fn push_buffered_event(&mut self, event: ThreadBufferedEvent) -> u64 {
++        let sequence = self.record_event_sequence();
++        self.buffer.push_back(event);
++        self.buffer_sequences.push_back(sequence);
++        if self.buffer.len() > self.capacity {
++            self.buffer_sequences.pop_front();
++            if let Some(removed) = self.buffer.pop_front()
++                && let ThreadBufferedEvent::Request(request) = &removed
++            {
++                self.pending_interactive_replay
++                    .note_evicted_server_request(request);
++            }
+         }
++        sequence
++    }
++
++    pub(super) fn record_transient_event(&mut self) -> u64 {
++        self.record_event_sequence()
++    }
++
++    fn record_event_sequence(&mut self) -> u64 {
++        self.next_sequence = self.next_sequence.saturating_add(1);
++        self.next_sequence
++    }
++
++    pub(super) fn event_sequence(&self) -> u64 {
++        self.next_sequence
+     }
+ 
+     pub(super) fn pending_replay_requests(&self) -> Vec<ServerRequest> {
+@@ -230,26 +258,58 @@ impl ThreadEventStore {
+     }
+ 
+     pub(super) fn snapshot(&self) -> ThreadEventSnapshot {
+-        ThreadEventSnapshot {
+-            session: self.session.clone(),
+-            turns: self.turns.clone(),
++        self.snapshot_after(/*event_sequence*/ None)
++            .expect("a full snapshot cannot be stale")
++    }
++
++    pub(super) fn snapshot_after(
++        &self,
++        event_sequence: Option<u64>,
++    ) -> Option<ThreadEventSnapshot> {
++        let requested_delta = event_sequence.is_some();
++        let event_sequence = event_sequence.unwrap_or_default();
++        if event_sequence > self.next_sequence {
++            return None;
++        }
++        if requested_delta {
++            let expected_events = self.next_sequence.saturating_sub(event_sequence);
++            let retained_events = self
++                .buffer_sequences
++                .iter()
++                .filter(|sequence| **sequence > event_sequence)
++                .count() as u64;
++            if retained_events != expected_events {
++                return None;
++            }
++        }
++        Some(ThreadEventSnapshot {
++            session: (!requested_delta).then(|| self.session.clone()).flatten(),
++            turns: if requested_delta {
++                Vec::new()
++            } else {
++                self.turns.clone()
++            },
+             // Thread switches replay buffered events into a rebuilt ChatWidget. Only replay
+             // interactive prompts that are still pending, or answered approvals/input will reappear.
+             events: self
+-                .buffer
++                .buffer_sequences
+                 .iter()
+-                .filter(|event| match event {
++                .zip(&self.buffer)
++                .filter(|(sequence, _)| **sequence > event_sequence)
++                .filter_map(|(_, event)| match event {
+                     ThreadBufferedEvent::Request(request) => self
+                         .pending_interactive_replay
+-                        .should_replay_snapshot_request(request),
++                        .should_replay_snapshot_request(request)
++                        .then(|| event.clone()),
+                     ThreadBufferedEvent::Notification(_)
+                     | ThreadBufferedEvent::HistoryEntryResponse(_)
+-                    | ThreadBufferedEvent::FeedbackSubmission(_) => true,
++                    | ThreadBufferedEvent::FeedbackSubmission(_) => Some(event.clone()),
+                 })
+-                .cloned()
+                 .collect(),
+-            input_state: self.input_state.clone(),
+-        }
++            input_state: (!requested_delta)
++                .then(|| self.input_state.clone())
++                .flatten(),
++        })
+     }
+ 
+     pub(super) fn note_outbound_op<T>(&mut self, op: T)
+@@ -705,4 +765,49 @@ mod tests {
+             serde_json::to_value(notification).expect("MCP notification should serialize"),
+         );
+     }
++
++    #[test]
++    fn cached_presentation_snapshot_replays_only_later_events() {
++        let thread_id = ThreadId::new();
++        let session = test_thread_session(thread_id, test_path_buf("/tmp/project"));
++        let turns = vec![test_turn("turn-0", TurnStatus::Completed, Vec::new())];
++        let mut store = ThreadEventStore::new_with_session(/*capacity*/ 8, session, turns);
++        store.push_notification(turn_started_notification(thread_id, "turn-1"));
++        let cached_sequence = store.event_sequence();
++        let expected = turn_completed_notification(thread_id, "turn-1", TurnStatus::Completed);
++        store.push_notification(expected.clone());
++
++        let snapshot = store
++            .snapshot_after(Some(cached_sequence))
++            .expect("cached event sequence should still be retained");
++
++        assert_eq!(snapshot.session, None);
++        assert!(snapshot.turns.is_empty());
++        assert!(snapshot.input_state.is_none());
++        let [ThreadBufferedEvent::Notification(actual)] = snapshot.events.as_slice() else {
++            panic!("expected one delta notification");
++        };
++        assert_eq!(
++            serde_json::to_value(actual).expect("notification should serialize"),
++            serde_json::to_value(expected).expect("notification should serialize")
++        );
++    }
++
++    #[test]
++    fn cached_presentation_snapshot_rejects_evicted_or_transient_gaps() {
++        let thread_id = ThreadId::new();
++        let mut store = ThreadEventStore::new(/*capacity*/ 1);
++        let cached_sequence = store.event_sequence();
++        store.push_notification(turn_started_notification(thread_id, "turn-1"));
++        store.push_notification(turn_completed_notification(
++            thread_id,
++            "turn-1",
++            TurnStatus::Completed,
++        ));
++        assert!(store.snapshot_after(Some(cached_sequence)).is_none());
++
++        let cached_sequence = store.event_sequence();
++        store.record_transient_event();
++        assert!(store.snapshot_after(Some(cached_sequence)).is_none());
++    }
+ }
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+index 6ddaed1320..0dd78a0178 100644
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -107,6 +107,7 @@ impl App {
+         self.refresh_pending_thread_approvals().await;
+     }
+ 
++    #[cfg(test)]
+     pub(super) async fn store_active_thread_receiver(&mut self) {
+         let Some(active_id) = self.active_thread_id else {
+             return;
+@@ -123,16 +124,68 @@ impl App {
+         }
+     }
+ 
++    pub(super) async fn freeze_active_thread_presentation(&mut self) -> u64 {
++        let Some(active_id) = self.active_thread_id else {
++            return 0;
++        };
++        let Some(mut receiver) = self.active_thread_rx.take() else {
++            return self
++                .thread_event_sequence(active_id)
++                .await
++                .unwrap_or_default();
++        };
++        let Some(channel) = self.thread_event_channels.get_mut(&active_id) else {
++            return 0;
++        };
++        let (event_sequence, drained) = {
++            let mut store = channel.store.lock().await;
++            store.active = false;
++            let event_sequence = store.event_sequence();
++            let mut drained = Vec::new();
++            loop {
++                match receiver.try_recv() {
++                    Ok(event) => drained.push(event),
++                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
++                }
++            }
++            channel.receiver = Some(receiver);
++            (event_sequence, drained)
++        };
++        for event in drained {
++            self.handle_thread_event_now(event);
++        }
++        let input_state = self.chat_widget.capture_thread_input_state();
++        if let Some(channel) = self.thread_event_channels.get(&active_id) {
++            channel.store.lock().await.input_state = input_state;
++        }
++        event_sequence
++    }
++
++    pub(super) async fn thread_event_sequence(&self, thread_id: ThreadId) -> Option<u64> {
++        let channel = self.thread_event_channels.get(&thread_id)?;
++        Some(channel.store.lock().await.event_sequence())
++    }
++
+     pub(super) async fn activate_thread_for_replay(
+         &mut self,
+         thread_id: ThreadId,
+-    ) -> Option<(mpsc::Receiver<ThreadBufferedEvent>, ThreadEventSnapshot)> {
++        cached_event_sequence: Option<u64>,
++    ) -> Option<(
++        mpsc::Receiver<ThreadBufferedEvent>,
++        ThreadEventSnapshot,
++        bool,
++    )> {
+         let channel = self.thread_event_channels.get_mut(&thread_id)?;
+         let receiver = channel.receiver.take()?;
+         let mut store = channel.store.lock().await;
+         store.active = true;
+-        let mut snapshot = store.snapshot();
+-        if let Some(active_turn_id) = store.active_turn_id()
++        let (mut snapshot, reused_cached_presentation) =
++            match cached_event_sequence.and_then(|sequence| store.snapshot_after(Some(sequence))) {
++                Some(snapshot) => (snapshot, true),
++                None => (store.snapshot(), false),
++            };
++        if !reused_cached_presentation
++            && let Some(active_turn_id) = store.active_turn_id()
+             && !snapshot.turns.iter().any(|turn| {
+                 turn.id == active_turn_id && matches!(turn.status, TurnStatus::InProgress)
+             })
+@@ -156,7 +209,7 @@ impl App {
+                 duration_ms: None,
+             });
+         }
+-        Some((receiver, snapshot))
++        Some((receiver, snapshot, reused_cached_presentation))
+     }
+ 
+     pub(super) async fn clear_active_thread(&mut self) {
+@@ -1228,17 +1281,9 @@ impl App {
+             // retaining another deep copy for thread replay only accumulates already-delivered
+             // history data. Inactive responses still need the buffer because they are not sent.
+             if !should_send || !matches!(&event, HistoryLookupResponse::Batch { .. }) {
+-                guard
+-                    .buffer
+-                    .push_back(ThreadBufferedEvent::HistoryEntryResponse(event.clone()));
+-                if guard.buffer.len() > guard.capacity
+-                    && let Some(removed) = guard.buffer.pop_front()
+-                    && let ThreadBufferedEvent::Request(request) = &removed
+-                {
+-                    guard
+-                        .pending_interactive_replay
+-                        .note_evicted_server_request(request);
+-                }
++                guard.push_buffered_event(ThreadBufferedEvent::HistoryEntryResponse(event.clone()));
++            } else {
++                guard.record_transient_event();
+             }
+             should_send
+         };
+@@ -1463,9 +1508,23 @@ impl App {
+             self.agent_navigation.mark_parent_owned(thread_id);
+         }
+         let AppServerStartedThread { session, turns, .. } = started;
++        let mut active_turn_id = None;
+         if let Some(channel) = self.thread_event_channels.get(&thread_id) {
+             let mut store = channel.store.lock().await;
++            active_turn_id =
++                store
++                    .active_turn_id()
++                    .map(ToOwned::to_owned)
++                    .filter(|active_turn_id| {
++                        !turns.iter().any(|turn| {
++                            turn.id == *active_turn_id
++                                && !matches!(turn.status, TurnStatus::InProgress)
++                        })
++                    });
+             store.set_session(session.clone(), turns.clone());
++            if let Some(active_turn_id) = active_turn_id.as_deref() {
++                store.active_turn_id = Some(active_turn_id.to_string());
++            }
+             store.rebase_buffer_after_session_refresh();
+         }
+         snapshot.session = Some(session);
+@@ -1473,6 +1532,22 @@ impl App {
+         snapshot
+             .events
+             .retain(ThreadEventStore::event_survives_session_refresh);
++        if let Some(active_turn_id) = active_turn_id
++            && !snapshot.turns.iter().any(|turn| {
++                turn.id == active_turn_id && matches!(turn.status, TurnStatus::InProgress)
++            })
++        {
++            snapshot.turns.push(Turn {
++                id: active_turn_id,
++                items_view: codex_app_server_protocol::TurnItemsView::NotLoaded,
++                items: Vec::new(),
++                status: TurnStatus::InProgress,
++                error: None,
++                started_at: None,
++                completed_at: None,
++                duration_ms: None,
++            });
++        }
+     }
+ 
+     /// Opens the `/agent` picker after refreshing cached labels for known threads.
+diff --git a/codex-rs/tui/src/app_backtrack.rs b/codex-rs/tui/src/app_backtrack.rs
+index f4114a3f90..9292dcfa27 100644
+--- a/codex-rs/tui/src/app_backtrack.rs
++++ b/codex-rs/tui/src/app_backtrack.rs
+@@ -27,13 +27,12 @@ use std::sync::Arc;
+ use crate::app::App;
+ use crate::app_event::AppEvent;
+ use crate::bottom_pane::LocalImageAttachment;
+-use crate::chatwidget::ChatWidget;
+ use crate::chatwidget::UserMessage;
+-use crate::chatwidget::mention_bindings_from_user_inputs;
+ #[cfg(test)]
+ use crate::history_cell::AgentMessageCell;
+ use crate::history_cell::SessionInfoCell;
+ use crate::history_cell::UserHistoryCell;
++use crate::history_cell::UserPromptIdentity;
+ use crate::pager_overlay::Overlay;
+ use crate::tui;
+ use crate::tui::TuiEvent;
+@@ -43,7 +42,6 @@ use codex_app_server_protocol::TurnStatus;
+ use codex_protocol::ThreadId;
+ use codex_protocol::models::local_image_label_text;
+ use color_eyre::eyre::Result;
+-use color_eyre::eyre::bail;
+ use crossterm::event::KeyCode;
+ use crossterm::event::KeyEvent;
+ use crossterm::event::KeyEventKind;
+@@ -76,6 +74,7 @@ pub(crate) struct BacktrackSelection {
+     pub(crate) thread_id: ThreadId,
+     /// The selected user message, counted from the most recent session start.
+     pub(crate) nth_user_message: usize,
++    pub(crate) persisted_prompt: UserPromptIdentity,
+     pub(crate) prompt: UserMessage,
+ }
+ 
+@@ -175,7 +174,7 @@ impl App {
+ 
+         self.app_event_tx.send(AppEvent::ForkSessionForPromptEdit {
+             thread_id: selection.thread_id,
+-            nth_user_message: selection.nth_user_message,
++            persisted_prompt: selection.persisted_prompt,
+             prompt: selection.prompt,
+         });
+     }
+@@ -439,6 +438,8 @@ impl App {
+         let selected = nth_user_position(&self.transcript_cells, nth_user_message)
+             .and_then(|idx| self.transcript_cells.get(idx))
+             .and_then(|cell| cell.as_any().downcast_ref::<UserHistoryCell>())?;
++        let persisted_prompt = selected.persisted_prompt()?.clone();
++        let mention_bindings = persisted_prompt.mention_bindings.clone();
+         let local_images = selected
+             .local_image_paths
+             .iter()
+@@ -452,97 +453,18 @@ impl App {
+         Some(BacktrackSelection {
+             thread_id: base_id,
+             nth_user_message,
++            persisted_prompt,
+             prompt: UserMessage {
+                 text: selected.message.clone(),
+                 local_images,
+                 remote_image_urls: selected.remote_image_urls.clone(),
+                 text_elements: selected.text_elements.clone(),
+-                mention_bindings: Vec::new(),
++                mention_bindings,
+             },
+         })
+     }
+ }
+ 
+-/// Find the persisted turn that contains a selected transcript prompt.
+-///
+-/// Replay hides review prompts and other display-empty inputs, so the selected ordinal must be
+-/// resolved against the same visible projection before restoring its canonical mention bindings.
+-///
+-/// A turn can contain multiple user messages when it was steered. Only its initial prompt can be
+-/// reopened independently because app-server cannot fork in the middle of a turn.
+-pub(crate) fn backtrack_fork_before_turn_id(
+-    turns: &[Turn],
+-    nth_user_message: usize,
+-    prompt: &mut UserMessage,
+-) -> Result<Option<String>> {
+-    let mut visible_user_messages_seen = 0_usize;
+-    let mut review_mode = false;
+-    for (turn_index, turn) in turns.iter().enumerate() {
+-        let hidden_nested_review_turn = turn_index
+-            .checked_sub(/*rhs*/ 1)
+-            .and_then(|index| turns.get(index))
+-            .is_some_and(|previous| is_hidden_nested_review_turn(previous, turn));
+-        let mut user_messages_in_turn = 0_usize;
+-        for item in &turn.items {
+-            let content = match item {
+-                ThreadItem::EnteredReviewMode { .. } => {
+-                    review_mode = true;
+-                    continue;
+-                }
+-                ThreadItem::ExitedReviewMode { .. } => {
+-                    review_mode = false;
+-                    continue;
+-                }
+-                ThreadItem::UserMessage { content, .. } => content,
+-                _ => continue,
+-            };
+-            let is_steer = user_messages_in_turn > 0;
+-            user_messages_in_turn = user_messages_in_turn.saturating_add(/*rhs*/ 1);
+-            if review_mode {
+-                continue;
+-            }
+-
+-            let display = ChatWidget::user_message_display_from_inputs(content);
+-            if hidden_nested_review_turn {
+-                continue;
+-            }
+-            if display.message.trim().is_empty()
+-                && display.text_elements.is_empty()
+-                && display.local_images.is_empty()
+-                && display.remote_image_urls.is_empty()
+-            {
+-                continue;
+-            }
+-            if visible_user_messages_seen != nth_user_message {
+-                visible_user_messages_seen =
+-                    visible_user_messages_seen.saturating_add(/*rhs*/ 1);
+-                continue;
+-            }
+-
+-            if is_steer {
+-                bail!("the selected prompt is a steer and cannot be branched independently");
+-            }
+-            if matches!(turn.status, TurnStatus::InProgress) {
+-                bail!("the selected prompt belongs to a turn that is still in progress");
+-            }
+-
+-            let selected_local_images = prompt.local_images.iter().map(|image| &image.path);
+-            if prompt.text != display.message
+-                || prompt.text_elements != display.text_elements
+-                || prompt.remote_image_urls != display.remote_image_urls
+-                || !selected_local_images.eq(display.local_images.iter())
+-            {
+-                bail!("the selected transcript prompt no longer matches the persisted thread");
+-            }
+-            prompt.mention_bindings = mention_bindings_from_user_inputs(content, &display.message);
+-
+-            return Ok((turn_index > 0).then(|| turn.id.clone()));
+-        }
+-    }
+-
+-    bail!("the selected prompt was not found in the persisted thread")
+-}
+-
+ /// Returns whether a turn is the reconstructed inline-review child with duplicated prompt inputs.
+ pub(crate) fn is_hidden_nested_review_turn(previous: &Turn, turn: &Turn) -> bool {
+     if previous.status != TurnStatus::Completed
+@@ -641,13 +563,10 @@ fn agent_group_positions_iter(
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use crate::bottom_pane::MentionBinding;
+     use crate::history_cell::AgentMessageCell;
+     use crate::history_cell::HistoryCell;
+-    use codex_app_server_protocol::UserInput;
+     use pretty_assertions::assert_eq;
+     use ratatui::prelude::Line;
+-    use std::path::PathBuf;
+     use std::sync::Arc;
+ 
+     fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
+@@ -662,303 +581,6 @@ mod tests {
+             .collect()
+     }
+ 
+-    fn turn(turn_id: &str, status: TurnStatus, user_messages: usize) -> Turn {
+-        Turn {
+-            id: turn_id.to_string(),
+-            items: (0..user_messages)
+-                .map(|index| ThreadItem::UserMessage {
+-                    id: format!("user-{index}"),
+-                    client_id: None,
+-                    content: vec![UserInput::Text {
+-                        text: format!("{turn_id}-prompt-{index}"),
+-                        text_elements: Vec::new(),
+-                    }],
+-                })
+-                .collect(),
+-            items_view: codex_app_server_protocol::TurnItemsView::Full,
+-            status,
+-            error: None,
+-            started_at: None,
+-            completed_at: None,
+-            duration_ms: None,
+-        }
+-    }
+-
+-    fn prompt(text: &str) -> UserMessage {
+-        UserMessage {
+-            text: text.to_string(),
+-            local_images: Vec::new(),
+-            remote_image_urls: Vec::new(),
+-            text_elements: Vec::new(),
+-            mention_bindings: Vec::new(),
+-        }
+-    }
+-
+-    #[test]
+-    fn backtrack_fork_before_turn_id_resolves_first_and_later_prompts() {
+-        let turns = vec![
+-            turn("turn-1", TurnStatus::Completed, /*user_messages*/ 1),
+-            turn(
+-                "turn-compaction",
+-                TurnStatus::Completed,
+-                /*user_messages*/ 0,
+-            ),
+-            turn("turn-2", TurnStatus::Completed, /*user_messages*/ 1),
+-        ];
+-
+-        assert_eq!(
+-            backtrack_fork_before_turn_id(
+-                &turns,
+-                /*nth_user_message*/ 0,
+-                &mut prompt("turn-1-prompt-0"),
+-            )
+-            .expect("first prompt should resolve"),
+-            None
+-        );
+-        assert_eq!(
+-            backtrack_fork_before_turn_id(
+-                &turns,
+-                /*nth_user_message*/ 1,
+-                &mut prompt("turn-2-prompt-0"),
+-            )
+-            .expect("later prompt should resolve"),
+-            Some("turn-2".to_string())
+-        );
+-    }
+-
+-    #[test]
+-    fn backtrack_fork_before_turn_id_rejects_mid_turn_steers() {
+-        let turns = vec![turn(
+-            "turn-1",
+-            TurnStatus::Completed,
+-            /*user_messages*/ 2,
+-        )];
+-
+-        let error = backtrack_fork_before_turn_id(
+-            &turns,
+-            /*nth_user_message*/ 1,
+-            &mut prompt("turn-1-prompt-1"),
+-        )
+-        .expect_err("a steer cannot be branched independently");
+-
+-        assert_eq!(
+-            error.to_string(),
+-            "the selected prompt is a steer and cannot be branched independently"
+-        );
+-    }
+-
+-    #[test]
+-    fn backtrack_fork_before_turn_id_rejects_in_progress_and_missing_prompts() {
+-        let turns = vec![turn(
+-            "turn-1",
+-            TurnStatus::InProgress,
+-            /*user_messages*/ 1,
+-        )];
+-
+-        assert_eq!(
+-            backtrack_fork_before_turn_id(
+-                &turns,
+-                /*nth_user_message*/ 0,
+-                &mut prompt("turn-1-prompt-0"),
+-            )
+-            .expect_err("in-progress prompt cannot be branched")
+-            .to_string(),
+-            "the selected prompt belongs to a turn that is still in progress"
+-        );
+-        assert_eq!(
+-            backtrack_fork_before_turn_id(
+-                &turns,
+-                /*nth_user_message*/ 1,
+-                &mut prompt("missing prompt"),
+-            )
+-            .expect_err("missing prompt cannot be branched")
+-            .to_string(),
+-            "the selected prompt was not found in the persisted thread"
+-        );
+-
+-        let completed_turns = vec![turn(
+-            "turn-1",
+-            TurnStatus::Completed,
+-            /*user_messages*/ 1,
+-        )];
+-        assert_eq!(
+-            backtrack_fork_before_turn_id(
+-                &completed_turns,
+-                /*nth_user_message*/ 0,
+-                &mut prompt("different prompt"),
+-            )
+-            .expect_err("a stale transcript prompt cannot be branched")
+-            .to_string(),
+-            "the selected transcript prompt no longer matches the persisted thread"
+-        );
+-    }
+-
+-    #[test]
+-    fn backtrack_fork_before_turn_id_skips_hidden_review_prompts() {
+-        let mut review_turn = turn(
+-            "turn-review",
+-            TurnStatus::Completed,
+-            /*user_messages*/ 1,
+-        );
+-        review_turn.items.insert(
+-            /*index*/ 0,
+-            ThreadItem::EnteredReviewMode {
+-                id: "review-start".to_string(),
+-                review: "changes against main".to_string(),
+-            },
+-        );
+-        review_turn.items.push(ThreadItem::ExitedReviewMode {
+-            id: "review-end".to_string(),
+-            review: "review complete".to_string(),
+-        });
+-        let turns = vec![
+-            turn("turn-1", TurnStatus::Completed, /*user_messages*/ 1),
+-            review_turn,
+-            turn("turn-2", TurnStatus::Completed, /*user_messages*/ 1),
+-        ];
+-
+-        assert_eq!(
+-            backtrack_fork_before_turn_id(
+-                &turns,
+-                /*nth_user_message*/ 1,
+-                &mut prompt("turn-2-prompt-0"),
+-            )
+-            .expect("the visible prompt after review should resolve"),
+-            Some("turn-2".to_string())
+-        );
+-    }
+-
+-    #[test]
+-    fn backtrack_fork_before_turn_id_skips_hidden_nested_review_prompts() {
+-        let review_hint = "current changes";
+-        let review_prompt =
+-            "Review the current code changes (staged, unstaged, and untracked files).";
+-        let review_turn = Turn {
+-            items: vec![
+-                ThreadItem::EnteredReviewMode {
+-                    id: "review-start".to_string(),
+-                    review: review_hint.to_string(),
+-                },
+-                ThreadItem::ExitedReviewMode {
+-                    id: "review-end".to_string(),
+-                    review: "review complete".to_string(),
+-                },
+-            ],
+-            ..turn(
+-                "turn-review",
+-                TurnStatus::Completed,
+-                /*user_messages*/ 0,
+-            )
+-        };
+-        let review_child_turn = Turn {
+-            items: (0..2)
+-                .map(|index| ThreadItem::UserMessage {
+-                    id: format!("review-prompt-{index}"),
+-                    client_id: None,
+-                    content: vec![UserInput::Text {
+-                        text: review_prompt.to_string(),
+-                        text_elements: Vec::new(),
+-                    }],
+-                })
+-                .collect(),
+-            ..turn(
+-                "turn-review-child",
+-                TurnStatus::Interrupted,
+-                /*user_messages*/ 0,
+-            )
+-        };
+-        let interrupted_steered_turn = Turn {
+-            items: review_child_turn.items.clone(),
+-            completed_at: Some(1),
+-            ..turn(
+-                "turn-interrupted-steer",
+-                TurnStatus::Interrupted,
+-                /*user_messages*/ 0,
+-            )
+-        };
+-        assert!(!is_hidden_nested_review_turn(
+-            &review_turn,
+-            &interrupted_steered_turn,
+-        ));
+-        let turns = vec![
+-            review_turn,
+-            review_child_turn,
+-            turn("turn-2", TurnStatus::Completed, /*user_messages*/ 1),
+-        ];
+-
+-        assert_eq!(
+-            backtrack_fork_before_turn_id(
+-                &turns,
+-                /*nth_user_message*/ 0,
+-                &mut prompt("turn-2-prompt-0"),
+-            )
+-            .expect("the visible prompt after a nested review should resolve"),
+-            Some("turn-2".to_string())
+-        );
+-    }
+-
+-    #[test]
+-    fn backtrack_fork_before_turn_id_restores_canonical_mention_bindings() {
+-        let mut selected_turn = turn("turn-2", TurnStatus::Completed, /*user_messages*/ 1);
+-        selected_turn.items = vec![ThreadItem::UserMessage {
+-            id: "selected-prompt".to_string(),
+-            client_id: None,
+-            content: vec![
+-                UserInput::Text {
+-                    text: "use $skill @sample $google-calendar".to_string(),
+-                    text_elements: Vec::new(),
+-                },
+-                UserInput::Skill {
+-                    name: "skill".to_string(),
+-                    path: PathBuf::from("/tmp/skills/skill/SKILL.md"),
+-                },
+-                UserInput::Mention {
+-                    name: "Sample Plugin".to_string(),
+-                    path: "plugin://sample@test".to_string(),
+-                },
+-                UserInput::Mention {
+-                    name: "Google Calendar".to_string(),
+-                    path: "app://google_calendar".to_string(),
+-                },
+-            ],
+-        }];
+-        let turns = vec![
+-            turn("turn-1", TurnStatus::Completed, /*user_messages*/ 1),
+-            selected_turn,
+-        ];
+-        let mut selected_prompt = prompt("use $skill @sample $google-calendar");
+-
+-        assert_eq!(
+-            backtrack_fork_before_turn_id(
+-                &turns,
+-                /*nth_user_message*/ 1,
+-                &mut selected_prompt,
+-            )
+-            .expect("the selected prompt should resolve"),
+-            Some("turn-2".to_string())
+-        );
+-        assert_eq!(
+-            selected_prompt.mention_bindings,
+-            vec![
+-                MentionBinding {
+-                    sigil: '$',
+-                    mention: "skill".to_string(),
+-                    path: "/tmp/skills/skill/SKILL.md".to_string(),
+-                },
+-                MentionBinding {
+-                    sigil: '@',
+-                    mention: "sample".to_string(),
+-                    path: "plugin://sample@test".to_string(),
+-                },
+-                MentionBinding {
+-                    sigil: '$',
+-                    mention: "google-calendar".to_string(),
+-                    path: "app://google_calendar".to_string(),
+-                },
+-            ]
+-        );
+-    }
+-
+     #[test]
+     fn agent_group_count_ignores_context_compacted_marker() {
+         let cells: Vec<Arc<dyn HistoryCell>> = vec![
+@@ -999,6 +621,7 @@ mod tests {
+             text_elements: Vec::new(),
+             local_image_paths: Vec::new(),
+             remote_image_urls: Vec::new(),
++            persisted_prompt: Default::default(),
+         }) as Arc<dyn HistoryCell>);
+ 
+         assert!(has_backtrack_target(&cells));
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+index 73ffac48ae..a245c91e21 100644
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -293,7 +293,7 @@ pub(crate) enum AppEvent {
+     /// Branch before a selected prompt and reopen it in the new thread's composer.
+     ForkSessionForPromptEdit {
+         thread_id: ThreadId,
+-        nth_user_message: usize,
++        persisted_prompt: crate::history_cell::UserPromptIdentity,
+         prompt: UserMessage,
+     },
+ 
+@@ -729,6 +729,7 @@ pub(crate) enum AppEvent {
+     BeginThreadSwitchHistoryReplayBuffer,
+ 
+     InsertHistoryCell(Box<dyn HistoryCell>),
++    BindPersistedUserPrompt(crate::history_cell::UserPromptIdentity),
+ 
+     /// Finish buffering initial resume replay after all replay events have been queued.
+     EndInitialHistoryReplayBuffer,
+diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+index da157929fc..7293e7f28e 100644
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -64,6 +64,8 @@ use codex_app_server_protocol::ThreadCompactStartParams;
+ use codex_app_server_protocol::ThreadCompactStartResponse;
+ use codex_app_server_protocol::ThreadDeleteParams;
+ use codex_app_server_protocol::ThreadDeleteResponse;
++use codex_app_server_protocol::ThreadForkBeforePromptParams;
++use codex_app_server_protocol::ThreadForkBeforePromptResponse;
+ use codex_app_server_protocol::ThreadForkParams;
+ use codex_app_server_protocol::ThreadForkResponse;
+ use codex_app_server_protocol::ThreadGoalClearParams;
+@@ -629,6 +631,44 @@ impl AppServerSession {
+         .await
+     }
+ 
++    pub(crate) async fn fork_thread_before_prompt(
++        &mut self,
++        config: Config,
++        thread_id: ThreadId,
++        turn_id: String,
++        item_id: String,
++    ) -> Result<AppServerStartedThread> {
++        let request_id = self.next_request_id();
++        let session_config = self.session_config_with_effective_service_tier(&config);
++        let response: ThreadForkBeforePromptResponse = self
++            .client
++            .request_typed(ClientRequest::ThreadForkBeforePrompt {
++                request_id,
++                params: ThreadForkBeforePromptParams {
++                    fork: thread_fork_params_from_config(
++                        session_config,
++                        thread_id,
++                        self.thread_params_mode(),
++                        self.remote_cwd_override.as_deref(),
++                    ),
++                    turn_id,
++                    item_id,
++                },
++            })
++            .await
++            .map_err(|err| {
++                bootstrap_request_error("thread/forkBeforePrompt failed during TUI bootstrap", err)
++            })?;
++        let response = response.fork;
++        let fork_parent_title = self
++            .fork_parent_title_from_app_server(response.thread.forked_from_id.as_deref())
++            .await;
++        let mut started =
++            started_thread_from_fork_response(response, &config, self.thread_params_mode()).await?;
++        started.session.fork_parent_title = fork_parent_title;
++        Ok(started)
++    }
++
+     pub(crate) async fn fork_side_thread(
+         &mut self,
+         config: Config,
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index ff16fb970f..f0974cec1b 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -1288,8 +1288,18 @@ impl ChatWidget {
+         self.request_redraw();
+     }
+ 
+-    fn on_committed_user_message(&mut self, items: &[UserInput], from_replay: bool) {
++    fn on_committed_user_message(
++        &mut self,
++        items: &[UserInput],
++        from_replay: bool,
++        mut persisted_prompt: Option<history_cell::UserPromptIdentity>,
++    ) {
+         let display = Self::user_message_display_from_inputs(items);
++        if let Some(persisted_prompt) = persisted_prompt.as_mut() {
++            persisted_prompt.mention_bindings =
++                mention_bindings_from_user_inputs(items, &display.message);
++        }
++        let mut inserted_identity_with_cell = false;
+         if from_replay {
+             if self.review.is_review_mode {
+                 return;
+@@ -1303,7 +1313,7 @@ impl ChatWidget {
+                     mention_bindings: mention_bindings_from_user_inputs(items, &display.message),
+                     pending_pastes: Vec::new(),
+                 });
+-            self.on_user_message_display(display);
++            self.on_user_message_display(display, persisted_prompt);
+             return;
+         }
+ 
+@@ -1318,32 +1328,47 @@ impl ChatWidget {
+                 self.refresh_pending_input_preview();
+                 let pending_display =
+                     user_message_display_for_history(pending.user_message, &pending.history_record);
+-                self.on_user_message_display(pending_display);
++                inserted_identity_with_cell = persisted_prompt.is_some();
++                self.on_user_message_display(pending_display, persisted_prompt.clone());
+             } else if self.last_rendered_user_message_display.as_ref() != Some(&display) {
+                 tracing::warn!(
+                     "pending steer matched compare key but queue was empty when rendering committed user message"
+                 );
+-                self.on_user_message_display(display);
++                inserted_identity_with_cell = persisted_prompt.is_some();
++                self.on_user_message_display(display, persisted_prompt.clone());
+             }
+         } else if !self.review.is_review_mode
+             && self.last_rendered_user_message_display.as_ref() != Some(&display)
+         {
+-            self.on_user_message_display(display);
++            inserted_identity_with_cell = persisted_prompt.is_some();
++            self.on_user_message_display(display, persisted_prompt.clone());
++        }
++        if !inserted_identity_with_cell
++            && !self.review.is_review_mode
++            && let Some(persisted_prompt) = persisted_prompt
++        {
++            self.app_event_tx
++                .send(AppEvent::BindPersistedUserPrompt(persisted_prompt));
+         }
+     }
+ 
+-    fn on_user_message_display(&mut self, display: UserMessageDisplay) {
++    fn on_user_message_display(
++        &mut self,
++        display: UserMessageDisplay,
++        persisted_prompt: Option<history_cell::UserPromptIdentity>,
++    ) {
+         self.last_rendered_user_message_display = Some(display.clone());
+         if !display.message.trim().is_empty()
+             || !display.text_elements.is_empty()
+             || !display.local_images.is_empty()
+             || !display.remote_image_urls.is_empty()
+         {
+-            self.add_to_history(history_cell::new_user_prompt(
++            self.add_to_history(history_cell::new_user_prompt_with_identity(
+                 display.message,
+                 display.text_elements,
+                 display.local_images,
+                 display.remote_image_urls,
++                persisted_prompt,
+             ));
+         }
+ 
+diff --git a/codex-rs/tui/src/chatwidget/input_submission.rs b/codex-rs/tui/src/chatwidget/input_submission.rs
+index 8cdacccc8b..0430213220 100644
+--- a/codex-rs/tui/src/chatwidget/input_submission.rs
++++ b/codex-rs/tui/src/chatwidget/input_submission.rs
+@@ -396,10 +396,10 @@ impl ChatWidget {
+         let render_before_submit =
+             render_in_history && matches!(&self.codex_op_target, CodexOpTarget::AppEvent);
+         if render_before_submit {
+-            self.on_user_message_display(user_message_display_for_history(
+-                submitted_message.clone(),
+-                &history_record,
+-            ));
++            self.on_user_message_display(
++                user_message_display_for_history(submitted_message.clone(), &history_record),
++                None,
++            );
+         }
+ 
+         if !self.submit_op(op.clone()) {
+@@ -447,10 +447,10 @@ impl ChatWidget {
+         if render_in_history {
+             self.safety_buffering_prompt = Some(submitted_message.clone());
+             if !render_before_submit {
+-                self.on_user_message_display(user_message_display_for_history(
+-                    submitted_message,
+-                    &history_record,
+-                ));
++                self.on_user_message_display(
++                    user_message_display_for_history(submitted_message, &history_record),
++                    None,
++                );
+             }
+         }
+ 
+diff --git a/codex-rs/tui/src/chatwidget/replay.rs b/codex-rs/tui/src/chatwidget/replay.rs
+index fad6eb8473..1119a4fe15 100644
+--- a/codex-rs/tui/src/chatwidget/replay.rs
++++ b/codex-rs/tui/src/chatwidget/replay.rs
+@@ -86,8 +86,16 @@ impl ChatWidget {
+         let from_replay = render_source.is_replay();
+         let replay_kind = render_source.replay_kind();
+         match item {
+-            ThreadItem::UserMessage { content, .. } => {
+-                self.on_committed_user_message(&content, from_replay);
++            ThreadItem::UserMessage { id, content, .. } => {
++                let persisted_prompt = self
++                    .turn_lifecycle
++                    .mark_initial_user_prompt(turn_id.clone())
++                    .then(|| crate::history_cell::UserPromptIdentity {
++                        turn_id: turn_id.clone(),
++                        item_id: id,
++                        mention_bindings: Vec::new(),
++                    });
++                self.on_committed_user_message(&content, from_replay, persisted_prompt);
+             }
+             ThreadItem::AgentMessage {
+                 id,
+diff --git a/codex-rs/tui/src/chatwidget/safety_buffering.rs b/codex-rs/tui/src/chatwidget/safety_buffering.rs
+index be65e5ee58..2f079c9c3f 100644
+--- a/codex-rs/tui/src/chatwidget/safety_buffering.rs
++++ b/codex-rs/tui/src/chatwidget/safety_buffering.rs
+@@ -71,7 +71,7 @@ impl ChatWidget {
+     }
+ 
+     pub(crate) fn commit_safety_buffered_retry_submission(&mut self, display: UserMessageDisplay) {
+-        self.on_user_message_display(display);
++        self.on_user_message_display(display, None);
+     }
+ 
+     pub(crate) fn cancel_safety_buffered_retry_submission(&mut self) {
+diff --git a/codex-rs/tui/src/chatwidget/turn_lifecycle.rs b/codex-rs/tui/src/chatwidget/turn_lifecycle.rs
+index 6ecc29e02f..13145ca41f 100644
+--- a/codex-rs/tui/src/chatwidget/turn_lifecycle.rs
++++ b/codex-rs/tui/src/chatwidget/turn_lifecycle.rs
+@@ -11,6 +11,7 @@ pub(super) struct TurnLifecycleState {
+     /// Tracks whether codex-core currently considers an agent turn to be in progress.
+     pub(super) agent_turn_running: bool,
+     pub(super) last_turn_id: Option<String>,
++    pub(super) canonical_user_prompt_turn_ids: HashSet<String>,
+     pub(super) budget_limited_turn_ids: HashSet<String>,
+     pub(super) goal_status_active_turn_started_at: Option<Instant>,
+ }
+@@ -21,6 +22,7 @@ impl TurnLifecycleState {
+             sleep_inhibitor: SleepInhibitor::new(prevent_idle_sleep),
+             agent_turn_running: false,
+             last_turn_id: None,
++            canonical_user_prompt_turn_ids: HashSet::new(),
+             budget_limited_turn_ids: HashSet::new(),
+             goal_status_active_turn_started_at: None,
+         }
+@@ -48,9 +50,14 @@ impl TurnLifecycleState {
+     pub(super) fn reset_thread(&mut self) {
+         self.finish();
+         self.last_turn_id = None;
++        self.canonical_user_prompt_turn_ids.clear();
+         self.budget_limited_turn_ids.clear();
+     }
+ 
++    pub(super) fn mark_initial_user_prompt(&mut self, turn_id: String) -> bool {
++        self.canonical_user_prompt_turn_ids.insert(turn_id)
++    }
++
+     pub(super) fn set_prevent_idle_sleep(&mut self, enabled: bool) {
+         self.sleep_inhibitor = SleepInhibitor::new(enabled);
+         self.sleep_inhibitor
+diff --git a/codex-rs/tui/src/history_cell/messages.rs b/codex-rs/tui/src/history_cell/messages.rs
+index 86cb1bee1a..3b7fc95eee 100644
+--- a/codex-rs/tui/src/history_cell/messages.rs
++++ b/codex-rs/tui/src/history_cell/messages.rs
+@@ -2,6 +2,14 @@
+ 
+ use super::markdown_render_cache::MarkdownRenderCache;
+ use super::*;
++use std::sync::OnceLock;
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub(crate) struct UserPromptIdentity {
++    pub(crate) turn_id: String,
++    pub(crate) item_id: String,
++    pub(crate) mention_bindings: Vec<crate::bottom_pane::MentionBinding>,
++}
+ 
+ #[derive(Debug)]
+ pub(crate) struct UserHistoryCell {
+@@ -10,6 +18,17 @@ pub(crate) struct UserHistoryCell {
+     #[allow(dead_code)]
+     pub local_image_paths: Vec<PathBuf>,
+     pub remote_image_urls: Vec<String>,
++    pub persisted_prompt: OnceLock<UserPromptIdentity>,
++}
++
++impl UserHistoryCell {
++    pub(crate) fn persisted_prompt(&self) -> Option<&UserPromptIdentity> {
++        self.persisted_prompt.get()
++    }
++
++    pub(crate) fn bind_persisted_prompt(&self, identity: UserPromptIdentity) -> bool {
++        self.persisted_prompt.set(identity).is_ok()
++    }
+ }
+ 
+ /// Remove CSI sequences and control characters, preserving tabs and newlines.
+@@ -529,17 +548,35 @@ impl HistoryCell for StreamingAgentTailCell {
+         !self.is_first_line
+     }
+ }
++#[cfg(test)]
+ pub(crate) fn new_user_prompt(
+     message: String,
+     text_elements: Vec<TextElement>,
+     local_image_paths: Vec<PathBuf>,
+     remote_image_urls: Vec<String>,
++) -> UserHistoryCell {
++    new_user_prompt_with_identity(
++        message,
++        text_elements,
++        local_image_paths,
++        remote_image_urls,
++        None,
++    )
++}
++
++pub(crate) fn new_user_prompt_with_identity(
++    message: String,
++    text_elements: Vec<TextElement>,
++    local_image_paths: Vec<PathBuf>,
++    remote_image_urls: Vec<String>,
++    persisted_prompt: Option<UserPromptIdentity>,
+ ) -> UserHistoryCell {
+     UserHistoryCell {
+         message,
+         text_elements,
+         local_image_paths,
+         remote_image_urls,
++        persisted_prompt: persisted_prompt.map(OnceLock::from).unwrap_or_default(),
+     }
+ }
+ /// Create the reasoning history cell emitted at the end of a reasoning block.
+diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
+index 02aa4c5028..bf122fddaf 100644
+--- a/codex-rs/tui/src/history_cell/tests.rs
++++ b/codex-rs/tui/src/history_cell/tests.rs
+@@ -2075,6 +2075,7 @@ fn user_history_cell_wraps_and_prefixes_each_line_snapshot() {
+         text_elements: Vec::new(),
+         local_image_paths: Vec::new(),
+         remote_image_urls: Vec::new(),
++        persisted_prompt: Default::default(),
+     };
+ 
+     // Small width to force wrapping more clearly. Effective wrap width is width-2 due to the ▌ prefix and trailing space.
+@@ -2093,6 +2094,7 @@ fn user_history_cell_renders_remote_image_urls() {
+         text_elements: Vec::new(),
+         local_image_paths: Vec::new(),
+         remote_image_urls: vec!["https://example.com/example.png".to_string()],
++        persisted_prompt: Default::default(),
+     };
+ 
+     let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+@@ -2109,6 +2111,7 @@ fn user_history_cell_summarizes_inline_data_urls() {
+         text_elements: Vec::new(),
+         local_image_paths: Vec::new(),
+         remote_image_urls: vec!["data:image/png;base64,aGVsbG8=".to_string()],
++        persisted_prompt: Default::default(),
+     };
+ 
+     let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+@@ -2127,6 +2130,7 @@ fn user_history_cell_numbers_multiple_remote_images() {
+             "https://example.com/one.png".to_string(),
+             "https://example.com/two.png".to_string(),
+         ],
++        persisted_prompt: Default::default(),
+     };
+ 
+     let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+@@ -2146,6 +2150,7 @@ fn user_history_cell_height_matches_rendered_lines_with_remote_images() {
+             "https://example.com/one.png".to_string(),
+             "https://example.com/two.png".to_string(),
+         ],
++        persisted_prompt: Default::default(),
+     };
+ 
+     let width = 80;
+@@ -2165,6 +2170,7 @@ fn user_history_cell_trims_trailing_blank_message_lines() {
+         text_elements: Vec::new(),
+         local_image_paths: Vec::new(),
+         remote_image_urls: vec!["https://example.com/one.png".to_string()],
++        persisted_prompt: Default::default(),
+     };
+ 
+     let rendered = render_lines(&cell.display_lines(/*width*/ 80));
+@@ -2188,6 +2194,7 @@ fn user_history_cell_trims_trailing_blank_message_lines_with_text_elements() {
+         )],
+         local_image_paths: Vec::new(),
+         remote_image_urls: vec!["https://example.com/one.png".to_string()],
++        persisted_prompt: Default::default(),
+     };
+ 
+     let rendered = render_lines(&cell.display_lines(/*width*/ 80));
+@@ -2208,6 +2215,7 @@ fn render_uses_wrapping_for_long_url_like_line() {
+         text_elements: Vec::new(),
+         local_image_paths: Vec::new(),
+         remote_image_urls: Vec::new(),
++        persisted_prompt: Default::default(),
+     });
+ 
+     let width: u16 = 52;
+@@ -2651,6 +2659,7 @@ fn wrapped_and_prefixed_cells_handle_tiny_widths() {
+         text_elements: Vec::new(),
+         local_image_paths: Vec::new(),
+         remote_image_urls: Vec::new(),
++        persisted_prompt: Default::default(),
+     };
+     let agent_message_cell = AgentMessageCell::new(
+         vec!["tiny width agent line".into()],
+@@ -2757,6 +2766,7 @@ fn consolidation_walker_replaces_agent_message_cells() {
+         text_elements: Vec::new(),
+         local_image_paths: Vec::new(),
+         remote_image_urls: Vec::new(),
++        persisted_prompt: Default::default(),
+     }) as Arc<dyn HistoryCell>;
+     let head = Arc::new(AgentMessageCell::new(
+         vec![Line::from("line 1")],
+diff --git a/codex-rs/tui/src/thread_transcript.rs b/codex-rs/tui/src/thread_transcript.rs
+index 81edf6e464..d110fd2570 100644
+--- a/codex-rs/tui/src/thread_transcript.rs
++++ b/codex-rs/tui/src/thread_transcript.rs
+@@ -1,14 +1,18 @@
+ //! Render persisted thread turns into history-cell building blocks.
+ 
+ use std::sync::Arc;
++use std::sync::OnceLock;
+ 
+ use crate::app_server_session::AppServerSession;
++use crate::chatwidget::ChatWidget;
++use crate::chatwidget::mention_bindings_from_user_inputs;
+ use crate::git_action_directives::parse_assistant_markdown;
+ use crate::history_cell::AgentMarkdownCell;
+ use crate::history_cell::HistoryCell;
+ use crate::history_cell::PlainHistoryCell;
+ use crate::history_cell::ReasoningSummaryCell;
+ use crate::history_cell::UserHistoryCell;
++use crate::history_cell::UserPromptIdentity;
+ use crate::history_cell::split_reasoning_summary_parts;
+ use crate::inline_visualization::InlineVisualizationContext;
+ use crate::multi_agents::sub_agent_activity_summary;
+@@ -57,80 +61,94 @@ pub(crate) fn thread_to_transcript_cells(
+             .and_then(|thread_id| InlineVisualizationContext::new(codex_home, thread_id))
+     });
+     let mut cells: TranscriptCells = Vec::new();
+-    for item in thread.turns.into_iter().flat_map(|turn| turn.items) {
+-        match item {
+-            ThreadItem::UserMessage {
+-                id,
+-                client_id,
+-                content,
+-            } => {
+-                if content.iter().any(|input| {
+-                    matches!(
+-                        input,
+-                        UserInput::Audio { .. } | UserInput::LocalAudio { .. }
+-                    )
+-                }) {
+-                    tracing::warn!(
+-                        user_message_id = id,
+-                        "audio user inputs are not supported by the TUI and will be omitted"
+-                    );
+-                }
+-                let item = UserMessageItem {
++    for turn in thread.turns {
++        let turn_id = turn.id;
++        let mut initial_user_prompt = true;
++        for item in turn.items {
++            match item {
++                ThreadItem::UserMessage {
+                     id,
+                     client_id,
+-                    content: content
+-                        .into_iter()
+-                        .map(codex_app_server_protocol::UserInput::into_core)
+-                        .collect(),
+-                };
+-                cells.push(Arc::new(UserHistoryCell {
+-                    message: item.message(),
+-                    text_elements: item.text_elements(),
+-                    local_image_paths: item.local_image_paths(),
+-                    remote_image_urls: item.image_urls(),
+-                }));
+-            }
+-            ThreadItem::AgentMessage { text, .. } => {
+-                let parsed = parse_assistant_markdown(&text, cwd.as_path());
+-                if !parsed.visible_markdown.trim().is_empty() {
+-                    cells.push(Arc::new(AgentMarkdownCell::new_with_inline_visualizations(
+-                        parsed.visible_markdown,
+-                        cwd.as_path(),
+-                        inline_visualization_context.clone(),
+-                    )));
++                    content,
++                } => {
++                    let display_message =
++                        ChatWidget::user_message_display_from_inputs(&content).message;
++                    let persisted_prompt = take_user_prompt_identity(
++                        &mut initial_user_prompt,
++                        &turn_id,
++                        &id,
++                        &content,
++                        &display_message,
++                    );
++                    if content.iter().any(|input| {
++                        matches!(
++                            input,
++                            UserInput::Audio { .. } | UserInput::LocalAudio { .. }
++                        )
++                    }) {
++                        tracing::warn!(
++                            user_message_id = id,
++                            "audio user inputs are not supported by the TUI and will be omitted"
++                        );
++                    }
++                    let item = UserMessageItem {
++                        id,
++                        client_id,
++                        content: content
++                            .into_iter()
++                            .map(codex_app_server_protocol::UserInput::into_core)
++                            .collect(),
++                    };
++                    cells.push(Arc::new(UserHistoryCell {
++                        message: item.message(),
++                        text_elements: item.text_elements(),
++                        local_image_paths: item.local_image_paths(),
++                        remote_image_urls: item.image_urls(),
++                        persisted_prompt: persisted_prompt.map(OnceLock::from).unwrap_or_default(),
++                    }));
+                 }
+-            }
+-            ThreadItem::Plan { text, .. } => {
+-                if !text.trim().is_empty() {
+-                    cells.push(Arc::new(crate::history_cell::new_proposed_plan(
+-                        text,
+-                        cwd.as_path(),
+-                    )));
++                ThreadItem::AgentMessage { text, .. } => {
++                    let parsed = parse_assistant_markdown(&text, cwd.as_path());
++                    if !parsed.visible_markdown.trim().is_empty() {
++                        cells.push(Arc::new(AgentMarkdownCell::new_with_inline_visualizations(
++                            parsed.visible_markdown,
++                            cwd.as_path(),
++                            inline_visualization_context.clone(),
++                        )));
++                    }
+                 }
+-            }
+-            ThreadItem::Reasoning {
+-                summary, content, ..
+-            } => {
+-                let (header, text) =
+-                    if matches!(raw_reasoning_visibility, RawReasoningVisibility::Visible)
+-                        && !content.is_empty()
+-                    {
+-                        ("Reasoning".to_string(), content.join("\n\n"))
+-                    } else {
+-                        split_reasoning_summary_parts(&summary)
+-                    };
+-                if !text.trim().is_empty() {
+-                    cells.push(Arc::new(ReasoningSummaryCell::new(
+-                        header,
+-                        text,
+-                        cwd.as_path(),
+-                        /*transcript_only*/ false,
+-                    )));
++                ThreadItem::Plan { text, .. } => {
++                    if !text.trim().is_empty() {
++                        cells.push(Arc::new(crate::history_cell::new_proposed_plan(
++                            text,
++                            cwd.as_path(),
++                        )));
++                    }
+                 }
+-            }
+-            other => {
+-                if let Some(cell) = fallback_transcript_cell(&other) {
+-                    cells.push(Arc::new(cell));
++                ThreadItem::Reasoning {
++                    summary, content, ..
++                } => {
++                    let (header, text) =
++                        if matches!(raw_reasoning_visibility, RawReasoningVisibility::Visible)
++                            && !content.is_empty()
++                        {
++                            ("Reasoning".to_string(), content.join("\n\n"))
++                        } else {
++                            split_reasoning_summary_parts(&summary)
++                        };
++                    if !text.trim().is_empty() {
++                        cells.push(Arc::new(ReasoningSummaryCell::new(
++                            header,
++                            text,
++                            cwd.as_path(),
++                            /*transcript_only*/ false,
++                        )));
++                    }
++                }
++                other => {
++                    if let Some(cell) = fallback_transcript_cell(&other) {
++                        cells.push(Arc::new(cell));
++                    }
+                 }
+             }
+         }
+@@ -143,6 +161,22 @@ pub(crate) fn thread_to_transcript_cells(
+     cells
+ }
+ 
++fn take_user_prompt_identity(
++    initial_user_prompt: &mut bool,
++    turn_id: &str,
++    item_id: &str,
++    content: &[UserInput],
++    display_message: &str,
++) -> Option<UserPromptIdentity> {
++    let identity = (*initial_user_prompt).then(|| UserPromptIdentity {
++        turn_id: turn_id.to_string(),
++        item_id: item_id.to_string(),
++        mention_bindings: mention_bindings_from_user_inputs(content, display_message),
++    });
++    *initial_user_prompt = false;
++    identity
++}
++
+ fn fallback_transcript_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
+     let lines = match item {
+         ThreadItem::HookPrompt { fragments, .. } => fragments
+@@ -258,3 +292,45 @@ fn fallback_transcript_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
+     };
+     (!lines.is_empty()).then(|| PlainHistoryCell::new(lines))
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::path::PathBuf;
++
++    #[test]
++    fn only_the_initial_user_item_gets_canonical_prompt_identity() {
++        let content = vec![
++            UserInput::Text {
++                text: "use $skill".to_string(),
++                text_elements: Vec::new(),
++            },
++            UserInput::Skill {
++                name: "skill".to_string(),
++                path: PathBuf::from("/tmp/skills/skill/SKILL.md"),
++            },
++        ];
++        let mut initial_user_prompt = true;
++
++        let prompt = take_user_prompt_identity(
++            &mut initial_user_prompt,
++            "turn-1",
++            "prompt-1",
++            &content,
++            "use $skill",
++        )
++        .expect("initial prompt identity");
++        let steer = take_user_prompt_identity(
++            &mut initial_user_prompt,
++            "turn-1",
++            "steer-1",
++            &content,
++            "use $skill",
++        );
++
++        assert_eq!(prompt.turn_id, "turn-1");
++        assert_eq!(prompt.item_id, "prompt-1");
++        assert_eq!(prompt.mention_bindings.len(), 1);
++        assert!(steer.is_none());
++    }
++}

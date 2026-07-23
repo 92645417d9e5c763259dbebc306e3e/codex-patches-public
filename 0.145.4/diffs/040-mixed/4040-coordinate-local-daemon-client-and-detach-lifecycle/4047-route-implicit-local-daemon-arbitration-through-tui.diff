@@ -1,0 +1,504 @@
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index 993b8b6019..7e4948cb7f 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -4151,6 +4151,7 @@ dependencies = [
+  "clap",
+  "codex-ansi-escape",
+  "codex-app-server-client",
++ "codex-app-server-daemon",
+  "codex-app-server-protocol",
+  "codex-arg0",
+  "codex-cli",
+diff --git a/codex-rs/tui/Cargo.toml b/codex-rs/tui/Cargo.toml
+index 7fd75990eb..9cce0aae06 100644
+--- a/codex-rs/tui/Cargo.toml
++++ b/codex-rs/tui/Cargo.toml
+@@ -28,6 +28,7 @@ chrono = { workspace = true, features = ["serde"] }
+ clap = { workspace = true, features = ["derive"] }
+ codex-ansi-escape = { workspace = true }
+ codex-app-server-client = { workspace = true }
++codex-app-server-daemon = { workspace = true }
+ codex-app-server-protocol = { workspace = true }
+ codex-arg0 = { workspace = true }
+ codex-install-context = { workspace = true }
+diff --git a/codex-rs/tui/src/cli.rs b/codex-rs/tui/src/cli.rs
+index 13ddffb14a..2afdf062c3 100644
+--- a/codex-rs/tui/src/cli.rs
++++ b/codex-rs/tui/src/cli.rs
+@@ -89,6 +89,22 @@ impl std::ops::DerefMut for Cli {
+     }
+ }
+ 
++impl Cli {
++    pub(crate) fn has_non_replayable_implicit_daemon_overrides(&self) -> bool {
++        self.strict_config
++            || self.model.is_some()
++            || self.oss
++            || self.oss_provider.is_some()
++            || self.config_profile_v2.is_some()
++            || self.sandbox_mode.is_some()
++            || self.dangerously_bypass_approvals_and_sandbox
++            || self.bypass_hook_trust
++            || !self.add_dir.is_empty()
++            || self.approval_policy.is_some()
++            || self.web_search
++    }
++}
++
+ #[derive(Clone, Debug, Default)]
+ pub struct TuiSharedCliOptions(SharedCliOptions);
+ 
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index ee481ca205..d50ba6fd75 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -30,6 +30,7 @@ use codex_app_server_client::InProcessClientStartArgs;
+ use codex_app_server_client::RemoteAppServerClient;
+ use codex_app_server_client::RemoteAppServerConnectArgs;
+ pub use codex_app_server_client::RemoteAppServerEndpoint;
++use codex_app_server_daemon::ImplicitLocalDaemonOutcome;
+ use codex_app_server_protocol::Account as AppServerAccount;
+ use codex_app_server_protocol::AskForApproval;
+ use codex_app_server_protocol::ConfigWarningNotification;
+@@ -230,10 +231,6 @@ pub use public_widgets::composer_input::ComposerInput;
+ 
+ const TUI_LOG_FILE_NAME: &str = "codex-tui.log";
+ 
+-#[cfg(unix)]
+-const AUTO_CONNECT_DAEMON_CONNECT_TIMEOUT: std::time::Duration =
+-    std::time::Duration::from_millis(50);
+-
+ #[allow(clippy::too_many_arguments)]
+ async fn start_embedded_app_server(
+     arg0_paths: Arg0DispatchPaths,
+@@ -422,40 +419,6 @@ async fn connect_remote_app_server(
+     Ok(AppServerClient::Remote(app_server))
+ }
+ 
+-#[cfg(unix)]
+-async fn maybe_probe_default_daemon_socket(codex_home: &Path) -> Option<AbsolutePathBuf> {
+-    let socket_path = codex_app_server_client::app_server_control_socket_path(codex_home).ok()?;
+-    if !socket_path.as_path().try_exists().unwrap_or(false) {
+-        return None;
+-    }
+-
+-    match tokio::time::timeout(
+-        AUTO_CONNECT_DAEMON_CONNECT_TIMEOUT,
+-        tokio::net::UnixStream::connect(socket_path.as_path()),
+-    )
+-    .await
+-    {
+-        Ok(Ok(_stream)) => Some(socket_path),
+-        Ok(Err(err)) => {
+-            tracing::debug!(%err, socket_path = %socket_path.display(), "skipping default app-server daemon socket");
+-            None
+-        }
+-        Err(_) => {
+-            tracing::debug!(
+-                socket_path = %socket_path.display(),
+-                timeout_ms = AUTO_CONNECT_DAEMON_CONNECT_TIMEOUT.as_millis(),
+-                "timed out probing default app-server daemon socket"
+-            );
+-            None
+-        }
+-    }
+-}
+-
+-#[cfg(not(unix))]
+-async fn maybe_probe_default_daemon_socket(_codex_home: &Path) -> Option<AbsolutePathBuf> {
+-    None
+-}
+-
+ #[allow(clippy::too_many_arguments)]
+ async fn start_app_server(
+     target: &AppServerTarget,
+@@ -867,24 +830,68 @@ fn latest_session_cwd_filter<'a>(
+     }
+ }
+ 
+-fn app_server_target_for_launch(
++fn app_server_target_for_implicit_daemon_result(
++    result: Result<ImplicitLocalDaemonOutcome, ()>,
++    default_daemon_socket: AbsolutePathBuf,
++) -> AppServerTarget {
++    match result {
++        Ok(
++            ImplicitLocalDaemonOutcome::Reused
++            | ImplicitLocalDaemonOutcome::Started
++            | ImplicitLocalDaemonOutcome::Replaced,
++        ) => AppServerTarget::LocalDaemon {
++            endpoint: RemoteAppServerEndpoint::UnixSocket {
++                socket_path: default_daemon_socket,
++            },
++        },
++        Ok(ImplicitLocalDaemonOutcome::EmbeddedFallback) | Err(()) => AppServerTarget::Embedded,
++    }
++}
++
++async fn app_server_target_for_launch(
+     explicit_remote_endpoint: Option<RemoteAppServerEndpoint>,
+-    default_daemon_socket: Option<AbsolutePathBuf>,
++    codex_home: &Path,
++    codex_self_exe: Option<&Path>,
+     can_reuse_implicit_local_daemon: bool,
++    force_embedded: bool,
+ ) -> AppServerTarget {
+-    match explicit_remote_endpoint {
+-        Some(endpoint) => AppServerTarget::Remote { endpoint },
+-        None if can_reuse_implicit_local_daemon => {
+-            default_daemon_socket.map_or(AppServerTarget::Embedded, |socket_path| {
+-                AppServerTarget::LocalDaemon {
+-                    endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path },
+-                }
+-            })
++    if let Some(endpoint) = explicit_remote_endpoint {
++        return AppServerTarget::Remote { endpoint };
++    }
++    if !can_reuse_implicit_local_daemon || force_embedded {
++        return AppServerTarget::Embedded;
++    }
++    let Some(codex_self_exe) = codex_self_exe else {
++        return AppServerTarget::Embedded;
++    };
++    let Ok(default_daemon_socket) =
++        codex_app_server_client::app_server_control_socket_path(codex_home)
++    else {
++        return AppServerTarget::Embedded;
++    };
++    match codex_app_server_daemon::prepare_implicit_local_daemon(codex_self_exe).await {
++        Ok(outcome) => {
++            app_server_target_for_implicit_daemon_result(Ok(outcome), default_daemon_socket)
++        }
++        Err(err) => {
++            tracing::debug!(%err, "falling back to embedded app server");
++            app_server_target_for_implicit_daemon_result(Err(()), default_daemon_socket)
+         }
+-        None => AppServerTarget::Embedded,
+     }
+ }
+ 
++fn launched_as_codex_embedded() -> bool {
++    std::env::args_os()
++        .next()
++        .is_some_and(|arg0| is_codex_embedded_arg0(&arg0))
++}
++
++fn is_codex_embedded_arg0(arg0: &std::ffi::OsStr) -> bool {
++    Path::new(arg0)
++        .file_name()
++        .is_some_and(|name| name == "codex-embedded")
++}
++
+ fn loader_overrides_are_default(loader_overrides: &LoaderOverrides) -> bool {
+     let loader_overrides_are_default = loader_overrides.user_config_path.is_none()
+         && loader_overrides.user_config_profile.is_none()
+@@ -904,16 +911,14 @@ fn loader_overrides_are_default(loader_overrides: &LoaderOverrides) -> bool {
+ }
+ 
+ fn can_reuse_implicit_local_daemon(
++    cli: &Cli,
+     cli_kv_overrides: &[(String, toml::Value)],
+     loader_overrides: &LoaderOverrides,
+-    strict_config: bool,
+-    has_non_replayable_launch_overrides: bool,
+ ) -> bool {
+     // A reused daemon cannot adopt this invocation's full launch config state.
+     cli_kv_overrides.is_empty()
+         && loader_overrides_are_default(loader_overrides)
+-        && !strict_config
+-        && !has_non_replayable_launch_overrides
++        && !cli.has_non_replayable_implicit_daemon_overrides()
+ }
+ 
+ pub async fn run_main(
+@@ -973,22 +978,16 @@ pub async fn run_main(
+         launch_loader_overrides.user_config_path = Some(user_config_path);
+         launch_loader_overrides.user_config_profile = Some(profile_v2.clone());
+     }
+-    let reuse_implicit_local_daemon = can_reuse_implicit_local_daemon(
+-        &cli_kv_overrides,
+-        &launch_loader_overrides,
+-        strict_config,
+-        cli.bypass_hook_trust,
+-    );
+-    let default_daemon = if explicit_remote_endpoint.is_none() && reuse_implicit_local_daemon {
+-        maybe_probe_default_daemon_socket(&codex_home).await
+-    } else {
+-        None
+-    };
++    let reuse_implicit_local_daemon =
++        can_reuse_implicit_local_daemon(&cli, &cli_kv_overrides, &launch_loader_overrides);
+     let app_server_target = app_server_target_for_launch(
+         explicit_remote_endpoint,
+-        default_daemon,
++        &codex_home,
++        arg0_paths.codex_self_exe.as_deref(),
+         reuse_implicit_local_daemon,
+-    );
++        launched_as_codex_embedded(),
++    )
++    .await;
+     let remote_cwd_override = cli
+         .cwd
+         .clone()
+@@ -2456,64 +2455,58 @@ mod tests {
+         }
+     }
+ 
+-    #[tokio::test]
+-    async fn default_daemon_auto_connect_skips_missing_socket() -> color_eyre::Result<()> {
+-        let codex_home = TempDir::new()?;
+-        assert!(
+-            maybe_probe_default_daemon_socket(codex_home.path())
+-                .await
+-                .is_none()
+-        );
+-        Ok(())
+-    }
+-
+-    #[cfg(unix)]
+-    #[tokio::test]
+-    async fn default_daemon_auto_connect_probes_socket_only() -> color_eyre::Result<()> {
+-        let codex_home = TempDir::new()?;
+-        let socket_path =
+-            codex_app_server_client::app_server_control_socket_path(codex_home.path())?;
+-        std::fs::create_dir_all(socket_path.as_path().parent().expect("socket parent"))?;
+-        let _listener = tokio::net::UnixListener::bind(socket_path.as_path())?;
+-
++    #[test]
++    fn implicit_daemon_success_outcomes_use_local_daemon() -> color_eyre::Result<()> {
++        let socket_path = AbsolutePathBuf::relative_to_current_dir("codex.sock")?;
++        for outcome in [
++            ImplicitLocalDaemonOutcome::Reused,
++            ImplicitLocalDaemonOutcome::Started,
++            ImplicitLocalDaemonOutcome::Replaced,
++        ] {
++            assert_eq!(
++                app_server_target_for_implicit_daemon_result(Ok(outcome), socket_path.clone()),
++                AppServerTarget::LocalDaemon {
++                    endpoint: RemoteAppServerEndpoint::UnixSocket {
++                        socket_path: socket_path.clone(),
++                    },
++                }
++            );
++        }
+         assert_eq!(
+-            maybe_probe_default_daemon_socket(codex_home.path()).await,
+-            Some(socket_path)
++            app_server_target_for_implicit_daemon_result(
++                Ok(ImplicitLocalDaemonOutcome::EmbeddedFallback),
++                socket_path,
++            ),
++            AppServerTarget::Embedded
+         );
+         Ok(())
+     }
+ 
+     #[test]
+-    fn app_server_target_for_launch_uses_local_daemon_for_default_socket() -> color_eyre::Result<()>
+-    {
++    fn implicit_daemon_preparation_error_uses_embedded() -> color_eyre::Result<()> {
+         let socket_path = AbsolutePathBuf::relative_to_current_dir("codex.sock")?;
+-        let target = app_server_target_for_launch(
+-            /*explicit_remote_endpoint*/ None,
+-            Some(socket_path.clone()),
+-            /*can_reuse_implicit_local_daemon*/ true,
+-        );
+-
+         assert_eq!(
+-            target,
+-            AppServerTarget::LocalDaemon {
+-                endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path },
+-            }
++            app_server_target_for_implicit_daemon_result(Err(()), socket_path),
++            AppServerTarget::Embedded
+         );
+-        assert!(!target.uses_remote_workspace());
+-        assert_eq!(target.thread_params_mode(), ThreadParamsMode::Embedded);
+         Ok(())
+     }
+ 
+-    #[test]
+-    fn app_server_target_for_launch_prefers_explicit_remote_endpoint() -> color_eyre::Result<()> {
++    #[tokio::test]
++    async fn app_server_target_for_launch_prefers_explicit_remote_endpoint()
++    -> color_eyre::Result<()> {
++        let codex_home = TempDir::new()?;
+         let explicit_endpoint = RemoteAppServerEndpoint::UnixSocket {
+             socket_path: AbsolutePathBuf::relative_to_current_dir("explicit.sock")?,
+         };
+         let target = app_server_target_for_launch(
+             Some(explicit_endpoint.clone()),
+-            Some(AbsolutePathBuf::relative_to_current_dir("default.sock")?),
+-            /*can_reuse_implicit_local_daemon*/ false,
+-        );
++            codex_home.path(),
++            Some(Path::new("codex-embedded")),
++            /*can_reuse_implicit_local_daemon*/ true,
++            /*force_embedded*/ true,
++        )
++        .await;
+ 
+         assert_eq!(
+             target,
+@@ -2526,56 +2519,102 @@ mod tests {
+         Ok(())
+     }
+ 
+-    #[test]
+-    fn app_server_target_for_launch_skips_local_daemon_when_launch_config_is_not_replayable()
++    #[tokio::test]
++    async fn app_server_target_for_launch_skips_local_daemon_when_launch_config_is_not_replayable()
+     -> color_eyre::Result<()> {
+-        let socket_path = AbsolutePathBuf::relative_to_current_dir("codex.sock")?;
++        let codex_home = TempDir::new()?;
+         let target = app_server_target_for_launch(
+             /*explicit_remote_endpoint*/ None,
+-            Some(socket_path),
++            codex_home.path(),
++            Some(Path::new("codex")),
+             /*can_reuse_implicit_local_daemon*/ false,
+-        );
++            /*force_embedded*/ false,
++        )
++        .await;
+ 
+         assert_eq!(target, AppServerTarget::Embedded);
+         Ok(())
+     }
+ 
++    #[tokio::test]
++    async fn codex_embedded_and_missing_executable_always_use_embedded() -> color_eyre::Result<()> {
++        let codex_home = TempDir::new()?;
++        assert_eq!(
++            app_server_target_for_launch(
++                None,
++                codex_home.path(),
++                Some(Path::new("/real/release/codex")),
++                true,
++                /*force_embedded*/ true,
++            )
++            .await,
++            AppServerTarget::Embedded
++        );
++        assert_eq!(
++            app_server_target_for_launch(
++                None,
++                codex_home.path(),
++                None,
++                true,
++                /*force_embedded*/ false,
++            )
++            .await,
++            AppServerTarget::Embedded
++        );
++        Ok(())
++    }
++
++    #[test]
++    fn codex_embedded_detection_uses_invoked_basename() {
++        assert!(is_codex_embedded_arg0("codex-embedded".as_ref()));
++        assert!(is_codex_embedded_arg0(
++            "/home/user/bin/codex-embedded".as_ref()
++        ));
++        assert!(!is_codex_embedded_arg0("codex".as_ref()));
++    }
++
+     #[test]
+     fn can_reuse_implicit_local_daemon_requires_default_launch_config() -> color_eyre::Result<()> {
++        use clap::Parser;
++
++        let default_cli = Cli::try_parse_from(["codex"])?;
+         let mut loader_overrides = LoaderOverrides::default();
+         let cli_kv_overrides = vec![("web_search".to_string(), toml::Value::String("live".into()))];
+ 
+         assert!(can_reuse_implicit_local_daemon(
++            &default_cli,
+             &[],
+             &LoaderOverrides::default(),
+-            /*strict_config*/ false,
+-            /*has_non_replayable_launch_overrides*/ false,
+         ));
+         assert!(!can_reuse_implicit_local_daemon(
++            &default_cli,
+             &cli_kv_overrides,
+             &LoaderOverrides::default(),
+-            /*strict_config*/ false,
+-            /*has_non_replayable_launch_overrides*/ false,
+         ));
+         loader_overrides.ignore_user_config = true;
+         assert!(!can_reuse_implicit_local_daemon(
++            &default_cli,
+             &[],
+             &loader_overrides,
+-            /*strict_config*/ false,
+-            /*has_non_replayable_launch_overrides*/ false,
+-        ));
+-        assert!(!can_reuse_implicit_local_daemon(
+-            &[],
+-            &LoaderOverrides::default(),
+-            /*strict_config*/ true,
+-            /*has_non_replayable_launch_overrides*/ false,
+-        ));
+-        assert!(!can_reuse_implicit_local_daemon(
+-            &[],
+-            &LoaderOverrides::default(),
+-            /*strict_config*/ false,
+-            /*has_non_replayable_launch_overrides*/ true,
+         ));
++        for args in [
++            vec!["codex", "--strict-config"],
++            vec!["codex", "--model", "gpt-test"],
++            vec!["codex", "--oss"],
++            vec!["codex", "--local-provider", "ollama"],
++            vec!["codex", "--sandbox", "workspace-write"],
++            vec!["codex", "--dangerously-bypass-approvals-and-sandbox"],
++            vec!["codex", "--dangerously-bypass-hook-trust"],
++            vec!["codex", "--add-dir", "/tmp/extra"],
++            vec!["codex", "--ask-for-approval", "on-request"],
++        ] {
++            let cli = Cli::try_parse_from(args)?;
++            assert!(!can_reuse_implicit_local_daemon(
++                &cli,
++                &[],
++                &LoaderOverrides::default(),
++            ));
++        }
+         Ok(())
+     }
+ 
+diff --git a/codex-rs/tui/src/session_archive_commands.rs b/codex-rs/tui/src/session_archive_commands.rs
+index 24e1a16c25..60033413c7 100644
+--- a/codex-rs/tui/src/session_archive_commands.rs
++++ b/codex-rs/tui/src/session_archive_commands.rs
+@@ -269,22 +269,16 @@ async fn start_app_server_for_archive_command(
+         launch_loader_overrides.user_config_profile = Some(profile_v2.clone());
+     }
+ 
+-    let reuse_implicit_local_daemon = super::can_reuse_implicit_local_daemon(
+-        &cli_kv_overrides,
+-        &launch_loader_overrides,
+-        strict_config,
+-        cli.bypass_hook_trust,
+-    );
+-    let default_daemon = if explicit_remote_endpoint.is_none() && reuse_implicit_local_daemon {
+-        super::maybe_probe_default_daemon_socket(codex_home.as_path()).await
+-    } else {
+-        None
+-    };
++    let reuse_implicit_local_daemon =
++        super::can_reuse_implicit_local_daemon(&cli, &cli_kv_overrides, &launch_loader_overrides);
+     let app_server_target = super::app_server_target_for_launch(
+         explicit_remote_endpoint,
+-        default_daemon,
++        codex_home.as_path(),
++        arg0_paths.codex_self_exe.as_deref(),
+         reuse_implicit_local_daemon,
+-    );
++        super::launched_as_codex_embedded(),
++    )
++    .await;
+     let remote_cwd_override = cli
+         .cwd
+         .clone()

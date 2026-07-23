@@ -1,0 +1,589 @@
+diff --git a/codex-rs/rollout/src/lib.rs b/codex-rs/rollout/src/lib.rs
+index 5a1f5fbe0c..3a1ebf5569 100644
+--- a/codex-rs/rollout/src/lib.rs
++++ b/codex-rs/rollout/src/lib.rs
+@@ -72,6 +72,8 @@ pub use policy::should_persist_response_item_for_memories;
+ pub use recorder::RolloutRecorder;
+ pub use recorder::RolloutRecorderParams;
+ pub use recorder::append_rollout_item_to_path;
++pub use reverse_jsonl_scanner::ReverseJsonlScanLimits;
++pub use reverse_jsonl_scanner::ReverseJsonlScanMetrics;
+ pub use reverse_jsonl_scanner::ReverseJsonlScanner;
+ pub use reverse_jsonl_scanner::ScanOutcome;
+ pub use rollout_reference_index::RolloutReferenceIndex;
+diff --git a/codex-rs/rollout/src/reverse_jsonl_scanner.rs b/codex-rs/rollout/src/reverse_jsonl_scanner.rs
+index cf6b6b8e9d..18c34742bf 100644
+--- a/codex-rs/rollout/src/reverse_jsonl_scanner.rs
++++ b/codex-rs/rollout/src/reverse_jsonl_scanner.rs
+@@ -7,6 +7,23 @@ use serde::de::DeserializeOwned;
+ 
+ const READ_CHUNK_SIZE: usize = 8 * 1024;
+ 
++/// Optional resource limits for a reverse JSONL scan.
++///
++/// `None` preserves the scanner's historical unbounded behavior.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct ReverseJsonlScanLimits {
++    pub max_bytes_read: Option<u64>,
++    pub max_records: Option<usize>,
++    pub max_record_bytes: Option<usize>,
++}
++
++/// I/O performed by a reverse JSONL scan.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct ReverseJsonlScanMetrics {
++    pub bytes_read: u64,
++    pub records_scanned: usize,
++}
++
+ #[derive(Debug)]
+ pub enum ScanOutcome<T> {
+     /// The record was valid JSON and deserialized as the requested type.
+@@ -23,6 +40,8 @@ pub struct ReverseJsonlScanner<R> {
+     chunk_position: usize,
+     chunk: Vec<u8>,
+     record_reversed: Vec<u8>,
++    limits: ReverseJsonlScanLimits,
++    metrics: ReverseJsonlScanMetrics,
+ }
+ 
+ impl<R> ReverseJsonlScanner<R>
+@@ -38,7 +57,23 @@ where
+     ///
+     /// This lets callers scan a frozen JSONL prefix without reading records appended after that
+     /// prefix was captured.
+-    pub fn new_at(mut reader: R, end_byte_offset: u64) -> io::Result<Self> {
++    pub fn new_at(reader: R, end_byte_offset: u64) -> io::Result<Self> {
++        Self::new_at_with_limits(reader, end_byte_offset, ReverseJsonlScanLimits::default())
++    }
++
++    /// Creates a reverse scanner with explicit limits on data retained and inspected.
++    pub fn new_with_limits(reader: R, limits: ReverseJsonlScanLimits) -> io::Result<Self> {
++        let mut reader = reader;
++        let next_chunk_end = reader.seek(SeekFrom::End(0))?;
++        Self::new_at_with_limits(reader, next_chunk_end, limits)
++    }
++
++    /// Creates a reverse scanner whose logical end is the given byte offset and applies limits.
++    pub fn new_at_with_limits(
++        mut reader: R,
++        end_byte_offset: u64,
++        limits: ReverseJsonlScanLimits,
++    ) -> io::Result<Self> {
+         let file_len = reader.seek(SeekFrom::End(0))?;
+         if end_byte_offset > file_len {
+             return Err(io::Error::new(
+@@ -52,9 +87,16 @@ where
+             chunk_position: 0,
+             chunk: vec![0; READ_CHUNK_SIZE],
+             record_reversed: Vec::new(),
++            limits,
++            metrics: ReverseJsonlScanMetrics::default(),
+         })
+     }
+ 
++    /// Returns the data inspected so far.
++    pub fn metrics(&self) -> ReverseJsonlScanMetrics {
++        self.metrics
++    }
++
+     /// Scans the next nonblank record.
+     ///
+     /// I/O failures are returned as [`Err`]. Invalid JSON records are returned as
+@@ -65,15 +107,22 @@ where
+     {
+         loop {
+             let Some(byte) = self.read_previous_byte()? else {
+-                return Ok(self.finish_record());
++                return self.finish_record();
+             };
+ 
+             if byte != b'\n' {
++                if self
++                    .limits
++                    .max_record_bytes
++                    .is_some_and(|limit| self.record_reversed.len() >= limit)
++                {
++                    return Err(limit_error("reverse JSONL record exceeds byte limit"));
++                }
+                 self.record_reversed.push(byte);
+                 continue;
+             }
+ 
+-            if let Some(outcome) = self.finish_record() {
++            if let Some(outcome) = self.finish_record()? {
+                 return Ok(Some(outcome));
+             }
+         }
+@@ -85,11 +134,24 @@ where
+                 return Ok(None);
+             }
+ 
+-            let read_size = usize::try_from(self.next_chunk_end.min(READ_CHUNK_SIZE as u64))
+-                .map_err(io::Error::other)?;
++            let remaining = self
++                .limits
++                .max_bytes_read
++                .map(|limit| limit.saturating_sub(self.metrics.bytes_read))
++                .unwrap_or(u64::MAX);
++            if remaining == 0 {
++                return Err(limit_error("reverse JSONL scan exceeds byte limit"));
++            }
++            let read_size = usize::try_from(
++                self.next_chunk_end
++                    .min(READ_CHUNK_SIZE as u64)
++                    .min(remaining),
++            )
++            .map_err(io::Error::other)?;
+             self.next_chunk_end -= read_size as u64;
+             self.reader.seek(SeekFrom::Start(self.next_chunk_end))?;
+             self.reader.read_exact(&mut self.chunk[..read_size])?;
++            self.metrics.bytes_read += read_size as u64;
+             self.chunk_position = read_size;
+         }
+ 
+@@ -97,7 +159,7 @@ where
+         Ok(Some(self.chunk[self.chunk_position]))
+     }
+ 
+-    fn finish_record<T>(&mut self) -> Option<ScanOutcome<T>>
++    fn finish_record<T>(&mut self) -> io::Result<Option<ScanOutcome<T>>>
+     where
+         T: DeserializeOwned,
+     {
+@@ -105,16 +167,31 @@ where
+         let outcome = if self.record_reversed.iter().all(u8::is_ascii_whitespace) {
+             None
+         } else {
++            if self
++                .limits
++                .max_records
++                .is_some_and(|limit| self.metrics.records_scanned >= limit)
++            {
++                // This is checked before accepting a record so callers never process more than
++                // the requested bounded history window.
++                self.record_reversed.clear();
++                return Err(limit_error("reverse JSONL scan exceeds record limit"));
++            }
++            self.metrics.records_scanned += 1;
+             Some(match serde_json::from_slice::<T>(&self.record_reversed) {
+                 Ok(value) => ScanOutcome::Parsed(value),
+                 Err(error) => ScanOutcome::Rejected(error),
+             })
+         };
+         self.record_reversed.clear();
+-        outcome
++        Ok(outcome)
+     }
+ }
+ 
++fn limit_error(message: &'static str) -> io::Error {
++    io::Error::new(io::ErrorKind::Other, message)
++}
++
+ #[cfg(test)]
+ #[path = "reverse_jsonl_scanner_tests.rs"]
+ mod tests;
+diff --git a/codex-rs/rollout/src/reverse_jsonl_scanner_tests.rs b/codex-rs/rollout/src/reverse_jsonl_scanner_tests.rs
+index 72c471f5de..21c18aeff8 100644
+--- a/codex-rs/rollout/src/reverse_jsonl_scanner_tests.rs
++++ b/codex-rs/rollout/src/reverse_jsonl_scanner_tests.rs
+@@ -6,6 +6,7 @@ use pretty_assertions::assert_eq;
+ use serde::Deserialize;
+ use serde::Serialize;
+ 
++use super::ReverseJsonlScanLimits;
+ use super::ReverseJsonlScanner;
+ use super::ScanOutcome;
+ 
+@@ -151,3 +152,23 @@ fn scans_record_spanning_three_read_chunks() -> std::io::Result<()> {
+ 
+     assert_records(&mut scanner, &["third", &large_value, "first"])
+ }
++
++#[test]
++fn bounded_scan_reports_bytes_and_rejects_a_large_record() -> std::io::Result<()> {
++    let input = format!("{}\n", serde_json::to_string(&record(&"x".repeat(32)))?);
++    let mut scanner = ReverseJsonlScanner::new_with_limits(
++        Cursor::new(input),
++        ReverseJsonlScanLimits {
++            max_bytes_read: Some(1024),
++            max_records: Some(1),
++            max_record_bytes: Some(16),
++        },
++    )?;
++
++    let error = scanner
++        .scan_next::<TestRecord>()
++        .expect_err("record limit should stop the scan");
++    assert!(error.to_string().contains("record exceeds byte limit"));
++    assert!(scanner.metrics().bytes_read <= 1024);
++    Ok(())
++}
+diff --git a/codex-rs/thread-store/src/local/model_context.rs b/codex-rs/thread-store/src/local/model_context.rs
+index 69a677ff74..a8c39bacc6 100644
+--- a/codex-rs/thread-store/src/local/model_context.rs
++++ b/codex-rs/thread-store/src/local/model_context.rs
+@@ -7,6 +7,7 @@ use codex_protocol::protocol::SessionMetaLine;
+ use codex_protocol::protocol::ThreadHistoryMode;
+ use codex_rollout::ModelContextScan;
+ use codex_rollout::ModelContextScanProgress;
++use codex_rollout::ReverseJsonlScanLimits;
+ use codex_rollout::ReverseJsonlScanner;
+ use codex_rollout::ScanOutcome;
+ 
+@@ -22,6 +23,10 @@ use crate::ThreadStoreResult;
+ #[path = "model_context_tests.rs"]
+ mod tests;
+ 
++const LEGACY_MODEL_CONTEXT_MAX_BYTES: u64 = 16 * 1024 * 1024;
++const LEGACY_MODEL_CONTEXT_MAX_RECORDS: usize = 8192;
++const LEGACY_MODEL_CONTEXT_MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
++
+ /// Loads rollout items needed to reconstruct the latest model-visible context.
+ ///
+ /// Plain paginated JSONL rollouts use a reverse scan. When it finds both a usable replacement-
+@@ -30,7 +35,11 @@ mod tests;
+ /// bounded cutoff is available, the scan continues to the beginning and returns the complete
+ /// replay it already accumulated.
+ ///
+-/// Legacy and compressed rollout shapes keep the existing full-history path.
++/// Plain legacy JSONL uses the same reverse cutoff selector under a fixed resource budget. Small
++/// files may reach their head and replay fully; a large legacy file without a safe cutoff returns
++/// a bounded-unavailable error instead of falling back to an unbounded read. Compressed legacy
++/// rollouts deliberately retain the existing full-history behavior until they have a bounded
++/// streaming reader.
+ pub(super) async fn load_latest_model_context(
+     store: &LocalThreadStore,
+     params: LoadThreadHistoryParams,
+@@ -57,15 +66,20 @@ pub(super) async fn load_latest_model_context(
+         });
+     }
+ 
++    let is_compressed = path
++        .file_name()
++        .and_then(|file_name| file_name.to_str())
++        .is_some_and(|file_name| file_name.ends_with(".jsonl.zst"));
+     let items = if matches!(session_meta.meta.history_mode, ThreadHistoryMode::Paginated)
+-        && !path
+-            .file_name()
+-            .and_then(|file_name| file_name.to_str())
+-            .is_some_and(|file_name| file_name.ends_with(".jsonl.zst"))
++        && !is_compressed
+     {
+         let lineage = store.resolve_rollout_lineage(params.thread_id).await?;
+         scan_model_context_from_lineage(lineage, session_meta).await?
++    } else if matches!(session_meta.meta.history_mode, ThreadHistoryMode::Legacy) && !is_compressed
++    {
++        scan_model_context_from_legacy_path(path.as_path(), session_meta).await?
+     } else {
++        // Compressed legacy rollouts intentionally keep their existing full-history behavior.
+         read_thread::load_history_items(path.as_path()).await?
+     };
+ 
+@@ -75,6 +89,103 @@ pub(super) async fn load_latest_model_context(
+     })
+ }
+ 
++async fn scan_model_context_from_legacy_path(
++    path: &std::path::Path,
++    session_meta: SessionMetaLine,
++) -> ThreadStoreResult<Vec<RolloutItem>> {
++    let path = path.to_path_buf();
++    let display_path = path.clone();
++    tokio::task::spawn_blocking(move || {
++        scan_model_context_from_legacy_path_blocking(&path, session_meta)
++    })
++    .await
++    .map_err(|err| ThreadStoreError::Internal {
++        message: format!("failed to join legacy model context scan: {err}"),
++    })?
++    .map_err(|err| ThreadStoreError::Internal {
++        message: format!(
++            "bounded model context unavailable for legacy rollout {}: {err}",
++            display_path.display()
++        ),
++    })
++}
++
++fn scan_model_context_from_legacy_path_blocking(
++    path: &std::path::Path,
++    session_meta: SessionMetaLine,
++) -> io::Result<Vec<RolloutItem>> {
++    let file = File::open(path)?;
++    let mut scanner = ReverseJsonlScanner::new_with_limits(
++        file,
++        ReverseJsonlScanLimits {
++            max_bytes_read: Some(LEGACY_MODEL_CONTEXT_MAX_BYTES),
++            max_records: Some(LEGACY_MODEL_CONTEXT_MAX_RECORDS),
++            max_record_bytes: Some(LEGACY_MODEL_CONTEXT_MAX_RECORD_BYTES),
++        },
++    )?;
++    scan_legacy_model_context_from_scanner(&mut scanner, session_meta)
++}
++
++#[cfg(test)]
++fn legacy_scan_metrics(
++    path: &std::path::Path,
++    session_meta: SessionMetaLine,
++) -> io::Result<codex_rollout::ReverseJsonlScanMetrics> {
++    let file = File::open(path)?;
++    let mut scanner = ReverseJsonlScanner::new_with_limits(
++        file,
++        ReverseJsonlScanLimits {
++            max_bytes_read: Some(LEGACY_MODEL_CONTEXT_MAX_BYTES),
++            max_records: Some(LEGACY_MODEL_CONTEXT_MAX_RECORDS),
++            max_record_bytes: Some(LEGACY_MODEL_CONTEXT_MAX_RECORD_BYTES),
++        },
++    )?;
++    scan_legacy_model_context_from_scanner(&mut scanner, session_meta)?;
++    Ok(scanner.metrics())
++}
++
++fn scan_legacy_model_context_from_scanner<R>(
++    scanner: &mut ReverseJsonlScanner<R>,
++    session_meta: SessionMetaLine,
++) -> io::Result<Vec<RolloutItem>>
++where
++    R: io::Read + io::Seek,
++{
++    let mut scan = ModelContextScan::default();
++    let mut at_crash_tail = true;
++    while let Some(outcome) = scanner.scan_next::<RolloutLine>()? {
++        let line = match outcome {
++            ScanOutcome::Parsed(line) => {
++                at_crash_tail = false;
++                line
++            }
++            ScanOutcome::Rejected(_) if at_crash_tail => {
++                // A process can crash while appending its final JSONL record. Only that newest
++                // malformed tail is safely ignorable; older corruption makes selection unsafe.
++                at_crash_tail = false;
++                continue;
++            }
++            ScanOutcome::Rejected(_) => {
++                return Err(io::Error::other(
++                    "bounded legacy model context unavailable after malformed JSONL record",
++                ));
++            }
++        };
++        if matches!(&line.item, RolloutItem::SessionMeta(_)) {
++            break;
++        }
++        if matches!(scan.push(line.item), ModelContextScanProgress::Complete) {
++            break;
++        }
++    }
++    let canonical_meta = session_meta.clone();
++    let mut items = scan.finish(session_meta);
++    if !matches!(items.first(), Some(RolloutItem::SessionMeta(_))) {
++        items.insert(0, RolloutItem::SessionMeta(canonical_meta));
++    }
++    Ok(items)
++}
++
+ async fn scan_model_context_from_lineage(
+     lineage: RolloutLineage,
+     session_meta: SessionMetaLine,
+@@ -105,19 +216,8 @@ fn scan_model_context_from_lineage_blocking(
+             Some(end_byte_offset) => ReverseJsonlScanner::new_at(file, end_byte_offset)?,
+             None => ReverseJsonlScanner::new(file)?,
+         };
+-        while let Some(outcome) = scanner.scan_next::<RolloutLine>()? {
+-            let ScanOutcome::Parsed(line) = outcome else {
+-                continue;
+-            };
+-            // Each physical segment contributes only its local delta. Its head metadata is
+-            // replaced with the requested thread's canonical SessionMeta after replay.
+-            if matches!(&line.item, RolloutItem::SessionMeta(_)) {
+-                break;
+-            }
+-            match scan.push(line.item) {
+-                ModelContextScanProgress::Continue => {}
+-                ModelContextScanProgress::Complete => break 'segments,
+-            }
++        if scan_segment(&mut scanner, &mut scan)? {
++            break 'segments;
+         }
+     }
+ 
+@@ -128,3 +228,24 @@ fn scan_model_context_from_lineage_blocking(
+     }
+     Ok(items)
+ }
++
++fn scan_segment<R>(
++    scanner: &mut ReverseJsonlScanner<R>,
++    scan: &mut ModelContextScan,
++) -> io::Result<bool>
++where
++    R: io::Read + io::Seek,
++{
++    while let Some(outcome) = scanner.scan_next::<RolloutLine>()? {
++        let ScanOutcome::Parsed(line) = outcome else {
++            continue;
++        };
++        if matches!(&line.item, RolloutItem::SessionMeta(_)) {
++            break;
++        }
++        if matches!(scan.push(line.item), ModelContextScanProgress::Complete) {
++            return Ok(true);
++        }
++    }
++    Ok(false)
++}
+diff --git a/codex-rs/thread-store/src/local/model_context_tests.rs b/codex-rs/thread-store/src/local/model_context_tests.rs
+index 6393b60134..03e44f6631 100644
+--- a/codex-rs/thread-store/src/local/model_context_tests.rs
++++ b/codex-rs/thread-store/src/local/model_context_tests.rs
+@@ -170,6 +170,150 @@ async fn returns_scanned_full_history_at_bof_without_checkpoint() {
+     assert_reverse_scan_matches_full_history(home.path(), path.as_path()).await;
+ }
+ 
++#[tokio::test]
++async fn small_legacy_rollout_falls_back_to_full_history_with_canonical_session_meta() {
++    let home = TempDir::new().expect("temp dir");
++    let uuid = Uuid::from_u128(/*v*/ 1101);
++    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
++    let path = write_session_file_with_history_mode(
++        home.path(),
++        "2025-01-03T13-02-00",
++        uuid,
++        ThreadHistoryMode::Legacy,
++    )
++    .expect("write legacy rollout");
++    append_items(path.as_path(), [user_message("small legacy")]);
++    let store = LocalThreadStore::new(test_config(home.path()), None);
++
++    let context = store
++        .load_latest_model_context(LoadThreadHistoryParams {
++            thread_id,
++            include_archived: false,
++        })
++        .await
++        .expect("load small legacy context");
++    let full = read_thread::load_history_items(path.as_path())
++        .await
++        .expect("load full legacy history");
++
++    assert_eq!(
++        serde_json::to_value(&context.items).unwrap(),
++        serde_json::to_value(&full).unwrap()
++    );
++    assert!(
++        matches!(context.items.first(), Some(RolloutItem::SessionMeta(meta)) if meta.meta.id == thread_id)
++    );
++}
++
++#[tokio::test]
++async fn large_legacy_cutoff_reads_less_than_an_eighth_of_the_source() {
++    let home = TempDir::new().expect("temp dir");
++    let uuid = Uuid::from_u128(/*v*/ 1102);
++    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
++    let path = write_session_file_with_history_mode(
++        home.path(),
++        "2025-01-03T13-02-01",
++        uuid,
++        ThreadHistoryMode::Legacy,
++    )
++    .expect("write legacy rollout");
++    append_items(
++        path.as_path(),
++        [
++            user_message(&"x".repeat(17 * 1024 * 1024)),
++            turn_started("turn-1"),
++            completed_user_message("turn-1", "latest"),
++            turn_context(home.path(), "turn-1"),
++            compacted("latest checkpoint", Some(Vec::new())),
++        ],
++    );
++    let meta = codex_rollout::read_session_meta_line(path.as_path())
++        .await
++        .expect("read metadata");
++    let metrics = legacy_scan_metrics(path.as_path(), meta).expect("bounded legacy scan");
++    let source_len = std::fs::metadata(path.as_path()).expect("metadata").len();
++    assert!(
++        metrics.bytes_read < source_len / 8,
++        "{metrics:?} of {source_len}"
++    );
++    let store = LocalThreadStore::new(test_config(home.path()), None);
++    let context = store
++        .load_latest_model_context(LoadThreadHistoryParams {
++            thread_id,
++            include_archived: false,
++        })
++        .await
++        .expect("load bounded context");
++    assert!(
++        matches!(context.items.first(), Some(RolloutItem::SessionMeta(meta)) if meta.meta.id == thread_id)
++    );
++}
++
++#[tokio::test]
++async fn large_legacy_without_a_cutoff_returns_bounded_unavailable() {
++    let home = TempDir::new().expect("temp dir");
++    let uuid = Uuid::from_u128(/*v*/ 1103);
++    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
++    let path = write_session_file_with_history_mode(
++        home.path(),
++        "2025-01-03T13-02-02",
++        uuid,
++        ThreadHistoryMode::Legacy,
++    )
++    .expect("write legacy rollout");
++    append_items(
++        path.as_path(),
++        [user_message(&"x".repeat(17 * 1024 * 1024))],
++    );
++    let store = LocalThreadStore::new(test_config(home.path()), None);
++    let error = store
++        .load_latest_model_context(LoadThreadHistoryParams {
++            thread_id,
++            include_archived: false,
++        })
++        .await
++        .expect_err("large unbounded legacy history must not be fully read");
++    assert!(
++        error
++            .to_string()
++            .contains("bounded model context unavailable")
++    );
++    assert!(error.to_string().contains("record exceeds byte limit"));
++}
++
++#[tokio::test]
++async fn legacy_scan_rejects_corruption_older_than_the_newest_record() {
++    let home = TempDir::new().expect("temp dir");
++    let uuid = Uuid::from_u128(/*v*/ 1104);
++    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
++    let path = write_session_file_with_history_mode(
++        home.path(),
++        "2025-01-03T13-02-03",
++        uuid,
++        ThreadHistoryMode::Legacy,
++    )
++    .expect("write legacy rollout");
++    std::fs::OpenOptions::new()
++        .append(true)
++        .open(path.as_path())
++        .and_then(|mut file| {
++            use std::io::Write;
++            writeln!(file, "not-json")
++        })
++        .expect("append corrupt record");
++    append_items(path.as_path(), [user_message("newest valid record")]);
++    let store = LocalThreadStore::new(test_config(home.path()), None);
++
++    let error = store
++        .load_latest_model_context(LoadThreadHistoryParams {
++            thread_id,
++            include_archived: false,
++        })
++        .await
++        .expect_err("corruption older than the newest record must fail");
++    assert!(error.to_string().contains("malformed JSONL record"));
++}
++
+ #[tokio::test]
+ async fn uses_agent_message_turn_context_without_scanning_older_turn() {
+     let home = TempDir::new().expect("temp dir");

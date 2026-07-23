@@ -1,0 +1,96 @@
+diff --git a/codex-rs/tui/src/clipboard_paste.rs b/codex-rs/tui/src/clipboard_paste.rs
+index 55ca6ca659..d7af8c2572 100644
+--- a/codex-rs/tui/src/clipboard_paste.rs
++++ b/codex-rs/tui/src/clipboard_paste.rs
+@@ -1,6 +1,8 @@
+ use std::path::Path;
+ use std::path::PathBuf;
+-use tempfile::Builder;
++
++#[cfg(not(target_os = "android"))]
++mod runtime_temp;
+ 
+ #[derive(Debug, Clone)]
+ pub enum PasteImageError {
+@@ -122,18 +124,8 @@ pub fn paste_image_to_temp_png() -> Result<(PathBuf, PastedImageInfo), PasteImag
+     // First attempt: read image from system clipboard via arboard (native paths or image data).
+     match paste_image_as_png() {
+         Ok((png, info)) => {
+-            // Create a unique temporary file with a .png suffix to avoid collisions.
+-            let tmp = Builder::new()
+-                .prefix("codex-clipboard-")
+-                .suffix(".png")
+-                .tempfile()
+-                .map_err(|e| PasteImageError::IoError(e.to_string()))?;
+-            std::fs::write(tmp.path(), &png)
+-                .map_err(|e| PasteImageError::IoError(e.to_string()))?;
+-            // Persist the file (so it remains after the handle is dropped) and return its PathBuf.
+-            let (_file, path) = tmp
+-                .keep()
+-                .map_err(|e| PasteImageError::IoError(e.error.to_string()))?;
++            let path = runtime_temp::write_png(&png)
++                .map_err(|error| PasteImageError::IoError(error.to_string()))?;
+             Ok((path, info))
+         }
+         Err(e) => {
+diff --git a/codex-rs/tui/src/clipboard_paste/runtime_temp.rs b/codex-rs/tui/src/clipboard_paste/runtime_temp.rs
+new file mode 100644
+index 0000000000..04d4f44abb
+--- /dev/null
++++ b/codex-rs/tui/src/clipboard_paste/runtime_temp.rs
+@@ -0,0 +1,55 @@
++use std::io;
++use std::path::Path;
++use std::path::PathBuf;
++use tempfile::Builder;
++
++const CLIPBOARD_TEMP_DIR: &str = "clipboard";
++
++pub(super) fn write_png(png: &[u8]) -> io::Result<PathBuf> {
++    #[cfg(unix)]
++    {
++        let temp_dir = codex_utils_home_dir::prepare_private_codex_tmp_root()?
++            .ensure_subdir(CLIPBOARD_TEMP_DIR)?;
++        return write_png_to_dir(png, temp_dir.as_path());
++    }
++
++    #[cfg(not(unix))]
++    {
++        let temp_dir = codex_utils_home_dir::find_codex_tmp_root()?.join(CLIPBOARD_TEMP_DIR);
++        std::fs::create_dir_all(temp_dir.as_path())?;
++        write_png_to_dir(png, temp_dir.as_path())
++    }
++}
++
++fn write_png_to_dir(png: &[u8], temp_dir: &Path) -> io::Result<PathBuf> {
++    let tmp = Builder::new()
++        .prefix("codex-clipboard-")
++        .suffix(".png")
++        .tempfile_in(temp_dir)?;
++    std::fs::write(tmp.path(), png)?;
++    tmp.keep()
++        .map(|(_file, path)| path)
++        .map_err(|error| error.error)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn clipboard_png_is_written_under_the_selected_runtime_temp_root() {
++        let temp_root = tempfile::tempdir().expect("create isolated temp root");
++        let clipboard_dir = temp_root.path().join(CLIPBOARD_TEMP_DIR);
++        std::fs::create_dir(&clipboard_dir).expect("create clipboard temp directory");
++
++        let path = write_png_to_dir(b"png", &clipboard_dir).expect("write clipboard png");
++
++        assert_eq!(path.parent(), Some(clipboard_dir.as_path()));
++        assert!(
++            path.file_name()
++                .and_then(|name| name.to_str())
++                .is_some_and(|name| name.starts_with("codex-clipboard-") && name.ends_with(".png"))
++        );
++        assert_eq!(std::fs::read(&path).expect("read clipboard png"), b"png");
++    }
++}

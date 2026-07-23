@@ -1,0 +1,760 @@
+diff --git a/codex-rs/tui/src/resume_picker.rs b/codex-rs/tui/src/resume_picker.rs
+index 966e414476..e07e83467f 100644
+--- a/codex-rs/tui/src/resume_picker.rs
++++ b/codex-rs/tui/src/resume_picker.rs
+@@ -34,6 +34,7 @@ use crate::wrapping::RtOptions;
+ use crate::wrapping::adaptive_wrap_lines;
+ use chrono::DateTime;
+ use chrono::Utc;
++use codex_app_server_protocol::SessionSource;
+ use codex_app_server_protocol::Thread;
+ use codex_app_server_protocol::ThreadItem;
+ use codex_app_server_protocol::ThreadListCwdFilter;
+@@ -146,6 +147,7 @@ struct PageLoadRequest {
+     cwd_filter: Option<PathBuf>,
+     provider_filter: ProviderFilter,
+     sort_key: ThreadSortKey,
++    load_pinned_renamed: bool,
+ }
+ 
+ enum PickerLoadRequest {
+@@ -263,6 +265,7 @@ enum PageCursor {
+ 
+ struct PickerPage {
+     rows: Vec<Row>,
++    pinned_thread_ids: HashSet<ThreadId>,
+     next_cursor: Option<PageCursor>,
+     num_scanned_files: usize,
+     reached_scan_cap: bool,
+@@ -572,6 +575,8 @@ fn spawn_app_server_page_loader(
+                         request.provider_filter,
+                         request.sort_key,
+                         include_non_interactive,
++                        request.load_pinned_renamed,
++                        codex_home.as_deref(),
+                     )
+                     .await;
+                     let _ = bg_tx.send(BackgroundEvent::Page {
+@@ -644,6 +649,8 @@ struct PickerState {
+     all_rows: Vec<Row>,
+     filtered_rows: Vec<Row>,
+     seen_rows: HashSet<SeenRowKey>,
++    seen_thread_ids: HashSet<ThreadId>,
++    pinned_thread_ids: HashSet<ThreadId>,
+     selected: usize,
+     scroll_top: usize,
+     pending_page_down_target: Option<usize>,
+@@ -744,31 +751,141 @@ async fn load_app_server_page(
+     provider_filter: ProviderFilter,
+     sort_key: ThreadSortKey,
+     include_non_interactive: bool,
++    load_pinned_renamed: bool,
++    codex_home: Option<&Path>,
+ ) -> std::io::Result<PickerPage> {
+     let response = app_server
+         .thread_list(thread_list_params(
+             cursor,
+             cwd_filter,
+-            provider_filter,
++            provider_filter.clone(),
+             sort_key,
+             include_non_interactive,
+         ))
+         .await
+         .map_err(std::io::Error::other)?;
+     let num_scanned_files = response.data.len();
+-
+-    Ok(PickerPage {
+-        rows: response
++    let (mut rows, pinned_thread_ids) = if load_pinned_renamed {
++        match codex_home {
++            Some(codex_home) => {
++                load_pinned_renamed_rows(
++                    app_server,
++                    codex_home,
++                    &provider_filter,
++                    include_non_interactive,
++                )
++                .await
++            }
++            None => (Vec::new(), HashSet::new()),
++        }
++    } else {
++        (Vec::new(), HashSet::new())
++    };
++    rows.extend(
++        response
+             .data
+             .into_iter()
+-            .filter_map(row_from_app_server_thread)
+-            .collect(),
++            .filter_map(row_from_app_server_thread),
++    );
++
++    Ok(PickerPage {
++        rows,
++        pinned_thread_ids,
+         next_cursor: response.next_cursor.map(PageCursor::AppServer),
+         num_scanned_files,
+         reached_scan_cap: false,
+     })
+ }
+ 
++async fn load_pinned_renamed_rows(
++    app_server: &mut AppServerSession,
++    codex_home: &Path,
++    provider_filter: &ProviderFilter,
++    include_non_interactive: bool,
++) -> (Vec<Row>, HashSet<ThreadId>) {
++    let entries = match codex_rollout::list_current_thread_name_entries(codex_home, PAGE_SIZE).await
++    {
++        Ok(entries) => entries,
++        Err(err) => {
++            warn!(%err, "failed to read renamed-thread candidates for resume picker");
++            return (Vec::new(), HashSet::new());
++        }
++    };
++    let mut rows = Vec::with_capacity(entries.len());
++    let mut pinned_thread_ids = HashSet::with_capacity(entries.len());
++    for entry in entries {
++        let mut thread = match app_server
++            .thread_read(entry.id, /*include_turns*/ false)
++            .await
++        {
++            Ok(thread) => thread,
++            Err(err) => {
++                warn!(thread_id = %entry.id, %err, "skipping unreadable renamed thread");
++                continue;
++            }
++        };
++        let Some(thread_name) = pinned_thread_name(&thread, &entry.thread_name) else {
++            continue;
++        };
++        if !thread_metadata_is_pinnable(
++            &thread,
++            codex_home,
++            provider_filter,
++            include_non_interactive,
++        ) {
++            continue;
++        }
++        thread.name = Some(thread_name);
++        if let Some(row) = row_from_app_server_thread(thread) {
++            pinned_thread_ids.insert(entry.id);
++            rows.push(row);
++        }
++    }
++    (rows, pinned_thread_ids)
++}
++
++fn pinned_thread_name(thread: &Thread, indexed_name: &str) -> Option<String> {
++    let canonical_name = thread
++        .name
++        .as_deref()
++        .map(str::trim)
++        .filter(|name| !name.is_empty())
++        .map(str::to_string);
++    match thread.history_mode {
++        codex_app_server_protocol::ThreadHistoryMode::Paginated => canonical_name,
++        codex_app_server_protocol::ThreadHistoryMode::Legacy => canonical_name.or_else(|| {
++            let indexed_name = indexed_name.trim();
++            (!indexed_name.is_empty()).then(|| indexed_name.to_string())
++        }),
++    }
++}
++
++fn thread_metadata_is_pinnable(
++    thread: &Thread,
++    codex_home: &Path,
++    provider_filter: &ProviderFilter,
++    include_non_interactive: bool,
++) -> bool {
++    if thread.ephemeral
++        || thread.parent_thread_id.is_some()
++        || thread.path.as_ref().is_some_and(|path| {
++            path.starts_with(codex_home.join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR))
++        })
++    {
++        return false;
++    }
++    let provider_matches = match provider_filter {
++        ProviderFilter::Any => true,
++        ProviderFilter::MatchDefault(provider) => thread.model_provider.as_str() == provider,
++    };
++    provider_matches
++        && match &thread.source {
++            SessionSource::Cli | SessionSource::VsCode => true,
++            SessionSource::Exec | SessionSource::AppServer => include_non_interactive,
++            SessionSource::Custom(_) | SessionSource::SubAgent(_) | SessionSource::Unknown => false,
++        }
++}
++
+ async fn load_transcript_preview(
+     app_server: &mut AppServerSession,
+     thread_id: ThreadId,
+@@ -941,6 +1058,8 @@ impl PickerState {
+             all_rows: Vec::new(),
+             filtered_rows: Vec::new(),
+             seen_rows: HashSet::new(),
++            seen_thread_ids: HashSet::new(),
++            pinned_thread_ids: HashSet::new(),
+             selected: 0,
+             scroll_top: 0,
+             pending_page_down_target: None,
+@@ -1279,6 +1398,8 @@ impl PickerState {
+         self.all_rows.clear();
+         self.filtered_rows.clear();
+         self.seen_rows.clear();
++        self.seen_thread_ids.clear();
++        self.pinned_thread_ids.clear();
+         self.selected = 0;
+         self.pending_page_down_target = None;
+         self.frozen_footer_percent = None;
+@@ -1306,6 +1427,8 @@ impl PickerState {
+             cwd_filter: self.active_cwd_filter(),
+             provider_filter: self.provider_filter.clone(),
+             sort_key: self.sort_key,
++            load_pinned_renamed: matches!(self.action, SessionPickerAction::Resume)
++                && self.filter_mode == SessionFilterMode::All,
+         }));
+     }
+ 
+@@ -1377,6 +1500,7 @@ impl PickerState {
+     }
+ 
+     fn ingest_page(&mut self, page: PickerPage) {
++        self.pinned_thread_ids.extend(page.pinned_thread_ids);
+         if let Some(cursor) = page.next_cursor.clone() {
+             self.pagination.next_cursor = Some(cursor);
+         } else {
+@@ -1391,6 +1515,11 @@ impl PickerState {
+         }
+ 
+         for row in page.rows {
++            if let Some(thread_id) = row.thread_id
++                && !self.seen_thread_ids.insert(thread_id)
++            {
++                continue;
++            }
+             if let Some(seen_key) = row.seen_key() {
+                 if self.seen_rows.insert(seen_key) {
+                     self.all_rows.push(row);
+@@ -1616,6 +1745,7 @@ impl PickerState {
+             cwd_filter: self.active_cwd_filter(),
+             provider_filter: self.provider_filter.clone(),
+             sort_key: self.sort_key,
++            load_pinned_renamed: false,
+         }));
+     }
+ 
+@@ -1750,6 +1880,7 @@ impl PickerState {
+             })
+             .sum::<usize>()
+             + self.row_separator_height() * end_inclusive.saturating_sub(start)
++            + self.pinned_group_boundaries_between(start, end_inclusive)
+     }
+ 
+     fn has_more_above(&self) -> bool {
+@@ -1779,7 +1910,8 @@ impl PickerState {
+                 self.view_width.unwrap_or(u16::MAX),
+             )
+             .len();
+-            let separator_height = usize::from(offset > 0) * self.row_separator_height();
++            let separator_height = usize::from(offset > 0) * self.row_separator_height()
++                + usize::from(offset > 0 && self.is_pinned_group_boundary(row_idx));
+             if used + separator_height + row_height > capacity {
+                 return true;
+             }
+@@ -1804,6 +1936,38 @@ impl PickerState {
+             SessionListDensity::Dense => 0,
+         }
+     }
++
++    fn is_pinned_row(&self, row: &Row) -> bool {
++        row.thread_id
++            .is_some_and(|thread_id| self.pinned_thread_ids.contains(&thread_id))
++    }
++
++    fn is_pinned_group_boundary(&self, row_idx: usize) -> bool {
++        row_idx > 0
++            && self
++                .filtered_rows
++                .get(row_idx - 1)
++                .zip(self.filtered_rows.get(row_idx))
++                .is_some_and(|(previous, current)| {
++                    self.is_pinned_row(previous) && !self.is_pinned_row(current)
++                })
++    }
++
++    fn pinned_group_boundaries_between(&self, start: usize, end_inclusive: usize) -> usize {
++        if start >= end_inclusive {
++            return 0;
++        }
++        (start.saturating_add(1)..=end_inclusive)
++            .filter(|&idx| self.is_pinned_group_boundary(idx))
++            .count()
++    }
++
++    fn visual_row_idx(&self, row_idx: usize) -> usize {
++        row_idx
++            + (1..=row_idx)
++                .filter(|&idx| self.is_pinned_group_boundary(idx))
++                .count()
++    }
+ }
+ 
+ fn row_from_app_server_thread(thread: Thread) -> Option<Row> {
+@@ -2484,10 +2648,19 @@ fn render_list(frame: &mut crate::custom_terminal::Frame, area: Rect, state: &Pi
+             break;
+         }
+         let row_idx = start + idx;
++        if idx > 0 && state.is_pinned_group_boundary(row_idx) {
++            let separator_idx = state.visual_row_idx(row_idx).saturating_sub(1);
++            let line = pinned_group_separator_line(separator_idx.is_multiple_of(2), area.width);
++            frame.render_widget_ref(line, Rect::new(area.x, y, area.width, 1));
++            y = y.saturating_add(1);
++            if y >= content_area.y.saturating_add(content_area.height) {
++                break;
++            }
++        }
+         let is_selected = row_idx == state.selected;
+         let is_expanded =
+             is_selected && row.thread_id.is_some() && state.expanded_thread_id == row.thread_id;
+-        let is_zebra = row_idx.is_multiple_of(2);
++        let is_zebra = state.visual_row_idx(row_idx).is_multiple_of(2);
+         for line in render_session_lines(row, state, is_selected, is_expanded, is_zebra, area.width)
+         {
+             if y >= content_area.y.saturating_add(content_area.height) {
+@@ -2529,6 +2702,14 @@ fn render_list(frame: &mut crate::custom_terminal::Frame, area: Rect, state: &Pi
+     }
+ }
+ 
++fn pinned_group_separator_line(is_zebra: bool, width: u16) -> Line<'static> {
++    if is_zebra {
++        apply_line_background(Line::default(), dense_zebra_style(), width)
++    } else {
++        Line::default()
++    }
++}
++
+ fn more_line(label: &'static str) -> Line<'static> {
+     vec![label.dim()].into()
+ }
+@@ -2560,13 +2741,24 @@ fn render_comfortable_session_lines(
+     width: u16,
+ ) -> Vec<Line<'static>> {
+     let marker = selection_marker(is_selected, is_expanded);
+-    let title = truncate_text(row.display_preview(), width.saturating_sub(2) as usize);
++    let available_title_width = (width as usize).saturating_sub(marker.width());
++    let pinned_label = (state.is_pinned_row(row)
++        && available_title_width > UnicodeWidthStr::width("Pinned "))
++    .then(pinned_session_label_span);
++    let label_width = pinned_label.as_ref().map_or(0, Span::width);
++    let title_width = available_title_width.saturating_sub(label_width);
++    let title = truncate_text(row.display_preview(), title_width);
+     let title = if is_selected {
+         selected_session_title_span(title)
+     } else {
+         title.into()
+     };
+-    let title_line = Line::from(vec![marker, title]);
++    let mut title_spans = vec![marker];
++    if let Some(label) = pinned_label {
++        title_spans.push(label);
++    }
++    title_spans.push(title);
++    let title_line = Line::from(title_spans);
+     let mut lines = vec![title_line];
+     let row_style = if is_selected {
+         Some(dense_selected_style())
+@@ -2651,6 +2843,7 @@ fn render_dense_session_lines(
+         marker,
+         date: &date,
+         title: row.display_preview(),
++        pinned: state.is_pinned_row(row),
+         is_selected,
+         is_zebra,
+         width,
+@@ -2665,6 +2858,7 @@ struct DenseSummaryInput<'a> {
+     marker: Span<'static>,
+     date: &'a str,
+     title: &'a str,
++    pinned: bool,
+     is_selected: bool,
+     is_zebra: bool,
+     width: u16,
+@@ -2674,17 +2868,27 @@ fn dense_summary_line(input: DenseSummaryInput<'_>) -> Line<'static> {
+     let marker_width = input.marker.width();
+     let available = (input.width as usize).saturating_sub(marker_width);
+     let columns = dense_columns(available);
++    let pinned_label = (input.pinned
++        && columns.title_width >= UnicodeWidthStr::width("Pinned ").saturating_add(2))
++    .then(pinned_session_label_span);
++    let label_width = pinned_label.as_ref().map_or(0, Span::width);
+     let title = if input.is_selected {
+-        selected_session_title_span(dense_column_text(input.title, columns.title_width))
++        selected_session_title_span(dense_column_text(
++            input.title,
++            columns.title_width.saturating_sub(label_width),
++        ))
+     } else {
+-        dense_column_text(input.title, columns.title_width).into()
++        dense_column_text(input.title, columns.title_width.saturating_sub(label_width)).into()
+     };
+ 
+-    let spans = vec![
++    let mut spans = vec![
+         input.marker,
+         dense_column_text(input.date, columns.date_width).dim(),
+-        title,
+     ];
++    if let Some(label) = pinned_label {
++        spans.push(label);
++    }
++    spans.push(title);
+     let mut line = Line::from(spans);
+     if input.is_selected {
+         let padding = (input.width as usize).saturating_sub(line.width());
+@@ -2763,6 +2967,18 @@ fn selected_session_title_span(title: String) -> Span<'static> {
+     title.set_style(selected_session_style())
+ }
+ 
++fn pinned_session_label_span() -> Span<'static> {
++    "Pinned ".set_style(pinned_session_label_style().bold())
++}
++
++fn pinned_session_label_style() -> Style {
++    if default_bg().is_some_and(is_light) {
++        Style::default().fg(best_color((0, 100, 0)))
++    } else {
++        Style::default().fg(Color::Cyan)
++    }
++}
++
+ fn render_footer_lines(
+     sort_key: ThreadSortKey,
+     created: &str,
+@@ -3254,6 +3470,7 @@ mod tests {
+     ) -> PickerPage {
+         PickerPage {
+             rows,
++            pinned_thread_ids: HashSet::new(),
+             next_cursor: next_cursor.map(|cursor| PageCursor::AppServer(cursor.to_string())),
+             num_scanned_files,
+             reached_scan_cap,
+@@ -3282,6 +3499,36 @@ mod tests {
+         }
+     }
+ 
++    fn make_named_thread(thread_id: ThreadId, source: SessionSource) -> Thread {
++        Thread {
++            id: thread_id.to_string(),
++            extra: None,
++            session_id: thread_id.to_string(),
++            forked_from_id: None,
++            parent_thread_id: None,
++            preview: String::from("conversation preview"),
++            ephemeral: false,
++            is_pinned: false,
++            history_mode: Default::default(),
++            model_provider: String::from("openai"),
++            created_at: 1,
++            updated_at: 2,
++            recency_at: Some(2),
++            status: codex_app_server_protocol::ThreadStatus::Idle,
++            path: Some(PathBuf::from("/tmp/live-session.jsonl")),
++            cwd: test_path_buf("/tmp").abs(),
++            cli_version: String::from("0.0.0"),
++            source,
++            can_accept_direct_input: None,
++            thread_source: None,
++            agent_nickname: None,
++            agent_role: None,
++            git_info: None,
++            name: Some(String::from("Named session")),
++            turns: Vec::new(),
++        }
++    }
++
+     fn footer_lines_text(state: &PickerState, width: u16) -> String {
+         footer_hint_lines(state, width)
+             .into_iter()
+@@ -3330,6 +3577,183 @@ mod tests {
+         assert_eq!(row.display_preview(), "My session");
+     }
+ 
++    #[test]
++    fn pinned_candidate_requires_canonical_resumable_metadata() {
++        let home = Path::new("/tmp/codex-home");
++        let provider = ProviderFilter::MatchDefault(String::from("openai"));
++        let base = make_named_thread(ThreadId::new(), SessionSource::Cli);
++        assert!(thread_metadata_is_pinnable(&base, home, &provider, false));
++        assert_eq!(
++            pinned_thread_name(&base, "stale index name"),
++            Some(String::from("Named session"))
++        );
++
++        let mut wrong_provider = base.clone();
++        wrong_provider.model_provider = String::from("other");
++        assert!(!thread_metadata_is_pinnable(
++            &wrong_provider,
++            home,
++            &provider,
++            false
++        ));
++
++        let mut child = base.clone();
++        child.parent_thread_id = Some(ThreadId::new().to_string());
++        assert!(!thread_metadata_is_pinnable(&child, home, &provider, false));
++
++        let mut legacy_without_distinct_name = base.clone();
++        legacy_without_distinct_name.name = None;
++        assert_eq!(
++            pinned_thread_name(&legacy_without_distinct_name, "conversation preview"),
++            Some(String::from("conversation preview"))
++        );
++        let mut paginated_without_canonical_name = legacy_without_distinct_name.clone();
++        paginated_without_canonical_name.history_mode =
++            codex_app_server_protocol::ThreadHistoryMode::Paginated;
++        assert_eq!(
++            pinned_thread_name(&paginated_without_canonical_name, "stale index name"),
++            None
++        );
++
++        let mut archived = base.clone();
++        archived.path = Some(
++            home.join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR)
++                .join("row.jsonl"),
++        );
++        assert!(!thread_metadata_is_pinnable(
++            &archived, home, &provider, false
++        ));
++
++        let exec = make_named_thread(ThreadId::new(), SessionSource::Exec);
++        assert!(!thread_metadata_is_pinnable(&exec, home, &provider, false));
++        assert!(thread_metadata_is_pinnable(&exec, home, &provider, true));
++
++        let subagent = make_named_thread(
++            ThreadId::new(),
++            SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::Other(
++                String::from("test"),
++            )),
++        );
++        assert!(!thread_metadata_is_pinnable(
++            &subagent, home, &provider, true
++        ));
++    }
++
++    #[test]
++    fn pinned_rows_precede_regular_page_and_deduplicate_by_thread() {
++        let loader = page_only_loader(|_| {});
++        let mut state = PickerState::new(
++            FrameRequester::test_dummy(),
++            loader,
++            ProviderFilter::MatchDefault(String::from("openai")),
++            /*show_all*/ true,
++            /*filter_cwd*/ None,
++            SessionPickerAction::Resume,
++        );
++        let pinned_id = ThreadId::new();
++        let regular_id = ThreadId::new();
++        let mut pinned = make_row("/tmp/pinned.jsonl", "2026-05-02T12:00:00Z", "pinned");
++        pinned.thread_id = Some(pinned_id);
++        pinned.thread_name = Some(String::from("Named session"));
++        let mut duplicate = pinned.clone();
++        duplicate.path = Some(PathBuf::from("/tmp/pinned-duplicate.jsonl"));
++        let mut regular = make_row("/tmp/regular.jsonl", "2026-05-01T12:00:00Z", "regular");
++        regular.thread_id = Some(regular_id);
++        let mut first_page = page(
++            vec![pinned, duplicate, regular],
++            /*next_cursor*/ None,
++            /*num_scanned_files*/ 2,
++            /*reached_scan_cap*/ false,
++        );
++        first_page.pinned_thread_ids.insert(pinned_id);
++
++        state.ingest_page(first_page);
++
++        assert_eq!(state.all_rows.len(), 2);
++        assert_eq!(state.all_rows[0].thread_id, Some(pinned_id));
++        assert_eq!(state.all_rows[1].thread_id, Some(regular_id));
++        assert!(state.is_pinned_row(&state.all_rows[0]));
++        assert!(state.is_pinned_group_boundary(1));
++        let height_without_boundary = {
++            let pinned_ids = std::mem::take(&mut state.pinned_thread_ids);
++            let height = state.rendered_height_between(0, 1);
++            state.pinned_thread_ids = pinned_ids;
++            height
++        };
++        assert_eq!(
++            state.rendered_height_between(0, 1),
++            height_without_boundary + 1
++        );
++
++        let comfortable = render_comfortable_session_lines(
++            &state.all_rows[0],
++            &state,
++            /*is_selected*/ false,
++            /*is_expanded*/ false,
++            /*is_zebra*/ false,
++            /*width*/ 80,
++        )
++        .into_iter()
++        .map(|line| line.to_string())
++        .collect::<Vec<_>>()
++        .join("\n");
++        assert!(comfortable.contains("Pinned Named session"));
++
++        let dense = render_dense_session_lines(
++            &state.all_rows[0],
++            &state,
++            /*is_selected*/ false,
++            /*is_expanded*/ false,
++            /*is_zebra*/ false,
++            /*width*/ 80,
++        )
++        .into_iter()
++        .map(|line| line.to_string())
++        .collect::<Vec<_>>()
++        .join("\n");
++        assert!(dense.contains("Pinned Named session"));
++
++        assert!(
++            render_comfortable_session_lines(
++                &state.all_rows[0],
++                &state,
++                /*is_selected*/ false,
++                /*is_expanded*/ false,
++                /*is_zebra*/ false,
++                /*width*/ 8,
++            )
++            .iter()
++            .all(|line| line.width() <= 8)
++        );
++        assert!(
++            render_dense_session_lines(
++                &state.all_rows[0],
++                &state,
++                /*is_selected*/ false,
++                /*is_expanded*/ false,
++                /*is_zebra*/ false,
++                /*width*/ 20,
++            )
++            .iter()
++            .all(|line| line.width() <= 20)
++        );
++        let narrow_dense = render_dense_session_lines(
++            &state.all_rows[0],
++            &state,
++            /*is_selected*/ false,
++            /*is_expanded*/ false,
++            /*is_zebra*/ false,
++            /*width*/ 22,
++        );
++        assert!(narrow_dense.iter().all(|line| line.width() <= 22));
++        assert!(
++            narrow_dense
++                .iter()
++                .flat_map(|line| line.spans.iter().skip(2))
++                .any(|span| !span.content.trim().is_empty())
++        );
++    }
++
+     #[test]
+     fn local_picker_thread_list_params_include_cwd_filter() {
+         let cwd_filter = picker_cwd_filter(
+@@ -4840,6 +5264,7 @@ session_picker_view = "dense"
+             marker: selection_marker(/*is_selected*/ true, /*is_expanded*/ false),
+             date: "15m ago",
+             title: "Selected dense row",
++            pinned: false,
+             is_selected: true,
+             is_zebra: false,
+             width: 80,
+@@ -4856,6 +5281,7 @@ session_picker_view = "dense"
+             marker: selection_marker(/*is_selected*/ false, /*is_expanded*/ false),
+             date: "15m ago",
+             title: "Zebra dense row",
++            pinned: false,
+             is_selected: false,
+             is_zebra: true,
+             width: 80,
+@@ -5258,6 +5684,7 @@ session_picker_view = "dense"
+         let guard = recorded_requests.lock().unwrap();
+         assert_eq!(guard.len(), 1);
+         assert!(guard[0].search_token.is_none());
++        assert!(!guard[0].load_pinned_renamed);
+     }
+ 
+     #[test]
+@@ -5359,6 +5786,7 @@ session_picker_view = "dense"
+             let guard = recorded_requests.lock().unwrap();
+             assert_eq!(guard.len(), 1);
+             assert_eq!(guard[0].sort_key, ThreadSortKey::UpdatedAt);
++            assert!(guard[0].load_pinned_renamed);
+         }
+ 
+         state
+@@ -5373,6 +5801,30 @@ session_picker_view = "dense"
+         let guard = recorded_requests.lock().unwrap();
+         assert_eq!(guard.len(), 2);
+         assert_eq!(guard[1].sort_key, ThreadSortKey::CreatedAt);
++        assert!(guard[1].load_pinned_renamed);
++    }
++
++    #[test]
++    fn fork_picker_never_requests_pinned_renamed_threads() {
++        let recorded_requests: Arc<Mutex<Vec<PageLoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
++        let request_sink = recorded_requests.clone();
++        let loader = page_only_loader(move |request| {
++            request_sink.lock().unwrap().push(request);
++        });
++        let mut state = PickerState::new(
++            FrameRequester::test_dummy(),
++            loader,
++            ProviderFilter::MatchDefault(String::from("openai")),
++            /*show_all*/ true,
++            /*filter_cwd*/ None,
++            SessionPickerAction::Fork,
++        );
++
++        state.start_initial_load();
++
++        let guard = recorded_requests.lock().unwrap();
++        assert_eq!(guard.len(), 1);
++        assert!(!guard[0].load_pinned_renamed);
+     }
+ 
+     #[tokio::test]
+@@ -5397,6 +5849,7 @@ session_picker_view = "dense"
+             let guard = recorded_requests.lock().unwrap();
+             assert_eq!(guard.len(), 1);
+             assert_eq!(guard[0].cwd_filter, Some(PathBuf::from("/tmp/project")));
++            assert!(!guard[0].load_pinned_renamed);
+         }
+ 
+         state
+@@ -5407,6 +5860,7 @@ session_picker_view = "dense"
+         let guard = recorded_requests.lock().unwrap();
+         assert_eq!(guard.len(), 2);
+         assert_eq!(guard[1].cwd_filter, None);
++        assert!(guard[1].load_pinned_renamed);
+     }
+ 
+     #[tokio::test]
+@@ -5431,6 +5885,7 @@ session_picker_view = "dense"
+             let guard = recorded_requests.lock().unwrap();
+             assert_eq!(guard.len(), 1);
+             assert_eq!(guard[0].cwd_filter, None);
++            assert!(guard[0].load_pinned_renamed);
+         }
+ 
+         state
+@@ -5441,6 +5896,7 @@ session_picker_view = "dense"
+         let guard = recorded_requests.lock().unwrap();
+         assert_eq!(guard.len(), 2);
+         assert_eq!(guard[1].cwd_filter, Some(PathBuf::from("/tmp/project")));
++        assert!(!guard[1].load_pinned_renamed);
+     }
+ 
+     #[tokio::test]

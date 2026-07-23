@@ -1,0 +1,263 @@
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index b132420620..fcd949073b 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -525,8 +525,10 @@ impl ModelClient {
+         _model_info: &ModelInfo,
+     ) -> bool {
+         let websocket_enabled = self.responses_websocket_enabled();
+-        let activated =
+-            websocket_enabled && !self.state.disable_websockets.swap(true, Ordering::Relaxed);
++        let fallback_allowed = self.state.provider.info().allows_websocket_http_fallback();
++        let activated = fallback_allowed
++            && websocket_enabled
++            && !self.state.disable_websockets.swap(true, Ordering::Relaxed);
+         if activated {
+             warn!("falling back to HTTP");
+             session_telemetry.counter(
+@@ -1775,8 +1777,11 @@ impl ModelClientSession {
+                 Ok(())
+             }
+             Ok(WebsocketStreamOutcome::FallbackToHttp) => {
+-                self.try_switch_fallback_transport(session_telemetry, model_info);
+-                Ok(())
++                if self.try_switch_fallback_transport(session_telemetry, model_info) {
++                    Ok(())
++                } else {
++                    Err(websocket_http_fallback_disabled())
++                }
+             }
+             Err(err) => Err(err),
+         }
+@@ -1824,7 +1829,9 @@ impl ModelClientSession {
+                     {
+                         WebsocketStreamOutcome::Stream(stream) => return Ok(stream),
+                         WebsocketStreamOutcome::FallbackToHttp => {
+-                            self.try_switch_fallback_transport(session_telemetry, model_info);
++                            if !self.try_switch_fallback_transport(session_telemetry, model_info) {
++                                return Err(websocket_http_fallback_disabled());
++                            }
+                         }
+                     }
+                 }
+@@ -1863,6 +1870,13 @@ impl ModelClientSession {
+     }
+ }
+ 
++fn websocket_http_fallback_disabled() -> CodexErr {
++    CodexErr::Stream(
++        "Responses WebSocket requested HTTP fallback, but HTTP fallback is disabled".to_string(),
++        None,
++    )
++}
++
+ /// Stamp a ResponsesWsRequest with the current time.
+ ///
+ /// Meant to be called just before sending the request over the socket, to capture realistic
+diff --git a/codex-rs/core/src/responses_retry.rs b/codex-rs/core/src/responses_retry.rs
+index 7a1325eb92..1c0a3a2366 100644
+--- a/codex-rs/core/src/responses_retry.rs
++++ b/codex-rs/core/src/responses_retry.rs
+@@ -17,6 +17,18 @@ pub(crate) enum ResponsesStreamRequest {
+     RemoteCompactionV2,
+ }
+ 
++pub(crate) fn sampling_error_is_retryable(
++    err: &CodexErr,
++    responses_websocket_enabled: bool,
++) -> bool {
++    match err {
++        CodexErr::UnexpectedStatus(response) if response.status.is_client_error() => {
++            responses_websocket_enabled
++        }
++        _ => err.is_retryable(),
++    }
++}
++
+ /// Handles a retryable stream error and returns `Ok(())` when the caller should
+ /// retry the request loop.
+ pub(crate) async fn handle_retryable_response_stream_error(
+diff --git a/codex-rs/core/src/responses_retry_tests.rs b/codex-rs/core/src/responses_retry_tests.rs
+index 8ec040060d..7ed952a5a5 100644
+--- a/codex-rs/core/src/responses_retry_tests.rs
++++ b/codex-rs/core/src/responses_retry_tests.rs
+@@ -3,7 +3,9 @@ use super::log_retry;
+ use super::sampling_external_limit_should_surface;
+ use crate::session::tests::make_session_and_context;
+ use codex_protocol::error::CodexErr;
++use codex_protocol::error::UnexpectedResponseError;
+ use codex_protocol::error::UsageLimitReachedError;
++use http::StatusCode;
+ use std::time::Duration;
+ use tracing_test::internal::MockWriter;
+ 
+@@ -86,3 +88,20 @@ fn model_retry_flag_only_surfaces_sampling_external_limits() {
+         &CodexErr::Stream("disconnected".to_string(), None),
+     ));
+ }
++
++#[test]
++fn sampling_client_errors_retry_only_for_websocket_transport() {
++    let error = CodexErr::UnexpectedStatus(UnexpectedResponseError {
++        status: StatusCode::BAD_REQUEST,
++        body: String::new(),
++        user_message: None,
++        url: None,
++        cf_ray: None,
++        request_id: None,
++        identity_authorization_error: None,
++        identity_error_code: None,
++    });
++
++    assert!(super::sampling_error_is_retryable(&error, true));
++    assert!(!super::sampling_error_is_retryable(&error, false));
++}
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index 8f694e444c..33425fc0f4 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -41,6 +41,7 @@ use crate::responses_metadata::CodexResponsesMetadata;
+ use crate::responses_metadata::CodexResponsesRequestKind;
+ use crate::responses_retry::ResponsesStreamRequest;
+ use crate::responses_retry::handle_retryable_response_stream_error;
++use crate::responses_retry::sampling_error_is_retryable;
+ use crate::session::McpRuntimeSnapshot;
+ use crate::session::PreviousTurnSettings;
+ use crate::session::TurnInput;
+@@ -1275,7 +1276,10 @@ async fn run_sampling_request(
+             original_input = Some(prompt.input);
+         }
+ 
+-        if !err.is_retryable() {
++        if !sampling_error_is_retryable(
++            &err,
++            sess.services.model_client.responses_websocket_enabled(),
++        ) {
+             return Err(err);
+         }
+ 
+diff --git a/codex-rs/core/tests/suite/websocket_fallback.rs b/codex-rs/core/tests/suite/websocket_fallback.rs
+index cdf77694c2..3987dbb48d 100644
+--- a/codex-rs/core/tests/suite/websocket_fallback.rs
++++ b/codex-rs/core/tests/suite/websocket_fallback.rs
+@@ -46,6 +46,7 @@ async fn websocket_fallback_switches_to_http_on_upgrade_required_connect() -> Re
+     let mut builder = test_codex().with_config({
+         let base_url = format!("{}/v1", server.uri());
+         move |config| {
++            config.model_provider.name = "Custom".to_string();
+             config.model_provider.base_url = Some(base_url);
+             config.model_provider.wire_api = WireApi::Responses;
+             config.model_provider.supports_websockets = true;
+@@ -78,6 +79,47 @@ async fn websocket_fallback_switches_to_http_on_upgrade_required_connect() -> Re
+     Ok(())
+ }
+ 
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn openai_websocket_upgrade_failure_does_not_fallback_to_http() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = responses::start_mock_server().await;
++    Mock::given(method("GET"))
++        .and(path_regex(".*/responses$"))
++        .respond_with(ResponseTemplate::new(426))
++        .mount(&server)
++        .await;
++
++    let mut builder = test_codex().with_config({
++        let base_url = format!("{}/v1", server.uri());
++        move |config| {
++            config.model_provider.base_url = Some(base_url);
++            config.model_provider.wire_api = WireApi::Responses;
++            config.model_provider.supports_websockets = true;
++            config.model_provider.stream_max_retries = Some(0);
++            config.model_provider.request_max_retries = Some(0);
++        }
++    });
++    let test = builder.build(&server).await?;
++
++    test.submit_turn("hello").await?;
++
++    let requests = server.received_requests().await.unwrap_or_default();
++    let websocket_attempts = requests
++        .iter()
++        .filter(|req| req.method == Method::GET && req.url.path().ends_with("/responses"))
++        .count();
++    let http_attempts = requests
++        .iter()
++        .filter(|req| req.method == Method::POST && req.url.path().ends_with("/responses"))
++        .count();
++
++    assert!(websocket_attempts >= 1);
++    assert_eq!(http_attempts, 0);
++
++    Ok(())
++}
++
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+@@ -92,6 +134,7 @@ async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result
+     let mut builder = test_codex().with_config({
+         let base_url = format!("{}/v1", server.uri());
+         move |config| {
++            config.model_provider.name = "Custom".to_string();
+             config.model_provider.base_url = Some(base_url);
+             config.model_provider.wire_api = WireApi::Responses;
+             config.model_provider.supports_websockets = true;
+@@ -137,6 +180,7 @@ async fn websocket_fallback_hides_first_websocket_retry_stream_error() -> Result
+     let mut builder = test_codex().with_config({
+         let base_url = format!("{}/v1", server.uri());
+         move |config| {
++            config.model_provider.name = "Custom".to_string();
+             config.model_provider.base_url = Some(base_url);
+             config.model_provider.wire_api = WireApi::Responses;
+             config.model_provider.supports_websockets = true;
+@@ -222,6 +266,7 @@ async fn websocket_fallback_is_sticky_across_turns() -> Result<()> {
+     let mut builder = test_codex().with_config({
+         let base_url = format!("{}/v1", server.uri());
+         move |config| {
++            config.model_provider.name = "Custom".to_string();
+             config.model_provider.base_url = Some(base_url);
+             config.model_provider.wire_api = WireApi::Responses;
+             config.model_provider.supports_websockets = true;
+diff --git a/codex-rs/model-provider-info/src/lib.rs b/codex-rs/model-provider-info/src/lib.rs
+index 3a40cf32db..4a335b5633 100644
+--- a/codex-rs/model-provider-info/src/lib.rs
++++ b/codex-rs/model-provider-info/src/lib.rs
+@@ -470,6 +470,15 @@ impl ModelProviderInfo {
+         self.name == OPENAI_PROVIDER_NAME
+     }
+ 
++    /// Whether a failed Responses WebSocket session may switch to HTTP.
++    ///
++    /// The built-in OpenAI route keeps WebSocket transport failures visible
++    /// instead of silently changing transports. Other providers retain the
++    /// upstream fallback policy.
++    pub fn allows_websocket_http_fallback(&self) -> bool {
++        !self.is_openai()
++    }
++
+     pub fn uses_openai_actor_authorization(&self) -> bool {
+         !self.requires_openai_auth
+             && self.http_headers.as_ref().is_some_and(|headers| {
+diff --git a/codex-rs/model-provider-info/src/model_provider_info_tests.rs b/codex-rs/model-provider-info/src/model_provider_info_tests.rs
+index 363fbeb554..456fc84c20 100644
+--- a/codex-rs/model-provider-info/src/model_provider_info_tests.rs
++++ b/codex-rs/model-provider-info/src/model_provider_info_tests.rs
+@@ -170,6 +170,16 @@ fn custom_openai_base_url_requires_explicit_websocket_opt_in() {
+     assert!(!custom.supports_websockets);
+ }
+ 
++#[test]
++fn only_openai_disables_websocket_http_fallback() {
++    let openai = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
++    let mut custom = openai.clone();
++    custom.name = "Custom".to_string();
++
++    assert!(!openai.allows_websocket_http_fallback());
++    assert!(custom.allows_websocket_http_fallback());
++}
++
+ #[test]
+ fn configured_model_provider_preserves_explicit_default_values() {
+     let explicit = ConfiguredModelProvider {

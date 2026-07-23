@@ -1,0 +1,310 @@
+diff --git a/codex-rs/tui/tests/terminal_chrome_regression.rs b/codex-rs/tui/tests/terminal_chrome_regression.rs
+new file mode 100644
+index 0000000000..c81485711b
+--- /dev/null
++++ b/codex-rs/tui/tests/terminal_chrome_regression.rs
+@@ -0,0 +1,304 @@
++#![allow(clippy::expect_used)]
++
++use std::collections::BTreeSet;
++use std::fs;
++use std::path::Path;
++use std::path::PathBuf;
++use unicode_width::UnicodeWidthChar;
++use unicode_width::UnicodeWidthStr;
++
++fn codepoint(value: u32) -> char {
++    char::from_u32(value).expect("test codepoint should be valid")
++}
++
++fn chrome_sources_under(dir: &Path) -> Vec<PathBuf> {
++    let mut files = Vec::new();
++    let entries = fs::read_dir(dir).expect("TUI source directory should be readable");
++    for entry in entries {
++        let entry = entry.expect("TUI source directory entry should be readable");
++        let path = entry.path();
++        if path.is_dir() {
++            files.extend(chrome_sources_under(&path));
++        } else if path
++            .extension()
++            .is_some_and(|extension| extension == "rs" || extension == "snap")
++        {
++            files.push(path);
++        }
++    }
++    files.sort();
++    files
++}
++
++fn relative_source_path(root: &Path, path: &Path) -> String {
++    path.strip_prefix(root)
++        .expect("TUI source should stay below its source root")
++        .to_string_lossy()
++        .replace('\\', "/")
++}
++
++fn source_text(root: &Path, relative: &str) -> String {
++    fs::read_to_string(root.join(relative)).expect("TUI source fixture should be readable")
++}
++
++fn record(violations: &mut Vec<String>, condition: bool, message: impl Into<String>) {
++    if !condition {
++        violations.push(message.into());
++    }
++}
++
++fn check_plain_box_width(contents: &str, path: &str, violations: &mut Vec<String>) {
++    let Some(top) = contents
++        .lines()
++        .find(|line| line.starts_with('┌') && line.ends_with('┐'))
++    else {
++        violations.push(format!("{path} should contain a plain top border"));
++        return;
++    };
++    let width = UnicodeWidthStr::width(top);
++    record(
++        violations,
++        contents
++            .lines()
++            .any(|line| line.starts_with('└') && line.ends_with('┘')),
++        format!("{path} should contain a plain bottom border"),
++    );
++    for line in contents
++        .lines()
++        .filter(|line| line.starts_with('│') && line.ends_with('│'))
++    {
++        record(
++            violations,
++            UnicodeWidthStr::width(line) == width,
++            format!("{path} content row should match its border width"),
++        );
++    }
++}
++
++#[test]
++fn terminal_chrome_source_tree_is_normalized_and_script_fixed_point() {
++    let src_file = codex_utils_cargo_bin::find_resource!("src/lib.rs")
++        .expect("TUI source runfile should resolve");
++    let src_dir = src_file
++        .parent()
++        .expect("TUI source file should have a parent");
++    let unicode_semantics_files: BTreeSet<&str> = [
++        "bottom_pane/chat_composer.rs",
++        "bottom_pane/textarea.rs",
++        "live_wrap.rs",
++        "markdown.rs",
++        "markdown_stream.rs",
++        "mention_codec.rs",
++        "streaming/controller.rs",
++        "text_formatting.rs",
++        "wrapping.rs",
++    ]
++    .into_iter()
++    .collect();
++    let diff_snapshot_prefix = "snapshots/codex_tui__diff_render__tests__";
++    let rounded_borders = [0x256D, 0x256E, 0x2570, 0x256F].map(codepoint);
++    let product_chrome_inputs = [
++        0x2714, 0x2717, 0x2718, 0x26A0, 0x2022, 0x25E6, 0x00B7, 0x25A0, 0x21B3, 0x2301, 0x2304,
++        0x24D8, 0xE0A0, 0x2728, 0x1F50C,
++    ]
++    .map(codepoint);
++    let mut violations = Vec::new();
++    let mut saw_primary_output = false;
++
++    for path in chrome_sources_under(src_dir) {
++        let relative = relative_source_path(src_dir, &path);
++        let contents = fs::read_to_string(&path).expect("TUI source should be readable");
++        saw_primary_output |= contents.contains('▪');
++
++        for input in rounded_borders {
++            if contents.contains(input) {
++                violations.push(format!(
++                    "{relative} retains rounded border U+{:04X}",
++                    input as u32
++                ));
++            }
++        }
++        if path.extension().is_some_and(|extension| extension == "rs")
++            && contents.contains("BorderType::Rounded")
++        {
++            violations.push(format!("{relative} retains BorderType::Rounded"));
++        }
++
++        if unicode_semantics_files.contains(relative.as_str())
++            || relative == "diff_render.rs"
++            || relative.starts_with(diff_snapshot_prefix)
++        {
++            continue;
++        }
++        for input in product_chrome_inputs {
++            if contents.contains(input) {
++                violations.push(format!(
++                    "{relative} retains product chrome U+{:04X}",
++                    input as u32
++                ));
++            }
++        }
++    }
++
++    record(
++        &mut violations,
++        saw_primary_output,
++        "normalized source should contain the selected ▪ output",
++    );
++
++    let onboarding = source_text(src_dir, "onboarding/auth.rs");
++    record(
++        &mut violations,
++        onboarding.contains("BorderType::Plain"),
++        "onboarding/auth.rs should use BorderType::Plain",
++    );
++
++    let separators = source_text(src_dir, "history_cell/separators.rs");
++    record(
++        &mut violations,
++        !separators.contains(&format!("join(\" {} \")", codepoint(0x2022))),
++        "history_cell/separators.rs should not retain the input separator",
++    );
++    record(
++        &mut violations,
++        separators.contains("join(\" ▪ \")"),
++        "history_cell/separators.rs should use the selected separator",
++    );
++
++    let wrapping = source_text(src_dir, "wrapping.rs");
++    record(
++        &mut violations,
++        wrapping.contains(codepoint(0x2022)),
++        "wrapping.rs should preserve the primary Unicode semantic fixture",
++    );
++    record(
++        &mut violations,
++        wrapping.contains(codepoint(0x25E6)),
++        "wrapping.rs should preserve the secondary Unicode semantic fixture",
++    );
++
++    let text_formatting = source_text(src_dir, "text_formatting.rs");
++    record(
++        &mut violations,
++        text_formatting.contains(codepoint(0x2728)),
++        "text_formatting.rs should preserve its wide Unicode semantic fixture",
++    );
++
++    let composer = source_text(src_dir, "bottom_pane/chat_composer.rs");
++    record(
++        &mut violations,
++        !composer.contains(&format!(" {} ", codepoint(0x00B7))),
++        "bottom_pane/chat_composer.rs should not retain the input separator",
++    );
++    record(
++        &mut violations,
++        composer.contains(" ▪ "),
++        "bottom_pane/chat_composer.rs should use the selected separator",
++    );
++
++    let streaming = source_text(src_dir, "streaming/controller.rs");
++    record(
++        &mut violations,
++        streaming.contains("vec![\"▪ \".dim(), \"Proposed Plan\".bold()]"),
++        "streaming/controller.rs should normalize proposed-plan chrome",
++    );
++    record(
++        &mut violations,
++        streaming.contains("vec![\"▪ tail without newline\".to_string()]"),
++        "streaming/controller.rs should normalize tail chrome",
++    );
++    record(
++        &mut violations,
++        !streaming.contains(&format!("vec![\"{} \".dim()", codepoint(0x2022))),
++        "streaming/controller.rs should not retain the primary input chrome",
++    );
++    record(
++        &mut violations,
++        !streaming.contains(&format!("vec![\"{} \".dim()", codepoint(0x25A0))),
++        "streaming/controller.rs should not retain the square input chrome",
++    );
++
++    let diff_render = source_text(src_dir, "diff_render.rs");
++    record(
++        &mut violations,
++        diff_render.matches("vec![\"▪ \".dim()]").count() == 1,
++        "diff_render.rs should contain exactly one selected input chrome vector",
++    );
++    record(
++        &mut violations,
++        !diff_render.contains(&format!("\"{}\".dim()", codepoint(0x22EE))),
++        "diff_render.rs should not retain the vertical ellipsis",
++    );
++    record(
++        &mut violations,
++        diff_render.contains("\"...\".dim()"),
++        "diff_render.rs should use the ASCII ellipsis",
++    );
++
++    let diff_gallery = source_text(
++        src_dir,
++        "snapshots/codex_tui__diff_render__tests__diff_gallery_120x40.snap",
++    );
++    record(
++        &mut violations,
++        diff_gallery
++            .lines()
++            .any(|line| line.starts_with("\"▪ Edited")),
++        "diff gallery should use selected edit chrome",
++    );
++    record(
++        &mut violations,
++        diff_gallery.contains(codepoint(0x2728)),
++        "diff gallery should preserve its wide input payload",
++    );
++    let cjk_payload: String = [0x4F60, 0x597D, 0x4E16, 0x754C]
++        .into_iter()
++        .map(codepoint)
++        .collect();
++    record(
++        &mut violations,
++        diff_gallery.contains(&cjk_payload),
++        "diff gallery should preserve its CJK payload",
++    );
++
++    record(
++        &mut violations,
++        UnicodeWidthChar::width(codepoint(0x2728)) == Some(2),
++        "the first wide input should occupy two cells",
++    );
++    record(
++        &mut violations,
++        UnicodeWidthChar::width(codepoint(0x1F50C)) == Some(2),
++        "the second wide input should occupy two cells",
++    );
++    record(
++        &mut violations,
++        UnicodeWidthStr::width("* ") == 2,
++        "the ASCII replacement should preserve two-cell width",
++    );
++
++    for relative in [
++        "history_cell/snapshots/codex_tui__history_cell__tests__pnpm_update_available_history_cell_snapshot.snap",
++        "history_cell/snapshots/codex_tui__history_cell__tests__standalone_unix_update_available_history_cell_snapshot.snap",
++        "history_cell/snapshots/codex_tui__history_cell__tests__standalone_windows_update_available_history_cell_snapshot.snap",
++    ] {
++        let contents = source_text(src_dir, relative);
++        record(
++            &mut violations,
++            !contents.contains(codepoint(0x2728)),
++            format!("{relative} should not retain the wide input chrome"),
++        );
++        record(
++            &mut violations,
++            contents.contains("* "),
++            format!("{relative} should contain the width-preserving replacement"),
++        );
++        check_plain_box_width(&contents, relative, &mut violations);
++    }
++
++    assert!(
++        violations.is_empty(),
++        "terminal chrome source tree is not a normalized script fixed point:\n{}",
++        violations.join("\n")
++    );
++}

@@ -1,0 +1,307 @@
+diff --git a/codex-rs/core/src/agent/control.rs b/codex-rs/core/src/agent/control.rs
+index 749c3f3f4b..c89bb48dbc 100644
+--- a/codex-rs/core/src/agent/control.rs
++++ b/codex-rs/core/src/agent/control.rs
+@@ -281,6 +281,47 @@ impl AgentControl {
+             .ok_or(CodexErr::ThreadNotFound(agent_id))
+     }
+ 
++    /// Returns the currently loaded peers that can send mailbox activity to `sender_thread_id`.
++    pub(crate) async fn list_live_agent_peer_thread_ids(
++        &self,
++        sender_thread_id: ThreadId,
++    ) -> CodexResult<Vec<ThreadId>> {
++        let state = self.upgrade()?;
++        let root_path = AgentPath::root();
++        let root_thread_id = self.state.agent_id_for_path(&root_path);
++        let mut candidates = self
++            .state
++            .live_agents()
++            .into_iter()
++            .filter_map(|metadata| metadata.agent_id.map(|thread_id| (metadata, thread_id)))
++            .collect::<Vec<_>>();
++
++        if let Some(root_thread_id) = root_thread_id
++            && let Some(root_metadata) = self.state.agent_metadata_for_thread(root_thread_id)
++        {
++            candidates.push((root_metadata, root_thread_id));
++        }
++
++        candidates.sort_by(
++            |(left_metadata, left_thread_id), (right_metadata, right_thread_id)| {
++                left_metadata
++                    .agent_path
++                    .as_deref()
++                    .unwrap_or_default()
++                    .cmp(right_metadata.agent_path.as_deref().unwrap_or_default())
++                    .then_with(|| left_thread_id.to_string().cmp(&right_thread_id.to_string()))
++            },
++        );
++
++        let mut peer_thread_ids = Vec::with_capacity(candidates.len());
++        for (_, thread_id) in candidates {
++            if thread_id != sender_thread_id && state.get_thread(thread_id).await.is_ok() {
++                peer_thread_ids.push(thread_id);
++            }
++        }
++        Ok(peer_thread_ids)
++    }
++
+     pub(crate) async fn list_live_agent_subtree_thread_ids(
+         &self,
+         agent_id: ThreadId,
+diff --git a/codex-rs/core/src/agent/control_tests.rs b/codex-rs/core/src/agent/control_tests.rs
+index 445794da15..471fd63936 100644
+--- a/codex-rs/core/src/agent/control_tests.rs
++++ b/codex-rs/core/src/agent/control_tests.rs
+@@ -501,6 +501,65 @@ async fn get_status_returns_pending_init_for_new_thread() {
+     assert_eq!(status, AgentStatus::PendingInit);
+ }
+ 
++#[test]
++fn live_agent_peer_thread_ids_are_sorted_and_exclude_the_sender() {
++    let runtime = tokio::runtime::Builder::new_multi_thread()
++        .worker_threads(1)
++        .thread_stack_size(8 * 1024 * 1024)
++        .enable_all()
++        .build()
++        .expect("large-stack test runtime");
++    runtime.block_on(async {
++        let harness = AgentControlHarness::new().await;
++        let (root_thread_id, _root_thread) = harness.start_thread().await;
++        harness
++            .control
++            .register_session_root(root_thread_id, /*parent_thread_id*/ None);
++        let first_child = harness
++            .spawn_anonymous_child(root_thread_id, SpawnAgentOptions::default())
++            .await;
++        let second_child = harness
++            .spawn_anonymous_child(root_thread_id, SpawnAgentOptions::default())
++            .await;
++
++        let root_peers = harness
++            .control
++            .list_live_agent_peer_thread_ids(root_thread_id)
++            .await
++            .expect("root peer snapshot");
++        assert_eq!(root_peers, {
++            let mut expected = vec![first_child, second_child];
++            expected.sort_by_key(|thread_id| thread_id.to_string());
++            expected
++        });
++
++        let child_peers = harness
++            .control
++            .list_live_agent_peer_thread_ids(first_child)
++            .await
++            .expect("child peer snapshot");
++        assert_eq!(child_peers, vec![second_child, root_thread_id]);
++    });
++}
++
++#[tokio::test]
++async fn live_agent_peer_thread_ids_are_empty_without_other_live_agents() {
++    let harness = AgentControlHarness::new().await;
++    let (root_thread_id, _root_thread) = harness.start_thread().await;
++    harness
++        .control
++        .register_session_root(root_thread_id, /*parent_thread_id*/ None);
++
++    assert_eq!(
++        harness
++            .control
++            .list_live_agent_peer_thread_ids(root_thread_id)
++            .await
++            .expect("root peer snapshot"),
++        Vec::new()
++    );
++}
++
+ #[tokio::test]
+ async fn subscribe_status_errors_for_missing_thread() {
+     let harness = AgentControlHarness::new().await;
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs b/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
+index 67f8057e43..1114230a4b 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs
+@@ -48,6 +48,10 @@ async fn handle_spawn_agent(
+     } = invocation;
+     let arguments = function_arguments(payload)?;
+     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
++    session
++        .services
++        .agent_control
++        .register_session_root(session.thread_id, turn.parent_thread_id);
+     let fork_mode = args.fork_mode()?;
+     let role_name = args
+         .agent_type
+diff --git a/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs b/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs
+index 4e2eced260..6cb0899bb3 100644
+--- a/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs
++++ b/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs
+@@ -65,6 +65,13 @@ impl Handler {
+             None => default_timeout_ms,
+         };
+ 
++        let receiver_thread_ids = session
++            .services
++            .agent_control
++            .list_live_agent_peer_thread_ids(session.thread_id)
++            .await
++            .unwrap_or_default();
++
+         let turn_state = session
+             .input_queue
+             .turn_state_for_sub_id(&session.active_turn, &turn.sub_id)
+@@ -82,7 +89,7 @@ impl Handler {
+                     tool: CollabAgentTool::Wait,
+                     status: CollabAgentToolCallStatus::InProgress,
+                     sender_thread_id: session.thread_id,
+-                    receiver_thread_ids: Vec::new(),
++                    receiver_thread_ids: receiver_thread_ids.clone(),
+                     receiver_agents: Vec::new(),
+                     prompt: None,
+                     model: None,
+@@ -104,7 +111,7 @@ impl Handler {
+                     tool: CollabAgentTool::Wait,
+                     status: CollabAgentToolCallStatus::Completed,
+                     sender_thread_id: session.thread_id,
+-                    receiver_thread_ids: Vec::new(),
++                    receiver_thread_ids,
+                     receiver_agents: Vec::new(),
+                     prompt: None,
+                     model: None,
+diff --git a/codex-rs/core/tests/suite/pending_input.rs b/codex-rs/core/tests/suite/pending_input.rs
+index 2fefccc019..fc4793d2b2 100644
+--- a/codex-rs/core/tests/suite/pending_input.rs
++++ b/codex-rs/core/tests/suite/pending_input.rs
+@@ -35,6 +35,7 @@ use core_test_support::test_codex::TestCodex;
+ use core_test_support::test_codex::test_codex;
+ use core_test_support::test_codex::turn_permission_fields;
+ use core_test_support::wait_for_event;
++use core_test_support::wait_for_event_match;
+ use pretty_assertions::assert_eq;
+ use serde_json::Value;
+ use serde_json::from_slice;
+@@ -327,14 +328,41 @@ async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
+         .codex;
+ 
+     submit_user_input(&codex, INITIAL_PROMPT).await;
++    let wait_started = wait_for_event_match(&codex, |event| match event {
++        EventMsg::ItemStarted(item_started) => match &item_started.item {
++            TurnItem::CollabAgentToolCall(item) if item.id == WAIT_CALL_ID => Some(item.clone()),
++            _ => None,
++        },
++        _ => None,
++    })
++    .await;
+     wait_for_event(&codex, |event| {
+         matches!(event, EventMsg::CollabWaitingBegin(_))
+     })
+     .await;
+ 
++    assert_eq!(wait_started.receiver_thread_ids, Vec::new());
++
+     steer_user_input(&codex, STEER_PROMPT).await;
++    let wait_completed = wait_for_event_match(&codex, |event| match event {
++        EventMsg::ItemCompleted(item_completed) => match &item_completed.item {
++            TurnItem::CollabAgentToolCall(item) if item.id == WAIT_CALL_ID => Some(item.clone()),
++            _ => None,
++        },
++        _ => None,
++    })
++    .await;
+     wait_for_turn_complete(&codex).await;
+ 
++    assert_eq!(
++        wait_completed.receiver_thread_ids,
++        wait_started.receiver_thread_ids
++    );
++    assert_eq!(
++        wait_completed.sender_thread_id,
++        wait_started.sender_thread_id
++    );
++
+     let requests = server.requests().await;
+     assert_eq!(requests.len(), 2);
+     let second: Value = from_slice(&requests[1]).expect("parse second request");
+diff --git a/codex-rs/core/tests/suite/subagent_notifications.rs b/codex-rs/core/tests/suite/subagent_notifications.rs
+index 697c80cb1a..50acb423b5 100644
+--- a/codex-rs/core/tests/suite/subagent_notifications.rs
++++ b/codex-rs/core/tests/suite/subagent_notifications.rs
+@@ -6,6 +6,7 @@ use codex_features::Feature;
+ use codex_models_manager::bundled_models_response;
+ use codex_protocol::ThreadId;
+ use codex_protocol::config_types::ReasoningSummary;
++use codex_protocol::items::TurnItem;
+ use codex_protocol::models::PermissionProfile;
+ use codex_protocol::openai_models::ReasoningEffort;
+ use codex_protocol::protocol::AskForApproval;
+@@ -1591,10 +1592,66 @@ async fn plaintext_multi_agent_v2_completion_sends_agent_message(
+         })
+         .build(&server)
+         .await?;
++    let root_thread_id = test
++        .thread_manager
++        .list_thread_ids()
++        .await
++        .into_iter()
++        .next()
++        .expect("root thread ID");
+ 
+     test.submit_turn(TURN_1_PROMPT).await?;
+     let _ = wait_for_requests(&child_request).await?;
+-    test.submit_turn(TURN_2_NO_WAIT_PROMPT).await?;
++    let child_thread_id = test
++        .thread_manager
++        .list_thread_ids()
++        .await
++        .into_iter()
++        .find(|thread_id| *thread_id != root_thread_id)
++        .expect("child thread ID");
++    test.codex
++        .submit(Op::UserInput {
++            items: vec![UserInput::Text {
++                text: TURN_2_NO_WAIT_PROMPT.to_string(),
++                text_elements: Vec::new(),
++            }],
++            final_output_json_schema: None,
++            responsesapi_client_metadata: None,
++            additional_context: Default::default(),
++            thread_settings: Default::default(),
++        })
++        .await?;
++    let wait_started = wait_for_event_match(test.codex.as_ref(), |event| match event {
++        EventMsg::ItemStarted(item_started) => match &item_started.item {
++            TurnItem::CollabAgentToolCall(item) if item.id == "wait-agent-call" => {
++                Some(item.clone())
++            }
++            _ => None,
++        },
++        _ => None,
++    })
++    .await;
++    let wait_completed = wait_for_event_match(test.codex.as_ref(), |event| match event {
++        EventMsg::ItemCompleted(item_completed) => match &item_completed.item {
++            TurnItem::CollabAgentToolCall(item) if item.id == "wait-agent-call" => {
++                Some(item.clone())
++            }
++            _ => None,
++        },
++        _ => None,
++    })
++    .await;
++
++    assert_eq!(wait_started.sender_thread_id, root_thread_id);
++    assert_eq!(wait_started.receiver_thread_ids, vec![child_thread_id]);
++    assert_eq!(
++        wait_completed.receiver_thread_ids,
++        wait_started.receiver_thread_ids
++    );
++    assert_eq!(
++        wait_completed.sender_thread_id,
++        wait_started.sender_thread_id
++    );
+ 
+     let request = wait_for_requests(&agent_request)
+         .await?

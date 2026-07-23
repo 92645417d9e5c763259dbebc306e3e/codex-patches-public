@@ -1,0 +1,432 @@
+diff --git a/codex-rs/app-server/src/connection_cleanup.rs b/codex-rs/app-server/src/connection_cleanup.rs
+index 529020fe3f..806247f61e 100644
+--- a/codex-rs/app-server/src/connection_cleanup.rs
++++ b/codex-rs/app-server/src/connection_cleanup.rs
+@@ -20,6 +20,10 @@ impl ConnectionCleanupTasks {
+         self.tasks.spawn(future);
+     }
+ 
++    pub(crate) fn is_empty(&self) -> bool {
++        self.tasks.is_empty()
++    }
++
+     pub(crate) async fn reap_next(&mut self) {
+         if self.tasks.is_empty() {
+             pending::<()>().await;
+@@ -47,3 +51,25 @@ fn log_cleanup_result(result: Result<(), JoinError>) {
+         warn!("connection cleanup task failed: {err}");
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::ConnectionCleanupTasks;
++    use tokio::sync::oneshot;
++
++    #[tokio::test]
++    async fn cleanup_task_remains_pending_until_reaped() {
++        let (release_tx, release_rx) = oneshot::channel();
++        let mut tasks = ConnectionCleanupTasks::new();
++        tasks.spawn(async move {
++            let _ = release_rx.await;
++        });
++
++        assert!(!tasks.is_empty());
++        release_tx
++            .send(())
++            .expect("cleanup task should still exist");
++        tasks.reap_next().await;
++        assert!(tasks.is_empty());
++    }
++}
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+index 169a6ca73e..c26dadf417 100644
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -183,6 +183,26 @@ enum ShutdownAction {
+     Finish,
+ }
+ 
++fn should_wait_for_zero_client_drain(
++    enabled: bool,
++    had_connection: bool,
++    connection_count: usize,
++) -> bool {
++    enabled && had_connection && connection_count == 0
++}
++
++fn should_finish_zero_client_drain(
++    enabled: bool,
++    had_connection: bool,
++    connection_count: usize,
++    running_turn_count: usize,
++    cleanup_complete: bool,
++) -> bool {
++    should_wait_for_zero_client_drain(enabled, had_connection, connection_count)
++        && running_turn_count == 0
++        && cleanup_complete
++}
++
+ #[derive(Clone, Copy)]
+ enum ShutdownSignal {
+     Forceable,
+@@ -877,6 +897,9 @@ pub async fn run_main_with_transport_options(
+         async move {
+             let mut listen_for_threads = true;
+             let mut shutdown_state = ShutdownState::default();
++            let mut had_connection = false;
++            let mut transport_event_channel_open = true;
++            let mut running_turn_watch_open = true;
+             let exit_reason = loop {
+                 let running_turn_count = {
+                     let running_turn_count = running_turn_count_rx.borrow();
+@@ -892,6 +915,15 @@ pub async fn run_main_with_transport_options(
+                         .await;
+                     break "shutdown_requested";
+                 }
++                if should_finish_zero_client_drain(
++                    shutdown_when_no_connections,
++                    had_connection,
++                    connections.len(),
++                    running_turn_count,
++                    connection_cleanup_tasks.is_empty(),
++                ) {
++                    break "zero_client_drain_complete";
++                }
+ 
+                 tokio::select! {
+                     shutdown_signal_result = shutdown_signal(), if graceful_signal_restart_enabled && !shutdown_state.forced() => {
+@@ -905,14 +937,26 @@ pub async fn run_main_with_transport_options(
+                         let running_turn_count = *running_turn_count_rx.borrow();
+                         shutdown_state.on_signal(signal, connections.len(), running_turn_count);
+                     }
+-                    changed = running_turn_count_rx.changed(), if graceful_signal_restart_enabled && shutdown_state.requested() => {
++                    changed = running_turn_count_rx.changed(), if running_turn_watch_open && (
++                        (graceful_signal_restart_enabled && shutdown_state.requested())
++                            || (shutdown_when_no_connections && had_connection && connections.is_empty())
++                    ) => {
+                         if changed.is_err() {
+-                            warn!("running-turn watcher closed during graceful restart drain");
++                            running_turn_watch_open = false;
++                            warn!("running-turn watcher closed during shutdown drain");
+                         }
+                     }
+-                    event = transport_event_rx.recv() => {
++                    event = transport_event_rx.recv(), if transport_event_channel_open => {
+                         let Some(event) = event else {
+-                            break "transport_channel_closed";
++                            if !should_wait_for_zero_client_drain(
++                                shutdown_when_no_connections,
++                                had_connection,
++                                connections.len(),
++                            ) {
++                                break "transport_channel_closed";
++                            }
++                            transport_event_channel_open = false;
++                            continue;
+                         };
+                         match event {
+                             TransportEvent::ConnectionOpened {
+@@ -921,6 +965,7 @@ pub async fn run_main_with_transport_options(
+                                 writer,
+                                 disconnect_sender,
+                             } => {
++                                had_connection = true;
+                                 let outbound_initialized = Arc::new(AtomicBool::new(false));
+                                 let outbound_experimental_api_enabled =
+                                     Arc::new(AtomicBool::new(false));
+@@ -972,9 +1017,6 @@ pub async fn run_main_with_transport_options(
+                                 if !outbound_closed {
+                                     break "outbound_router_closed";
+                                 }
+-                                if shutdown_when_no_connections && connections.is_empty() {
+-                                    break "last_connection_closed";
+-                                }
+                             }
+                             TransportEvent::IncomingMessage { connection_id, message } => {
+                                 match message {
+@@ -1336,12 +1378,32 @@ mod tests {
+     use super::LogFormat;
+     #[cfg(debug_assertions)]
+     use super::loader_overrides_with_test_user_config_file;
++    use super::should_finish_zero_client_drain;
++    use super::should_wait_for_zero_client_drain;
+     #[cfg(debug_assertions)]
+     use codex_config::LoaderOverrides;
+     #[cfg(debug_assertions)]
+     use codex_utils_absolute_path::AbsolutePathBuf;
+     use pretty_assertions::assert_eq;
+ 
++    #[test]
++    fn zero_client_drain_requires_a_prior_connection_and_all_work_to_finish() {
++        assert!(!should_finish_zero_client_drain(true, false, 0, 0, true));
++        assert!(!should_finish_zero_client_drain(true, true, 1, 0, true));
++        assert!(!should_finish_zero_client_drain(true, true, 0, 1, true));
++        assert!(!should_finish_zero_client_drain(true, true, 0, 0, false));
++        assert!(should_finish_zero_client_drain(true, true, 0, 0, true));
++    }
++
++    #[test]
++    fn zero_client_drain_is_disabled_for_multi_client_transports() {
++        assert!(!should_finish_zero_client_drain(false, true, 0, 0, true));
++        assert!(!should_wait_for_zero_client_drain(false, true, 0));
++        assert!(!should_wait_for_zero_client_drain(true, false, 0));
++        assert!(!should_wait_for_zero_client_drain(true, true, 1));
++        assert!(should_wait_for_zero_client_drain(true, true, 0));
++    }
++
+     #[test]
+     fn log_format_from_env_value_matches_json_values_case_insensitively() {
+         assert_eq!(LogFormat::from_env_value(Some("json")), LogFormat::Json);
+diff --git a/codex-rs/app-server/tests/common/test_app_server.rs b/codex-rs/app-server/tests/common/test_app_server.rs
+index 8a0504f196..946a8cb535 100644
+--- a/codex-rs/app-server/tests/common/test_app_server.rs
++++ b/codex-rs/app-server/tests/common/test_app_server.rs
+@@ -186,6 +186,14 @@ impl TestAppServer {
+         self.process.wait().await
+     }
+ 
++    pub fn close_stdin(&mut self) {
++        drop(self.stdin.take());
++    }
++
++    pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
++        self.process.try_wait()
++    }
++
+     /// Closes stdio and waits for app-server's graceful thread teardown to finish.
+     pub async fn shutdown_gracefully(&mut self) -> std::io::Result<ExitStatus> {
+         drop(self.stdin.take());
+diff --git a/codex-rs/app-server/tests/suite/mod.rs b/codex-rs/app-server/tests/suite/mod.rs
+index 09c40493f6..b1fdbd8c61 100644
+--- a/codex-rs/app-server/tests/suite/mod.rs
++++ b/codex-rs/app-server/tests/suite/mod.rs
+@@ -2,5 +2,6 @@ mod auth;
+ mod conversation_summary;
+ mod fuzzy_file_search;
+ mod logging;
++mod stdio_shutdown;
+ mod strict_config;
+ mod v2;
+diff --git a/codex-rs/app-server/tests/suite/stdio_shutdown.rs b/codex-rs/app-server/tests/suite/stdio_shutdown.rs
+new file mode 100644
+index 0000000000..f907467f65
+--- /dev/null
++++ b/codex-rs/app-server/tests/suite/stdio_shutdown.rs
+@@ -0,0 +1,216 @@
++use anyhow::Context;
++use anyhow::Result;
++use app_test_support::TestAppServer;
++use app_test_support::to_response;
++use app_test_support::write_mock_responses_config_toml;
++use codex_app_server_protocol::JSONRPCResponse;
++use codex_app_server_protocol::RequestId;
++use codex_app_server_protocol::ThreadStartParams;
++use codex_app_server_protocol::ThreadStartResponse;
++use codex_app_server_protocol::TurnStartParams;
++use codex_app_server_protocol::TurnStartResponse;
++use codex_app_server_protocol::TurnSteerParams;
++use codex_app_server_protocol::TurnSteerResponse;
++use codex_app_server_protocol::UserInput;
++use core_test_support::responses;
++use core_test_support::streaming_sse::StreamingSseChunk;
++use core_test_support::streaming_sse::start_streaming_sse_server;
++use std::collections::BTreeMap;
++use tempfile::TempDir;
++use tokio::sync::oneshot;
++use tokio::time::Duration;
++use tokio::time::timeout;
++
++const READ_TIMEOUT: Duration = Duration::from_secs(10);
++
++#[tokio::test]
++async fn stdio_eof_waits_for_an_accepted_turn_to_finish() -> Result<()> {
++    let (release_tx, release_rx) = oneshot::channel();
++    let (server, mut completions) = start_streaming_sse_server(vec![vec![
++        StreamingSseChunk {
++            gate: None,
++            body: responses::sse(vec![responses::ev_response_created("resp-1")]),
++        },
++        StreamingSseChunk {
++            gate: Some(release_rx),
++            body: responses::sse(vec![
++                responses::ev_assistant_message("msg-1", "shutdown-drain-complete"),
++                responses::ev_completed("resp-1"),
++            ]),
++        },
++    ]])
++    .await;
++    let response_completed = completions.remove(0);
++    let codex_home = TempDir::new()?;
++    write_mock_responses_config_toml(
++        codex_home.path(),
++        server.uri(),
++        &BTreeMap::new(),
++        100_000,
++        None,
++        "mock_provider",
++        "compact",
++    )?;
++    let mut app_server = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .build()
++        .await?;
++    timeout(READ_TIMEOUT, app_server.initialize()).await??;
++    let thread_start_id = app_server
++        .send_thread_start_request_with_auto_env(ThreadStartParams {
++            model: Some("mock-model".to_string()),
++            ..Default::default()
++        })
++        .await?;
++    let response: JSONRPCResponse = timeout(
++        READ_TIMEOUT,
++        app_server.read_stream_until_response_message(RequestId::Integer(thread_start_id)),
++    )
++    .await??;
++    let ThreadStartResponse { thread, .. } = to_response(response)?;
++    let rollout_path = thread.path.context("thread path should be present")?;
++    let turn_start_id = app_server
++        .send_turn_start_request(TurnStartParams {
++            thread_id: thread.id,
++            input: vec![UserInput::Text {
++                text: "finish after stdin closes".to_string(),
++                text_elements: Vec::new(),
++            }],
++            ..Default::default()
++        })
++        .await?;
++    let response: JSONRPCResponse = timeout(
++        READ_TIMEOUT,
++        app_server.read_stream_until_response_message(RequestId::Integer(turn_start_id)),
++    )
++    .await??;
++    let _: TurnStartResponse = to_response(response)?;
++    app_server.close_stdin();
++    timeout(READ_TIMEOUT, server.wait_for_request_count(1)).await?;
++    tokio::time::sleep(Duration::from_millis(100)).await;
++    assert!(
++        app_server.try_wait()?.is_none(),
++        "app-server must remain alive while the accepted turn is running"
++    );
++    release_tx
++        .send(())
++        .expect("model response gate should still be waiting");
++    timeout(READ_TIMEOUT, response_completed).await??;
++    let status = timeout(READ_TIMEOUT, app_server.wait_for_exit()).await??;
++    assert!(status.success(), "app-server exited with {status}");
++    assert!(std::fs::read_to_string(rollout_path)?.contains("shutdown-drain-complete"));
++    server.shutdown().await;
++    Ok(())
++}
++
++#[tokio::test]
++async fn stdio_eof_after_an_accepted_steer_exits_with_its_active_turn() -> Result<()> {
++    let (release_tx, release_rx) = oneshot::channel();
++    let (server, mut completions) = start_streaming_sse_server(vec![
++        vec![
++            StreamingSseChunk {
++                gate: None,
++                body: responses::sse(vec![responses::ev_response_created("resp-1")]),
++            },
++            StreamingSseChunk {
++                gate: Some(release_rx),
++                body: responses::sse(vec![
++                    responses::ev_assistant_message("msg-1", "first leg"),
++                    responses::ev_completed("resp-1"),
++                ]),
++            },
++        ],
++        vec![StreamingSseChunk {
++            gate: None,
++            body: responses::sse(vec![
++                responses::ev_response_created("resp-2"),
++                responses::ev_assistant_message("msg-2", "steer-drain-complete"),
++                responses::ev_completed("resp-2"),
++            ]),
++        }],
++    ])
++    .await;
++    let first_response_completed = completions.remove(0);
++    let second_response_completed = completions.remove(0);
++    let codex_home = TempDir::new()?;
++    write_mock_responses_config_toml(
++        codex_home.path(),
++        server.uri(),
++        &BTreeMap::new(),
++        100_000,
++        None,
++        "mock_provider",
++        "compact",
++    )?;
++    let mut app_server = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .build()
++        .await?;
++    timeout(READ_TIMEOUT, app_server.initialize()).await??;
++    let id = app_server
++        .send_thread_start_request_with_auto_env(ThreadStartParams {
++            model: Some("mock-model".to_string()),
++            ..Default::default()
++        })
++        .await?;
++    let response: JSONRPCResponse = timeout(
++        READ_TIMEOUT,
++        app_server.read_stream_until_response_message(RequestId::Integer(id)),
++    )
++    .await??;
++    let ThreadStartResponse { thread, .. } = to_response(response)?;
++    let rollout_path = thread.path.context("thread path should be present")?;
++    let id = app_server
++        .send_turn_start_request(TurnStartParams {
++            thread_id: thread.id.clone(),
++            input: vec![UserInput::Text {
++                text: "start a gated turn".to_string(),
++                text_elements: Vec::new(),
++            }],
++            ..Default::default()
++        })
++        .await?;
++    let response: JSONRPCResponse = timeout(
++        READ_TIMEOUT,
++        app_server.read_stream_until_response_message(RequestId::Integer(id)),
++    )
++    .await??;
++    let TurnStartResponse { turn, .. } = to_response(response)?;
++    timeout(READ_TIMEOUT, server.wait_for_request_count(1)).await?;
++    let id = app_server
++        .send_turn_steer_request(TurnSteerParams {
++            thread_id: thread.id,
++            expected_turn_id: turn.id,
++            client_user_message_id: Some("stdio-steer".to_string()),
++            input: vec![UserInput::Text {
++                text: "continue in the active turn".to_string(),
++                text_elements: Vec::new(),
++            }],
++            responsesapi_client_metadata: None,
++            additional_context: None,
++        })
++        .await?;
++    let response: JSONRPCResponse = timeout(
++        READ_TIMEOUT,
++        app_server.read_stream_until_response_message(RequestId::Integer(id)),
++    )
++    .await??;
++    let _: TurnSteerResponse = to_response(response)?;
++    app_server.close_stdin();
++    tokio::time::sleep(Duration::from_millis(100)).await;
++    assert!(
++        app_server.try_wait()?.is_none(),
++        "app-server must remain alive while the steered turn is running"
++    );
++    release_tx
++        .send(())
++        .expect("first model response gate should still be waiting");
++    timeout(READ_TIMEOUT, first_response_completed).await??;
++    timeout(READ_TIMEOUT, server.wait_for_request_count(2)).await?;
++    timeout(READ_TIMEOUT, second_response_completed).await??;
++    let status = timeout(READ_TIMEOUT, app_server.wait_for_exit()).await??;
++    assert!(status.success(), "app-server exited with {status}");
++    assert!(std::fs::read_to_string(rollout_path)?.contains("steer-drain-complete"));
++    server.shutdown().await;
++    Ok(())
++}

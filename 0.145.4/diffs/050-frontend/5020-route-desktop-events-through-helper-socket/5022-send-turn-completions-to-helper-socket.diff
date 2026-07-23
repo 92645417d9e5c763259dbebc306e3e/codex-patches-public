@@ -1,0 +1,250 @@
+diff --git a/codex-rs/tui/src/app/app_server_events.rs b/codex-rs/tui/src/app/app_server_events.rs
+index e5196cf9d5..82bb194c5e 100644
+--- a/codex-rs/tui/src/app/app_server_events.rs
++++ b/codex-rs/tui/src/app/app_server_events.rs
+@@ -11,11 +11,19 @@ use crate::app_event::RateLimitRefreshOrigin;
+ use crate::app_info::app_info_from_api;
+ use crate::app_server_session::AppServerSession;
+ use crate::app_server_session::status_account_display_from_auth_mode;
++use crate::codex_socket::CompletionRequest;
+ use codex_app_server_client::AppServerEvent;
+ use codex_app_server_protocol::AuthMode;
+ use codex_app_server_protocol::RateLimitReachedType;
+ use codex_app_server_protocol::ServerNotification;
+ use codex_app_server_protocol::ServerRequest;
++use codex_app_server_protocol::TurnStatus;
++use codex_protocol::ThreadId;
++use std::collections::hash_map::DefaultHasher;
++use std::hash::Hash;
++use std::hash::Hasher;
++use std::path::Path;
++use uuid::Uuid;
+ 
+ impl App {
+     pub(super) fn refresh_mcp_startup_expected_servers_from_config(&mut self) {
+@@ -169,9 +177,18 @@ impl App {
+ 
+         match server_notification_thread_target(&notification) {
+             ServerNotificationThreadTarget::Thread(thread_id) => {
+-                let result = if self.primary_thread_id == Some(thread_id)
+-                    || self.primary_thread_id.is_none()
+-                {
++                let is_primary_thread =
++                    is_primary_or_bootstrap_thread(self.primary_thread_id, thread_id);
++                if let Some(request) = completion_request_for_notification(
++                    &notification,
++                    is_primary_thread,
++                    self.config.cwd.as_path(),
++                    chrono::Utc::now(),
++                ) {
++                    crate::codex_socket::notify_completion(request);
++                }
++
++                let result = if is_primary_thread {
+                     self.enqueue_primary_thread_notification(notification).await
+                 } else {
+                     self.enqueue_thread_notification(thread_id, notification)
+@@ -248,3 +265,203 @@ impl App {
+         }
+     }
+ }
++
++fn is_primary_or_bootstrap_thread(
++    primary_thread_id: Option<ThreadId>,
++    thread_id: ThreadId,
++) -> bool {
++    primary_thread_id == Some(thread_id) || primary_thread_id.is_none()
++}
++
++fn completion_request_for_notification(
++    notification: &ServerNotification,
++    is_primary_thread: bool,
++    working_dir: &Path,
++    created_at: chrono::DateTime<chrono::Utc>,
++) -> Option<CompletionRequest> {
++    if !is_primary_thread {
++        return None;
++    }
++    let ServerNotification::TurnCompleted(notification) = notification else {
++        return None;
++    };
++    if notification.turn.status != TurnStatus::Completed {
++        return None;
++    }
++
++    let session_id = Uuid::parse_str(&notification.thread_id).ok()?.to_string();
++    let duration_ms = notification
++        .turn
++        .duration_ms
++        .and_then(|duration_ms| u64::try_from(duration_ms).ok())
++        .unwrap_or_default();
++
++    Some(CompletionRequest::new(
++        session_id.clone(),
++        stable_turn_id(&notification.turn.id),
++        "Completed".to_string(),
++        duration_ms,
++        working_dir.display().to_string(),
++        "Codex task finished".to_string(),
++        format!(
++            "Thread {session_id} turn {} completed.",
++            notification.turn.id
++        ),
++        created_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
++    ))
++}
++
++fn stable_turn_id(turn_id: &str) -> u64 {
++    if let Some(turn_id) = trailing_positive_number(turn_id) {
++        return turn_id;
++    }
++
++    let mut hasher = DefaultHasher::new();
++    turn_id.hash(&mut hasher);
++    (hasher.finish() % (i64::MAX as u64)).max(1)
++}
++
++fn trailing_positive_number(value: &str) -> Option<u64> {
++    let digits = value
++        .chars()
++        .rev()
++        .take_while(|character| character.is_ascii_digit())
++        .collect::<Vec<_>>();
++    if digits.is_empty() {
++        return None;
++    }
++
++    digits
++        .into_iter()
++        .rev()
++        .collect::<String>()
++        .parse::<u64>()
++        .ok()
++        .filter(|number| *number > 0)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use codex_app_server_protocol::Turn;
++    use codex_app_server_protocol::TurnCompletedNotification;
++    use codex_app_server_protocol::TurnItemsView;
++
++    fn turn_completed_notification(
++        status: TurnStatus,
++        thread_id: &str,
++        turn_id: &str,
++    ) -> ServerNotification {
++        ServerNotification::TurnCompleted(TurnCompletedNotification {
++            thread_id: thread_id.to_string(),
++            turn: Turn {
++                id: turn_id.to_string(),
++                items: Vec::new(),
++                items_view: TurnItemsView::NotLoaded,
++                status,
++                error: None,
++                started_at: Some(1),
++                completed_at: Some(3),
++                duration_ms: Some(2_000),
++            },
++        })
++    }
++
++    #[test]
++    fn completion_request_maps_completed_primary_turn() {
++        let notification = turn_completed_notification(
++            TurnStatus::Completed,
++            "123e4567-e89b-12d3-a456-426614174000",
++            "turn-9",
++        );
++        let created_at = chrono::DateTime::parse_from_rfc3339("2026-06-12T10:11:12Z")
++            .expect("valid timestamp")
++            .with_timezone(&chrono::Utc);
++
++        let request = completion_request_for_notification(
++            &notification,
++            true,
++            Path::new("/repo"),
++            created_at,
++        )
++        .expect("completion request");
++
++        assert_eq!(request.session_id, "123e4567-e89b-12d3-a456-426614174000");
++        assert_eq!(request.turn_id, 9);
++        assert_eq!(request.status, "Completed");
++        assert_eq!(request.duration_ms, 2_000);
++        assert_eq!(request.working_dir, "/repo");
++        assert_eq!(request.title, "Codex task finished");
++        assert_eq!(
++            request.body,
++            "Thread 123e4567-e89b-12d3-a456-426614174000 turn turn-9 completed."
++        );
++        assert_eq!(request.created_at, "2026-06-12T10:11:12Z");
++    }
++
++    #[test]
++    fn completion_request_skips_failed_or_secondary_turns() {
++        let completed = turn_completed_notification(
++            TurnStatus::Completed,
++            "123e4567-e89b-12d3-a456-426614174000",
++            "turn-9",
++        );
++        let failed = turn_completed_notification(
++            TurnStatus::Failed,
++            "123e4567-e89b-12d3-a456-426614174000",
++            "turn-9",
++        );
++        let created_at = chrono::Utc::now();
++
++        assert!(
++            completion_request_for_notification(&completed, false, Path::new("/repo"), created_at,)
++                .is_none()
++        );
++        assert!(
++            completion_request_for_notification(&failed, true, Path::new("/repo"), created_at,)
++                .is_none()
++        );
++    }
++
++    #[test]
++    fn completion_notifications_route_to_primary_or_bootstrap_thread_only() {
++        let primary_thread_id = ThreadId::new();
++        let secondary_thread_id = ThreadId::new();
++
++        assert!(is_primary_or_bootstrap_thread(
++            Some(primary_thread_id),
++            primary_thread_id
++        ));
++        assert!(is_primary_or_bootstrap_thread(None, secondary_thread_id));
++        assert!(!is_primary_or_bootstrap_thread(
++            Some(primary_thread_id),
++            secondary_thread_id
++        ));
++    }
++
++    #[test]
++    fn completion_request_skips_invalid_session_id() {
++        let notification =
++            turn_completed_notification(TurnStatus::Completed, "session-123", "turn-9");
++
++        assert!(
++            completion_request_for_notification(
++                &notification,
++                true,
++                Path::new("/repo"),
++                chrono::Utc::now(),
++            )
++            .is_none()
++        );
++    }
++
++    #[test]
++    fn stable_turn_id_uses_numeric_suffix_or_stable_fallback() {
++        assert_eq!(stable_turn_id("42"), 42);
++        assert_eq!(stable_turn_id("turn-9"), 9);
++        assert_eq!(
++            stable_turn_id("turn-without-number"),
++            stable_turn_id("turn-without-number")
++        );
++    }
++}

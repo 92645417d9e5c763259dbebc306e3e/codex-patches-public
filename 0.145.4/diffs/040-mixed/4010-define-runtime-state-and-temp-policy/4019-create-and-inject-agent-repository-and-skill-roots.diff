@@ -1,0 +1,191 @@
+diff --git a/codex-rs/core/src/exec_env.rs b/codex-rs/core/src/exec_env.rs
+index 9232bf188f..bacd183ce4 100644
+--- a/codex-rs/core/src/exec_env.rs
++++ b/codex-rs/core/src/exec_env.rs
+@@ -8,8 +8,11 @@ pub use codex_utils_home_dir::CODEX_TMP_ENV as CODEX_TMP_ENV_VAR;
+ pub use codex_utils_home_dir::PROJECT_NAME_ENV as PROJECT_NAME_ENV_VAR;
+ pub use codex_utils_home_dir::PROJECT_SCRATCH_ROOT_ENV as PROJECT_SCRATCH_ROOT_ENV_VAR;
+ pub use codex_utils_home_dir::PROJECT_WORKING_ROOT_ENV as PROJECT_WORKING_ROOT_ENV_VAR;
++pub use codex_utils_home_dir::REPOS_ROOT_ENV as REPOS_ROOT_ENV_VAR;
+ pub use codex_utils_home_dir::RUNTIME_STATE_ROOT_ENV as RUNTIME_STATE_ROOT_ENV_VAR;
+ pub use codex_utils_home_dir::RUNTIME_TMP_ROOT_ENV as RUNTIME_TMP_ROOT_ENV_VAR;
++pub use codex_utils_home_dir::SKILLS_ROOT_ENV as SKILLS_ROOT_ENV_VAR;
++use codex_utils_home_dir::resolve_agent_path_roots;
+ use codex_utils_home_dir::resolve_runtime_path_roots;
+ use std::collections::HashMap;
+ use std::path::Path;
+@@ -100,6 +103,17 @@ fn inject_runtime_path_env(
+         tracing::warn!(%error, "failed to create project scratch root");
+         return;
+     }
++    let agent_roots = match resolve_agent_path_roots(resolved_codex_home) {
++        Ok(agent_roots) => agent_roots,
++        Err(error) => {
++            tracing::warn!(%error, "failed to resolve agent path roots");
++            return;
++        }
++    };
++    if let Err(error) = agent_roots.ensure() {
++        tracing::warn!(%error, "failed to create agent path roots");
++        return;
++    }
+ 
+     for (key, value) in [
+         (TMPDIR_ENV_VAR, roots.system_tmp_root.as_path()),
+@@ -117,13 +131,15 @@ fn inject_runtime_path_env(
+             RUNTIME_STATE_ROOT_ENV_VAR,
+             roots.runtime_state_root.as_path(),
+         ),
++        (REPOS_ROOT_ENV_VAR, agent_roots.repos_root.as_path()),
++        (SKILLS_ROOT_ENV_VAR, agent_roots.skills_root.as_path()),
+     ] {
+         env.insert(key.to_string(), value.to_string_lossy().into_owned());
+     }
+     env.insert(PROJECT_NAME_ENV_VAR.to_string(), roots.project_name);
+ }
+ 
+-pub(crate) fn runtime_path_env_keys() -> [&'static str; 8] {
++pub(crate) fn runtime_path_env_keys() -> [&'static str; 10] {
+     [
+         TMPDIR_ENV_VAR,
+         CODEX_HOME_ENV_VAR,
+@@ -133,6 +149,8 @@ pub(crate) fn runtime_path_env_keys() -> [&'static str; 8] {
+         PROJECT_WORKING_ROOT_ENV_VAR,
+         RUNTIME_TMP_ROOT_ENV_VAR,
+         RUNTIME_STATE_ROOT_ENV_VAR,
++        REPOS_ROOT_ENV_VAR,
++        SKILLS_ROOT_ENV_VAR,
+     ]
+ }
+ 
+diff --git a/codex-rs/core/src/exec_env_tests.rs b/codex-rs/core/src/exec_env_tests.rs
+index c18ce5fa88..5c2e18bd99 100644
+--- a/codex-rs/core/src/exec_env_tests.rs
++++ b/codex-rs/core/src/exec_env_tests.rs
+@@ -355,6 +355,15 @@ fn create_runtime_env_injects_authoritative_local_roots() {
+         env.get(CODEX_HOME_ENV_VAR).map(String::as_str),
+         temp.path().to_str()
+     );
++    let repos_root = env.get(REPOS_ROOT_ENV_VAR).expect("REPOS_ROOT");
++    let skills_root = env.get(SKILLS_ROOT_ENV_VAR).expect("SKILLS_ROOT");
++    assert!(std::path::Path::new(repos_root).ends_with("repos"));
++    assert_eq!(
++        std::path::Path::new(skills_root),
++        temp.path().join("skills")
++    );
++    assert!(std::path::Path::new(repos_root).is_dir());
++    assert!(std::path::Path::new(skills_root).is_dir());
+     assert!(roots.project_scratch_root.as_path().is_dir());
+ }
+ 
+diff --git a/codex-rs/utils/home-dir/src/agent_paths.rs b/codex-rs/utils/home-dir/src/agent_paths.rs
+new file mode 100644
+index 0000000000..f30a614721
+--- /dev/null
++++ b/codex-rs/utils/home-dir/src/agent_paths.rs
+@@ -0,0 +1,82 @@
++use codex_utils_absolute_path::AbsolutePathBuf;
++use dirs::home_dir;
++use std::io;
++use std::path::Path;
++
++pub const REPOS_ROOT_ENV: &str = "REPOS_ROOT";
++pub const SKILLS_ROOT_ENV: &str = "SKILLS_ROOT";
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct AgentPathRoots {
++    pub repos_root: AbsolutePathBuf,
++    pub skills_root: AbsolutePathBuf,
++}
++
++impl AgentPathRoots {
++    pub fn ensure(&self) -> io::Result<()> {
++        std::fs::create_dir_all(self.repos_root.as_path())?;
++        std::fs::create_dir_all(self.skills_root.as_path())
++    }
++}
++
++pub fn resolve_agent_path_roots(codex_home: &Path) -> io::Result<AgentPathRoots> {
++    let user_home = home_dir()
++        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "could not find home directory"))?;
++    resolve_agent_path_roots_from(&user_home, codex_home)
++}
++
++fn resolve_agent_path_roots_from(
++    user_home: &Path,
++    codex_home: &Path,
++) -> io::Result<AgentPathRoots> {
++    let user_home =
++        AbsolutePathBuf::from_absolute_path(user_home.to_path_buf()).map_err(|error| {
++            io::Error::new(
++                io::ErrorKind::InvalidInput,
++                format!("invalid user home: {error}"),
++            )
++        })?;
++    let codex_home =
++        AbsolutePathBuf::from_absolute_path(codex_home.to_path_buf()).map_err(|error| {
++            io::Error::new(
++                io::ErrorKind::InvalidInput,
++                format!("invalid CODEX_HOME: {error}"),
++            )
++        })?;
++    Ok(AgentPathRoots {
++        repos_root: user_home.join("repos"),
++        skills_root: codex_home.join("skills"),
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn agent_roots_derive_from_user_and_codex_homes() {
++        let temp = tempfile::tempdir().expect("temp dir");
++        let user_home = temp.path().join("home");
++        let codex_home = temp.path().join("codex-home");
++
++        let roots = resolve_agent_path_roots_from(&user_home, &codex_home).expect("agent roots");
++
++        assert_eq!(roots.repos_root.as_path(), user_home.join("repos"));
++        assert_eq!(roots.skills_root.as_path(), codex_home.join("skills"));
++    }
++
++    #[test]
++    fn ensure_creates_both_agent_roots() {
++        let temp = tempfile::tempdir().expect("temp dir");
++        let roots = resolve_agent_path_roots_from(
++            &temp.path().join("home"),
++            &temp.path().join("codex-home"),
++        )
++        .expect("agent roots");
++
++        roots.ensure().expect("create agent roots");
++
++        assert!(roots.repos_root.as_path().is_dir());
++        assert!(roots.skills_root.as_path().is_dir());
++    }
++}
+diff --git a/codex-rs/utils/home-dir/src/lib.rs b/codex-rs/utils/home-dir/src/lib.rs
+index b5b3d85b2a..6acc0eb2d2 100644
+--- a/codex-rs/utils/home-dir/src/lib.rs
++++ b/codex-rs/utils/home-dir/src/lib.rs
+@@ -2,6 +2,7 @@ use codex_utils_absolute_path::AbsolutePathBuf;
+ use dirs::home_dir;
+ use std::path::PathBuf;
+ 
++mod agent_paths;
+ mod runtime_paths;
+ 
+ #[cfg(unix)]
+@@ -12,6 +13,10 @@ pub use private_tmp::PrivateCodexTmpDir;
+ #[cfg(unix)]
+ pub use private_tmp::prepare_private_codex_tmp_root;
+ 
++pub use agent_paths::AgentPathRoots;
++pub use agent_paths::REPOS_ROOT_ENV;
++pub use agent_paths::SKILLS_ROOT_ENV;
++pub use agent_paths::resolve_agent_path_roots;
+ pub use runtime_paths::CODEX_TMP_ENV;
+ pub use runtime_paths::PROJECT_NAME_ENV;
+ pub use runtime_paths::PROJECT_SCRATCH_ROOT_ENV;

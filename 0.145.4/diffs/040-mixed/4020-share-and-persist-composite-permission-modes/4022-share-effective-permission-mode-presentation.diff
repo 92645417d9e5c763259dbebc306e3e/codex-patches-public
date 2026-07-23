@@ -1,0 +1,508 @@
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 7120462330..2fce88958c 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -9,6 +9,7 @@ use crate::branch_summary;
+ use crate::chatwidget::limit_label_for_window;
+ use crate::chatwidget::rate_limits::get_limits_duration;
+ use crate::legacy_core::config::Config;
++use crate::permission_mode::PermissionMode;
+ use crate::status::format_tokens_compact;
+ use codex_app_server_protocol::AskForApproval;
+ use codex_config::ConfigLayerSource;
+@@ -1093,6 +1094,10 @@ fn matches_window_label(window: &RateLimitWindowDisplay, label: &str) -> bool {
+ }
+ 
+ fn permissions_display(config: &Config) -> String {
++    if let Some(mode) = PermissionMode::from_config(config) {
++        return mode.sandbox_label().to_string();
++    }
++
+     let active_permission_profile = config.permissions.active_permission_profile();
+     if let Some(active_permission_profile) = active_permission_profile.as_ref()
+         && !active_permission_profile.id.starts_with(':')
+@@ -1122,6 +1127,10 @@ fn permissions_display(config: &Config) -> String {
+ }
+ 
+ fn approval_mode_display(config: &Config) -> String {
++    if let Some(mode) = PermissionMode::from_config(config) {
++        return mode.approval_label().to_string();
++    }
++
+     let approval_policy = AskForApproval::from(config.permissions.approval_policy.value());
+     if approval_policy == AskForApproval::OnRequest {
+         return match config.approvals_reviewer {
+diff --git a/codex-rs/tui/src/history_cell/session.rs b/codex-rs/tui/src/history_cell/session.rs
+index 2cd8f08340..2ad010989c 100644
+--- a/codex-rs/tui/src/history_cell/session.rs
++++ b/codex-rs/tui/src/history_cell/session.rs
+@@ -148,10 +148,23 @@ pub(crate) fn new_session_info(
+         config.cwd.to_path_buf(),
+         CODEX_CLI_VERSION,
+     )
+-    .with_yolo_mode(has_yolo_permissions(
+-        session.approval_policy,
+-        &session.permission_profile,
+-    ));
++    .with_yolo_mode(
++        crate::permission_mode::PermissionMode::from_session(
++            session
++                .active_permission_profile
++                .as_ref()
++                .map(|profile| profile.id.as_str()),
++            &session.permission_profile,
++            &session.cwd,
++            &session.runtime_workspace_roots,
++            session.approval_policy,
++            session.approvals_reviewer,
++        )
++        .map(crate::permission_mode::PermissionMode::is_yolo)
++        .unwrap_or_else(|| {
++            has_yolo_permissions(session.approval_policy, &session.permission_profile)
++        }),
++    );
+     let mut parts: Vec<Box<dyn HistoryCell>> = vec![Box::new(header)];
+ 
+     if is_first_event {
+@@ -211,6 +224,10 @@ pub(crate) fn new_session_info(
+ }
+ 
+ pub(crate) fn is_yolo_mode(config: &Config) -> bool {
++    if let Some(mode) = crate::permission_mode::PermissionMode::from_config(config) {
++        return mode.is_yolo();
++    }
++
+     has_yolo_permissions(
+         AskForApproval::from(config.permissions.approval_policy.value()),
+         &config.permissions.effective_permission_profile(),
+diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
+index 4477e940bd..2058f152a6 100644
+--- a/codex-rs/tui/src/history_cell/tests.rs
++++ b/codex-rs/tui/src/history_cell/tests.rs
+@@ -631,6 +631,35 @@ async fn session_info_uses_availability_nux_tooltip_override() {
+     assert!(rendered.contains("Model just became available"));
+ }
+ 
++#[tokio::test]
++async fn session_info_uses_shared_builtin_yolo_classification() {
++    let config = test_config().await;
++    let mut session = session_configured_event("gpt-5");
++    session.permission_profile = PermissionProfile::Disabled;
++    session.active_permission_profile = Some(codex_protocol::models::ActivePermissionProfile::new(
++        codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
++    ));
++    session.runtime_workspace_roots = vec![session.cwd.clone()];
++
++    let yolo = new_session_info(
++        &config, "gpt-5", &session, /*is_first_event*/ false, /*tooltip_override*/ None,
++        /*auth_plan*/ None, /*show_fast_status*/ false,
++    );
++    assert!(render_transcript(&yolo).join("\n").contains("YOLO mode"));
++
++    session.approval_policy = AskForApproval::OnRequest;
++    session.approvals_reviewer = codex_protocol::config_types::ApprovalsReviewer::AutoReview;
++    let auto_review = new_session_info(
++        &config, "gpt-5", &session, /*is_first_event*/ false, /*tooltip_override*/ None,
++        /*auth_plan*/ None, /*show_fast_status*/ false,
++    );
++    assert!(
++        !render_transcript(&auto_review)
++            .join("\n")
++            .contains("YOLO mode")
++    );
++}
++
+ #[tokio::test]
+ #[cfg_attr(
+     target_os = "windows",
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index 83eb28f8a6..ee481ca205 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -157,6 +157,7 @@ pub(crate) mod onboarding;
+ mod oss_selection;
+ mod pager_overlay;
+ mod permission_compat;
++mod permission_mode;
+ pub(crate) mod public_widgets;
+ mod render;
+ mod resize_reflow_cap;
+diff --git a/codex-rs/tui/src/permission_mode.rs b/codex-rs/tui/src/permission_mode.rs
+new file mode 100644
+index 0000000000..dc69f1f0c6
+--- /dev/null
++++ b/codex-rs/tui/src/permission_mode.rs
+@@ -0,0 +1,287 @@
++use crate::legacy_core::config::Config;
++use codex_app_server_protocol::AskForApproval;
++use codex_protocol::config_types::ApprovalsReviewer;
++use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS;
++use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
++use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
++use codex_protocol::models::PermissionProfile;
++use codex_utils_absolute_path::AbsolutePathBuf;
++
++/// Canonical presentation for the built-in permission combinations exposed by
++/// this TUI. Custom and modified profiles remain on the upstream fallback path.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(crate) enum PermissionMode {
++    ReadOnly,
++    WorkspaceManualApproval,
++    WorkspaceAutoReview,
++    FullAccessAutoReview,
++    Yolo,
++}
++
++impl PermissionMode {
++    pub(crate) fn from_config(config: &Config) -> Option<Self> {
++        let approval_policy = AskForApproval::from(config.permissions.approval_policy.value());
++        let reviewer = config.approvals_reviewer;
++        let permission_profile = config.permissions.effective_permission_profile();
++        let canonical_permission_profile = config.permissions.permission_profile();
++        let active_profile = config.permissions.active_permission_profile();
++        let active_id = active_profile.as_ref().map(|profile| profile.id.as_str());
++        let has_only_primary_workspace_root = config
++            .effective_workspace_roots()
++            .iter()
++            .all(|root| root == &config.cwd);
++        let canonical_profile = match active_id {
++            Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY) => {
++                canonical_permission_profile == &PermissionProfile::read_only()
++                    && has_only_primary_workspace_root
++            }
++            Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE) => {
++                (canonical_permission_profile == &PermissionProfile::workspace_write()
++                    || canonical_permission_profile
++                        == &PermissionProfile::local_workspace_write(&config.cwd))
++                    && has_only_primary_workspace_root
++            }
++            Some(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS) => {
++                matches!(permission_profile, PermissionProfile::Disabled)
++            }
++            _ => false,
++        };
++
++        Self::from_parts(
++            active_id,
++            &permission_profile,
++            approval_policy,
++            reviewer,
++            canonical_profile,
++        )
++    }
++
++    pub(crate) fn from_session(
++        active_id: Option<&str>,
++        permission_profile: &PermissionProfile,
++        cwd: &AbsolutePathBuf,
++        workspace_roots: &[AbsolutePathBuf],
++        approval_policy: AskForApproval,
++        reviewer: ApprovalsReviewer,
++    ) -> Option<Self> {
++        let has_only_primary_workspace_root = workspace_roots.iter().all(|root| root == cwd);
++        let canonical_profile = match active_id {
++            Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY) => {
++                permission_profile == &PermissionProfile::read_only()
++                    && has_only_primary_workspace_root
++            }
++            Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE) => {
++                let upstream = PermissionProfile::workspace_write()
++                    .materialize_project_roots_with_workspace_roots(workspace_roots);
++                let local = PermissionProfile::local_workspace_write(cwd)
++                    .materialize_project_roots_with_workspace_roots(workspace_roots);
++                (permission_profile == &upstream || permission_profile == &local)
++                    && has_only_primary_workspace_root
++            }
++            Some(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS) => {
++                matches!(permission_profile, PermissionProfile::Disabled)
++            }
++            _ => false,
++        };
++
++        Self::from_parts(
++            active_id,
++            permission_profile,
++            approval_policy,
++            reviewer,
++            canonical_profile,
++        )
++    }
++
++    fn from_parts(
++        active_id: Option<&str>,
++        permission_profile: &PermissionProfile,
++        approval_policy: AskForApproval,
++        reviewer: ApprovalsReviewer,
++        canonical_profile: bool,
++    ) -> Option<Self> {
++        if !canonical_profile {
++            return None;
++        }
++
++        if matches!(permission_profile, PermissionProfile::Disabled) {
++            return match (approval_policy, reviewer) {
++                (AskForApproval::Never, _) => Some(Self::Yolo),
++                (AskForApproval::OnRequest, ApprovalsReviewer::AutoReview) => {
++                    Some(Self::FullAccessAutoReview)
++                }
++                _ => None,
++            };
++        }
++
++        match (active_id, approval_policy, reviewer) {
++            (
++                Some(BUILT_IN_PERMISSION_PROFILE_READ_ONLY),
++                AskForApproval::OnRequest,
++                ApprovalsReviewer::User,
++            ) => Some(Self::ReadOnly),
++            (
++                Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE),
++                AskForApproval::OnRequest,
++                ApprovalsReviewer::User,
++            ) => Some(Self::WorkspaceManualApproval),
++            (
++                Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE),
++                AskForApproval::OnRequest,
++                ApprovalsReviewer::AutoReview,
++            ) => Some(Self::WorkspaceAutoReview),
++            (Some(BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS), _, _) => None,
++            _ => None,
++        }
++    }
++
++    pub(crate) fn label(self) -> &'static str {
++        match self {
++            Self::ReadOnly => "Read Only",
++            Self::WorkspaceManualApproval => "Workspace + Manual Approval",
++            Self::WorkspaceAutoReview => "Workspace + Auto Review",
++            Self::FullAccessAutoReview => "Full Access + Auto Review",
++            Self::Yolo => "YOLO",
++        }
++    }
++
++    pub(crate) fn sandbox_label(self) -> &'static str {
++        match self {
++            Self::ReadOnly => "Read Only",
++            Self::WorkspaceManualApproval | Self::WorkspaceAutoReview => "Workspace",
++            Self::FullAccessAutoReview => "Full Access",
++            Self::Yolo => "YOLO",
++        }
++    }
++
++    pub(crate) fn approval_label(self) -> &'static str {
++        match self {
++            Self::ReadOnly | Self::WorkspaceManualApproval => "Manual Approval",
++            Self::WorkspaceAutoReview | Self::FullAccessAutoReview => "Auto Review",
++            Self::Yolo => "No Approval",
++        }
++    }
++
++    pub(crate) fn is_yolo(self) -> bool {
++        self == Self::Yolo
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn classifies_the_five_builtin_permission_modes() {
++        let cases = [
++            (
++                BUILT_IN_PERMISSION_PROFILE_READ_ONLY,
++                PermissionProfile::read_only(),
++                AskForApproval::OnRequest,
++                ApprovalsReviewer::User,
++                PermissionMode::ReadOnly,
++                "Read Only",
++                "Read Only",
++                "Manual Approval",
++            ),
++            (
++                BUILT_IN_PERMISSION_PROFILE_WORKSPACE,
++                PermissionProfile::workspace_write(),
++                AskForApproval::OnRequest,
++                ApprovalsReviewer::User,
++                PermissionMode::WorkspaceManualApproval,
++                "Workspace + Manual Approval",
++                "Workspace",
++                "Manual Approval",
++            ),
++            (
++                BUILT_IN_PERMISSION_PROFILE_WORKSPACE,
++                PermissionProfile::workspace_write(),
++                AskForApproval::OnRequest,
++                ApprovalsReviewer::AutoReview,
++                PermissionMode::WorkspaceAutoReview,
++                "Workspace + Auto Review",
++                "Workspace",
++                "Auto Review",
++            ),
++            (
++                BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
++                PermissionProfile::Disabled,
++                AskForApproval::OnRequest,
++                ApprovalsReviewer::AutoReview,
++                PermissionMode::FullAccessAutoReview,
++                "Full Access + Auto Review",
++                "Full Access",
++                "Auto Review",
++            ),
++            (
++                BUILT_IN_PERMISSION_PROFILE_DANGER_FULL_ACCESS,
++                PermissionProfile::Disabled,
++                AskForApproval::Never,
++                ApprovalsReviewer::User,
++                PermissionMode::Yolo,
++                "YOLO",
++                "YOLO",
++                "No Approval",
++            ),
++        ];
++
++        for (
++            active_id,
++            profile,
++            approval_policy,
++            reviewer,
++            expected,
++            label,
++            sandbox_label,
++            approval_label,
++        ) in cases
++        {
++            let actual = PermissionMode::from_parts(
++                Some(active_id),
++                &profile,
++                approval_policy,
++                reviewer,
++                true,
++            );
++            assert_eq!(actual, Some(expected));
++            assert_eq!(expected.label(), label);
++            assert_eq!(expected.sandbox_label(), sandbox_label);
++            assert_eq!(expected.approval_label(), approval_label);
++        }
++    }
++
++    #[test]
++    fn leaves_custom_profiles_on_the_upstream_presentation_path() {
++        assert_eq!(
++            PermissionMode::from_parts(
++                Some("custom"),
++                &PermissionProfile::workspace_write(),
++                AskForApproval::OnRequest,
++                ApprovalsReviewer::User,
++                false,
++            ),
++            None
++        );
++        assert_eq!(
++            PermissionMode::from_parts(
++                Some("custom"),
++                &PermissionProfile::Disabled,
++                AskForApproval::Never,
++                ApprovalsReviewer::User,
++                false,
++            ),
++            None
++        );
++        assert_eq!(
++            PermissionMode::from_parts(
++                Some("custom"),
++                &PermissionProfile::Disabled,
++                AskForApproval::OnRequest,
++                ApprovalsReviewer::AutoReview,
++                false,
++            ),
++            None
++        );
++    }
++}
+diff --git a/codex-rs/tui/src/status/card.rs b/codex-rs/tui/src/status/card.rs
+index 91027f8103..b6ce9dbd0f 100644
+--- a/codex-rs/tui/src/status/card.rs
++++ b/codex-rs/tui/src/status/card.rs
+@@ -4,6 +4,7 @@ use crate::history_cell::PlainHistoryCell;
+ use crate::history_cell::plain_lines;
+ use crate::history_cell::with_border_with_inner_width;
+ use crate::legacy_core::config::Config;
++use crate::permission_mode::PermissionMode;
+ use crate::token_usage::TokenUsage;
+ use crate::token_usage::TokenUsageInfo;
+ use crate::version::CODEX_CLI_VERSION;
+@@ -310,14 +311,18 @@ impl StatusHistoryCell {
+             status_permission_summary(&permission_profile, &config.cwd, workspace_roots.as_slice());
+         let workspace_root_suffix = workspace_root_suffix(workspace_roots.as_slice(), &config.cwd);
+         let approval = status_approval_label(approval_policy, config.approvals_reviewer, &approval);
+-        let permissions = status_permissions_label(
+-            active_permission_profile.as_ref(),
+-            &permission_profile,
+-            approval_policy,
+-            &sandbox,
+-            &approval,
+-            workspace_root_suffix.as_deref(),
+-        );
++        let permissions = PermissionMode::from_config(config)
++            .map(|mode| mode.label().to_string())
++            .unwrap_or_else(|| {
++                status_permissions_label(
++                    active_permission_profile.as_ref(),
++                    &permission_profile,
++                    approval_policy,
++                    &sandbox,
++                    &approval,
++                    workspace_root_suffix.as_deref(),
++                )
++            });
+         let model_provider = format_model_provider(config, runtime_model_provider_base_url);
+         let show_chatgpt_usage_link = config.model_provider.requires_openai_auth;
+         let account = compose_account_display(account_display);
+diff --git a/codex-rs/tui/src/status/snapshots/codex_tui__status__tests__status_snapshot_shows_auto_review_permissions.snap b/codex-rs/tui/src/status/snapshots/codex_tui__status__tests__status_snapshot_shows_auto_review_permissions.snap
+index 922b03c1a0..dd5f153701 100644
+--- a/codex-rs/tui/src/status/snapshots/codex_tui__status__tests__status_snapshot_shows_auto_review_permissions.snap
++++ b/codex-rs/tui/src/status/snapshots/codex_tui__status__tests__status_snapshot_shows_auto_review_permissions.snap
+@@ -12,7 +12,7 @@ expression: sanitized
+ │                                                                       │
+ │  Model:            gpt-5.1-codex-max (reasoning none, summaries auto) │
+ │  Directory: [[workspace]]                                             │
+-│  Permissions:      Workspace (Approve for me)                         │
++│  Permissions:      Workspace + Auto Review                            │
+ │  Agents.md:        <none>                                             │
+ │                                                                       │
+ │  Token usage:      0 total  (0 input + 0 output)                      │
+diff --git a/codex-rs/tui/src/status/tests.rs b/codex-rs/tui/src/status/tests.rs
+index 78923aa5c5..af2993c3f2 100644
+--- a/codex-rs/tui/src/status/tests.rs
++++ b/codex-rs/tui/src/status/tests.rs
+@@ -456,10 +456,7 @@ async fn status_permissions_named_read_only_profile_shows_builtin_label() {
+         ))
+         .expect("set permission profile");
+ 
+-    assert_eq!(
+-        permissions_text_for(&config).as_deref(),
+-        Some("Read Only (Ask for approval)")
+-    );
++    assert_eq!(permissions_text_for(&config).as_deref(), Some("Read Only"));
+ }
+ 
+ #[tokio::test]
+@@ -511,7 +508,7 @@ async fn status_permissions_named_workspace_profile_shows_builtin_label() {
+ 
+     assert_eq!(
+         permissions_text_for(&config).as_deref(),
+-        Some("Workspace (Ask for approval)")
++        Some("Workspace + Manual Approval")
+     );
+ }
+ 
+@@ -535,7 +532,7 @@ async fn status_permissions_workspace_auto_review_shows_reviewer_label() {
+ 
+     assert_eq!(
+         permissions_text_for(&config).as_deref(),
+-        Some("Workspace (Approve for me)")
++        Some("Workspace + Auto Review")
+     );
+ }
+ 

@@ -1,0 +1,1152 @@
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index c70d1ea5d6..77168ff63b 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -1306,7 +1306,7 @@ See the Codex keymap documentation for supported actions and examples."
+                 }
+                 TuiEvent::Draw | TuiEvent::Resize => {
+                     if self.backtrack_render_pending {
+-                        self.rebuild_transcript_after_backtrack(tui)?;
++                        self.rebuild_transcript_after_trim(tui)?;
+                         self.backtrack_render_pending = false;
+                     }
+                     self.chat_widget.maybe_post_pending_notification(tui);
+diff --git a/codex-rs/tui/src/app/agent_message_consolidation.rs b/codex-rs/tui/src/app/agent_message_consolidation.rs
+index e3486c46e9..7dcd063e94 100644
+--- a/codex-rs/tui/src/app/agent_message_consolidation.rs
++++ b/codex-rs/tui/src/app/agent_message_consolidation.rs
+@@ -22,6 +22,20 @@ use crate::pager_overlay::Overlay;
+ use crate::tui;
+ 
+ impl App {
++    pub(super) fn discard_incomplete_agent_message(&mut self) -> bool {
++        let end = self.transcript_cells.len();
++        let start = trailing_run_start::<history_cell::AgentMessageCell>(&self.transcript_cells);
++        if start == end {
++            return false;
++        }
++
++        self.transcript_cells.truncate(start);
++        if let Some(Overlay::Transcript(transcript)) = &mut self.overlay {
++            transcript.replace_cells(self.transcript_cells.clone());
++        }
++        true
++    }
++
+     pub(super) fn handle_consolidate_agent_message(
+         &mut self,
+         tui: &mut tui::Tui,
+diff --git a/codex-rs/tui/src/app/app_server_event_targets.rs b/codex-rs/tui/src/app/app_server_event_targets.rs
+index 5935e46d68..f34e47b26b 100644
+--- a/codex-rs/tui/src/app/app_server_event_targets.rs
++++ b/codex-rs/tui/src/app/app_server_event_targets.rs
+@@ -129,6 +129,9 @@ pub(super) fn server_notification_thread_target(
+         ServerNotification::ModelSafetyBufferingUpdated(notification) => {
+             Some(notification.thread_id.as_str())
+         }
++        ServerNotification::ResponsesStreamConnectionStatus(notification) => {
++            Some(notification.thread_id.as_str())
++        }
+         ServerNotification::TurnModerationMetadata(notification) => {
+             Some(notification.thread_id.as_str())
+         }
+@@ -205,6 +208,7 @@ mod tests {
+     use codex_app_server_protocol::GuardianWarningNotification;
+     use codex_app_server_protocol::McpServerStartupState;
+     use codex_app_server_protocol::McpServerStatusUpdatedNotification;
++    use codex_app_server_protocol::ResponsesStreamConnectionStatusNotification;
+     use codex_app_server_protocol::ServerNotification;
+     use codex_app_server_protocol::ThreadSettings;
+     use codex_app_server_protocol::ThreadSettingsUpdatedNotification;
+@@ -281,6 +285,22 @@ mod tests {
+         assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
+     }
+ 
++    #[test]
++    fn responses_stream_connection_notifications_route_to_threads() {
++        let thread_id = ThreadId::new();
++        let notification = ServerNotification::ResponsesStreamConnectionStatus(
++            ResponsesStreamConnectionStatusNotification {
++                thread_id: thread_id.to_string(),
++                connected: true,
++                rtt_ms: Some(42),
++            },
++        );
++
++        let target = server_notification_thread_target(&notification);
++
++        assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
++    }
++
+     #[test]
+     fn mcp_startup_notifications_route_to_threads() {
+         let thread_id = ThreadId::new();
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index 3f3bd661d0..0ae4c20bb0 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -332,6 +332,11 @@ impl App {
+                 self.chat_widget.note_stream_consolidation_completed();
+                 self.insert_pending_usage_output_after_stream_shutdown(tui);
+             }
++            AppEvent::DiscardIncompleteAgentMessage => {
++                if self.discard_incomplete_agent_message() {
++                    self.rebuild_transcript_after_trim(tui)?;
++                }
++            }
+             AppEvent::ConsolidateProposedPlan(source) => {
+                 let end = self.transcript_cells.len();
+                 let start = trailing_run_start::<history_cell::ProposedPlanStreamCell>(
+@@ -460,6 +465,12 @@ impl App {
+                 )
+                 .await;
+             }
++            AppEvent::RetryCurrentStream { thread_id, turn_id } => {
++                if let Err(err) = app_server.turn_retry_now(thread_id, turn_id).await {
++                    self.chat_widget
++                        .add_error_message(format!("Failed to reset stream retry budget: {err}"));
++                }
++            }
+             AppEvent::AppendMessageHistoryEntry { thread_id, text } => {
+                 self.append_message_history_entry(thread_id, text);
+             }
+diff --git a/codex-rs/tui/src/app/resize_reflow.rs b/codex-rs/tui/src/app/resize_reflow.rs
+index 7d00f7f5ff..a9a7c66396 100644
+--- a/codex-rs/tui/src/app/resize_reflow.rs
++++ b/codex-rs/tui/src/app/resize_reflow.rs
+@@ -433,12 +433,11 @@ impl App {
+         Ok(terminal_width)
+     }
+ 
+-    /// Rebuild scrollback after rollback removes transcript cells.
++    /// Rebuild scrollback after transcript cells are removed.
+     ///
+-    /// Unlike resize reflow, rollback must clear the terminal even when no cells remain. Otherwise
+-    /// the cancelled user prompt stays visible in scrollback despite being removed from the source
+-    /// transcript.
+-    pub(super) fn rebuild_transcript_after_backtrack(&mut self, tui: &mut tui::Tui) -> Result<()> {
++    /// Unlike resize reflow, a trim must clear the terminal even when no cells remain. Otherwise
++    /// removed content stays visible in scrollback despite leaving the source transcript.
++    pub(super) fn rebuild_transcript_after_trim(&mut self, tui: &mut tui::Tui) -> Result<()> {
+         let terminal_width = tui.terminal.size()?.width;
+         let width = self.chat_widget.history_wrap_width(terminal_width);
+         let reflowed_lines = if self.transcript_cells.is_empty() {
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index 8a36c542d5..90f8be8d80 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -7493,6 +7493,41 @@ async fn clear_only_ui_reset_allows_active_skill_warning_to_render_again() {
+     );
+ }
+ 
++#[tokio::test]
++async fn retry_discards_only_trailing_provisional_agent_cells() {
++    let mut app = make_test_app().await;
++    app.transcript_cells = vec![
++        Arc::new(UserHistoryCell {
++            message: "keep".to_string(),
++            text_elements: Vec::new(),
++            local_image_paths: Vec::new(),
++            remote_image_urls: Vec::new(),
++        }) as Arc<dyn HistoryCell>,
++        Arc::new(AgentMessageCell::new(
++            vec![Line::from("partial one")],
++            /*is_first_line*/ true,
++        )) as Arc<dyn HistoryCell>,
++        Arc::new(AgentMessageCell::new(
++            vec![Line::from("partial two")],
++            /*is_first_line*/ false,
++        )) as Arc<dyn HistoryCell>,
++    ];
++    app.overlay = Some(Overlay::new_transcript(
++        app.transcript_cells.clone(),
++        app.keymap.pager.clone(),
++    ));
++
++    assert!(app.discard_incomplete_agent_message());
++    assert_eq!(app.transcript_cells.len(), 1);
++    assert!(app.transcript_cells[0].as_any().is::<UserHistoryCell>());
++    let overlay_cell_count = match app.overlay.as_ref() {
++        Some(Overlay::Transcript(transcript)) => transcript.committed_cell_count(),
++        _ => panic!("expected transcript overlay"),
++    };
++    assert_eq!(overlay_cell_count, 1);
++    assert!(!app.discard_incomplete_agent_message());
++}
++
+ #[tokio::test]
+ async fn backtrack_esc_does_not_steal_empty_vim_insert_escape() {
+     let mut app = make_test_app().await;
+diff --git a/codex-rs/tui/src/app/tests/rate_limits.rs b/codex-rs/tui/src/app/tests/rate_limits.rs
+index 1844c7fea6..8c533b2826 100644
+--- a/codex-rs/tui/src/app/tests/rate_limits.rs
++++ b/codex-rs/tui/src/app/tests/rate_limits.rs
+@@ -93,6 +93,7 @@ fn deliver_usage_limit_error(app: &mut App) {
+                 additional_details: None,
+             },
+             will_retry: false,
++            retry_info: None,
+             thread_id: "thread-1".to_string(),
+             turn_id: "turn-1".to_string(),
+         }),
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+index 1c1d12c434..c3bbdd7188 100644
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -221,6 +221,12 @@ pub(crate) enum AppEvent {
+         branch: String,
+     },
+ 
++    /// Reset the current stream retry budget and wake its delay.
++    RetryCurrentStream {
++        thread_id: ThreadId,
++        turn_id: String,
++    },
++
+     /// Fetch a persistent cross-session message history entry by offset.
+     LookupMessageHistoryEntry {
+         thread_id: ThreadId,
+@@ -744,6 +750,9 @@ pub(crate) enum AppEvent {
+         deferred_history_cell: Option<Box<dyn HistoryCell>>,
+     },
+ 
++    /// Remove provisional assistant stream cells after a retryable stream failure.
++    DiscardIncompleteAgentMessage,
++
+     /// Replace the contiguous run of streaming `ProposedPlanStreamCell`s at the
+     /// end of the transcript with a single source-backed `ProposedPlanCell`.
+     ///
+diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+index 487778ca6c..3be36f6e80 100644
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -103,6 +103,8 @@ use codex_app_server_protocol::ThreadUnsubscribeResponse;
+ use codex_app_server_protocol::Turn;
+ use codex_app_server_protocol::TurnInterruptParams;
+ use codex_app_server_protocol::TurnInterruptResponse;
++use codex_app_server_protocol::TurnRetryNowParams;
++use codex_app_server_protocol::TurnRetryNowResponse;
+ use codex_app_server_protocol::TurnStartParams;
+ use codex_app_server_protocol::TurnStartResponse;
+ use codex_app_server_protocol::TurnSteerParams;
+@@ -968,6 +970,23 @@ impl AppServerSession {
+         self.turn_interrupt(thread_id, String::new()).await
+     }
+ 
++    pub(crate) async fn turn_retry_now(
++        &mut self,
++        thread_id: ThreadId,
++        turn_id: String,
++    ) -> std::result::Result<TurnRetryNowResponse, TypedRequestError> {
++        let request_id = self.next_request_id();
++        self.client
++            .request_typed(ClientRequest::TurnRetryNow {
++                request_id,
++                params: TurnRetryNowParams {
++                    thread_id: thread_id.to_string(),
++                    turn_id,
++                },
++            })
++            .await
++    }
++
+     pub(crate) async fn turn_steer(
+         &mut self,
+         thread_id: ThreadId,
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+index dce31d47e5..0bd1c7586f 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -16,6 +16,7 @@
+ //! - Approval mode
+ //! - Context usage (remaining %, used %, window size)
+ //! - Usage limits (primary, secondary)
++//! - Responses stream connection latency
+ //! - Session info (thread title, thread ID, tokens used)
+ //! - Application version
+ 
+@@ -87,6 +88,14 @@ pub(crate) enum StatusLineItem {
+     #[strum(to_string = "run-state", serialize = "status")]
+     Status,
+ 
++    /// Current Responses stream connection latency or disconnect state.
++    #[strum(
++        to_string = "responses-stream-connection",
++        serialize = "websocket",
++        serialize = "remote-connection"
++    )]
++    ResponsesStreamConnection,
++
+     /// Active permission profile or sandbox summary.
+     Permissions,
+ 
+@@ -161,6 +170,9 @@ impl StatusLineItem {
+                 "Committed branch changes against the default branch (omitted when unavailable)"
+             }
+             StatusLineItem::Status => "Compact session run-state text (Ready, Working, Thinking)",
++            StatusLineItem::ResponsesStreamConnection => {
++                "Current Responses stream connection latency or disconnect state (omitted when unavailable)"
++            }
+             StatusLineItem::Permissions => "Active permission profile or sandbox mode",
+             StatusLineItem::ApprovalMode => "Active command approval mode",
+             StatusLineItem::ContextRemaining => {
+@@ -208,6 +220,9 @@ impl StatusLineItem {
+             StatusLineItem::PullRequestNumber => StatusSurfacePreviewItem::PullRequestNumber,
+             StatusLineItem::BranchChanges => StatusSurfacePreviewItem::BranchChanges,
+             StatusLineItem::Status => StatusSurfacePreviewItem::Status,
++            StatusLineItem::ResponsesStreamConnection => {
++                StatusSurfacePreviewItem::ResponsesStreamConnection
++            }
+             StatusLineItem::Permissions => StatusSurfacePreviewItem::Permissions,
+             StatusLineItem::ApprovalMode => StatusSurfacePreviewItem::ApprovalMode,
+             StatusLineItem::ContextRemaining => StatusSurfacePreviewItem::ContextRemaining,
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+index 852b229afc..79f2b4dd1a 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -2,6 +2,7 @@
+ 
+ use ratatui::prelude::Stylize;
+ use ratatui::style::Color;
++use ratatui::style::Modifier;
+ use ratatui::style::Style;
+ use ratatui::text::Line;
+ use ratatui::text::Span;
+@@ -37,7 +38,7 @@ impl StatusLineAccent {
+             StatusLineItem::GitBranch
+             | StatusLineItem::PullRequestNumber
+             | StatusLineItem::BranchChanges => Self::Branch,
+-            StatusLineItem::Status => Self::State,
++            StatusLineItem::Status | StatusLineItem::ResponsesStreamConnection => Self::State,
+             StatusLineItem::ContextRemaining
+             | StatusLineItem::ContextUsed
+             | StatusLineItem::ContextWindowSize
+@@ -117,6 +118,13 @@ where
+         } else {
+             style
+         };
++        if item == StatusLineItem::ResponsesStreamConnection && text == "X" {
++            spans.push(Span::styled(
++                "X".to_string(),
++                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
++            ));
++            continue;
++        }
+         spans.push(Span::styled(text, style));
+     }
+ 
+@@ -286,6 +294,19 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn responses_stream_connection_disconnect_uses_red_bold_style() {
++        let line = status_line_from_segments_with_resolver(
++            [(StatusLineItem::ResponsesStreamConnection, "X".to_string())],
++            /*use_theme_colors*/ true,
++            |_| None,
++        )
++        .expect("status line");
++
++        assert_eq!(line.spans[0].style.fg, Some(Color::Red));
++        assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
++    }
++
+     #[test]
+     fn status_line_segments_return_none_when_empty() {
+         assert_eq!(
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+index b8b7a6fbd4..6c171185ba 100644
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -18,6 +18,7 @@ pub(crate) enum StatusSurfacePreviewItem {
+     BranchChanges,
+     Permissions,
+     ApprovalMode,
++    ResponsesStreamConnection,
+     ContextRemaining,
+     ContextUsed,
+     FiveHourLimit,
+@@ -51,6 +52,7 @@ impl StatusSurfacePreviewItem {
+             StatusSurfacePreviewItem::BranchChanges => "+12 -3",
+             StatusSurfacePreviewItem::Permissions => "Workspace",
+             StatusSurfacePreviewItem::ApprovalMode => "on-request",
++            StatusSurfacePreviewItem::ResponsesStreamConnection => "42ms",
+             StatusSurfacePreviewItem::ContextRemaining => "Context 0% left",
+             StatusSurfacePreviewItem::ContextUsed => "Context 0% used",
+             StatusSurfacePreviewItem::FiveHourLimit => "primary 0%",
+@@ -84,6 +86,7 @@ impl StatusSurfacePreviewItem {
+             Self::BranchChanges,
+             Self::Permissions,
+             Self::ApprovalMode,
++            Self::ResponsesStreamConnection,
+             Self::ContextRemaining,
+             Self::ContextUsed,
+             Self::FiveHourLimit,
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 1b26af3746..1b7d06106b 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -408,6 +408,8 @@ mod side;
+ use self::safety_buffering::SafetyBufferingState;
+ mod status_state;
+ mod windows_sandbox_prompts;
++use self::status_state::ResponsesStreamConnectionStatus;
++use self::status_state::RetryCountdownStatus;
+ use self::status_state::StatusIndicatorState;
+ use self::status_state::StatusState;
+ use self::status_state::TerminalTitleStatusKind;
+@@ -477,7 +479,11 @@ use unicode_segmentation::UnicodeSegmentation;
+ const USER_SHELL_COMMAND_HELP_TITLE: &str = "Prefix a command with ! to run it locally";
+ const USER_SHELL_COMMAND_HELP_HINT: &str = "Example: !ls";
+ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+-const DEFAULT_STATUS_LINE_ITEMS: [&str; 2] = ["model-with-reasoning", "current-dir"];
++const DEFAULT_STATUS_LINE_ITEMS: [&str; 3] = [
++    "model-with-reasoning",
++    "responses-stream-connection",
++    "current-dir",
++];
+ 
+ /// Common initialization parameters shared by all `ChatWidget` constructors.
+ pub(crate) struct ChatWidgetInit {
+@@ -554,6 +560,7 @@ pub(crate) struct ChatWidget {
+     pub(crate) remote_connection: Option<RemoteConnectionStatus>,
+     token_info: Option<TokenUsageInfo>,
+     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
++    responses_stream_connection_status: Option<ResponsesStreamConnectionStatus>,
+     refreshing_status_outputs: Vec<(u64, StatusHistoryHandle)>,
+     next_status_refresh_request_id: u64,
+     refreshing_token_activity_output: Option<tokens::PendingTokenActivityOutput>,
+@@ -1180,6 +1187,7 @@ impl ChatWidget {
+     pub(crate) fn pre_draw_tick(&mut self) {
+         self.update_due_hook_visibility();
+         self.schedule_hook_timer_if_needed();
++        self.refresh_retry_countdown_status_for_time_tick();
+         self.bottom_pane.pre_draw_tick();
+         if let Some(pet) = self.ambient_pet.as_ref() {
+             pet.schedule_next_frame();
+@@ -1197,6 +1205,26 @@ impl ChatWidget {
+         self.refresh_status_line_if_workspace_headline_due();
+     }
+ 
++    fn refresh_retry_countdown_status_for_time_tick(&mut self) {
++        let Some(status) = self.status_state.retry_countdown_status.clone() else {
++            return;
++        };
++        let header = Self::retry_countdown_header(&status.base_header, status.retry_at);
++        if self.status_state.current_status.header != header {
++            self.set_status(
++                header,
++                status.details.clone(),
++                StatusDetailsCapitalization::Preserve,
++                status.details_max_lines,
++            );
++            self.status_state.retry_countdown_status = Some(status.clone());
++        }
++        if Instant::now() < status.retry_at {
++            self.frame_requester
++                .schedule_frame_in(Duration::from_secs(1));
++        }
++    }
++
+     fn flush_active_cell(&mut self) {
+         if let Some(active) = self.transcript.active_cell.take() {
+             self.transcript.needs_final_message_separator = true;
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index eb979ceff1..bb58fbfdc6 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -124,6 +124,7 @@ impl ChatWidget {
+             remote_connection: None,
+             token_info: None,
+             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
++            responses_stream_connection_status: None,
+             refreshing_status_outputs: Vec::new(),
+             next_status_refresh_request_id: 0,
+             refreshing_token_activity_output: None,
+diff --git a/codex-rs/tui/src/chatwidget/interaction.rs b/codex-rs/tui/src/chatwidget/interaction.rs
+index c59a818851..5d6b29a7be 100644
+--- a/codex-rs/tui/src/chatwidget/interaction.rs
++++ b/codex-rs/tui/src/chatwidget/interaction.rs
+@@ -15,6 +15,7 @@ impl ChatWidget {
+                 } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'c')
+             )
+             && !key_hint::ctrl(KeyCode::Char('r')).is_press(key_event)
++            && !key_hint::ctrl(KeyCode::Char('x')).is_press(key_event)
+             && !key_hint::ctrl(KeyCode::Char('u')).is_press(key_event)
+         {
+             let should_pause_active_goal = self
+@@ -30,6 +31,13 @@ impl ChatWidget {
+             return;
+         }
+ 
++        if self.handle_retry_now_shortcut(key_event) {
++            self.bottom_pane.clear_quit_shortcut_hint();
++            self.quit_shortcut_expires_at = None;
++            self.quit_shortcut_key = None;
++            return;
++        }
++
+         if self.handle_reasoning_shortcut(key_event) {
+             self.bottom_pane.clear_quit_shortcut_hint();
+             self.quit_shortcut_expires_at = None;
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index 79e2c3fe6e..b8f96b4541 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -127,6 +127,8 @@ impl ChatWidget {
+                         self.on_stream_error(
+                             notification.error.message,
+                             notification.error.additional_details,
++                            notification.turn_id,
++                            notification.retry_info,
+                         );
+                     }
+                 } else {
+@@ -150,6 +152,11 @@ impl ChatWidget {
+             ServerNotification::ModelSafetyBufferingUpdated(notification) => {
+                 self.on_model_safety_buffering_updated(notification, replay_kind)
+             }
++            ServerNotification::ResponsesStreamConnectionStatus(notification) => self
++                .set_responses_stream_connection_status(
++                    notification.connected,
++                    notification.rtt_ms,
++                ),
+             ServerNotification::Warning(notification) => self.on_warning(notification.message),
+             ServerNotification::GuardianWarning(notification) => {
+                 self.on_warning(notification.message)
+diff --git a/codex-rs/tui/src/chatwidget/status_controls.rs b/codex-rs/tui/src/chatwidget/status_controls.rs
+index 8bae8b64fb..954d51ec9b 100644
+--- a/codex-rs/tui/src/chatwidget/status_controls.rs
++++ b/codex-rs/tui/src/chatwidget/status_controls.rs
+@@ -99,6 +99,16 @@ impl ChatWidget {
+         self.refresh_status_surfaces();
+     }
+ 
++    pub(crate) fn set_responses_stream_connection_status(
++        &mut self,
++        connected: bool,
++        rtt_ms: Option<u64>,
++    ) {
++        self.responses_stream_connection_status =
++            Some(ResponsesStreamConnectionStatus { connected, rtt_ms });
++        self.refresh_status_line();
++    }
++
+     /// Records that status-line setup was canceled.
+     ///
+     /// Cancellation is intentionally side-effect free for config state; the existing configuration
+diff --git a/codex-rs/tui/src/chatwidget/status_state.rs b/codex-rs/tui/src/chatwidget/status_state.rs
+index c281804579..1b3b73ccaf 100644
+--- a/codex-rs/tui/src/chatwidget/status_state.rs
++++ b/codex-rs/tui/src/chatwidget/status_state.rs
+@@ -1,6 +1,7 @@
+ //! Status indicator and terminal-title state for `ChatWidget`.
+ 
+ use crate::status_indicator_widget::STATUS_DETAILS_DEFAULT_MAX_LINES;
++use std::time::Instant;
+ 
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub(super) struct StatusIndicatorState {
+@@ -9,6 +10,21 @@ pub(super) struct StatusIndicatorState {
+     pub(super) details_max_lines: usize,
+ }
+ 
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(super) struct ResponsesStreamConnectionStatus {
++    pub(super) connected: bool,
++    pub(super) rtt_ms: Option<u64>,
++}
++
++#[derive(Clone, Debug)]
++pub(super) struct RetryCountdownStatus {
++    pub(super) turn_id: String,
++    pub(super) base_header: String,
++    pub(super) details: Option<String>,
++    pub(super) details_max_lines: usize,
++    pub(super) retry_at: Instant,
++}
++
+ impl StatusIndicatorState {
+     pub(super) fn working() -> Self {
+         Self {
+@@ -114,6 +130,7 @@ pub(super) struct StatusState {
+     pub(super) pending_guardian_review_status: PendingGuardianReviewStatus,
+     pub(super) terminal_title_status_kind: TerminalTitleStatusKind,
+     pub(super) retry_status_header: Option<String>,
++    pub(super) retry_countdown_status: Option<RetryCountdownStatus>,
+     pub(super) pending_status_indicator_restore: bool,
+ }
+ 
+@@ -124,6 +141,7 @@ impl Default for StatusState {
+             pending_guardian_review_status: PendingGuardianReviewStatus::default(),
+             terminal_title_status_kind: TerminalTitleStatusKind::Working,
+             retry_status_header: None,
++            retry_countdown_status: None,
+             pending_status_indicator_restore: false,
+         }
+     }
+@@ -132,6 +150,7 @@ impl Default for StatusState {
+ impl StatusState {
+     pub(super) fn set_status(&mut self, status: StatusIndicatorState) {
+         self.current_status = status;
++        self.retry_countdown_status = None;
+     }
+ 
+     pub(super) fn take_retry_status_header(&mut self) -> Option<String> {
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 2fce88958c..7eb56ff3b9 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -683,6 +683,9 @@ impl ChatWidget {
+                     }
+                 }),
+             StatusLineItem::Status => Some(self.run_state_status_text()),
++            StatusLineItem::ResponsesStreamConnection => {
++                self.status_line_responses_stream_connection_display()
++            }
+             StatusLineItem::Permissions => Some(permissions_display(&self.config)),
+             StatusLineItem::ApprovalMode => Some(approval_mode_display(&self.config)),
+             StatusLineItem::UsedTokens => {
+@@ -777,6 +780,9 @@ impl ChatWidget {
+             StatusSurfacePreviewItem::BranchChanges => StatusLineItem::BranchChanges,
+             StatusSurfacePreviewItem::Permissions => StatusLineItem::Permissions,
+             StatusSurfacePreviewItem::ApprovalMode => StatusLineItem::ApprovalMode,
++            StatusSurfacePreviewItem::ResponsesStreamConnection => {
++                StatusLineItem::ResponsesStreamConnection
++            }
+             StatusSurfacePreviewItem::ContextRemaining => StatusLineItem::ContextRemaining,
+             StatusSurfacePreviewItem::ContextUsed => StatusLineItem::ContextUsed,
+             StatusSurfacePreviewItem::FiveHourLimit => StatusLineItem::FiveHourLimit,
+@@ -796,6 +802,14 @@ impl ChatWidget {
+         };
+         self.status_line_value_for_item(status_line_item)
+     }
++
++    fn status_line_responses_stream_connection_display(&self) -> Option<String> {
++        let status = self.responses_stream_connection_status.as_ref()?;
++        if !status.connected {
++            return Some("X".to_string());
++        }
++        status.rtt_ms.map(|rtt_ms| format!("{rtt_ms}ms"))
++    }
+     /// Resolves one configured terminal-title item into a displayable segment.
+     ///
+     /// Returning `None` means "omit this segment for now" so callers can keep
+diff --git a/codex-rs/tui/src/chatwidget/streaming.rs b/codex-rs/tui/src/chatwidget/streaming.rs
+index dcccbd027f..aa663bb229 100644
+--- a/codex-rs/tui/src/chatwidget/streaming.rs
++++ b/codex-rs/tui/src/chatwidget/streaming.rs
+@@ -6,6 +6,15 @@
+ use super::*;
+ 
+ impl ChatWidget {
++    pub(super) fn retry_countdown_header(base_header: &str, retry_at: Instant) -> String {
++        let remaining = retry_at.saturating_duration_since(Instant::now());
++        if remaining.is_zero() {
++            return format!("{base_header} ▪ retrying now");
++        }
++        let remaining_secs = remaining.as_millis().div_ceil(1000);
++        format!("{base_header} ▪ next retry in {remaining_secs}s ▪ ctrl+x reset retry budget")
++    }
++
+     pub(super) fn restore_reasoning_status_header(&mut self) {
+         if self.reasoning_header.is_none() {
+             self.reasoning_header = extract_first_bold(&self.reasoning_buffer);
+@@ -296,16 +305,77 @@ impl ChatWidget {
+         self.reasoning_header = None;
+     }
+ 
+-    pub(super) fn on_stream_error(&mut self, message: String, additional_details: Option<String>) {
++    pub(super) fn on_stream_error(
++        &mut self,
++        message: String,
++        additional_details: Option<String>,
++        turn_id: String,
++        retry_info: Option<codex_app_server_protocol::StreamRetryInfo>,
++    ) {
++        let had_answer_stream = self.stream_controller.take().is_some();
++        if had_answer_stream {
++            self.clear_active_stream_tail();
++            self.transcript.needs_final_message_separator = false;
++            self.adaptive_chunking.reset();
++            self.app_event_tx
++                .send(AppEvent::DiscardIncompleteAgentMessage);
++            self.app_event_tx.send(AppEvent::StopCommitAnimation);
++        }
++        self.reasoning_buffer.clear();
++        self.reasoning_header = None;
++        self.reasoning_summary_parts.clear();
+         self.status_state.remember_retry_status_header();
+         self.bottom_pane.ensure_status_indicator();
+         self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Thinking;
++        let retry_at = retry_info
++            .as_ref()
++            .map(|info| Instant::now() + Duration::from_millis(info.retry_delay_ms));
+         self.set_status(
+-            message,
+-            additional_details,
++            retry_at
++                .map(|retry_at| Self::retry_countdown_header(&message, retry_at))
++                .unwrap_or_else(|| message.clone()),
++            additional_details.clone(),
+             StatusDetailsCapitalization::CapitalizeFirst,
+             STATUS_DETAILS_DEFAULT_MAX_LINES,
+         );
++        if let Some(retry_at) = retry_at {
++            self.status_state.retry_countdown_status = Some(RetryCountdownStatus {
++                turn_id,
++                base_header: message,
++                details: additional_details,
++                details_max_lines: STATUS_DETAILS_DEFAULT_MAX_LINES,
++                retry_at,
++            });
++            self.frame_requester
++                .schedule_frame_in(Duration::from_secs(1));
++        }
++    }
++
++    pub(super) fn handle_retry_now_shortcut(&mut self, key_event: KeyEvent) -> bool {
++        if !key_hint::ctrl(KeyCode::Char('x')).is_press(key_event)
++            || !self.bottom_pane.no_modal_or_popup_active()
++        {
++            return false;
++        }
++        let Some(status) = self.status_state.retry_countdown_status.clone() else {
++            return false;
++        };
++        let Some(thread_id) = self.thread_id else {
++            return false;
++        };
++
++        self.set_status(
++            format!("{} ▪ resetting retry budget", status.base_header),
++            status.details,
++            StatusDetailsCapitalization::Preserve,
++            status.details_max_lines,
++        );
++        self.app_event_tx.send(AppEvent::RetryCurrentStream {
++            thread_id,
++            turn_id: status.turn_id,
++        });
++        self.request_redraw();
++        true
+     }
+ 
+     /// Handle completion of an `AgentMessage` turn item.
+diff --git a/codex-rs/tui/src/chatwidget/tests.rs b/codex-rs/tui/src/chatwidget/tests.rs
+index b8cd9e2b3f..1de09f123d 100644
+--- a/codex-rs/tui/src/chatwidget/tests.rs
++++ b/codex-rs/tui/src/chatwidget/tests.rs
+@@ -97,6 +97,7 @@ pub(super) use codex_app_server_protocol::RateLimitReachedType;
+ pub(super) use codex_app_server_protocol::RateLimitSnapshot;
+ pub(super) use codex_app_server_protocol::RateLimitWindow;
+ pub(super) use codex_app_server_protocol::ReasoningSummaryTextDeltaNotification;
++pub(super) use codex_app_server_protocol::ResponsesStreamConnectionStatusNotification;
+ pub(super) use codex_app_server_protocol::ReviewTarget;
+ pub(super) use codex_app_server_protocol::ServerNotification;
+ pub(super) use codex_app_server_protocol::SkillMetadata;
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index 5bdc5328ee..23f3896d5a 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -1090,6 +1090,7 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
+                 additional_details: None,
+             },
+             will_retry: false,
++            retry_info: None,
+             thread_id: "thread-1".to_string(),
+             turn_id: "turn-1".to_string(),
+         }),
+@@ -1268,6 +1269,7 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
+                 additional_details: None,
+             },
+             will_retry: true,
++            retry_info: None,
+             thread_id: "thread-1".to_string(),
+             turn_id: "turn-1".to_string(),
+         }),
+@@ -1296,6 +1298,124 @@ async fn live_app_server_stream_recovery_restores_previous_status_header() {
+     assert!(chat.status_state.retry_status_header.is_none());
+ }
+ 
++#[tokio::test]
++async fn live_app_server_stream_recovery_shows_retry_countdown() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++
++    chat.handle_server_notification(
++        ServerNotification::Error(ErrorNotification {
++            error: AppServerTurnError {
++                message: "Reconnecting... 2/30".to_string(),
++                codex_error_info: Some(CodexErrorInfo::Other),
++                additional_details: None,
++            },
++            will_retry: true,
++            retry_info: Some(codex_app_server_protocol::StreamRetryInfo {
++                retry_count: 2,
++                retry_limit: 30,
++                retry_delay_ms: 5_000,
++            }),
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++        }),
++        /*replay_kind*/ None,
++    );
++    drain_insert_history(&mut rx);
++
++    let status = chat
++        .bottom_pane
++        .status_widget()
++        .expect("status indicator should be visible");
++    assert!(status.header().starts_with("Reconnecting... 2/30"));
++    assert!(status.header().contains("next retry in 5s"));
++    assert!(status.header().contains("ctrl+x reset retry budget"));
++}
++
++#[tokio::test]
++async fn live_app_server_stream_recovery_zero_delay_shows_retrying_now() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++
++    chat.handle_server_notification(
++        ServerNotification::Error(ErrorNotification {
++            error: AppServerTurnError {
++                message: "Reconnecting... 1/30".to_string(),
++                codex_error_info: Some(CodexErrorInfo::Other),
++                additional_details: None,
++            },
++            will_retry: true,
++            retry_info: Some(codex_app_server_protocol::StreamRetryInfo {
++                retry_count: 1,
++                retry_limit: 30,
++                retry_delay_ms: 0,
++            }),
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++        }),
++        /*replay_kind*/ None,
++    );
++    drain_insert_history(&mut rx);
++
++    let status = chat
++        .bottom_pane
++        .status_widget()
++        .expect("status indicator should be visible");
++    assert_eq!(status.header(), "Reconnecting... 1/30 ▪ retrying now");
++}
++
++#[tokio::test]
++async fn live_app_server_stream_recovery_ctrl_x_resets_retry_budget_once() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    let thread_id = ThreadId::new();
++    chat.thread_id = Some(thread_id);
++
++    chat.handle_server_notification(
++        ServerNotification::Error(ErrorNotification {
++            error: AppServerTurnError {
++                message: "Reconnecting... 2/30".to_string(),
++                codex_error_info: Some(CodexErrorInfo::Other),
++                additional_details: None,
++            },
++            will_retry: true,
++            retry_info: Some(codex_app_server_protocol::StreamRetryInfo {
++                retry_count: 2,
++                retry_limit: 30,
++                retry_delay_ms: 5_000,
++            }),
++            thread_id: thread_id.to_string(),
++            turn_id: "turn-1".to_string(),
++        }),
++        /*replay_kind*/ None,
++    );
++    drain_insert_history(&mut rx);
++
++    let retry_key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
++    chat.handle_key_event(retry_key);
++    chat.handle_key_event(retry_key);
++
++    match rx.try_recv() {
++        Ok(AppEvent::RetryCurrentStream {
++            thread_id: event_thread_id,
++            turn_id,
++        }) => {
++            assert_eq!(event_thread_id, thread_id);
++            assert_eq!(turn_id, "turn-1");
++        }
++        other => panic!("expected RetryCurrentStream event, got {other:?}"),
++    }
++    assert!(
++        !std::iter::from_fn(|| rx.try_recv().ok())
++            .any(|event| matches!(event, AppEvent::RetryCurrentStream { .. }))
++    );
++    let status = chat
++        .bottom_pane
++        .status_widget()
++        .expect("status indicator should be visible");
++    assert_eq!(
++        status.header(),
++        "Reconnecting... 2/30 ▪ resetting retry budget"
++    );
++}
++
+ #[tokio::test]
+ async fn live_app_server_server_overloaded_error_renders_warning() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+@@ -1326,6 +1446,7 @@ async fn live_app_server_server_overloaded_error_renders_warning() {
+                 additional_details: None,
+             },
+             will_retry: false,
++            retry_info: None,
+             thread_id: "thread-1".to_string(),
+             turn_id: "turn-1".to_string(),
+         }),
+@@ -1368,6 +1489,7 @@ async fn live_app_server_cyber_policy_error_renders_dedicated_notice() {
+                 additional_details: None,
+             },
+             will_retry: false,
++            retry_info: None,
+             thread_id: "thread-1".to_string(),
+             turn_id: "turn-1".to_string(),
+         }),
+diff --git a/codex-rs/tui/src/chatwidget/tests/helpers.rs b/codex-rs/tui/src/chatwidget/tests/helpers.rs
+index fe392481f6..db81556119 100644
+--- a/codex-rs/tui/src/chatwidget/tests/helpers.rs
++++ b/codex-rs/tui/src/chatwidget/tests/helpers.rs
+@@ -426,6 +426,7 @@ pub(super) fn handle_error(
+                 additional_details: None,
+             },
+             will_retry: false,
++            retry_info: None,
+             thread_id: thread_id(chat),
+             turn_id: chat
+                 .turn_lifecycle
+@@ -459,6 +460,7 @@ pub(super) fn handle_stream_error_with_replay(
+                 additional_details,
+             },
+             will_retry: true,
++            retry_info: None,
+             thread_id: thread_id(chat),
+             turn_id: chat
+                 .turn_lifecycle
+@@ -498,6 +500,23 @@ pub(super) fn handle_model_verification(
+     );
+ }
+ 
++pub(super) fn handle_responses_stream_connection_status(
++    chat: &mut ChatWidget,
++    connected: bool,
++    rtt_ms: Option<u64>,
++) {
++    chat.handle_server_notification(
++        ServerNotification::ResponsesStreamConnectionStatus(
++            ResponsesStreamConnectionStatusNotification {
++                thread_id: thread_id(chat),
++                connected,
++                rtt_ms,
++            },
++        ),
++        /*replay_kind*/ None,
++    );
++}
++
+ pub(super) fn handle_agent_message_delta(chat: &mut ChatWidget, delta: impl Into<String>) {
+     chat.handle_server_notification(
+         ServerNotification::AgentMessageDelta(
+diff --git a/codex-rs/tui/src/chatwidget/tests/history_replay.rs b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
+index 03dcf4973b..98dad7da55 100644
+--- a/codex-rs/tui/src/chatwidget/tests/history_replay.rs
++++ b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
+@@ -980,6 +980,7 @@ async fn replayed_retryable_app_server_error_keeps_turn_running() {
+                 additional_details: Some("Idle timeout waiting for SSE".to_string()),
+             },
+             will_retry: true,
++            retry_info: None,
+             thread_id: "thread-1".to_string(),
+             turn_id: "turn-1".to_string(),
+         }),
+diff --git a/codex-rs/tui/src/chatwidget/tests/mcp_startup.rs b/codex-rs/tui/src/chatwidget/tests/mcp_startup.rs
+index 49588ba157..f9e1578775 100644
+--- a/codex-rs/tui/src/chatwidget/tests/mcp_startup.rs
++++ b/codex-rs/tui/src/chatwidget/tests/mcp_startup.rs
+@@ -38,6 +38,8 @@ async fn mcp_startup_ignores_status_for_other_thread() {
+     chat.on_stream_error(
+         "Connection interrupted, retrying".to_string(),
+         /*additional_details*/ None,
++        "turn-1".to_string(),
++        /*retry_info*/ None,
+     );
+     let status_before = chat.status_state.current_status.clone();
+     let retry_status_header_before = chat.status_state.retry_status_header.clone();
+diff --git a/codex-rs/tui/src/chatwidget/tests/slash_commands.rs b/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
+index 3f0e20205d..6589abb589 100644
+--- a/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
++++ b/codex-rs/tui/src/chatwidget/tests/slash_commands.rs
+@@ -1904,7 +1904,7 @@ async fn copy_shortcut_can_be_remapped() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+     let mut keymap_config = chat.config_ref().tui_keymap.clone();
+     keymap_config.global.copy = Some(codex_config::types::KeybindingsSpec::One(
+-        codex_config::types::KeybindingSpec("ctrl-x".to_string()),
++        codex_config::types::KeybindingSpec("alt-c".to_string()),
+     ));
+     let runtime_keymap =
+         crate::keymap::RuntimeKeymap::from_config(&keymap_config).expect("valid copy remap");
+@@ -1916,7 +1916,7 @@ async fn copy_shortcut_can_be_remapped() {
+         "old copy shortcut should no longer copy"
+     );
+ 
+-    chat.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
++    chat.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT));
+     let cells = drain_insert_history(&mut rx);
+     assert_eq!(cells.len(), 1, "expected one info message");
+     let rendered = lines_to_single_string(&cells[0]);
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index 2de57337eb..31d62b2bf6 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -77,6 +77,36 @@ async fn app_server_model_verification_renders_warning() {
+     assert!(rendered.contains("https://chatgpt.com/cyber"));
+ }
+ 
++#[tokio::test]
++async fn status_line_responses_stream_connection_renders_rtt_and_disconnect() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++
++    assert_eq!(
++        chat.status_line_value_for_item(
++            crate::bottom_pane::StatusLineItem::ResponsesStreamConnection
++        ),
++        None
++    );
++
++    handle_responses_stream_connection_status(&mut chat, /*connected*/ true, Some(42));
++    assert_eq!(
++        chat.status_line_value_for_item(
++            crate::bottom_pane::StatusLineItem::ResponsesStreamConnection
++        ),
++        Some("42ms".to_string())
++    );
++
++    handle_responses_stream_connection_status(
++        &mut chat, /*connected*/ false, /*rtt_ms*/ None,
++    );
++    assert_eq!(
++        chat.status_line_value_for_item(
++            crate::bottom_pane::StatusLineItem::ResponsesStreamConnection
++        ),
++        Some("X".to_string())
++    );
++}
++
+ #[tokio::test]
+ async fn context_indicator_shows_used_tokens_when_window_unknown() {
+     let (mut chat, _rx, _ops) = make_chatwidget_manual(Some("unknown-model")).await;
+@@ -2616,6 +2646,49 @@ async fn stream_error_restores_hidden_status_indicator() {
+     assert_eq!(status.details(), Some(details));
+ }
+ 
++#[tokio::test]
++async fn stream_error_discards_incomplete_answer_and_reasoning() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.on_task_started();
++    chat.transcript.had_work_activity = true;
++    chat.on_agent_message_delta("partial answer\n".to_string());
++    chat.on_commit_tick();
++    chat.on_agent_reasoning_delta("**Partial reasoning**".to_string());
++
++    handle_stream_error(&mut chat, "Reconnecting... 1/30", None);
++
++    assert!(chat.stream_controller.is_none());
++    assert!(chat.reasoning_buffer.is_empty());
++    assert!(chat.reasoning_header.is_none());
++    assert!(chat.reasoning_summary_parts.is_empty());
++    assert!(!chat.has_active_stream_tail());
++    assert!(!chat.transcript.needs_final_message_separator);
++    assert!(
++        std::iter::from_fn(|| rx.try_recv().ok())
++            .any(|event| matches!(event, AppEvent::DiscardIncompleteAgentMessage)),
++        "retry should remove provisional stream cells from transcript"
++    );
++
++    chat.on_agent_message_delta("retry answer\n".to_string());
++    chat.on_commit_tick();
++    assert!(
++        !std::iter::from_fn(|| rx.try_recv().ok()).any(|event| {
++            matches!(
++                event,
++                AppEvent::InsertHistoryCell(cell)
++                    if cell.as_any().is::<history_cell::FinalMessageSeparator>()
++            )
++        }),
++        "retry should not insert another final-message separator"
++    );
++    assert!(chat.stream_controller.as_ref().is_some_and(|controller| {
++        !controller
++            .current_tail_lines()
++            .iter()
++            .any(|line| line.line.to_string().contains("partial answer"))
++    }));
++}
++
+ #[tokio::test]
+ async fn warning_event_adds_warning_history_cell() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/keymap.rs b/codex-rs/tui/src/keymap.rs
+index b4f00a4d2f..d8ecd14fad 100644
+--- a/codex-rs/tui/src/keymap.rs
++++ b/codex-rs/tui/src/keymap.rs
+@@ -1793,6 +1793,7 @@ const MAIN_RESERVED_BINDINGS: &[(&str, KeyBinding)] = &[
+         "fixed.cycle_collaboration_mode",
+         key_hint::shift(KeyCode::Tab),
+     ),
++    ("fixed.retry_stream_now", key_hint::ctrl(KeyCode::Char('x'))),
+     ("fixed.backtrack", key_hint::plain(KeyCode::Esc)),
+     ("fixed.previous_agent", key_hint::alt(KeyCode::Left)),
+     ("fixed.next_agent", key_hint::alt(KeyCode::Right)),
+@@ -2692,6 +2693,14 @@ mod tests {
+         expect_conflict(&keymap, "composer.submit", "fixed.paste_image");
+     }
+ 
++    #[test]
++    fn rejects_main_bindings_that_collide_with_retry_stream_now() {
++        let mut keymap = TuiKeymap::default();
++        keymap.composer.submit = Some(one("ctrl-x"));
++
++        expect_conflict(&keymap, "composer.submit", "fixed.retry_stream_now");
++    }
++
+     #[test]
+     fn interrupt_turn_allows_backtrack_escape_and_can_be_remapped_or_unbound() {
+         let mut keymap = TuiKeymap::default();
+diff --git a/codex-rs/tui/src/keymap_setup.rs b/codex-rs/tui/src/keymap_setup.rs
+index 8c64cf8189..69e1336f18 100644
+--- a/codex-rs/tui/src/keymap_setup.rs
++++ b/codex-rs/tui/src/keymap_setup.rs
+@@ -1383,11 +1383,11 @@ mod tests {
+     #[test]
+     fn debug_view_uses_custom_binding_source() {
+         let keymap =
+-            keymap_with_replacement(&TuiKeymap::default(), "global", "copy", "ctrl-x").unwrap();
++            keymap_with_replacement(&TuiKeymap::default(), "global", "copy", "alt-c").unwrap();
+         let runtime = RuntimeKeymap::from_config(&keymap).unwrap();
+         let mut view = build_keymap_debug_view(&runtime, &keymap);
+ 
+-        view.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
++        view.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT));
+ 
+         let rendered = render_debug(&view, /*width*/ 100);
+         assert!(rendered.contains("global.copy (Copy)"));
+diff --git a/codex-rs/tui/src/pager_overlay.rs b/codex-rs/tui/src/pager_overlay.rs
+index 23e470cb00..0362805b40 100644
+--- a/codex-rs/tui/src/pager_overlay.rs
++++ b/codex-rs/tui/src/pager_overlay.rs
+@@ -490,6 +490,11 @@ impl TranscriptOverlay {
+         }
+     }
+ 
++    #[cfg(test)]
++    pub(crate) fn committed_cell_count(&self) -> usize {
++        self.cells.len()
++    }
++
+     fn render_cells(
+         cells: &[Arc<dyn HistoryCell>],
+         highlight_cell: Option<usize>,

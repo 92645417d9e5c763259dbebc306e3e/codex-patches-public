@@ -1,0 +1,399 @@
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index f0974cec1b..220aa3681f 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -564,6 +564,7 @@ pub(crate) struct ChatWidget {
+     app_server_active_client_count: Option<usize>,
+     owned_app_server_stops_when_idle: bool,
+     token_info: Option<TokenUsageInfo>,
++    context_compaction_started_at_ms: HashMap<String, i64>,
+     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
+     rate_limit_paces_by_limit_id: BTreeMap<String, RateLimitWindowPace>,
+     responses_stream_connection_status: Option<ResponsesStreamConnectionStatus>,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 650a078a32..dc977ffc71 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -125,6 +125,7 @@ impl ChatWidget {
+             app_server_active_client_count: None,
+             owned_app_server_stops_when_idle: false,
+             token_info: None,
++            context_compaction_started_at_ms: HashMap::new(),
+             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
+             rate_limit_paces_by_limit_id: BTreeMap::new(),
+             responses_stream_connection_status: None,
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index bb3abeb7b6..ea0adf5331 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -338,6 +338,11 @@ impl ChatWidget {
+             ThreadItem::ImageGeneration(_) => {
+                 self.on_image_generation_begin();
+             }
++            ThreadItem::ContextCompaction { id } => {
++                self.context_compaction_started_at_ms
++                    .insert(id, notification.started_at_ms);
++                self.start_context_compaction_status();
++            }
+             ThreadItem::CollabAgentToolCall {
+                 id,
+                 tool,
+@@ -372,10 +377,22 @@ impl ChatWidget {
+         notification: ItemCompletedNotification,
+         replay_kind: Option<ReplayKind>,
+     ) {
+-        self.handle_thread_item(
+-            notification.item,
+-            notification.turn_id,
+-            replay_kind.map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay),
+-        );
++        let render_source =
++            replay_kind.map_or(ThreadItemRenderSource::Live, ThreadItemRenderSource::Replay);
++        match notification.item {
++            ThreadItem::ContextCompaction { id } => {
++                let duration_ms =
++                    self.context_compaction_started_at_ms
++                        .remove(&id)
++                        .map(|started_at_ms| {
++                            notification
++                                .completed_at_ms
++                                .saturating_sub(started_at_ms)
++                                .max(0)
++                        });
++                self.handle_context_compaction_item(duration_ms, render_source);
++            }
++            item => self.handle_thread_item(item, notification.turn_id, render_source),
++        }
+     }
+ }
+diff --git a/codex-rs/tui/src/chatwidget/replay.rs b/codex-rs/tui/src/chatwidget/replay.rs
+index 1119a4fe15..50414f63ce 100644
+--- a/codex-rs/tui/src/chatwidget/replay.rs
++++ b/codex-rs/tui/src/chatwidget/replay.rs
+@@ -195,7 +195,7 @@ impl ChatWidget {
+                 self.exit_review_mode_after_item();
+             }
+             ThreadItem::ContextCompaction { .. } => {
+-                self.add_info_message("Context compacted".to_string(), /*hint*/ None);
++                self.handle_context_compaction_item(/*duration_ms*/ None, render_source);
+             }
+             ThreadItem::HookPrompt { .. } => {}
+             ThreadItem::CollabAgentToolCall {
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index 23f3896d5a..382d43635b 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -431,6 +431,65 @@ async fn thread_settings_updated_preserves_default_settings_for_plan_mode() {
+     );
+ }
+ 
++#[tokio::test]
++async fn context_compaction_item_tracks_live_duration_and_replay_omits_it() {
++    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++
++    chat.handle_server_notification(
++        ServerNotification::ItemStarted(ItemStartedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            started_at_ms: 1_000,
++            item: AppServerThreadItem::ContextCompaction {
++                id: "compact-1".to_string(),
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++
++    assert_eq!(chat.current_status_header_for_test(), "Working");
++    let cells = drain_insert_history(&mut rx);
++    assert!(
++        lines_to_single_string(&cells[0]).contains("Context compaction triggered"),
++        "expected compaction trigger banner"
++    );
++
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            completed_at_ms: 85_000,
++            item: AppServerThreadItem::ContextCompaction {
++                id: "compact-1".to_string(),
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++
++    let cells = drain_insert_history(&mut rx);
++    assert!(
++        lines_to_single_string(&cells[0]).contains("Context compacted ▪ Worked 1m 24s"),
++        "expected live compaction duration"
++    );
++
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            completed_at_ms: 200_000,
++            item: AppServerThreadItem::ContextCompaction {
++                id: "replay-compact".to_string(),
++            },
++        }),
++        Some(ReplayKind::ResumeInitialMessages),
++    );
++
++    let cells = drain_insert_history(&mut rx);
++    let replay_text = lines_to_single_string(&cells[0]);
++    assert!(replay_text.contains("Context compacted"));
++    assert!(!replay_text.contains("Worked"));
++}
++
+ #[tokio::test]
+ async fn collab_spawn_end_shows_requested_model_and_effort() {
+     let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+index 17daa99f03..f2f91d9123 100644
+--- a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
++++ b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+@@ -273,4 +273,32 @@ impl ChatWidget {
+             _ => {}
+         }
+     }
++
++    pub(crate) fn start_context_compaction_status(&mut self) {
++        self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Working;
++        self.add_to_history(history_cell::new_context_compaction_triggered_event(
++            self.context_compaction_trigger_usage(),
++        ));
++        self.set_status_header(String::from("Working"));
++        self.request_redraw();
++    }
++
++    pub(super) fn handle_context_compaction_item(
++        &mut self,
++        duration_ms: Option<i64>,
++        _render_source: ThreadItemRenderSource,
++    ) {
++        self.add_to_history(history_cell::new_context_compacted_event(duration_ms));
++        self.request_redraw();
++    }
++
++    fn context_compaction_trigger_usage(&self) -> history_cell::ContextCompactionTriggerUsage {
++        history_cell::ContextCompactionTriggerUsage {
++            used_tokens: self
++                .token_info
++                .as_ref()
++                .map(|info| info.last_token_usage.tokens_in_context_window().max(0)),
++            context_window: self.status_line_context_window_size(),
++        }
++    }
+ }
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+index 2beb032cd9..32e9aff0dd 100644
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -186,6 +186,7 @@ impl ChatWidget {
+         self.clear_safety_buffering();
+         self.update_task_running_state();
+         self.running_commands.clear();
++        self.context_compaction_started_at_ms.clear();
+         self.suppressed_exec_calls.clear();
+         self.last_unified_wait = None;
+         self.unified_exec_wait_streak = None;
+@@ -339,6 +340,7 @@ impl ChatWidget {
+         self.turn_lifecycle.finish();
+         self.update_task_running_state();
+         self.running_commands.clear();
++        self.context_compaction_started_at_ms.clear();
+         self.suppressed_exec_calls.clear();
+         self.last_unified_wait = None;
+         self.unified_exec_wait_streak = None;
+diff --git a/codex-rs/tui/src/history_cell/notices.rs b/codex-rs/tui/src/history_cell/notices.rs
+index 06cd9f8588..4914c2442d 100644
+--- a/codex-rs/tui/src/history_cell/notices.rs
++++ b/codex-rs/tui/src/history_cell/notices.rs
+@@ -210,6 +210,142 @@ pub(crate) fn new_info_event(message: String, hint: Option<String>) -> PlainHist
+     PlainHistoryCell { lines }
+ }
+ 
++#[derive(Debug)]
++struct ContextCompactedHistoryCell {
++    duration_ms: Option<i64>,
++}
++
++#[derive(Debug)]
++struct ContextCompactionTriggeredHistoryCell {
++    trigger_context_usage: ContextCompactionTriggerUsage,
++}
++
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct ContextCompactionTriggerUsage {
++    pub(crate) used_tokens: Option<i64>,
++    pub(crate) context_window: Option<i64>,
++}
++
++impl HistoryCell for ContextCompactedHistoryCell {
++    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
++        vec![context_compaction_separator_line(
++            "Context compacted",
++            self.details_text().as_deref(),
++            width,
++        )]
++    }
++
++    fn raw_lines(&self) -> Vec<Line<'static>> {
++        let mut text = "Context compacted".to_string();
++        if let Some(details) = self.details_text() {
++            text.push_str(" ▪ ");
++            text.push_str(&details);
++        }
++        vec![text.into()]
++    }
++}
++
++impl HistoryCell for ContextCompactionTriggeredHistoryCell {
++    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
++        vec![context_compaction_separator_line(
++            "Context compaction triggered",
++            self.trigger_context_usage.label().as_deref(),
++            width,
++        )]
++    }
++
++    fn raw_lines(&self) -> Vec<Line<'static>> {
++        vec![Line::from(self.label())]
++    }
++}
++
++impl ContextCompactionTriggeredHistoryCell {
++    fn label(&self) -> String {
++        match self.trigger_context_usage.label() {
++            Some(details) => format!("Context compaction triggered ▪ {details}"),
++            None => "Context compaction triggered".to_string(),
++        }
++    }
++}
++
++impl ContextCompactionTriggerUsage {
++    fn label(self) -> Option<String> {
++        match (self.used_tokens, self.context_window) {
++            (Some(used_tokens), Some(context_window)) if context_window > 0 => {
++                let percent =
++                    (used_tokens.saturating_mul(100) + context_window / 2) / context_window;
++                Some(format!("{}% Used", percent.clamp(0, 100)))
++            }
++            _ => None,
++        }
++    }
++}
++
++impl ContextCompactedHistoryCell {
++    fn details_text(&self) -> Option<String> {
++        let duration_ms = self.duration_ms?;
++        let elapsed_seconds = u64::try_from(duration_ms.max(0))
++            .unwrap_or_default()
++            .saturating_add(999)
++            / 1_000;
++        let elapsed = crate::status_indicator_widget::fmt_elapsed_compact(elapsed_seconds);
++        Some(format!("Worked {elapsed}"))
++    }
++}
++
++fn context_compaction_separator_line(
++    label: &str,
++    details: Option<&str>,
++    width: u16,
++) -> Line<'static> {
++    let label_text = match details {
++        Some(details) => format!("{label} ▪ {details}"),
++        None => label.to_string(),
++    };
++    let visible_label = format!("─ {label_text} ─");
++    let label_width = UnicodeWidthStr::width(visible_label.as_str());
++    if label_width > usize::from(width) {
++        let (prefix, _suffix, prefix_width) =
++            take_prefix_by_width(&visible_label, usize::from(width));
++        return Line::from_iter([
++            prefix,
++            "─".repeat(usize::from(width).saturating_sub(prefix_width)),
++        ])
++        .dim();
++    }
++
++    let mut spans = vec![
++        "─ ".dim(),
++        label
++            .to_string()
++            .fg(Color::Yellow)
++            .add_modifier(Modifier::BOLD),
++    ];
++    if let Some(details) = details {
++        spans.push(" ▪ ".dim());
++        spans.push(details.to_string().dim());
++    }
++    spans.push(" ─".dim());
++    spans.push(
++        "─"
++            .repeat(usize::from(width).saturating_sub(label_width))
++            .dim(),
++    );
++    Line::from(spans)
++}
++
++pub(crate) fn new_context_compacted_event(duration_ms: Option<i64>) -> impl HistoryCell {
++    ContextCompactedHistoryCell { duration_ms }
++}
++
++pub(crate) fn new_context_compaction_triggered_event(
++    trigger_context_usage: ContextCompactionTriggerUsage,
++) -> impl HistoryCell {
++    ContextCompactionTriggeredHistoryCell {
++        trigger_context_usage,
++    }
++}
++
+ pub(crate) fn new_error_event(message: String) -> PlainHistoryCell {
+     let mut message_lines = message.split('\n');
+     let first = message_lines
+@@ -246,4 +382,43 @@ mod tests {
+                 .all(|span| span.style.fg == Some(Color::Red))
+         );
+     }
++
++    #[test]
++    fn context_compacted_event_matches_triggered_separator_style() {
++        let cell = new_context_compacted_event(Some(84_000));
++        let lines = cell.display_lines(60);
++
++        assert_eq!(lines.len(), 1);
++        assert_eq!(
++            lines[0].to_string(),
++            "─ Context compacted ▪ Worked 1m 24s ────────────────────────"
++        );
++        let rendered_width: usize = lines[0].spans.iter().map(Span::width).sum();
++        assert_eq!(rendered_width, 60);
++        assert!(!lines[0].to_string().contains("Used"));
++        assert!(!lines[0].to_string().contains("tokens"));
++    }
++
++    #[test]
++    fn context_compacted_event_without_duration_omits_details() {
++        let cell = new_context_compacted_event(/*duration_ms*/ None);
++        assert_eq!(cell.raw_lines()[0].to_string(), "Context compacted");
++        assert_eq!(
++            cell.display_lines(30)[0].to_string(),
++            "─ Context compacted ──────────"
++        );
++    }
++
++    #[test]
++    fn context_compaction_trigger_reports_used_percentage() {
++        let cell = new_context_compaction_triggered_event(ContextCompactionTriggerUsage {
++            used_tokens: Some(85_000),
++            context_window: Some(100_000),
++        });
++
++        assert_eq!(
++            cell.raw_lines()[0].to_string(),
++            "Context compaction triggered ▪ 85% Used"
++        );
++    }
+ }

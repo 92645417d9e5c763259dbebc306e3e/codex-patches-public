@@ -1,0 +1,172 @@
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+index 92a577dc84..30abd8b13b 100644
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -712,7 +712,10 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
+ 
+     let mut lines = Vec::new();
+     if !token_usage.is_zero() {
+-        lines.push(token_usage.to_string());
++        lines.push(codex_tui::format_token_usage_for_terminal(
++            token_usage.to_string(),
++            color_enabled,
++        ));
+     }
+ 
+     if let Some(resume_cmd) = resume_hint {
+@@ -3352,6 +3355,24 @@ mod tests {
+         assert!(lines[1].contains("\u{1b}[36m"));
+     }
+ 
++    #[test]
++    fn format_exit_messages_highlights_cache_hit_rate_when_color_enabled() {
++        let mut exit_info =
++            sample_exit_info(/*conversation_id*/ None, /*thread_name*/ None);
++        exit_info.token_usage = TokenUsage {
++            input_tokens: 740_625_103,
++            cached_input_tokens: 714_727_936,
++            output_tokens: 1_803_629,
++            reasoning_output_tokens: 519_362,
++            total_tokens: 27_700_796,
++        };
++
++        let lines = format_exit_messages(exit_info, /*color_enabled*/ true);
++
++        assert_eq!(lines.len(), 1);
++        assert!(lines[0].contains("\u{1b}[33m96.5% hit\u{1b}[39m"));
++    }
++
+     #[test]
+     fn format_exit_messages_names_picker_item_when_thread_has_name() {
+         let exit_info = sample_exit_info(
+diff --git a/codex-rs/tui/src/lib.rs b/codex-rs/tui/src/lib.rs
+index 599e2582d1..5d25f06284 100644
+--- a/codex-rs/tui/src/lib.rs
++++ b/codex-rs/tui/src/lib.rs
+@@ -78,6 +78,7 @@ use std::path::PathBuf;
+ use std::sync::Arc;
+ use std::time::Instant;
+ pub use token_usage::TokenUsage;
++pub use token_usage::format_token_usage_for_terminal;
+ use tracing::error;
+ use tracing::warn;
+ use tracing_appender::non_blocking;
+diff --git a/codex-rs/tui/src/main.rs b/codex-rs/tui/src/main.rs
+index 179b6b140a..4a861c1e1d 100644
+--- a/codex-rs/tui/src/main.rs
++++ b/codex-rs/tui/src/main.rs
+@@ -5,6 +5,7 @@ use codex_config::LoaderOverrides;
+ use codex_tui::AppExitInfo;
+ use codex_tui::Cli;
+ use codex_tui::ExitReason;
++use codex_tui::format_token_usage_for_terminal;
+ use codex_tui::run_main;
+ use codex_utils_cli::CliConfigOverrides;
+ use std::io::Write;
+@@ -49,34 +50,6 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
+     lines
+ }
+ 
+-fn format_token_usage_for_terminal(text: String, color_enabled: bool) -> String {
+-    if !color_enabled {
+-        return text;
+-    }
+-    let Some(hit_suffix_start) = text.find("% hit") else {
+-        return text;
+-    };
+-    let mut marker_start = hit_suffix_start;
+-    while marker_start > 0 {
+-        let byte = text.as_bytes()[marker_start - 1];
+-        if byte.is_ascii_digit() || byte == b'.' {
+-            marker_start -= 1;
+-        } else {
+-            break;
+-        }
+-    }
+-    let marker_end = hit_suffix_start + "% hit".len();
+-    if marker_start == hit_suffix_start {
+-        return text;
+-    }
+-    format!(
+-        "{}\u{1b}[33m{}\u{1b}[39m{}",
+-        &text[..marker_start],
+-        &text[marker_start..marker_end],
+-        &text[marker_end..]
+-    )
+-}
+-
+ #[derive(Parser, Debug)]
+ struct TopCli {
+     #[clap(flatten)]
+diff --git a/codex-rs/tui/src/token_usage.rs b/codex-rs/tui/src/token_usage.rs
+index 8c6b3c46e6..4eca6f9897 100644
+--- a/codex-rs/tui/src/token_usage.rs
++++ b/codex-rs/tui/src/token_usage.rs
+@@ -117,6 +117,22 @@ mod tests {
+             "Token usage: total=61,813 input=43,468 (+ 987,264 cached, 95.8% hit) output=18,345 (reasoning 5,262)"
+         );
+     }
++
++    #[test]
++    fn terminal_cache_hit_highlight_requires_a_well_formed_percentage() {
++        let valid = "Token usage: total=12 (+ 90 cached, 90.0% hit)".to_string();
++        assert_eq!(
++            format_token_usage_for_terminal(valid, /*color_enabled*/ true),
++            "Token usage: total=12 (+ 90 cached, \u{1b}[33m90.0% hit\u{1b}[39m)"
++        );
++
++        for malformed in [".% hit", "1..2% hit", "3.% hit", "% hit"] {
++            assert_eq!(
++                format_token_usage_for_terminal(malformed.to_string(), /*color_enabled*/ true),
++                malformed
++            );
++        }
++    }
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+@@ -154,3 +170,44 @@ impl fmt::Display for TokenUsage {
+         )
+     }
+ }
++
++/// Highlights the cache-hit suffix in terminal output when ANSI color is enabled.
++pub fn format_token_usage_for_terminal(text: String, color_enabled: bool) -> String {
++    if !color_enabled {
++        return text;
++    }
++    let Some(hit_suffix_start) = text.find("% hit") else {
++        return text;
++    };
++    let mut marker_start = hit_suffix_start;
++    while marker_start > 0 {
++        let byte = text.as_bytes()[marker_start - 1];
++        if byte.is_ascii_digit() || byte == b'.' {
++            marker_start -= 1;
++        } else {
++            break;
++        }
++    }
++    let marker_end = hit_suffix_start + "% hit".len();
++    let numeric = &text[marker_start..hit_suffix_start];
++    let mut parts = numeric.split('.');
++    let Some(integer) = parts.next() else {
++        return text;
++    };
++    let fraction = parts.next();
++    let valid = !integer.is_empty()
++        && integer.bytes().all(|byte| byte.is_ascii_digit())
++        && fraction.is_none_or(|digits| {
++            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
++        })
++        && parts.next().is_none();
++    if !valid {
++        return text;
++    }
++    format!(
++        "{}\u{1b}[33m{}\u{1b}[39m{}",
++        &text[..marker_start],
++        &text[marker_start..marker_end],
++        &text[marker_end..]
++    )
++}

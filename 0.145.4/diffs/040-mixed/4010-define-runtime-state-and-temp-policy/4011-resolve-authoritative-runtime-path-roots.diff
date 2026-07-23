@@ -1,0 +1,416 @@
+diff --git a/codex-rs/utils/home-dir/src/lib.rs b/codex-rs/utils/home-dir/src/lib.rs
+index caa43569c7..26d8568ebd 100644
+--- a/codex-rs/utils/home-dir/src/lib.rs
++++ b/codex-rs/utils/home-dir/src/lib.rs
+@@ -2,6 +2,24 @@ use codex_utils_absolute_path::AbsolutePathBuf;
+ use dirs::home_dir;
+ use std::path::PathBuf;
+ 
++mod runtime_paths;
++
++pub use runtime_paths::CODEX_TMP_ENV;
++pub use runtime_paths::PROJECT_NAME_ENV;
++pub use runtime_paths::PROJECT_SCRATCH_ROOT_ENV;
++pub use runtime_paths::PROJECT_WORKING_ROOT_ENV;
++pub use runtime_paths::RUNTIME_STATE_ROOT_ENV;
++pub use runtime_paths::RUNTIME_TMP_ROOT_ENV;
++pub use runtime_paths::RuntimePathRoots;
++pub use runtime_paths::find_codex_tmp_root;
++pub use runtime_paths::find_project_name;
++pub use runtime_paths::find_project_scratch_root;
++pub use runtime_paths::find_project_working_root;
++pub use runtime_paths::find_runtime_state_root;
++pub use runtime_paths::find_runtime_tmp_root;
++pub use runtime_paths::find_system_tmp_root;
++pub use runtime_paths::resolve_runtime_path_roots;
++
+ /// Returns the path to the Codex configuration directory, which can be
+ /// specified by the `CODEX_HOME` environment variable. If not set, defaults to
+ /// `~/.codex`.
+diff --git a/codex-rs/utils/home-dir/src/runtime_paths.rs b/codex-rs/utils/home-dir/src/runtime_paths.rs
+new file mode 100644
+index 0000000000..573dcf9d86
+--- /dev/null
++++ b/codex-rs/utils/home-dir/src/runtime_paths.rs
+@@ -0,0 +1,381 @@
++use codex_utils_absolute_path::AbsolutePathBuf;
++use dirs::home_dir;
++use std::ffi::OsString;
++use std::io;
++use std::path::Component;
++use std::path::Path;
++use std::path::PathBuf;
++
++pub const CODEX_TMP_ENV: &str = "CODEX_TMP";
++pub const PROJECT_NAME_ENV: &str = "PROJECT_NAME";
++pub const PROJECT_SCRATCH_ROOT_ENV: &str = "PROJECT_SCRATCH_ROOT";
++pub const PROJECT_WORKING_ROOT_ENV: &str = "PROJECT_WORKING_ROOT";
++pub const RUNTIME_STATE_ROOT_ENV: &str = "RUNTIME_STATE_ROOT";
++pub const RUNTIME_TMP_ROOT_ENV: &str = "RUNTIME_TMP_ROOT";
++const TMPDIR_ENV: &str = "TMPDIR";
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct RuntimePathRoots {
++    pub system_tmp_root: AbsolutePathBuf,
++    pub codex_tmp_root: AbsolutePathBuf,
++    pub project_name: String,
++    pub project_scratch_root: AbsolutePathBuf,
++    pub project_working_root: AbsolutePathBuf,
++    pub runtime_tmp_root: AbsolutePathBuf,
++    pub runtime_state_root: AbsolutePathBuf,
++}
++
++impl RuntimePathRoots {
++    pub fn ensure_project_scratch_root(&self) -> io::Result<()> {
++        std::fs::create_dir_all(self.project_scratch_root.as_path())
++    }
++}
++
++#[derive(Debug, Clone, Default)]
++struct RuntimePathEnvironment {
++    tmpdir: Option<OsString>,
++    codex_tmp: Option<OsString>,
++    project_name: Option<OsString>,
++    project_scratch_root: Option<OsString>,
++    project_working_root: Option<OsString>,
++    runtime_tmp_root: Option<OsString>,
++    runtime_state_root: Option<OsString>,
++}
++
++impl RuntimePathEnvironment {
++    fn capture() -> Self {
++        Self {
++            tmpdir: std::env::var_os(TMPDIR_ENV),
++            codex_tmp: std::env::var_os(CODEX_TMP_ENV),
++            project_name: std::env::var_os(PROJECT_NAME_ENV),
++            project_scratch_root: std::env::var_os(PROJECT_SCRATCH_ROOT_ENV),
++            project_working_root: std::env::var_os(PROJECT_WORKING_ROOT_ENV),
++            runtime_tmp_root: std::env::var_os(RUNTIME_TMP_ROOT_ENV),
++            runtime_state_root: std::env::var_os(RUNTIME_STATE_ROOT_ENV),
++        }
++    }
++}
++
++pub fn resolve_runtime_path_roots(cwd: &Path) -> io::Result<RuntimePathRoots> {
++    resolve_runtime_path_roots_from(cwd, RuntimePathEnvironment::capture())
++}
++
++pub fn find_system_tmp_root() -> io::Result<AbsolutePathBuf> {
++    required_absolute_env(TMPDIR_ENV, std::env::var_os(TMPDIR_ENV))
++}
++
++pub fn find_codex_tmp_root() -> io::Result<AbsolutePathBuf> {
++    optional_absolute_env(CODEX_TMP_ENV, std::env::var_os(CODEX_TMP_ENV))?
++        .map_or_else(|| Ok(find_system_tmp_root()?.join("codex")), Ok)
++}
++
++pub fn find_project_scratch_root(cwd: &Path) -> io::Result<AbsolutePathBuf> {
++    let roots = resolve_runtime_path_roots(cwd)?;
++    roots.ensure_project_scratch_root()?;
++    Ok(roots.project_scratch_root)
++}
++
++pub fn find_project_working_root(cwd: &Path) -> io::Result<AbsolutePathBuf> {
++    Ok(resolve_runtime_path_roots(cwd)?.project_working_root)
++}
++
++pub fn find_project_name(cwd: &Path) -> io::Result<String> {
++    Ok(resolve_runtime_path_roots(cwd)?.project_name)
++}
++
++pub fn find_runtime_tmp_root(cwd: &Path) -> io::Result<AbsolutePathBuf> {
++    Ok(resolve_runtime_path_roots(cwd)?.runtime_tmp_root)
++}
++
++pub fn find_runtime_state_root(cwd: &Path) -> io::Result<AbsolutePathBuf> {
++    Ok(resolve_runtime_path_roots(cwd)?.runtime_state_root)
++}
++
++fn resolve_runtime_path_roots_from(
++    cwd: &Path,
++    env: RuntimePathEnvironment,
++) -> io::Result<RuntimePathRoots> {
++    let system_tmp_root = required_absolute_env(TMPDIR_ENV, env.tmpdir)?;
++    let codex_tmp_root = optional_absolute_env(CODEX_TMP_ENV, env.codex_tmp)?
++        .unwrap_or_else(|| system_tmp_root.join("codex"));
++    let project_working_root =
++        optional_absolute_env(PROJECT_WORKING_ROOT_ENV, env.project_working_root)?.map_or_else(
++            || AbsolutePathBuf::from_absolute_path(project_root_for(cwd)),
++            Ok,
++        )?;
++    let project_name = match nonempty_env(PROJECT_NAME_ENV, env.project_name)? {
++        Some(value) => validate_project_name(value)?,
++        None => path_leaf(project_working_root.as_path(), "workspace"),
++    };
++    let project_scratch_root =
++        optional_absolute_env(PROJECT_SCRATCH_ROOT_ENV, env.project_scratch_root)?.map_or_else(
++            || {
++                let parent_name = path_leaf(
++                    project_working_root
++                        .as_path()
++                        .parent()
++                        .unwrap_or(Path::new("")),
++                    "root",
++                );
++                Ok::<_, io::Error>(codex_tmp_root.join(parent_name).join(&project_name))
++            },
++            Ok,
++        )?;
++    let runtime_tmp_root = optional_absolute_env(RUNTIME_TMP_ROOT_ENV, env.runtime_tmp_root)?
++        .unwrap_or_else(|| system_tmp_root.join(&project_name));
++    let runtime_state_root = optional_absolute_env(RUNTIME_STATE_ROOT_ENV, env.runtime_state_root)?
++        .map_or_else(
++            || {
++                let root = home_dir().ok_or_else(|| {
++                    io::Error::new(io::ErrorKind::NotFound, "could not find home directory")
++                })?;
++                AbsolutePathBuf::from_absolute_path(root.join(&project_name))
++            },
++            Ok,
++        )?;
++
++    Ok(RuntimePathRoots {
++        system_tmp_root,
++        codex_tmp_root,
++        project_name,
++        project_scratch_root,
++        project_working_root,
++        runtime_tmp_root,
++        runtime_state_root,
++    })
++}
++
++fn required_absolute_env(name: &str, value: Option<OsString>) -> io::Result<AbsolutePathBuf> {
++    optional_absolute_env(name, value)?.ok_or_else(|| {
++        io::Error::new(
++            io::ErrorKind::NotFound,
++            format!("{name} must name the supplied system temporary directory"),
++        )
++    })
++}
++
++fn optional_absolute_env(
++    name: &str,
++    value: Option<OsString>,
++) -> io::Result<Option<AbsolutePathBuf>> {
++    let Some(value) = nonempty_env(name, value)? else {
++        return Ok(None);
++    };
++    let path = PathBuf::from(value);
++    if !path.is_absolute() {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidInput,
++            format!("{name} must be an absolute path"),
++        ));
++    }
++    AbsolutePathBuf::from_absolute_path(path)
++        .map(Some)
++        .map_err(|err| {
++            io::Error::new(
++                io::ErrorKind::InvalidInput,
++                format!("invalid {name}: {err}"),
++            )
++        })
++}
++
++fn nonempty_env(name: &str, value: Option<OsString>) -> io::Result<Option<OsString>> {
++    match value {
++        Some(value) if value.is_empty() => Err(io::Error::new(
++            io::ErrorKind::InvalidInput,
++            format!("{name} must not be empty"),
++        )),
++        value => Ok(value),
++    }
++}
++
++fn validate_project_name(value: OsString) -> io::Result<String> {
++    let path = PathBuf::from(&value);
++    let mut components = path.components();
++    let valid =
++        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
++    if !valid {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidInput,
++            format!("{PROJECT_NAME_ENV} must be one normal path component"),
++        ));
++    }
++    value.into_string().map_err(|_| {
++        io::Error::new(
++            io::ErrorKind::InvalidInput,
++            format!("{PROJECT_NAME_ENV} must be valid UTF-8"),
++        )
++    })
++}
++
++fn project_root_for(cwd: &Path) -> PathBuf {
++    cwd.ancestors()
++        .find(|candidate| candidate.join(".git").exists())
++        .unwrap_or(cwd)
++        .to_path_buf()
++}
++
++fn path_leaf(path: &Path, fallback: &str) -> String {
++    path.file_name()
++        .filter(|name| !name.is_empty())
++        .map(|name| name.to_string_lossy().into_owned())
++        .unwrap_or_else(|| fallback.to_string())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use pretty_assertions::assert_eq;
++    use tempfile::TempDir;
++
++    fn env_with_tmpdir(tmpdir: &Path) -> RuntimePathEnvironment {
++        RuntimePathEnvironment {
++            tmpdir: Some(tmpdir.as_os_str().to_owned()),
++            ..RuntimePathEnvironment::default()
++        }
++    }
++
++    #[test]
++    fn supplied_runtime_paths_are_authoritative() {
++        let temp = TempDir::new().expect("temp dir");
++        let cwd = temp.path().join("cwd");
++        std::fs::create_dir_all(&cwd).expect("create cwd");
++        let supplied = temp.path().join("supplied");
++        let env = RuntimePathEnvironment {
++            tmpdir: Some(temp.path().join("system").into_os_string()),
++            codex_tmp: Some(supplied.join("codex").into_os_string()),
++            project_name: Some(OsString::from("project-token")),
++            project_scratch_root: Some(supplied.join("scratch").into_os_string()),
++            project_working_root: Some(supplied.join("work").into_os_string()),
++            runtime_tmp_root: Some(supplied.join("runtime-tmp").into_os_string()),
++            runtime_state_root: Some(supplied.join("runtime-state").into_os_string()),
++        };
++
++        let roots = resolve_runtime_path_roots_from(&cwd, env).expect("runtime roots");
++
++        assert_eq!(roots.system_tmp_root.as_path(), temp.path().join("system"));
++        assert_eq!(roots.codex_tmp_root.as_path(), supplied.join("codex"));
++        assert_eq!(roots.project_name, "project-token");
++        assert_eq!(
++            roots.project_scratch_root.as_path(),
++            supplied.join("scratch")
++        );
++        assert_eq!(roots.project_working_root.as_path(), supplied.join("work"));
++        assert_eq!(
++            roots.runtime_tmp_root.as_path(),
++            supplied.join("runtime-tmp")
++        );
++        assert_eq!(
++            roots.runtime_state_root.as_path(),
++            supplied.join("runtime-state")
++        );
++    }
++
++    #[test]
++    fn missing_optional_paths_derive_from_tmpdir_and_project_root() {
++        let temp = TempDir::new().expect("temp dir");
++        let repo = temp.path().join("repos").join("project");
++        let cwd = repo.join("nested");
++        std::fs::create_dir_all(repo.join(".git")).expect("create git marker");
++        std::fs::create_dir_all(&cwd).expect("create cwd");
++
++        let roots = resolve_runtime_path_roots_from(&cwd, env_with_tmpdir(temp.path()))
++            .expect("runtime roots");
++
++        assert_eq!(roots.system_tmp_root.as_path(), temp.path());
++        assert_eq!(roots.codex_tmp_root.as_path(), temp.path().join("codex"));
++        assert_eq!(roots.project_name, "project");
++        assert_eq!(roots.project_working_root.as_path(), repo);
++        assert_eq!(
++            roots.project_scratch_root.as_path(),
++            temp.path().join("codex").join("repos").join("project")
++        );
++        assert_eq!(
++            roots.runtime_tmp_root.as_path(),
++            temp.path().join("project")
++        );
++        assert!(roots.runtime_state_root.as_path().ends_with("project"));
++    }
++
++    #[test]
++    fn missing_project_marker_uses_cwd() {
++        let temp = TempDir::new().expect("temp dir");
++        let cwd = temp.path().join("workspace");
++        std::fs::create_dir_all(&cwd).expect("create cwd");
++
++        let roots = resolve_runtime_path_roots_from(&cwd, env_with_tmpdir(temp.path()))
++            .expect("runtime roots");
++
++        assert_eq!(roots.project_working_root.as_path(), cwd);
++        assert_eq!(roots.project_name, "workspace");
++    }
++
++    #[test]
++    fn linked_worktree_marker_selects_project_root() {
++        let temp = TempDir::new().expect("temp dir");
++        let repo = temp.path().join("workspace");
++        let cwd = repo.join("nested");
++        std::fs::create_dir_all(&cwd).expect("create cwd");
++        std::fs::write(repo.join(".git"), "gitdir: /tmp/example\n").expect("git marker");
++
++        let roots = resolve_runtime_path_roots_from(&cwd, env_with_tmpdir(temp.path()))
++            .expect("runtime roots");
++
++        assert_eq!(roots.project_working_root.as_path(), repo);
++    }
++
++    #[test]
++    fn tmpdir_is_required_and_must_be_absolute() {
++        let temp = TempDir::new().expect("temp dir");
++        let missing =
++            resolve_runtime_path_roots_from(temp.path(), RuntimePathEnvironment::default())
++                .expect_err("missing TMPDIR");
++        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
++
++        let relative = resolve_runtime_path_roots_from(
++            temp.path(),
++            RuntimePathEnvironment {
++                tmpdir: Some(OsString::from("relative")),
++                ..RuntimePathEnvironment::default()
++            },
++        )
++        .expect_err("relative TMPDIR");
++        assert_eq!(relative.kind(), io::ErrorKind::InvalidInput);
++    }
++
++    #[test]
++    fn project_name_requires_one_normal_path_component() {
++        let temp = TempDir::new().expect("temp dir");
++        for invalid in ["", ".", "..", "a/b"] {
++            let error = resolve_runtime_path_roots_from(
++                temp.path(),
++                RuntimePathEnvironment {
++                    tmpdir: Some(temp.path().as_os_str().to_owned()),
++                    project_name: Some(OsString::from(invalid)),
++                    ..RuntimePathEnvironment::default()
++                },
++            )
++            .expect_err("invalid project name");
++            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
++        }
++    }
++
++    #[test]
++    fn find_project_scratch_root_creates_the_selected_directory() {
++        let temp = TempDir::new().expect("temp dir");
++        let cwd = temp.path().join("workspace");
++        let scratch = temp.path().join("scratch");
++        std::fs::create_dir_all(&cwd).expect("create cwd");
++        let roots = resolve_runtime_path_roots_from(
++            &cwd,
++            RuntimePathEnvironment {
++                tmpdir: Some(temp.path().as_os_str().to_owned()),
++                project_scratch_root: Some(scratch.clone().into_os_string()),
++                ..RuntimePathEnvironment::default()
++            },
++        )
++        .expect("runtime roots");
++        roots.ensure_project_scratch_root().expect("create scratch");
++
++        assert!(scratch.is_dir());
++    }
++}
