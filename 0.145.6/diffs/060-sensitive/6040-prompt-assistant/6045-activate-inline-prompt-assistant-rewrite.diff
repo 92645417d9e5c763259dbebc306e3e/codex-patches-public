@@ -154,7 +154,7 @@ index e25dbe482c..807721adba 100644
      OpenAgentPicker,
      /// Switch the active thread to the selected agent.
 diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
-index 5b248541da..6ae2572953 100644
+index 5b248541da..e0781b7c8e 100644
 --- a/codex-rs/tui/src/app_server_session.rs
 +++ b/codex-rs/tui/src/app_server_session.rs
 @@ -44,6 +44,10 @@ use codex_app_server_protocol::Model as ApiModel;
@@ -186,7 +186,7 @@ index 5b248541da..6ae2572953 100644
      pub(crate) fn new(client: AppServerClient, thread_params_mode: ThreadParamsMode) -> Self {
          Self {
              client,
-@@ -1402,6 +1417,17 @@ impl AppServerSession {
+@@ -1402,6 +1417,16 @@ impl AppServerSession {
      }
  }
  
@@ -194,11 +194,10 @@ index 5b248541da..6ae2572953 100644
 +    request_handle: AppServerRequestHandle,
 +    request_id: RequestId,
 +    params: PromptAssistantRewriteParams,
-+) -> Result<PromptAssistantRewriteResponse> {
++) -> std::result::Result<PromptAssistantRewriteResponse, TypedRequestError> {
 +    request_handle
 +        .request_typed(ClientRequest::PromptAssistantRewrite { request_id, params })
 +        .await
-+        .wrap_err("promptAssistant/rewrite failed in TUI")
 +}
 +
  pub(crate) async fn start_thread_with_request_handle(
@@ -655,10 +654,10 @@ index 0e0658b59a..889920aaa6 100644
              return true;
 diff --git a/codex-rs/tui/src/chatwidget/prompt_assistant.rs b/codex-rs/tui/src/chatwidget/prompt_assistant.rs
 new file mode 100644
-index 0000000000..22aabab525
+index 0000000000..a4c8a3051d
 --- /dev/null
 +++ b/codex-rs/tui/src/chatwidget/prompt_assistant.rs
-@@ -0,0 +1,403 @@
+@@ -0,0 +1,399 @@
 +use codex_app_server_protocol::PromptAssistantInterruptParams;
 +use codex_app_server_protocol::PromptAssistantOutcome;
 +use codex_app_server_protocol::PromptAssistantProgressNotification;
@@ -812,10 +811,7 @@ index 0000000000..22aabab525
 +                }
 +                self.show_prompt_assistant_terminal_flash(&response);
 +            }
-+            Err(reason) => self.bottom_pane.show_footer_flash(
-+                Line::from(format!("Prompt Assistant failed: {reason}")),
-+                Duration::from_secs(5),
-+            ),
++            Err(reason) => self.add_error_message(format!("Prompt Assistant failed: {reason}")),
 +        }
 +        self.refresh_prompt_assistant_footer();
 +        self.request_redraw();
@@ -859,11 +855,7 @@ index 0000000000..22aabab525
 +    }
 +
 +    pub(crate) fn show_prompt_assistant_interrupt_error(&mut self, error: String) {
-+        self.bottom_pane.show_footer_flash(
-+            Line::from(format!("Prompt Assistant interrupt failed: {error}")),
-+            Duration::from_secs(5),
-+        );
-+        self.request_redraw();
++        self.add_error_message(format!("Prompt Assistant interrupt failed: {error}"));
 +    }
 +
 +    fn prompt_assistant_selection(&self) -> Option<(String, ReasoningEffort)> {
@@ -1053,13 +1045,16 @@ index 0000000000..22aabab525
 +                )
 +            })
 +            .unwrap_or_default();
-+        self.bottom_pane.show_footer_flash(
-+            Line::from(format!(
-+                "{outcome}: {} {}{fallback} {detail}{usage}",
-+                response.effective_model, response.effective_reasoning_effort,
-+            )),
-+            Duration::from_secs(5),
++        let message = format!(
++            "{outcome}: {} {}{fallback} {detail}{usage}",
++            response.effective_model, response.effective_reasoning_effort,
 +        );
++        if response.outcome == PromptAssistantOutcome::Failed {
++            self.add_error_message(message);
++        } else {
++            self.bottom_pane
++                .show_footer_flash(Line::from(message), Duration::from_secs(5));
++        }
 +    }
 +}
 diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
@@ -1104,10 +1099,10 @@ index af5c14fc8e..7f042c2916 100644
          .supported_reasoning_efforts
          .iter()
 diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
-index 755dfe3ca4..5d45714300 100644
+index 755dfe3ca4..29a4ae2006 100644
 --- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
 +++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
-@@ -4,6 +4,69 @@ use pretty_assertions::assert_eq;
+@@ -4,6 +4,85 @@ use pretty_assertions::assert_eq;
  const SAFETY_BUFFERING_HEADER_TEXT: &str =
      "Our systems are thinking a bit more about this request before responding.";
  
@@ -1160,18 +1155,34 @@ index 755dfe3ca4..5d45714300 100644
 +    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
 +    let thread_id = ThreadId::new();
 +    chat.thread_id = Some(thread_id);
++    let source = "保留 Tab 按键的行为。\n保留 hook 的说明。".to_string();
 +    chat.bottom_pane
-+        .set_composer_text("rough source".to_string(), Vec::new(), Vec::new());
++        .set_composer_text(source.clone(), Vec::new(), Vec::new());
 +
 +    chat.open_prompt_assistant();
-+    let _ = rx.try_recv().expect("rewrite request");
++    let params = match rx.try_recv().expect("rewrite request") {
++        AppEvent::PromptAssistantRewrite(params) => params,
++        other => panic!("unexpected event: {other:?}"),
++    };
++    assert_eq!(params.input, source.as_str());
 +    chat.prompt_assistant_rewrite_finished(
 +        thread_id.to_string(),
-+        Err("transport failed".to_string()),
++        Err(
++            "promptAssistant/rewrite failed: Prompt Assistant cannot run while the parent turn is active (code -32602)"
++                .to_string(),
++        ),
 +    );
 +
-+    assert_eq!(chat.bottom_pane.composer_text(), "rough source");
++    assert_eq!(chat.bottom_pane.composer_text(), source);
 +    assert!(chat.bottom_pane.composer_input_enabled());
++    let rendered = drain_insert_history(&mut rx)
++        .into_iter()
++        .flatten()
++        .map(|line| line.to_string())
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert!(rendered.contains("Prompt Assistant failed: promptAssistant/rewrite failed:"));
++    assert!(rendered.contains("cannot run while the parent turn is active"));
 +}
 +
  #[tokio::test]
