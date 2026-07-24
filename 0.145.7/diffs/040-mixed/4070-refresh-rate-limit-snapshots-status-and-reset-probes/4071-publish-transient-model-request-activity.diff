@@ -1,0 +1,534 @@
+diff --git a/codex-rs/app-server-protocol/src/protocol/event_mapping.rs b/codex-rs/app-server-protocol/src/protocol/event_mapping.rs
+index b32b15272b..1ab7b3ce6f 100644
+--- a/codex-rs/app-server-protocol/src/protocol/event_mapping.rs
++++ b/codex-rs/app-server-protocol/src/protocol/event_mapping.rs
+@@ -35,6 +35,9 @@ pub fn item_event_to_server_notification(
+     let thread_id = thread_id.to_string();
+     let turn_id = turn_id.to_string();
+     match msg {
++        EventMsg::ModelRequestStarted(_) => {
++            unreachable!("model request activity is consumed by thread lifecycle")
++        }
+         EventMsg::DynamicToolCallResponse(response) => {
+             let status = if response.success {
+                 DynamicToolCallStatus::Completed
+diff --git a/codex-rs/app-server/src/request_processors/thread_lifecycle.rs b/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
+index 84d66bb294..c945a58d37 100644
+--- a/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
++++ b/codex-rs/app-server/src/request_processors/thread_lifecycle.rs
+@@ -309,6 +309,21 @@ pub(super) async fn ensure_listener_task_running(
+                         }
+                     };
+ 
++                    if let EventMsg::ModelRequestStarted(activity) = &event.msg {
++                        if thread_watch_manager
++                            .note_model_request_started(
++                                conversation_id,
++                                activity.auth_revision,
++                                activity.account_id.clone(),
++                                activity.request_started_at_ms,
++                            )
++                            .is_err()
++                        {
++                            tracing::warn!("discarding invalid model request activity timestamp");
++                        }
++                        continue;
++                    }
++
+                     // Track the event before emitting any typed translations
+                     // so thread-local state such as raw event opt-in stays
+                     // synchronized with the conversation.
+diff --git a/codex-rs/app-server/src/thread_status.rs b/codex-rs/app-server/src/thread_status.rs
+index b357597372..c9ffc8130e 100644
+--- a/codex-rs/app-server/src/thread_status.rs
++++ b/codex-rs/app-server/src/thread_status.rs
+@@ -15,7 +15,6 @@ use std::sync::OnceLock;
+ use std::sync::atomic::AtomicU64;
+ use std::sync::atomic::Ordering;
+ use tokio::sync::Mutex;
+-#[cfg(test)]
+ use tokio::sync::mpsc;
+ use tokio::sync::watch;
+ 
+@@ -25,6 +24,16 @@ pub(crate) struct ThreadWatchManager {
+     outgoing: Option<Arc<OutgoingMessageSender>>,
+     running_turn_count_tx: watch::Sender<usize>,
+     next_pending_turn_start_token: Arc<AtomicU64>,
++    model_request_activity_tx: mpsc::UnboundedSender<ModelRequestActivity>,
++    model_request_activity_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<ModelRequestActivity>>>>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(crate) struct ModelRequestActivity {
++    pub(crate) thread_id: ThreadId,
++    pub(crate) auth_revision: Option<u64>,
++    pub(crate) account_id: Option<String>,
++    pub(crate) observed_at: std::time::SystemTime,
+ }
+ 
+ pub(crate) struct PendingTurnStartGuard {
+@@ -112,24 +121,57 @@ impl Default for ThreadWatchManager {
+ impl ThreadWatchManager {
+     pub(crate) fn new() -> Self {
+         let (running_turn_count_tx, _running_turn_count_rx) = watch::channel(0);
++        let (model_request_activity_tx, model_request_activity_rx) = mpsc::unbounded_channel();
+         Self {
+             state: Arc::new(Mutex::new(ThreadWatchState::default())),
+             outgoing: None,
+             running_turn_count_tx,
+             next_pending_turn_start_token: Arc::new(AtomicU64::new(1)),
++            model_request_activity_tx,
++            model_request_activity_rx: Arc::new(Mutex::new(Some(model_request_activity_rx))),
+         }
+     }
+ 
+     pub(crate) fn new_with_outgoing(outgoing: Arc<OutgoingMessageSender>) -> Self {
+         let (running_turn_count_tx, _running_turn_count_rx) = watch::channel(0);
++        let (model_request_activity_tx, model_request_activity_rx) = mpsc::unbounded_channel();
+         Self {
+             state: Arc::new(Mutex::new(ThreadWatchState::default())),
+             outgoing: Some(outgoing),
+             running_turn_count_tx,
+             next_pending_turn_start_token: Arc::new(AtomicU64::new(1)),
++            model_request_activity_tx,
++            model_request_activity_rx: Arc::new(Mutex::new(Some(model_request_activity_rx))),
+         }
+     }
+ 
++    pub(crate) fn note_model_request_started(
++        &self,
++        thread_id: ThreadId,
++        auth_revision: Option<u64>,
++        account_id: Option<String>,
++        request_started_at_ms: i64,
++    ) -> Result<(), ()> {
++        let request_started_at_ms = u64::try_from(request_started_at_ms).map_err(|_| ())?;
++        let observed_at = std::time::UNIX_EPOCH
++            .checked_add(std::time::Duration::from_millis(request_started_at_ms))
++            .ok_or(())?;
++        self.model_request_activity_tx
++            .send(ModelRequestActivity {
++                thread_id,
++                auth_revision,
++                account_id,
++                observed_at,
++            })
++            .map_err(|_| ())
++    }
++
++    pub(crate) async fn take_model_request_activity_receiver(
++        &self,
++    ) -> Option<mpsc::UnboundedReceiver<ModelRequestActivity>> {
++        self.model_request_activity_rx.lock().await.take()
++    }
++
+     pub(crate) async fn upsert_thread(&self, thread_id: &str) {
+         let thread_id = thread_id.to_string();
+         self.mutate_and_publish(move |state| {
+@@ -592,6 +634,68 @@ mod tests {
+     const INTERACTIVE_THREAD_ID: &str = "00000000-0000-0000-0000-000000000001";
+     const NON_INTERACTIVE_THREAD_ID: &str = "00000000-0000-0000-0000-000000000002";
+ 
++    #[tokio::test]
++    async fn model_request_activity_preserves_each_observation_for_one_consumer() {
++        let manager = ThreadWatchManager::new();
++        let thread_id = ThreadId::new();
++        let mut receiver = manager
++            .take_model_request_activity_receiver()
++            .await
++            .expect("first receiver");
++
++        manager
++            .note_model_request_started(thread_id, Some(7), Some("account-a".to_string()), 299_000)
++            .expect("valid first activity");
++        manager
++            .note_model_request_started(thread_id, Some(8), Some("account-a".to_string()), 301_000)
++            .expect("valid second activity");
++
++        assert_eq!(
++            receiver.recv().await,
++            Some(ModelRequestActivity {
++                thread_id,
++                auth_revision: Some(7),
++                account_id: Some("account-a".to_string()),
++                observed_at: std::time::UNIX_EPOCH + Duration::from_secs(299),
++            })
++        );
++        assert_eq!(
++            receiver.recv().await,
++            Some(ModelRequestActivity {
++                thread_id,
++                auth_revision: Some(8),
++                account_id: Some("account-a".to_string()),
++                observed_at: std::time::UNIX_EPOCH + Duration::from_secs(301),
++            })
++        );
++        assert!(
++            manager
++                .take_model_request_activity_receiver()
++                .await
++                .is_none()
++        );
++    }
++
++    #[tokio::test]
++    async fn model_request_activity_rejects_negative_timestamp() {
++        let manager = ThreadWatchManager::new();
++        let mut receiver = manager
++            .take_model_request_activity_receiver()
++            .await
++            .expect("first receiver");
++
++        assert_eq!(
++            manager.note_model_request_started(
++                ThreadId::new(),
++                Some(7),
++                Some("account-a".to_string()),
++                -1,
++            ),
++            Err(())
++        );
++        assert!(receiver.try_recv().is_err());
++    }
++
+     #[tokio::test]
+     async fn loaded_status_defaults_to_not_loaded_for_untracked_threads() {
+         let manager = ThreadWatchManager::new();
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index b132420620..5edf1254a8 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -83,6 +83,7 @@ use codex_protocol::models::ResponseItem;
+ use codex_protocol::openai_models::ModelInfo;
+ use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+ use codex_protocol::protocol::InternalSessionSource;
++use codex_protocol::protocol::ModelRequestStartedEvent;
+ use codex_protocol::protocol::SessionSource;
+ use codex_protocol::protocol::W3cTraceContext;
+ use codex_rollout_trace::CompactionTraceContext;
+@@ -222,6 +223,8 @@ struct ModelClientState {
+ /// share the same auth/provider setup flow.
+ struct CurrentClientSetup {
+     auth: Option<CodexAuth>,
++    auth_revision: Option<u64>,
++    account_id: Option<String>,
+     api_provider: ApiProvider,
+     api_auth: SharedAuthProvider,
+     agent_identity_telemetry: Option<AgentIdentityTelemetry>,
+@@ -418,6 +421,26 @@ fn sideband_websocket_auth_headers(api_auth: &dyn AuthProvider) -> ApiHeaderMap
+ }
+ 
+ impl ModelClient {
++    async fn emit_model_request_started(
++        &self,
++        responses_metadata: &CodexResponsesMetadata,
++        auth_revision: Option<u64>,
++        account_id: Option<String>,
++    ) {
++        let Some(tx_event) = &self.state.tx_event else {
++            return;
++        };
++        let event = CodexEvent {
++            id: responses_metadata.turn_id.clone().unwrap_or_default(),
++            msg: EventMsg::ModelRequestStarted(ModelRequestStartedEvent {
++                auth_revision,
++                account_id,
++                request_started_at_ms: crate::turn_timing::now_unix_timestamp_ms(),
++            }),
++        };
++        let _ = tx_event.send(event).await;
++    }
++
+     #[allow(clippy::too_many_arguments)]
+     /// Creates a new session-scoped `ModelClient`.
+     ///
+@@ -562,6 +585,8 @@ impl ModelClient {
+             return Ok(Vec::new());
+         }
+         let client_setup = self.current_client_setup().await?;
++        let auth_revision = client_setup.auth_revision;
++        let account_id = client_setup.account_id.clone();
+         let transport =
+             self.build_api_transport(&client_setup.api_provider, RESPONSES_COMPACT_ENDPOINT)?;
+         let request_telemetry = Self::build_request_telemetry(
+@@ -635,6 +660,8 @@ impl ModelClient {
+             ApiCompactClient::new(transport, client_setup.api_provider, client_setup.api_auth)
+                 .with_telemetry(Some(request_telemetry));
+         let trace_attempt = compaction_trace.start_attempt(&payload);
++        self.emit_model_request_started(responses_metadata, auth_revision, account_id)
++            .await;
+         let result = client
+             .compact_input(
+                 &payload,
+@@ -950,23 +977,41 @@ impl ModelClient {
+     /// This centralizes setup used by both prewarm and normal request paths so they stay in
+     /// lockstep when auth/provider resolution changes.
+     async fn current_client_setup(&self) -> Result<CurrentClientSetup> {
+-        let auth = self.state.provider.auth().await;
+-        let api_provider = self.state.provider.api_provider().await?;
+-        let resolved_auth = self
+-            .state
+-            .provider
+-            .api_auth_for_scope(ProviderAuthScope {
+-                agent_identity_policy: self.agent_identity_policy,
+-                session_source: self.state.session_source.clone(),
+-                agent_identity_session_fallback: self.state.agent_identity_session_fallback.clone(),
+-            })
+-            .await?;
+-        Ok(CurrentClientSetup {
+-            auth,
+-            api_provider,
+-            api_auth: resolved_auth.auth,
+-            agent_identity_telemetry: resolved_auth.agent_identity_telemetry,
+-        })
++        let auth_manager = self.state.provider.auth_manager();
++        loop {
++            let auth_revision = auth_manager
++                .as_ref()
++                .map(|manager| *manager.auth_change_receiver().borrow());
++            let auth = self.state.provider.auth().await;
++            let api_provider = self.state.provider.api_provider().await?;
++            let resolved_auth = self
++                .state
++                .provider
++                .api_auth_for_scope(ProviderAuthScope {
++                    agent_identity_policy: self.agent_identity_policy,
++                    session_source: self.state.session_source.clone(),
++                    agent_identity_session_fallback: self
++                        .state
++                        .agent_identity_session_fallback
++                        .clone(),
++                })
++                .await?;
++            if auth_revision
++                != auth_manager
++                    .as_ref()
++                    .map(|manager| *manager.auth_change_receiver().borrow())
++            {
++                continue;
++            }
++            return Ok(CurrentClientSetup {
++                account_id: auth.as_ref().and_then(CodexAuth::get_account_id),
++                auth,
++                auth_revision,
++                api_provider,
++                api_auth: resolved_auth.auth,
++                agent_identity_telemetry: resolved_auth.agent_identity_telemetry,
++            });
++        }
+     }
+ 
+     fn build_api_transport(
+@@ -1410,6 +1455,8 @@ impl ModelClientSession {
+         let mut pending_retry = PendingUnauthorizedRetry::default();
+         loop {
+             let client_setup = self.client.current_client_setup().await?;
++            let auth_revision = client_setup.auth_revision;
++            let account_id = client_setup.account_id.clone();
+             let transport = self
+                 .client
+                 .build_api_transport(&client_setup.api_provider, RESPONSES_ENDPOINT)?;
+@@ -1456,6 +1503,9 @@ impl ModelClientSession {
+                 client_setup.api_auth,
+             )
+             .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
++            self.client
++                .emit_model_request_started(responses_metadata, auth_revision, account_id)
++                .await;
+             let stream_result = client.stream_request(request, options).await;
+ 
+             match stream_result {
+@@ -1540,6 +1590,8 @@ impl ModelClientSession {
+         let mut pending_retry = PendingUnauthorizedRetry::default();
+         loop {
+             let client_setup = self.client.current_client_setup().await?;
++            let auth_revision = client_setup.auth_revision;
++            let account_id = client_setup.account_id.clone();
+             let request_auth_context = AuthRequestTelemetryContext::new(
+                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                 client_setup.api_auth.as_ref(),
+@@ -1659,6 +1711,11 @@ impl ModelClientSession {
+                         "websocket connection is unavailable".to_string(),
+                     ))
+                 })?;
++            if !warmup {
++                self.client
++                    .emit_model_request_started(responses_metadata, auth_revision, account_id)
++                    .await;
++            }
+             let stream_result = websocket_connection
+                 .stream_request(
+                     ws_request,
+diff --git a/codex-rs/core/src/client_tests.rs b/codex-rs/core/src/client_tests.rs
+index f1ab387d3d..ca9bfa28d3 100644
+--- a/codex-rs/core/src/client_tests.rs
++++ b/codex-rs/core/src/client_tests.rs
+@@ -110,6 +110,32 @@ fn test_model_client_with_thread_id(
+     )
+ }
+ 
++#[tokio::test]
++async fn model_request_activity_keeps_request_identity_and_auth_snapshot() {
++    let (tx_event, rx_event) = async_channel::bounded(1);
++    let client = test_model_client(SessionSource::Cli).with_event_sender(tx_event);
++    let responses_metadata = test_responses_metadata_for_client(
++        &client,
++        Some("turn-activity"),
++        format!("{}:0", client.state.thread_id),
++        /*parent_thread_id*/ None,
++        TestCodexResponsesRequestKind::Turn,
++    );
++
++    client
++        .emit_model_request_started(&responses_metadata, Some(7), Some("account-a".to_string()))
++        .await;
++
++    let event = rx_event.recv().await.expect("model request activity");
++    assert_eq!(event.id, "turn-activity");
++    let EventMsg::ModelRequestStarted(activity) = event.msg else {
++        panic!("expected model request activity");
++    };
++    assert_eq!(activity.auth_revision, Some(7));
++    assert_eq!(activity.account_id.as_deref(), Some("account-a"));
++    assert!(activity.request_started_at_ms > 0);
++}
++
+ #[tokio::test]
+ async fn compact_uses_bearer_after_agent_identity_session_fallback() -> anyhow::Result<()> {
+     let server = MockServer::start().await;
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index e37480db39..b915b82b58 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -1728,7 +1728,8 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<
+         | EventMsg::CollabCloseEnd(_)
+         | EventMsg::CollabResumeBegin(_)
+         | EventMsg::CollabResumeEnd(_)
+-        | EventMsg::SubAgentActivity(_) => None,
++        | EventMsg::SubAgentActivity(_)
++        | EventMsg::ModelRequestStarted(_) => None,
+     }
+ }
+ 
+diff --git a/codex-rs/mcp-server/src/codex_tool_runner.rs b/codex-rs/mcp-server/src/codex_tool_runner.rs
+index b2fbe28717..c76adbb2a1 100644
+--- a/codex-rs/mcp-server/src/codex_tool_runner.rs
++++ b/codex-rs/mcp-server/src/codex_tool_runner.rs
+@@ -338,6 +338,7 @@ async fn run_codex_tool_session_inner(
+                         // TODO: think how we want to support this in the MCP
+                     }
+                     EventMsg::AgentReasoningRawContent(_)
++                    | EventMsg::ModelRequestStarted(_)
+                     | EventMsg::TurnStarted(_)
+                     | EventMsg::ThreadSettingsApplied(_)
+                     | EventMsg::EnvironmentConnected(_)
+diff --git a/codex-rs/protocol/src/protocol.rs b/codex-rs/protocol/src/protocol.rs
+index d3381e7e82..ac9233e742 100644
+--- a/codex-rs/protocol/src/protocol.rs
++++ b/codex-rs/protocol/src/protocol.rs
+@@ -1311,6 +1311,9 @@ pub enum EventMsg {
+     /// Backend recommends additional account verification for this turn.
+     ModelVerification(ModelVerificationEvent),
+ 
++    /// Internal transient signal emitted immediately before a real Responses request.
++    ModelRequestStarted(ModelRequestStartedEvent),
++
+     /// Backend moderation metadata intended for first-party turn presentation.
+     TurnModerationMetadata(TurnModerationMetadataEvent),
+ 
+@@ -1968,6 +1971,13 @@ pub struct ModelVerificationEvent {
+     pub verifications: Vec<ModelVerification>,
+ }
+ 
++#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
++pub struct ModelRequestStartedEvent {
++    pub auth_revision: Option<u64>,
++    pub account_id: Option<String>,
++    pub request_started_at_ms: i64,
++}
++
+ #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+ pub struct TurnModerationMetadataEvent {
+     pub metadata: Value,
+diff --git a/codex-rs/rollout-trace/src/protocol_event.rs b/codex-rs/rollout-trace/src/protocol_event.rs
+index 22d2974514..142d176fa9 100644
+--- a/codex-rs/rollout-trace/src/protocol_event.rs
++++ b/codex-rs/rollout-trace/src/protocol_event.rs
+@@ -404,6 +404,7 @@ pub(crate) fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTr
+         | EventMsg::GuardianAssessment(_)
+         | EventMsg::DeprecationNotice(_)
+         | EventMsg::StreamError(_)
++        | EventMsg::ModelRequestStarted(_)
+         | EventMsg::PatchApplyUpdated(_)
+         | EventMsg::TurnDiff(_)
+         | EventMsg::RealtimeConversationListVoicesResponse(_)
+@@ -508,7 +509,8 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
+         | EventMsg::CollabCloseEnd(_)
+         | EventMsg::CollabResumeBegin(_)
+         | EventMsg::CollabResumeEnd(_)
+-        | EventMsg::SubAgentActivity(_) => None,
++        | EventMsg::SubAgentActivity(_)
++        | EventMsg::ModelRequestStarted(_) => None,
+     }
+ }
+ 
+diff --git a/codex-rs/rollout/src/persistence_metrics_tests.rs b/codex-rs/rollout/src/persistence_metrics_tests.rs
+index 3a352263b7..6b859675d6 100644
+--- a/codex-rs/rollout/src/persistence_metrics_tests.rs
++++ b/codex-rs/rollout/src/persistence_metrics_tests.rs
+@@ -9,6 +9,7 @@ use codex_protocol::protocol::EnteredReviewModeEvent;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::ExitedReviewModeEvent;
+ use codex_protocol::protocol::ItemCompletedEvent;
++use codex_protocol::protocol::ModelRequestStartedEvent;
+ use codex_protocol::protocol::ReviewTarget;
+ use codex_protocol::protocol::RolloutItem;
+ use codex_protocol::protocol::ThreadHistoryMode;
+@@ -135,6 +136,33 @@ fn mixed_batch_reports_exact_policy_counts_and_bytes() {
+     assert_eq!(measurement.items[1].rollout_item_type, "response.other");
+ }
+ 
++#[test]
++fn model_request_activity_is_transient_in_every_history_mode() {
++    let item = RolloutItem::EventMsg(EventMsg::ModelRequestStarted(ModelRequestStartedEvent {
++        auth_revision: Some(7),
++        account_id: Some("account-a".to_string()),
++        request_started_at_ms: 1_700_000_000_000,
++    }));
++
++    for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
++        let (persisted, measurement) =
++            measure_and_filter_rollout_items(std::slice::from_ref(&item), history_mode);
++
++        assert!(persisted.is_empty());
++        assert_eq!(measurement.pre_filter.items, 1);
++        assert_eq!(measurement.post_filter.items, 0);
++        assert_eq!(measurement.items.len(), 1);
++        assert_eq!(
++            measurement.items[0].decision,
++            super::PersistenceDecision::Dropped
++        );
++        assert_eq!(
++            measurement.items[0].rollout_item_type,
++            "event.model_request_started"
++        );
++    }
++}
++
+ #[test]
+ fn retained_items_are_byte_identical() {
+     let item = retained_message("a moderately sized payload");
+diff --git a/codex-rs/rollout/src/policy.rs b/codex-rs/rollout/src/policy.rs
+index 65a8213f08..b9a1973f93 100644
+--- a/codex-rs/rollout/src/policy.rs
++++ b/codex-rs/rollout/src/policy.rs
+@@ -119,7 +119,8 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode)
+         | EventMsg::SubAgentActivity(_) => matches!(history_mode, ThreadHistoryMode::Legacy),
+ 
+         // Transient, non-durable events.
+-        EventMsg::Error(_)
++        EventMsg::ModelRequestStarted(_)
++        | EventMsg::Error(_)
+         | EventMsg::GuardianAssessment(_)
+         | EventMsg::ExecCommandEnd(_)
+         | EventMsg::ViewImageToolCall(_)

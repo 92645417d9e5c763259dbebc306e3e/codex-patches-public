@@ -1,0 +1,207 @@
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index e09aac7d12..0e3c134986 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -33,6 +33,7 @@
+ use std::collections::BTreeMap;
+ use std::collections::HashMap;
+ use std::collections::HashSet;
++use std::collections::VecDeque;
+ use std::path::Path;
+ use std::path::PathBuf;
+ use std::sync::Arc;
+@@ -616,6 +617,7 @@ pub(crate) struct ChatWidget {
+     copy_last_response_binding: Vec<KeyBinding>,
+     running_commands: HashMap<String, RunningCommand>,
+     collab_agent_metadata: HashMap<ThreadId, AgentMetadata>,
++    pending_sub_agent_activity: VecDeque<ThreadItem>,
+     pending_collab_spawn_requests: HashMap<String, multi_agents::SpawnRequestSummary>,
+     suppressed_exec_calls: HashSet<String>,
+     skills_all: Vec<SkillMetadata>,
+@@ -1003,6 +1005,7 @@ impl ChatWidget {
+                 agent_role,
+             },
+         );
++        self.flush_pending_sub_agent_activity();
+     }
+ 
+     /// Returns the cached metadata for a thread, defaulting to empty if none has been registered.
+@@ -1013,6 +1016,13 @@ impl ChatWidget {
+             .unwrap_or_default()
+     }
+ 
++    fn has_collab_agent_identity(&self, thread_id: ThreadId) -> bool {
++        self.collab_agent_metadata(thread_id)
++            .agent_nickname
++            .as_deref()
++            .is_some_and(|nickname| !nickname.trim().is_empty())
++    }
++
+     fn restore_retry_status_header_if_present(&mut self) {
+         if let Some(header) = self.status_state.take_retry_status_header() {
+             self.set_status_header(header);
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index a4fd5b0690..b287f6ae59 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -158,6 +158,7 @@ impl ChatWidget {
+             copy_last_response_binding,
+             running_commands: HashMap::new(),
+             collab_agent_metadata: HashMap::new(),
++            pending_sub_agent_activity: VecDeque::new(),
+             pending_collab_spawn_requests: HashMap::new(),
+             suppressed_exec_calls: HashSet::new(),
+             last_unified_wait: None,
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index b70147f9aa..667a36e229 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -1307,6 +1307,47 @@ async fn live_app_server_collab_wait_items_render_history() {
+     assert_chatwidget_snapshot!("app_server_collab_wait_items_render_history", combined);
+ }
+ 
++#[tokio::test]
++async fn v2_activity_waits_for_agent_identity_before_rendering() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    let receiver_thread_id = ThreadId::new();
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            completed_at_ms: 0,
++            item: AppServerThreadItem::SubAgentActivity {
++                id: "activity-1".to_string(),
++                kind: codex_app_server_protocol::SubAgentActivityKind::Started,
++                agent_thread_id: receiver_thread_id.to_string(),
++                agent_path: "/root/robie".to_string(),
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++
++    assert!(
++        drain_insert_history(&mut rx).is_empty(),
++        "activity must not commit a UUID while thread metadata is still in flight"
++    );
++
++    chat.set_collab_agent_metadata(
++        receiver_thread_id,
++        Some("Robie".to_string()),
++        Some("default".to_string()),
++    );
++    let rendered = drain_insert_history(&mut rx)
++        .into_iter()
++        .map(|lines| lines_to_single_string(&lines))
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert!(rendered.contains("Started Robie [default]"), "{rendered}");
++    assert!(
++        !rendered.contains(&receiver_thread_id.to_string()),
++        "{rendered}"
++    );
++}
++
+ #[tokio::test]
+ async fn live_app_server_collab_spawn_completed_renders_requested_model_and_effort() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+index 3ee6483ead..0edbea38b1 100644
+--- a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
++++ b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+@@ -150,8 +150,30 @@ impl ChatWidget {
+     }
+ 
+     pub(super) fn on_sub_agent_activity(&mut self, item: ThreadItem) {
+-        if let Some(cell) = multi_agents::sub_agent_activity_history_cell(&item) {
+-            self.on_collab_event(cell);
++        self.pending_sub_agent_activity.push_back(item);
++        self.flush_pending_sub_agent_activity();
++    }
++
++    pub(super) fn flush_pending_sub_agent_activity(&mut self) {
++        loop {
++            let Some(thread_id) = self
++                .pending_sub_agent_activity
++                .front()
++                .and_then(multi_agents::sub_agent_activity_thread_id)
++            else {
++                return;
++            };
++            if !self.has_collab_agent_identity(thread_id) {
++                return;
++            }
++            let Some(item) = self.pending_sub_agent_activity.pop_front() else {
++                return;
++            };
++            if let Some(cell) = multi_agents::sub_agent_activity_history_cell(&item, |thread_id| {
++                self.collab_agent_metadata(thread_id)
++            }) {
++                self.on_collab_event(cell);
++            }
+         }
+     }
+ 
+diff --git a/codex-rs/tui/src/multi_agents.rs b/codex-rs/tui/src/multi_agents.rs
+index 67691a24c8..3bca90e35c 100644
+--- a/codex-rs/tui/src/multi_agents.rs
++++ b/codex-rs/tui/src/multi_agents.rs
+@@ -302,15 +302,31 @@ pub(crate) fn sub_agent_activity_display(item: &ThreadItem) -> Option<SubAgentAc
+     })
+ }
+ 
+-pub(crate) fn sub_agent_activity_history_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
++pub(crate) fn sub_agent_activity_thread_id(item: &ThreadItem) -> Option<ThreadId> {
+     let ThreadItem::SubAgentActivity {
+-        kind, agent_path, ..
++        agent_thread_id, ..
+     } = item
+     else {
+         return None;
+     };
++    parse_thread_id(agent_thread_id)
++}
++
++pub(crate) fn sub_agent_activity_history_cell(
++    item: &ThreadItem,
++    mut agent_metadata: impl FnMut(ThreadId) -> AgentMetadata,
++) -> Option<PlainHistoryCell> {
++    let ThreadItem::SubAgentActivity {
++        kind,
++        agent_thread_id,
++        ..
++    } = item
++    else {
++        return None;
++    };
++    let thread_id = parse_thread_id(agent_thread_id)?;
+     Some(collab_event(
+-        sub_agent_activity_title(*kind, agent_path),
++        sub_agent_activity_title(*kind, agent_label(thread_id, &agent_metadata(thread_id))),
+         Vec::new(),
+     ))
+ }
+@@ -323,16 +339,15 @@ pub(crate) fn sub_agent_activity_summary(kind: SubAgentActivityKind, agent_path:
+     }
+ }
+ 
+-fn sub_agent_activity_title(kind: SubAgentActivityKind, agent_path: &str) -> Line<'static> {
+-    let (prefix, path) = match kind {
+-        SubAgentActivityKind::Started => ("Started ", agent_path),
+-        SubAgentActivityKind::Interacted => ("Interacted with ", agent_path),
+-        SubAgentActivityKind::Interrupted => ("Interrupted ", agent_path),
++fn sub_agent_activity_title(kind: SubAgentActivityKind, agent: AgentLabel<'_>) -> Line<'static> {
++    let prefix = match kind {
++        SubAgentActivityKind::Started => "Started ",
++        SubAgentActivityKind::Interacted => "Interacted with ",
++        SubAgentActivityKind::Interrupted => "Interrupted ",
+     };
+-    title_spans_line(vec![
+-        Span::from(prefix).bold(),
+-        Span::from(format!("`{path}`")).cyan(),
+-    ])
++    let mut spans = vec![Span::from(prefix).bold()];
++    spans.extend(agent_label_spans(agent));
++    title_spans_line(spans)
+ }
+ 
+ fn spawn_end(

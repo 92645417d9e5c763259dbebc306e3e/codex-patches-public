@@ -1,0 +1,485 @@
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+index 643330a075..8ec98eb0e6 100644
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -1113,7 +1113,7 @@ impl BottomPane {
+         request_id: &str,
+         byte_count: u64,
+         reset: bool,
+-    ) {
++    ) -> bool {
+         if reset {
+             self.response_output_request_id = Some(request_id.to_string());
+             self.response_output_bytes = None;
+@@ -1124,13 +1124,14 @@ impl BottomPane {
+                 .saturating_add(byte_count);
+             self.response_output_bytes = (total > 0).then_some(total);
+         } else {
+-            return;
++            return false;
+         }
+ 
+         if let Some(status) = self.status.as_mut() {
+             status.update_response_output_bytes(self.response_output_bytes);
+         }
+         self.request_redraw();
++        true
+     }
+ 
+     pub(crate) fn set_interrupt_hint_visible(&mut self, visible: bool) {
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+index efec557b04..6c1b1a2964 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -139,6 +139,14 @@ pub(crate) enum StatusLineItem {
+     /// Prompt cache hit rate for input tokens.
+     CacheHitRate,
+ 
++    /// Current model request time to first byte, once observed.
++    #[strum(to_string = "ttfb")]
++    RequestTtfb,
++
++    /// Latest completed model request billed output throughput.
++    #[strum(to_string = "tps")]
++    RequestTps,
++
+     /// Full thread UUID.
+     #[strum(to_string = "thread-id", serialize = "session-id")]
+     SessionId,
+@@ -206,6 +214,12 @@ impl StatusLineItem {
+             StatusLineItem::CacheHitRate => {
+                 "Prompt cache hit rate for input tokens (omitted when unavailable)"
+             }
++            StatusLineItem::RequestTtfb => {
++                "Latest model request time to first byte (omitted when unavailable)"
++            }
++            StatusLineItem::RequestTps => {
++                "Latest model request billed output throughput (omitted when unavailable)"
++            }
+             StatusLineItem::SessionId => "Current thread identifier (omitted until thread starts)",
+             StatusLineItem::FastMode => "Whether Fast mode is currently active",
+             StatusLineItem::RawOutput => "Whether raw scrollback mode is active",
+@@ -248,6 +262,8 @@ impl StatusLineItem {
+             StatusLineItem::TotalInputTokens => StatusSurfacePreviewItem::TotalInputTokens,
+             StatusLineItem::TotalOutputTokens => StatusSurfacePreviewItem::TotalOutputTokens,
+             StatusLineItem::CacheHitRate => StatusSurfacePreviewItem::CacheHitRate,
++            StatusLineItem::RequestTtfb => StatusSurfacePreviewItem::RequestTtfb,
++            StatusLineItem::RequestTps => StatusSurfacePreviewItem::RequestTps,
+             StatusLineItem::SessionId => StatusSurfacePreviewItem::SessionId,
+             StatusLineItem::FastMode => StatusSurfacePreviewItem::FastMode,
+             StatusLineItem::RawOutput => StatusSurfacePreviewItem::RawOutput,
+@@ -470,6 +486,21 @@ mod tests {
+             Ok(StatusLineItem::ActiveClients)
+         );
+     }
++
++    #[test]
++    fn request_performance_items_are_selectable_ids() {
++        assert_eq!(
++            "ttfb".parse::<StatusLineItem>(),
++            Ok(StatusLineItem::RequestTtfb)
++        );
++        assert_eq!(
++            "tps".parse::<StatusLineItem>(),
++            Ok(StatusLineItem::RequestTps)
++        );
++        assert_eq!(StatusLineItem::RequestTtfb.to_string(), "ttfb");
++        assert_eq!(StatusLineItem::RequestTps.to_string(), "tps");
++    }
++
+     #[test]
+     fn project_name_is_canonical_and_accepts_legacy_ids() {
+         assert_eq!(StatusLineItem::ProjectRoot.to_string(), "project-name");
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+index 67dd243b17..7905ed056b 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -45,7 +45,9 @@ impl StatusLineAccent {
+             | StatusLineItem::UsedTokens
+             | StatusLineItem::TotalInputTokens
+             | StatusLineItem::TotalOutputTokens
+-            | StatusLineItem::CacheHitRate => Self::Usage,
++            | StatusLineItem::CacheHitRate
++            | StatusLineItem::RequestTtfb
++            | StatusLineItem::RequestTps => Self::Usage,
+             StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit => Self::Limit,
+             StatusLineItem::CodexVersion
+             | StatusLineItem::ActiveClients
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+index 77a1563e98..ec7e053c5d 100644
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -30,6 +30,8 @@ pub(crate) enum StatusSurfacePreviewItem {
+     TotalInputTokens,
+     TotalOutputTokens,
+     CacheHitRate,
++    RequestTtfb,
++    RequestTps,
+     SessionId,
+     FastMode,
+     RawOutput,
+@@ -66,6 +68,8 @@ impl StatusSurfacePreviewItem {
+             StatusSurfacePreviewItem::TotalInputTokens => "0 in",
+             StatusSurfacePreviewItem::TotalOutputTokens => "0 out",
+             StatusSurfacePreviewItem::CacheHitRate => "0.0% hit",
++            StatusSurfacePreviewItem::RequestTtfb => "TTFB 0.125s",
++            StatusSurfacePreviewItem::RequestTps => "TPS 42.5",
+             StatusSurfacePreviewItem::SessionId => "550e8400-e29b-41d4",
+             StatusSurfacePreviewItem::FastMode => "Fast on",
+             StatusSurfacePreviewItem::RawOutput => "raw output",
+@@ -102,6 +106,8 @@ impl StatusSurfacePreviewItem {
+             Self::TotalInputTokens,
+             Self::TotalOutputTokens,
+             Self::CacheHitRate,
++            Self::RequestTtfb,
++            Self::RequestTps,
+             Self::SessionId,
+             Self::FastMode,
+             Self::RawOutput,
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 4362436aa7..e09aac7d12 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -526,6 +526,21 @@ pub(crate) enum ExternalEditorState {
+     Active,
+ }
+ 
++const REQUEST_PERFORMANCE_FRESH_DURATION: Duration = Duration::from_secs(5);
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++struct ObservedRequestPerformanceValue {
++    value: f64,
++    observed_at: Instant,
++}
++
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++struct RequestPerformanceState {
++    ttfb: Option<ObservedRequestPerformanceValue>,
++    tps: Option<ObservedRequestPerformanceValue>,
++    next_freshness_refresh_at: Option<Instant>,
++}
++
+ /// Maintains the per-session UI state and interaction state machines for the chat screen.
+ ///
+ /// `ChatWidget` owns the state derived from the protocol event stream (history cells, streaming
+@@ -711,6 +726,7 @@ pub(crate) struct ChatWidget {
+     quit_shortcut_key: Option<KeyBinding>,
+     // Runtime metrics accumulated across delta snapshots for the active turn.
+     turn_runtime_metrics: RuntimeMetricsSummary,
++    request_performance: RequestPerformanceState,
+     last_rendered_width: std::cell::Cell<Option<usize>>,
+     // Feedback sink for /feedback
+     feedback: codex_feedback::CodexFeedback,
+@@ -1216,6 +1232,9 @@ impl ChatWidget {
+     }
+ 
+     pub(crate) fn pre_draw_tick(&mut self) {
++        if self.request_performance_freshness_due_at(Instant::now()) {
++            self.refresh_status_line();
++        }
+         self.update_due_hook_visibility();
+         self.schedule_hook_timer_if_needed();
+         self.refresh_retry_countdown_status_for_time_tick();
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 929b09e33f..a4fd5b0690 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -222,6 +222,7 @@ impl ChatWidget {
+             quit_shortcut_expires_at: None,
+             quit_shortcut_key: None,
+             turn_runtime_metrics: RuntimeMetricsSummary::default(),
++            request_performance: RequestPerformanceState::default(),
+             last_rendered_width: std::cell::Cell::new(None),
+             feedback,
+             current_rollout_path: None,
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index 9a515f8cba..11c62e44a7 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -109,11 +109,20 @@ impl ChatWidget {
+                 }
+             }
+             ServerNotification::ResponseOutputBytesDelta(notification) => {
+-                self.bottom_pane.update_response_output_bytes(
++                let accepted = self.bottom_pane.update_response_output_bytes(
+                     &notification.request_id,
+                     notification.byte_count,
+                     notification.reset,
+                 );
++                if accepted
++                    && self.merge_request_performance_at(
++                        notification.ttfb,
++                        notification.tps,
++                        Instant::now(),
++                    )
++                {
++                    self.refresh_status_line();
++                }
+             }
+             ServerNotification::ReasoningSummaryPartAdded(_) => self.on_reasoning_section_break(),
+             ServerNotification::TerminalInteraction(notification) => {
+@@ -270,6 +279,62 @@ impl ChatWidget {
+         }
+     }
+ 
++    pub(super) fn merge_request_performance_at(
++        &mut self,
++        ttfb: Option<f64>,
++        tps: Option<f64>,
++        observed_at: Instant,
++    ) -> bool {
++        if ttfb.is_none() && tps.is_none() {
++            return false;
++        }
++        if let Some(ttfb) = ttfb {
++            self.request_performance.ttfb = Some(ObservedRequestPerformanceValue {
++                value: ttfb,
++                observed_at,
++            });
++        }
++        if let Some(tps) = tps {
++            self.request_performance.tps = Some(ObservedRequestPerformanceValue {
++                value: tps,
++                observed_at,
++            });
++        }
++        self.schedule_request_performance_freshness_refresh_at(observed_at);
++        true
++    }
++
++    fn schedule_request_performance_freshness_refresh_at(&mut self, now: Instant) {
++        let next_refresh_at = [self.request_performance.ttfb, self.request_performance.tps]
++            .into_iter()
++            .flatten()
++            .filter_map(|metric| {
++                metric
++                    .observed_at
++                    .checked_add(REQUEST_PERFORMANCE_FRESH_DURATION)
++            })
++            .filter(|deadline| *deadline > now)
++            .min();
++        self.request_performance.next_freshness_refresh_at = next_refresh_at;
++        if let Some(next_refresh_at) = next_refresh_at {
++            self.frame_requester
++                .schedule_frame_in(next_refresh_at.saturating_duration_since(now));
++        }
++    }
++
++    pub(super) fn request_performance_freshness_due_at(&mut self, now: Instant) -> bool {
++        let Some(next_refresh_at) = self.request_performance.next_freshness_refresh_at else {
++            return false;
++        };
++        if now < next_refresh_at {
++            self.frame_requester
++                .schedule_frame_in(next_refresh_at.saturating_duration_since(now));
++            return false;
++        }
++        self.schedule_request_performance_freshness_refresh_at(now);
++        true
++    }
++
+     pub(super) fn handle_turn_completed_notification(
+         &mut self,
+         notification: TurnCompletedNotification,
+diff --git a/codex-rs/tui/src/chatwidget/session_flow.rs b/codex-rs/tui/src/chatwidget/session_flow.rs
+index 7a613ca02a..4d8db15ce8 100644
+--- a/codex-rs/tui/src/chatwidget/session_flow.rs
++++ b/codex-rs/tui/src/chatwidget/session_flow.rs
+@@ -24,6 +24,7 @@ impl ChatWidget {
+             .set_queue_submissions(/*queue_submissions*/ false);
+         if previous_thread_id != self.thread_id {
+             self.review.recent_auto_review_denials = RecentAutoReviewDenials::default();
++            self.request_performance = RequestPerformanceState::default();
+         }
+         self.refresh_plan_mode_nudge();
+         self.turn_lifecycle.reset_thread();
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 94e49be474..adbff95d19 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -229,10 +229,43 @@ impl ChatWidget {
+             StatusLineItem::WeeklyLimit => {
+                 self.status_line_limit_display_line(weekly_status_window)
+             }
++            StatusLineItem::RequestTtfb | StatusLineItem::RequestTps => {
++                self.request_performance_line_at(item, Instant::now())
++            }
+             _ => self.status_line_value_for_item(item).map(Line::from),
+         }
+     }
+ 
++    pub(super) fn request_performance_line_at(
++        &self,
++        item: StatusLineItem,
++        now: Instant,
++    ) -> Option<Line<'static>> {
++        let metric = match item {
++            StatusLineItem::RequestTtfb => self.request_performance.ttfb,
++            StatusLineItem::RequestTps => self.request_performance.tps,
++            _ => return None,
++        }?;
++        let text = match item {
++            StatusLineItem::RequestTtfb => format_request_ttfb(metric.value)?,
++            StatusLineItem::RequestTps if metric.value.is_finite() && metric.value > 0.0 => {
++                format!("TPS {:.1}", metric.value)
++            }
++            StatusLineItem::RequestTps => return None,
++            _ => unreachable!(),
++        };
++        let stale =
++            now.saturating_duration_since(metric.observed_at) >= REQUEST_PERFORMANCE_FRESH_DURATION;
++        let style = if stale {
++            Style::default()
++                .fg(Color::DarkGray)
++                .add_modifier(Modifier::DIM)
++        } else {
++            Style::default()
++        };
++        Some(Line::from(Span::styled(text, style)))
++    }
++
+     fn status_line_limit_display_line(
+         &self,
+         select_window: fn(&RateLimitSnapshotDisplay) -> Option<(&RateLimitWindowDisplay, bool)>,
+@@ -791,6 +824,16 @@ impl ChatWidget {
+                 .status_line_total_usage()
+                 .cache_hit_rate_percent()
+                 .map(|rate| format!("{rate:.1}% hit")),
++            StatusLineItem::RequestTtfb => self
++                .request_performance
++                .ttfb
++                .and_then(|metric| format_request_ttfb(metric.value)),
++            StatusLineItem::RequestTps => self
++                .request_performance
++                .tps
++                .map(|metric| metric.value)
++                .filter(|tps| tps.is_finite() && *tps > 0.0)
++                .map(|tps| format!("TPS {tps:.1}")),
+             StatusLineItem::SessionId => self.thread_id.map(|id| id.to_string()),
+             StatusLineItem::FastMode => Some(
+                 if self.current_service_tier() == Some(ServiceTier::Fast.request_value()) {
+@@ -850,6 +893,8 @@ impl ChatWidget {
+             StatusSurfacePreviewItem::TotalInputTokens => StatusLineItem::TotalInputTokens,
+             StatusSurfacePreviewItem::TotalOutputTokens => StatusLineItem::TotalOutputTokens,
+             StatusSurfacePreviewItem::CacheHitRate => StatusLineItem::CacheHitRate,
++            StatusSurfacePreviewItem::RequestTtfb => StatusLineItem::RequestTtfb,
++            StatusSurfacePreviewItem::RequestTps => StatusLineItem::RequestTps,
+             StatusSurfacePreviewItem::SessionId => StatusLineItem::SessionId,
+             StatusSurfacePreviewItem::FastMode => StatusLineItem::FastMode,
+             StatusSurfacePreviewItem::RawOutput => StatusLineItem::RawOutput,
+@@ -1206,6 +1251,10 @@ impl ChatWidget {
+     }
+ }
+ 
++fn format_request_ttfb(value: f64) -> Option<String> {
++    (value.is_finite() && value >= 0.0).then(|| format!("TTFB {:.3}s", value.max(0.001)))
++}
++
+ fn five_hour_status_window(
+     snapshot: &RateLimitSnapshotDisplay,
+ ) -> Option<(&RateLimitWindowDisplay, bool)> {
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index 4aa2bf98e2..b70147f9aa 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -33,6 +33,8 @@ async fn response_output_bytes_follow_the_active_request_lifecycle_without_histo
+                 request_id: "request-1".to_string(),
+                 byte_count: 0,
+                 reset: true,
++                ttfb: None,
++                tps: None,
+             },
+         ),
+         /*replay_kind*/ None,
+@@ -46,6 +48,8 @@ async fn response_output_bytes_follow_the_active_request_lifecycle_without_histo
+                     request_id: "request-1".to_string(),
+                     byte_count,
+                     reset: false,
++                    ttfb: None,
++                    tps: None,
+                 },
+             ),
+             /*replay_kind*/ None,
+@@ -87,6 +91,8 @@ async fn response_output_bytes_follow_the_active_request_lifecycle_without_histo
+                 request_id: "request-2".to_string(),
+                 byte_count: 0,
+                 reset: true,
++                ttfb: None,
++                tps: None,
+             },
+         ),
+         /*replay_kind*/ None,
+@@ -106,6 +112,8 @@ async fn response_output_bytes_follow_the_active_request_lifecycle_without_histo
+                     request_id: request_id.to_string(),
+                     byte_count,
+                     reset: false,
++                    ttfb: None,
++                    tps: None,
+                 },
+             ),
+             /*replay_kind*/ None,
+@@ -160,6 +168,8 @@ async fn response_output_bytes_follow_the_active_request_lifecycle_without_histo
+                 request_id: "request-2".to_string(),
+                 byte_count: 9,
+                 reset: false,
++                ttfb: None,
++                tps: None,
+             },
+         ),
+         /*replay_kind*/ None,
+@@ -175,6 +185,55 @@ async fn response_output_bytes_follow_the_active_request_lifecycle_without_histo
+     assert!(drain_insert_history(&mut rx).is_empty());
+ }
+ 
++#[tokio::test]
++async fn request_performance_values_merge_and_age_independently() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    let first_observed_at = Instant::now();
++    assert!(chat.merge_request_performance_at(Some(0.125), None, first_observed_at,));
++    assert!(
++        chat.request_performance_line_at(StatusLineItem::RequestTtfb, first_observed_at)
++            .is_some()
++    );
++    assert!(
++        chat.request_performance_line_at(StatusLineItem::RequestTps, first_observed_at)
++            .is_none()
++    );
++
++    let tps_observed_at = first_observed_at + Duration::from_secs(3);
++    assert!(chat.merge_request_performance_at(None, Some(42.5), tps_observed_at));
++    let stale_ttfb = chat
++        .request_performance_line_at(
++            StatusLineItem::RequestTtfb,
++            first_observed_at + Duration::from_secs(6),
++        )
++        .expect("TTFB should remain visible after becoming stale");
++    let fresh_tps = chat
++        .request_performance_line_at(
++            StatusLineItem::RequestTps,
++            first_observed_at + Duration::from_secs(6),
++        )
++        .expect("TPS should be fresh on its own lifecycle");
++    assert_eq!(stale_ttfb.spans[0].style.fg, Some(Color::DarkGray));
++    assert_ne!(fresh_tps.spans[0].style.fg, Some(Color::DarkGray));
++}
++
++#[tokio::test]
++async fn request_ttfb_display_clamps_to_one_millisecond() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    let observed_at = Instant::now();
++    assert!(chat.merge_request_performance_at(Some(0.000_873), None, observed_at));
++
++    let line = chat
++        .request_performance_line_at(StatusLineItem::RequestTtfb, observed_at)
++        .expect("TTFB line");
++    assert_eq!(line.spans[0].content, "TTFB 0.001s");
++    assert_eq!(
++        chat.status_line_value_for_item(StatusLineItem::RequestTtfb)
++            .as_deref(),
++        Some("TTFB 0.001s")
++    );
++}
++
+ fn thread_settings_for_test(
+     model: &str,
+     thread_id: ThreadId,

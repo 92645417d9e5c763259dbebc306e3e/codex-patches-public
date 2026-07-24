@@ -1,0 +1,348 @@
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index cbb67d5db2..738693aea5 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -35,6 +35,7 @@ use crate::context::world_state::WorldState;
+ use crate::current_time::TimeProvider;
+ use crate::default_skill_metadata_budget;
+ use crate::environment_selection::TurnEnvironmentSnapshot;
++use crate::exec_env::create_runtime_env;
+ use crate::exec_policy::ExecPolicyManager;
+ use crate::image_preparation::prepare_response_items as prepare_image_response_items;
+ use crate::parse_turn_item;
+@@ -4340,6 +4341,7 @@ async fn build_hooks_for_config(
+             (Some(program), argv)
+         })
+         .unwrap_or_default();
++    let runtime_env_overlay = build_hook_runtime_env_overlay(config, environment);
+     let plugins_input = config.plugins_config_input();
+     let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
+     let plugin_hook_sources = plugin_outcome.effective_plugin_hook_sources();
+@@ -4351,11 +4353,31 @@ async fn build_hooks_for_config(
+         config_layer_stack: Some(config.config_layer_stack.clone()),
+         plugin_hook_sources,
+         plugin_hook_load_warnings,
++        runtime_env_overlay,
+         shell_program: hook_shell_program,
+         shell_args: hook_shell_argv,
+     })
+ }
+ 
++fn build_hook_runtime_env_overlay(
++    config: &Config,
++    environment: Option<&TurnEnvironment>,
++) -> HashMap<String, String> {
++    if !config.features.enabled(Feature::CodexHooks) {
++        return HashMap::new();
++    }
++    let Some(cwd) = environment.and_then(|environment| environment.cwd().to_abs_path().ok()) else {
++        return HashMap::new();
++    };
++
++    create_runtime_env(
++        &config.permissions.shell_environment_policy,
++        /*thread_id*/ None,
++        Some(cwd.as_path()),
++        config.codex_home.as_path(),
++    )
++}
++
+ #[cfg(test)]
+ #[path = "elicitation_holders_tests.rs"]
+ mod elicitation_holders_tests;
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index 95c3143a83..1c9799084a 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -617,6 +617,25 @@ fn write_project_hooks(dot_codex: &Path) -> std::io::Result<()> {
+     )
+ }
+ 
++fn write_runtime_env_project_hook(dot_codex: &Path, output: &Path) -> std::io::Result<()> {
++    std::fs::create_dir_all(dot_codex)?;
++    let contents = serde_json::to_vec_pretty(&serde_json::json!({
++        "hooks": {
++            "SessionStart": [{
++                "hooks": [{
++                    "type": "command",
++                    "command": format!(
++                        "printf '%s' \"$CODEX_HOME\" > {}",
++                        output.display()
++                    )
++                }]
++            }]
++        }
++    }))
++    .map_err(std::io::Error::other)?;
++    std::fs::write(dot_codex.join("hooks.json"), contents)
++}
++
+ async fn write_project_trust_config(
+     codex_home: &Path,
+     trusted_projects: &[(&Path, TrustLevel)],
+@@ -667,6 +686,101 @@ async fn preview_session_start_hooks(
+     )
+ }
+ 
++#[tokio::test]
++async fn command_hooks_receive_resolved_runtime_environment() -> std::io::Result<()> {
++    let temp = tempfile::tempdir()?;
++    let codex_home = temp.path().join("home");
++    let project = temp.path().join("project");
++    let output = temp.path().join("hook-runtime-env.txt");
++    std::fs::create_dir_all(&codex_home)?;
++    std::fs::create_dir_all(&project)?;
++    std::fs::create_dir(project.join(".git"))?;
++    write_runtime_env_project_hook(&project.join(".codex"), &output)?;
++
++    let mut config = ConfigBuilder::without_managed_config_for_tests()
++        .codex_home(codex_home.clone())
++        .fallback_cwd(Some(project.clone()))
++        .build()
++        .await?;
++    config
++        .features
++        .enable(Feature::CodexHooks)
++        .expect("enable Codex hooks");
++    let cwd = AbsolutePathBuf::from_absolute_path(&project)?;
++    let environment = TurnEnvironment::new(
++        codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
++        Arc::new(codex_exec_server::Environment::default_for_tests()),
++        PathUri::from_abs_path(&cwd),
++        Vec::new(),
++        /*shell*/ None,
++    );
++    let plugins_manager = PluginsManager::new(config.codex_home.to_path_buf());
++    let hooks = super::build_hooks_for_config(&config, &plugins_manager, Some(&environment)).await;
++
++    let outcome = hooks
++        .run_session_start(
++            codex_hooks::SessionStartRequest {
++                session_id: ThreadId::new(),
++                cwd,
++                transcript_path: None,
++                model: "test-model".to_string(),
++                permission_mode: "default".to_string(),
++                target: codex_hooks::StartHookTarget::SessionStart {
++                    source: codex_hooks::SessionStartSource::Startup,
++                },
++            },
++            /*turn_id*/ None,
++        )
++        .await;
++
++    assert!(!outcome.should_stop);
++    assert_eq!(
++        std::fs::read_to_string(output)?,
++        codex_home.to_string_lossy()
++    );
++    Ok(())
++}
++
++#[tokio::test]
++async fn hook_runtime_environment_is_local_and_feature_gated() -> std::io::Result<()> {
++    let temp = tempfile::tempdir()?;
++    let codex_home = temp.path().join("home");
++    let cwd = temp.path().join("workspace");
++    std::fs::create_dir_all(&codex_home)?;
++    std::fs::create_dir_all(&cwd)?;
++    let cwd = AbsolutePathBuf::from_absolute_path(&cwd)?;
++    let mut config = ConfigBuilder::without_managed_config_for_tests()
++        .codex_home(codex_home.clone())
++        .fallback_cwd(Some(cwd.to_path_buf()))
++        .build()
++        .await?;
++    config
++        .features
++        .enable(Feature::CodexHooks)
++        .expect("enable Codex hooks");
++    let environment = TurnEnvironment::new(
++        codex_exec_server::LOCAL_ENVIRONMENT_ID.to_string(),
++        Arc::new(codex_exec_server::Environment::default_for_tests()),
++        PathUri::from_abs_path(&cwd),
++        Vec::new(),
++        /*shell*/ None,
++    );
++
++    let env = super::build_hook_runtime_env_overlay(&config, Some(&environment));
++
++    for key in crate::exec_env::runtime_path_env_keys() {
++        assert!(env.contains_key(key), "missing {key}");
++    }
++    assert_eq!(
++        env.get(crate::exec_env::CODEX_HOME_ENV_VAR),
++        Some(&codex_home.to_string_lossy().into_owned())
++    );
++    assert!(super::build_hook_runtime_env_overlay(&config, None).is_empty());
++    config.features.disable(Feature::CodexHooks);
++    assert!(super::build_hook_runtime_env_overlay(&config, Some(&environment)).is_empty());
++    Ok(())
++}
++
+ fn test_tool_runtime(session: Arc<Session>, turn_context: Arc<TurnContext>) -> ToolCallRuntime {
+     let step_context = StepContext::for_test(Arc::clone(&turn_context));
+     let router = Arc::new(ToolRouter::from_context(
+diff --git a/codex-rs/hooks/src/engine/mod.rs b/codex-rs/hooks/src/engine/mod.rs
+index de414e03a8..9c50ae1367 100644
+--- a/codex-rs/hooks/src/engine/mod.rs
++++ b/codex-rs/hooks/src/engine/mod.rs
+@@ -147,6 +147,14 @@ impl ClaudeHooksEngine {
+         &self.warnings
+     }
+ 
++    pub(crate) fn with_runtime_env_overlay(
++        mut self,
++        runtime_env_overlay: &HashMap<String, String>,
++    ) -> Self {
++        merge_runtime_env_overlay(&mut self.handlers, runtime_env_overlay);
++        self
++    }
++
+     pub(crate) fn preview_session_start(
+         &self,
+         request: &SessionStartRequest,
+@@ -296,6 +304,27 @@ impl ClaudeHooksEngine {
+     }
+ }
+ 
++fn merge_runtime_env_overlay(
++    handlers: &mut [ConfiguredHandler],
++    runtime_env_overlay: &HashMap<String, String>,
++) {
++    if runtime_env_overlay.is_empty() {
++        return;
++    }
++
++    for handler in handlers {
++        let source_env = std::mem::take(&mut handler.env);
++        handler.env = runtime_env_overlay.clone();
++        #[cfg(windows)]
++        for key in source_env.keys() {
++            handler
++                .env
++                .retain(|runtime_key, _| !runtime_key.eq_ignore_ascii_case(key));
++        }
++        handler.env.extend(source_env);
++    }
++}
++
+ #[cfg(test)]
+ #[path = "mod_tests.rs"]
+ mod tests;
+diff --git a/codex-rs/hooks/src/engine/mod_tests.rs b/codex-rs/hooks/src/engine/mod_tests.rs
+index 178dc0bdae..6e64a088ed 100644
+--- a/codex-rs/hooks/src/engine/mod_tests.rs
++++ b/codex-rs/hooks/src/engine/mod_tests.rs
+@@ -22,6 +22,7 @@ use codex_config::TomlValue;
+ use codex_plugin::PluginHookSource;
+ use codex_plugin::PluginId;
+ use codex_protocol::ThreadId;
++use codex_protocol::protocol::HookEventName;
+ use codex_protocol::protocol::HookOutputEntry;
+ use codex_protocol::protocol::HookOutputEntryKind;
+ use codex_protocol::protocol::HookRunStatus;
+@@ -32,6 +33,8 @@ use tempfile::tempdir;
+ 
+ use super::ClaudeHooksEngine;
+ use super::CommandShell;
++use super::ConfiguredHandler;
++use super::merge_runtime_env_overlay;
+ use crate::events::pre_tool_use::PreToolUseRequest;
+ 
+ fn cwd() -> AbsolutePathBuf {
+@@ -75,6 +78,50 @@ fn pre_tool_use_hook_events(command: impl Into<String>) -> HookEventsToml {
+     }
+ }
+ 
++#[test]
++fn handler_environment_overrides_runtime_environment_overlay() {
++    let runtime_plugin_key = if cfg!(windows) {
++        "plugin_root"
++    } else {
++        "PLUGIN_ROOT"
++    };
++    let mut handlers = vec![ConfiguredHandler {
++        event_name: HookEventName::SessionStart,
++        matcher: None,
++        command: "echo hook".to_string(),
++        timeout_sec: 600,
++        status_message: None,
++        additional_context_limit: Default::default(),
++        source_path: cwd().join("hooks.json"),
++        source: HookSource::Plugin,
++        display_order: 0,
++        env: HashMap::from([("PLUGIN_ROOT".to_string(), "/plugin".to_string())]),
++    }];
++    let runtime_env_overlay = HashMap::from([
++        (
++            runtime_plugin_key.to_string(),
++            "/runtime-plugin".to_string(),
++        ),
++        (
++            "PROJECT_SCRATCH_ROOT".to_string(),
++            "/runtime-scratch".to_string(),
++        ),
++    ]);
++
++    merge_runtime_env_overlay(&mut handlers, &runtime_env_overlay);
++
++    assert_eq!(
++        handlers[0].env,
++        HashMap::from([
++            ("PLUGIN_ROOT".to_string(), "/plugin".to_string()),
++            (
++                "PROJECT_SCRATCH_ROOT".to_string(),
++                "/runtime-scratch".to_string(),
++            ),
++        ])
++    );
++}
++
+ fn config_toml_with_pre_tool_use(command: &str) -> TomlValue {
+     let mut config_toml = TomlValue::Table(Default::default());
+     let TomlValue::Table(config_table) = &mut config_toml else {
+@@ -223,6 +270,7 @@ with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
+         config_layer_stack: Some(config_layer_stack.clone()),
+         plugin_hook_sources: Vec::new(),
+         plugin_hook_load_warnings: Vec::new(),
++        runtime_env_overlay: HashMap::new(),
+         shell_program: None,
+         shell_args: Vec::new(),
+     });
+@@ -1479,6 +1527,7 @@ print(json.dumps({
+         config_layer_stack: None,
+         plugin_hook_sources,
+         plugin_hook_load_warnings: Vec::new(),
++        runtime_env_overlay: HashMap::new(),
+         shell_program: None,
+         shell_args: Vec::new(),
+     });
+diff --git a/codex-rs/hooks/src/registry.rs b/codex-rs/hooks/src/registry.rs
+index 8fdfaf9cf4..bd8b539d73 100644
+--- a/codex-rs/hooks/src/registry.rs
++++ b/codex-rs/hooks/src/registry.rs
+@@ -1,5 +1,6 @@
+ use codex_config::ConfigLayerStack;
+ use codex_plugin::PluginHookSource;
++use std::collections::HashMap;
+ use tokio::process::Command;
+ 
+ use crate::engine::ClaudeHooksEngine;
+@@ -36,6 +37,7 @@ pub struct HooksConfig {
+     pub config_layer_stack: Option<ConfigLayerStack>,
+     pub plugin_hook_sources: Vec<PluginHookSource>,
+     pub plugin_hook_load_warnings: Vec<String>,
++    pub runtime_env_overlay: HashMap<String, String>,
+     pub shell_program: Option<String>,
+     pub shell_args: Vec<String>,
+ }
+@@ -76,7 +78,8 @@ impl Hooks {
+                 program: config.shell_program.unwrap_or_default(),
+                 args: config.shell_args,
+             },
+-        );
++        )
++        .with_runtime_env_overlay(&config.runtime_env_overlay);
+         Self {
+             after_agent,
+             engine,

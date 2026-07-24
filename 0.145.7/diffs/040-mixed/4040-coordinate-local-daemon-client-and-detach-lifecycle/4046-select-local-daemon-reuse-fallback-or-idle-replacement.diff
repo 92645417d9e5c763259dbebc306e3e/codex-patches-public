@@ -1,0 +1,1068 @@
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index f22f7635f6..965af5f8cc 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -2081,6 +2081,7 @@ dependencies = [
+  "codex-app-server-protocol",
+  "codex-app-server-transport",
+  "codex-http-client",
++ "codex-install-context",
+  "codex-uds",
+  "codex-utils-home-dir",
+  "futures",
+diff --git a/codex-rs/app-server-daemon/Cargo.toml b/codex-rs/app-server-daemon/Cargo.toml
+index fee5732197..22f16f4ecb 100644
+--- a/codex-rs/app-server-daemon/Cargo.toml
++++ b/codex-rs/app-server-daemon/Cargo.toml
+@@ -17,6 +17,7 @@ anyhow = { workspace = true }
+ codex-app-server-protocol = { workspace = true }
+ codex-app-server-transport = { workspace = true }
+ codex-http-client = { workspace = true }
++codex-install-context = { workspace = true }
+ codex-utils-home-dir = { workspace = true }
+ codex-uds = { workspace = true }
+ futures = { workspace = true }
+diff --git a/codex-rs/app-server-daemon/src/backend/pid.rs b/codex-rs/app-server-daemon/src/backend/pid.rs
+index f47bda2740..e59b80f8ac 100644
+--- a/codex-rs/app-server-daemon/src/backend/pid.rs
++++ b/codex-rs/app-server-daemon/src/backend/pid.rs
+@@ -85,6 +85,25 @@ enum PidCommandKind {
+ }
+ 
+ impl PidBackend {
++    #[cfg(unix)]
++    pub(crate) async fn running_executable_identity(&self) -> Result<Option<ExecutableIdentity>> {
++        loop {
++            match self.read_pid_file_state().await? {
++                PidFileState::Missing => return Ok(None),
++                PidFileState::Starting => return Ok(None),
++                PidFileState::Running(record) => {
++                    if self.record_is_active(&record).await? {
++                        return Ok(record.executable_identity);
++                    }
++                    match self.refresh_after_stale_record(&record).await? {
++                        PidFileState::Missing => return Ok(None),
++                        PidFileState::Starting | PidFileState::Running(_) => continue,
++                    }
++                }
++            }
++        }
++    }
++
+     pub(crate) fn new(codex_bin: PathBuf, pid_file: PathBuf, remote_control_enabled: bool) -> Self {
+         let lock_file = pid_file.with_extension("pid.lock");
+         Self {
+@@ -527,7 +546,7 @@ async fn terminate_spawned_child(child: &mut tokio::process::Child) -> Result<()
+     }
+     match child.kill().await {
+         Ok(()) => Ok(()),
+-        Err(err) if child.try_wait()?.is_some() => Ok(()),
++        Err(_err) if child.try_wait()?.is_some() => Ok(()),
+         Err(err) => Err(err).context("failed to kill spawned process"),
+     }
+ }
+diff --git a/codex-rs/app-server-daemon/src/client.rs b/codex-rs/app-server-daemon/src/client.rs
+index b0e023e7b2..cb115aad70 100644
+--- a/codex-rs/app-server-daemon/src/client.rs
++++ b/codex-rs/app-server-daemon/src/client.rs
+@@ -28,6 +28,8 @@ pub(crate) const CONTROL_SOCKET_RESPONSE_TIMEOUT: Duration = Duration::from_secs
+ const CLIENT_NAME: &str = "codex_app_server_daemon";
+ const INITIALIZE_REQUEST_ID: RequestId = RequestId::Integer(1);
+ const STATUS_REQUEST_ID: RequestId = RequestId::Integer(2);
++const CLAIM_IDLE_REQUEST_ID: RequestId = RequestId::Integer(3);
++const CLAIM_IDLE_METHOD: &str = "internal/daemon/claimIdleReplacement";
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub(crate) struct ProbeInfo {
+@@ -38,7 +40,14 @@ pub(crate) struct ProbeInfo {
+ }
+ 
+ pub(crate) async fn probe(socket_path: &Path) -> Result<ProbeInfo> {
+-    let deadline = Instant::now() + CONTROL_SOCKET_RESPONSE_TIMEOUT;
++    probe_with_timeout(socket_path, CONTROL_SOCKET_RESPONSE_TIMEOUT).await
++}
++
++pub(crate) async fn probe_with_timeout(
++    socket_path: &Path,
++    response_timeout: Duration,
++) -> Result<ProbeInfo> {
++    let deadline = Instant::now() + response_timeout;
+     timeout_at(deadline, probe_inner(socket_path, deadline))
+         .await
+         .with_context(|| {
+@@ -127,6 +136,76 @@ pub(crate) async fn connect(socket_path: &Path) -> Result<WebSocketStream<UnixSt
+     Ok(websocket)
+ }
+ 
++pub(crate) async fn is_socket_reachable(socket_path: &Path) -> bool {
++    UnixStream::connect(socket_path).await.is_ok()
++}
++
++pub(crate) struct IdleReplacementClaim {
++    _websocket: WebSocketStream<UnixStream>,
++}
++
++pub(crate) async fn claim_idle_replacement(
++    socket_path: &Path,
++    response_timeout: Duration,
++) -> Result<Option<IdleReplacementClaim>> {
++    timeout(response_timeout, claim_idle_replacement_inner(socket_path))
++        .await
++        .with_context(|| {
++            format!(
++                "timed out claiming idle app-server replacement at {}",
++                socket_path.display()
++            )
++        })?
++}
++
++async fn claim_idle_replacement_inner(socket_path: &Path) -> Result<Option<IdleReplacementClaim>> {
++    let mut websocket = connect(socket_path).await?;
++    initialize(&mut websocket, /*experimental_api*/ false).await?;
++    send_message(
++        &mut websocket,
++        &JSONRPCMessage::Notification(JSONRPCNotification {
++            method: "initialized".to_string(),
++            params: None,
++        }),
++    )
++    .await?;
++    send_message(
++        &mut websocket,
++        &JSONRPCMessage::Request(JSONRPCRequest {
++            id: CLAIM_IDLE_REQUEST_ID,
++            method: CLAIM_IDLE_METHOD.to_string(),
++            params: None,
++            trace: None,
++        }),
++    )
++    .await?;
++    loop {
++        match read_message(&mut websocket).await? {
++            JSONRPCMessage::Response(response) if response.id == CLAIM_IDLE_REQUEST_ID => {
++                #[derive(serde::Deserialize)]
++                struct ClaimIdleResponse {
++                    claimed: bool,
++                }
++                let response = serde_json::from_value::<ClaimIdleResponse>(response.result)
++                    .context("failed to parse idle replacement claim")?;
++                if response.claimed {
++                    return Ok(Some(IdleReplacementClaim {
++                        _websocket: websocket,
++                    }));
++                }
++                websocket.close(None).await.ok();
++                return Ok(None);
++            }
++            JSONRPCMessage::Error(error) if error.id == CLAIM_IDLE_REQUEST_ID => {
++                let _ = error;
++                websocket.close(None).await.ok();
++                return Ok(None);
++            }
++            _ => {}
++        }
++    }
++}
++
+ pub(crate) async fn initialize<S>(
+     websocket: &mut WebSocketStream<S>,
+     experimental_api: bool,
+@@ -311,6 +390,81 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[tokio::test]
++    async fn idle_replacement_claim_uses_daemon_control_method() -> Result<()> {
++        assert!(
++            claim_with_reply(JSONRPCMessage::Response(JSONRPCResponse {
++                id: CLAIM_IDLE_REQUEST_ID,
++                result: serde_json::json!({ "claimed": true }),
++            }))
++            .await?
++        );
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn unsupported_idle_replacement_claim_returns_fallback() -> Result<()> {
++        assert!(
++            !claim_with_reply(JSONRPCMessage::Error(JSONRPCError {
++                id: CLAIM_IDLE_REQUEST_ID,
++                error: JSONRPCErrorError {
++                    code: -32601,
++                    message: "Method not found".to_string(),
++                    data: None,
++                },
++            }))
++            .await?
++        );
++        Ok(())
++    }
++
++    async fn claim_with_reply(reply: JSONRPCMessage) -> Result<bool> {
++        let dir = TempDir::new()?;
++        let socket_path = dir.path().join("app-server.sock");
++        let mut listener = UnixListener::bind(&socket_path).await?;
++        let server_task = tokio::spawn(async move {
++            let stream = listener.accept().await?;
++            let mut websocket = accept_async(stream).await?;
++            let JSONRPCMessage::Request(initialize) = read_message(&mut websocket).await? else {
++                return Err(anyhow!("expected initialize request"));
++            };
++            send_message(
++                &mut websocket,
++                &JSONRPCMessage::Response(JSONRPCResponse {
++                    id: initialize.id,
++                    result: serde_json::json!({
++                        "userAgent": "codex_app_server/1.2.3",
++                        "codexHome": "/tmp/codex-home",
++                        "platformFamily": "unix",
++                        "platformOs": "linux",
++                    }),
++                }),
++            )
++            .await?;
++            let JSONRPCMessage::Notification(initialized) = read_message(&mut websocket).await?
++            else {
++                return Err(anyhow!("expected initialized notification"));
++            };
++            if initialized.method != "initialized" {
++                return Err(anyhow!("unexpected initialized notification"));
++            }
++            let JSONRPCMessage::Request(claim) = read_message(&mut websocket).await? else {
++                return Err(anyhow!("expected idle replacement claim"));
++            };
++            if claim.id != CLAIM_IDLE_REQUEST_ID || claim.method != CLAIM_IDLE_METHOD {
++                return Err(anyhow!("unexpected idle replacement claim"));
++            }
++            send_message(&mut websocket, &reply).await?;
++            Ok::<_, anyhow::Error>(())
++        });
++
++        let claim = claim_idle_replacement(&socket_path, Duration::from_secs(1)).await?;
++        let claimed = claim.is_some();
++        drop(claim);
++        server_task.await??;
++        Ok(claimed)
++    }
++
+     async fn probe_with_status_reply(reply: JSONRPCMessage) -> Result<ProbeInfo> {
+         let dir = TempDir::new()?;
+         let socket_path = dir.path().join("app-server.sock");
+diff --git a/codex-rs/app-server-daemon/src/lib.rs b/codex-rs/app-server-daemon/src/lib.rs
+index 8d4bf980b5..4fa1576a7a 100644
+--- a/codex-rs/app-server-daemon/src/lib.rs
++++ b/codex-rs/app-server-daemon/src/lib.rs
+@@ -26,6 +26,7 @@ use settings::DaemonSettings;
+ use tokio::time::sleep;
+ 
+ const START_POLL_INTERVAL: Duration = Duration::from_millis(50);
++const IMPLICIT_LOCAL_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+ const START_TIMEOUT: Duration = Duration::from_secs(10);
+ const OPERATION_LOCK_TIMEOUT: Duration = Duration::from_secs(75);
+ const PID_FILE_NAME: &str = "app-server.pid";
+@@ -75,6 +76,34 @@ pub struct BootstrapOptions {
+     pub remote_control_enabled: bool,
+ }
+ 
++/// How an implicit local app-server request was satisfied.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ImplicitLocalDaemonOutcome {
++    Reused,
++    Started,
++    Replaced,
++    EmbeddedFallback,
++}
++
++/// Prepares an implicit local daemon using the exact Codex executable that
++/// invoked the caller. Existing daemons are preserved unless a managed daemon
++/// is both incompatible and known to be completely idle.
++#[cfg(target_os = "linux")]
++pub async fn prepare_implicit_local_daemon(
++    invoking_codex_executable: &Path,
++) -> Result<ImplicitLocalDaemonOutcome> {
++    Daemon::from_environment()?
++        .prepare_implicit_local(invoking_codex_executable)
++        .await
++}
++
++#[cfg(not(target_os = "linux"))]
++pub async fn prepare_implicit_local_daemon(
++    _invoking_codex_executable: &Path,
++) -> Result<ImplicitLocalDaemonOutcome> {
++    Ok(ImplicitLocalDaemonOutcome::EmbeddedFallback)
++}
++
+ /// Passively probes an existing app-server socket and returns its reported
+ /// app-server version.
+ pub async fn probe_app_server_version(socket_path: &Path) -> Result<String> {
+@@ -188,6 +217,45 @@ enum RestartDecision {
+     Restart,
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum ImplicitLocalDecision {
++    Reuse,
++    Replace,
++    Start,
++    Fallback,
++}
++
++fn implicit_local_decision(
++    managed: bool,
++    identity_matches: Option<bool>,
++    probe: Option<&client::ProbeInfo>,
++    socket_reachable: bool,
++) -> ImplicitLocalDecision {
++    if managed {
++        if identity_matches == Some(true) && probe.is_some() {
++            return ImplicitLocalDecision::Reuse;
++        }
++        return match probe.map(|info| (info.active_client_count, info.running_assistant_turn_count))
++        {
++            Some((Some(0), Some(0))) => ImplicitLocalDecision::Replace,
++            _ => ImplicitLocalDecision::Fallback,
++        };
++    }
++    if socket_reachable {
++        ImplicitLocalDecision::Fallback
++    } else {
++        ImplicitLocalDecision::Start
++    }
++}
++
++fn implicit_local_build_identity_matches(probe: Option<&client::ProbeInfo>) -> Option<bool> {
++    probe.and_then(|info| {
++        info.build_identity
++            .as_deref()
++            .map(|running| running == codex_install_context::build_identity())
++    })
++}
++
+ pub async fn run(command: LifecycleCommand) -> Result<LifecycleOutput> {
+     ensure_supported_platform()?;
+     Daemon::from_environment()?.run(command).await
+@@ -294,6 +362,72 @@ impl Daemon {
+         }
+     }
+ 
++    #[cfg(target_os = "linux")]
++    async fn prepare_implicit_local(
++        &self,
++        invoking_codex_executable: &Path,
++    ) -> Result<ImplicitLocalDaemonOutcome> {
++        let _operation_lock = self.acquire_operation_lock().await?;
++        let settings = self.load_settings().await?;
++        self.stop_updater_if_running(&settings).await?;
++        let backend =
++            backend::pid_backend(self.backend_paths_with_bin(&settings, invoking_codex_executable));
++        let managed = backend.is_starting_or_running().await?;
++        let probe = client::probe_with_timeout(&self.socket_path, IMPLICIT_LOCAL_PROBE_TIMEOUT)
++            .await
++            .ok();
++        let socket_reachable =
++            probe.is_some() || client::is_socket_reachable(&self.socket_path).await;
++        let identity_matches = if managed {
++            implicit_local_build_identity_matches(probe.as_ref())
++        } else {
++            None
++        };
++
++        match implicit_local_decision(managed, identity_matches, probe.as_ref(), socket_reachable) {
++            ImplicitLocalDecision::Reuse => Ok(ImplicitLocalDaemonOutcome::Reused),
++            ImplicitLocalDecision::Fallback => Ok(ImplicitLocalDaemonOutcome::EmbeddedFallback),
++            ImplicitLocalDecision::Start => {
++                match tokio::fs::remove_file(&self.socket_path).await {
++                    Ok(()) => {}
++                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
++                    Err(err) => {
++                        return Err(err).context("failed to remove stale app-server socket");
++                    }
++                }
++                backend.start_for_implicit_local().await?;
++                let info = self.wait_until_ready().await?;
++                self.require_current_build_identity(&backend, &info).await?;
++                Ok(ImplicitLocalDaemonOutcome::Started)
++            }
++            ImplicitLocalDecision::Replace => {
++                let _claim = match client::claim_idle_replacement(
++                    &self.socket_path,
++                    IMPLICIT_LOCAL_PROBE_TIMEOUT,
++                )
++                .await
++                {
++                    Ok(Some(claim)) => claim,
++                    Ok(None) | Err(_) => {
++                        return Ok(ImplicitLocalDaemonOutcome::EmbeddedFallback);
++                    }
++                };
++                backend.stop().await?;
++                match tokio::fs::remove_file(&self.socket_path).await {
++                    Ok(()) => {}
++                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
++                    Err(err) => {
++                        return Err(err).context("failed to remove stale app-server socket");
++                    }
++                }
++                backend.start_for_implicit_local().await?;
++                let info = self.wait_until_ready().await?;
++                self.require_current_build_identity(&backend, &info).await?;
++                Ok(ImplicitLocalDaemonOutcome::Replaced)
++            }
++        }
++    }
++
+     async fn start(&self) -> Result<LifecycleOutput> {
+         let settings = self.load_settings().await?;
+         if let Ok(info) = client::probe(&self.socket_path).await {
+@@ -465,6 +599,26 @@ impl Daemon {
+         }
+     }
+ 
++    async fn require_current_build_identity(
++        &self,
++        backend: &backend::PidBackend,
++        info: &client::ProbeInfo,
++    ) -> Result<()> {
++        let expected = codex_install_context::build_identity();
++        let error = match info.build_identity.as_deref() {
++            Some(actual) if actual == expected => return Ok(()),
++            Some(actual) => {
++                anyhow!("started app-server build identity {actual} did not match {expected}")
++            }
++            None => anyhow!("started app-server did not report a build identity"),
++        };
++        backend
++            .stop()
++            .await
++            .context("failed to stop app-server with an invalid build identity")?;
++        Err(error)
++    }
++
+     async fn app_server_not_ready_context(&self) -> String {
+         let mut context = format!(
+             "app server did not become ready on {}",
+@@ -664,6 +818,14 @@ impl Daemon {
+         updater.is_starting_or_running().await
+     }
+ 
++    async fn stop_updater_if_running(&self, settings: &DaemonSettings) -> Result<()> {
++        let updater = backend::pid_update_loop_backend(self.backend_paths(settings));
++        if updater.is_starting_or_running().await? {
++            updater.stop().await?;
++        }
++        Ok(())
++    }
++
+     fn ensure_managed_codex_bin(&self) -> Result<()> {
+         if self.managed_codex_bin.is_file() {
+             return Ok(());
+@@ -856,6 +1018,7 @@ mod tests {
+     use super::BootstrapOutput;
+     use super::BootstrapStatus;
+     use super::Daemon;
++    use super::ImplicitLocalDecision;
+     use super::LifecycleOutput;
+     use super::LifecycleStatus;
+     use super::RemoteControlStartOutput;
+@@ -864,10 +1027,119 @@ mod tests {
+     use super::RestartIfRunningOutcome;
+     use super::RestartMode;
+     use super::UpdaterRefreshMode;
++    use super::implicit_local_build_identity_matches;
++    use super::implicit_local_decision;
+     use super::restart_decision;
+     use super::should_reexec_updater;
+     use crate::client::ProbeInfo;
+ 
++    fn probe_counts(active: Option<usize>, running: Option<usize>) -> ProbeInfo {
++        ProbeInfo {
++            app_server_version: "test".to_string(),
++            active_client_count: active,
++            build_identity: Some(codex_install_context::build_identity().to_string()),
++            running_assistant_turn_count: running,
++        }
++    }
++
++    #[test]
++    fn implicit_local_reuses_only_matching_managed_identity() {
++        let active = probe_counts(Some(3), Some(2));
++        assert_eq!(
++            implicit_local_decision(true, Some(true), Some(&active), true),
++            ImplicitLocalDecision::Reuse
++        );
++    }
++
++    #[test]
++    fn implicit_local_compares_reported_build_identity() {
++        let mut info = probe_counts(Some(1), Some(1));
++        assert_eq!(
++            implicit_local_build_identity_matches(Some(&info)),
++            Some(true)
++        );
++
++        info.build_identity = Some("different-build".to_string());
++        assert_eq!(
++            implicit_local_build_identity_matches(Some(&info)),
++            Some(false)
++        );
++
++        info.build_identity = None;
++        assert_eq!(implicit_local_build_identity_matches(Some(&info)), None);
++        assert_eq!(implicit_local_build_identity_matches(None), None);
++    }
++
++    #[test]
++    fn implicit_local_preserves_matching_identity_without_successful_probe() {
++        assert_eq!(
++            implicit_local_decision(true, Some(true), None, true),
++            ImplicitLocalDecision::Fallback
++        );
++    }
++
++    #[test]
++    fn implicit_local_replaces_mismatched_identity_only_when_idle() {
++        let idle = probe_counts(Some(0), Some(0));
++        assert_eq!(
++            implicit_local_decision(true, Some(false), Some(&idle), true),
++            ImplicitLocalDecision::Replace
++        );
++    }
++
++    #[test]
++    fn implicit_local_preserves_active_clients_and_turns() {
++        for info in [
++            probe_counts(Some(1), Some(0)),
++            probe_counts(Some(0), Some(1)),
++        ] {
++            assert_eq!(
++                implicit_local_decision(true, Some(false), Some(&info), true),
++                ImplicitLocalDecision::Fallback
++            );
++        }
++    }
++
++    #[test]
++    fn implicit_local_preserves_partial_and_unknown_counts() {
++        for info in [
++            probe_counts(None, None),
++            probe_counts(Some(0), None),
++            probe_counts(None, Some(0)),
++        ] {
++            assert_eq!(
++                implicit_local_decision(true, Some(false), Some(&info), true),
++                ImplicitLocalDecision::Fallback
++            );
++        }
++    }
++
++    #[test]
++    fn implicit_local_preserves_legacy_identity_unless_known_idle() {
++        let unknown = probe_counts(None, None);
++        assert_eq!(
++            implicit_local_decision(true, None, Some(&unknown), true),
++            ImplicitLocalDecision::Fallback
++        );
++    }
++
++    #[test]
++    fn implicit_local_preserves_unmanaged_daemon() {
++        let idle = probe_counts(Some(0), Some(0));
++        assert_eq!(
++            implicit_local_decision(false, None, Some(&idle), true),
++            ImplicitLocalDecision::Fallback
++        );
++        assert_eq!(
++            implicit_local_decision(false, None, None, false),
++            ImplicitLocalDecision::Start
++        );
++        assert_eq!(
++            implicit_local_decision(false, None, None, true),
++            ImplicitLocalDecision::Fallback
++        );
++    }
++
+     #[test]
+     fn remote_control_status_uses_camel_case_json() {
+         assert_eq!(
+@@ -913,6 +1185,7 @@ mod tests {
+         let current_info = ProbeInfo {
+             app_server_version: "0.1.0".to_string(),
+             active_client_count: None,
++            build_identity: None,
+             running_assistant_turn_count: None,
+         };
+ 
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+index d6ed0e48df..ae9653aca5 100644
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -109,6 +109,8 @@ mod image_url;
+ pub mod in_process;
+ mod mcp_refresh;
+ mod message_processor;
++#[cfg(test)]
++mod message_processor_admission_tests;
+ mod models;
+ mod models_refresh_worker;
+ mod outgoing_message;
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 478e036947..dfeaaf5161 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -3,8 +3,6 @@ use std::future::Future;
+ use std::sync::Arc;
+ use std::sync::OnceLock;
+ use std::sync::atomic::AtomicBool;
+-use std::sync::atomic::AtomicUsize;
+-use std::sync::atomic::Ordering;
+ 
+ use crate::attestation::app_server_attestation_provider;
+ use crate::config_manager::ConfigManager;
+@@ -92,6 +90,65 @@ use crate::models_refresh_worker::ModelsRefreshWorker;
+ const CONNECTION_RPC_DRAIN_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
+ const DAEMON_CLIENT_NAME: &str = "codex_app_server_daemon";
+ const INTERNAL_DAEMON_STATUS_METHOD: &str = "internal/daemon/status";
++const INTERNAL_DAEMON_CLAIM_IDLE_METHOD: &str = "internal/daemon/claimIdleReplacement";
++
++#[derive(Debug, Default)]
++pub(crate) struct ClientAdmissionState {
++    active_client_count: usize,
++    idle_replacement_claim_owner: Option<ConnectionId>,
++}
++
++impl ClientAdmissionState {
++    pub(crate) fn counts_as_active_client(client_name: &str) -> bool {
++        client_name != DAEMON_CLIENT_NAME && client_name != "codex-backend"
++    }
++
++    pub(crate) fn admit(&mut self, client_name: &str) -> bool {
++        let counts_as_active_client = Self::counts_as_active_client(client_name);
++        if counts_as_active_client && self.idle_replacement_claim_owner.is_some() {
++            return false;
++        }
++        if counts_as_active_client {
++            self.active_client_count += 1;
++        }
++        true
++    }
++
++    pub(crate) fn remove_active_client(&mut self) {
++        self.active_client_count = self
++            .active_client_count
++            .checked_sub(1)
++            .expect("active client count underflow");
++    }
++
++    pub(crate) fn active_client_count(&self) -> usize {
++        self.active_client_count
++    }
++
++    pub(crate) fn claim_idle_replacement(
++        &mut self,
++        owner: ConnectionId,
++        running_assistant_turn_count: usize,
++    ) -> bool {
++        if self.idle_replacement_claim_owner == Some(owner) {
++            return true;
++        }
++        if self.active_client_count != 0
++            || running_assistant_turn_count != 0
++            || self.idle_replacement_claim_owner.is_some()
++        {
++            return false;
++        }
++        self.idle_replacement_claim_owner = Some(owner);
++        true
++    }
++
++    pub(crate) fn release_idle_replacement_claim(&mut self, owner: ConnectionId) {
++        if self.idle_replacement_claim_owner == Some(owner) {
++            self.idle_replacement_claim_owner = None;
++        }
++    }
++}
+ 
+ fn deserialize_client_request(request: JSONRPCRequest) -> Result<ClientRequest, JSONRPCErrorError> {
+     ClientRequest::try_from(request)
+@@ -124,7 +181,7 @@ pub(crate) struct MessageProcessor {
+     turn_processor: TurnRequestProcessor,
+     windows_sandbox_processor: WindowsSandboxRequestProcessor,
+     request_serialization_queues: RequestSerializationQueues,
+-    active_client_count: Arc<AtomicUsize>,
++    client_admission: Arc<Mutex<ClientAdmissionState>>,
+ }
+ 
+ #[derive(Debug)]
+@@ -200,8 +257,7 @@ impl ConnectionSessionState {
+ 
+     pub(crate) fn counts_as_active_client(&self) -> bool {
+         self.initialized.get().is_some_and(|session| {
+-            session.app_server_client_name != DAEMON_CLIENT_NAME
+-                && session.app_server_client_name != "codex-backend"
++            ClientAdmissionState::counts_as_active_client(&session.app_server_client_name)
+         })
+     }
+ 
+@@ -390,14 +446,14 @@ impl MessageProcessor {
+             state_db.clone(),
+         );
+         let git_processor = GitRequestProcessor::new();
+-        let active_client_count = Arc::new(AtomicUsize::new(0));
++        let client_admission = Arc::new(Mutex::new(ClientAdmissionState::default()));
+         let initialize_processor = InitializeRequestProcessor::new(
+             outgoing.clone(),
+             analytics_events_client.clone(),
+             Arc::clone(&config),
+             config_warnings.clone(),
+             rpc_transport,
+-            Arc::clone(&active_client_count),
++            Arc::clone(&client_admission),
+         );
+         let marketplace_processor = MarketplaceRequestProcessor::new(
+             Arc::clone(&config),
+@@ -523,7 +579,7 @@ impl MessageProcessor {
+             turn_processor,
+             windows_sandbox_processor,
+             request_serialization_queues,
+-            active_client_count,
++            client_admission,
+         }
+     }
+ 
+@@ -571,6 +627,15 @@ impl MessageProcessor {
+                     }
+                     return;
+                 }
++                if request.method == INTERNAL_DAEMON_CLAIM_IDLE_METHOD {
++                    if let Err(error) = self
++                        .handle_internal_daemon_claim_idle_request(request_id.clone(), &session)
++                        .await
++                    {
++                        self.outgoing.send_error(request_id.clone(), error).await;
++                    }
++                    return;
++                }
+ 
+                 let codex_request = deserialize_client_request(request);
+                 let result = match codex_request {
+@@ -692,11 +757,12 @@ impl MessageProcessor {
+                 .subscribe_running_assistant_turn_count();
+             *running_turn_count_rx.borrow()
+         };
++        let active_client_count = self.client_admission.lock().await.active_client_count();
+         self.outgoing
+             .send_raw_response(
+                 request_id,
+                 serde_json::json!({
+-                    "activeClientCount": self.active_client_count.load(Ordering::Acquire),
++                    "activeClientCount": active_client_count,
+                     "buildIdentity": codex_install_context::build_identity(),
+                     "runningAssistantTurnCount": running_assistant_turn_count,
+                 }),
+@@ -705,6 +771,32 @@ impl MessageProcessor {
+         Ok(())
+     }
+ 
++    async fn handle_internal_daemon_claim_idle_request(
++        &self,
++        request_id: ConnectionRequestId,
++        session: &ConnectionSessionState,
++    ) -> Result<(), JSONRPCErrorError> {
++        if session.app_server_client_name() != Some(DAEMON_CLIENT_NAME) {
++            return Err(invalid_request(format!(
++                "Invalid request: unknown method `{INTERNAL_DAEMON_CLAIM_IDLE_METHOD}`"
++            )));
++        }
++        let mut admission = self.client_admission.lock().await;
++        let running_assistant_turn_count = {
++            let running_turn_count_rx = self
++                .thread_processor
++                .subscribe_running_assistant_turn_count();
++            *running_turn_count_rx.borrow()
++        };
++        let claimed = admission
++            .claim_idle_replacement(request_id.connection_id, running_assistant_turn_count);
++        drop(admission);
++        self.outgoing
++            .send_raw_response(request_id, serde_json::json!({ "claimed": claimed }))
++            .await;
++        Ok(())
++    }
++
+     pub(crate) async fn send_initialize_notifications_to_connection(
+         &self,
+         connection_id: ConnectionId,
+@@ -789,8 +881,12 @@ impl MessageProcessor {
+             .connection_closed(connection_id)
+             .await;
+         self.thread_processor.connection_closed(connection_id).await;
++        self.client_admission
++            .lock()
++            .await
++            .release_idle_replacement_claim(connection_id);
+         if session_state.counts_as_active_client() {
+-            self.active_client_count.fetch_sub(1, Ordering::AcqRel);
++            self.client_admission.lock().await.remove_active_client();
+         }
+     }
+ 
+diff --git a/codex-rs/app-server/src/message_processor_admission_tests.rs b/codex-rs/app-server/src/message_processor_admission_tests.rs
+new file mode 100644
+index 0000000000..da3c6c9919
+--- /dev/null
++++ b/codex-rs/app-server/src/message_processor_admission_tests.rs
+@@ -0,0 +1,64 @@
++use super::message_processor::ClientAdmissionState;
++use super::outgoing_message::ConnectionId;
++
++const DAEMON: &str = "codex_app_server_daemon";
++const BACKEND: &str = "codex-backend";
++const CLIENT: &str = "codex-cli";
++const CLAIM_OWNER: ConnectionId = ConnectionId(7);
++
++#[test]
++fn idle_claim_succeeds_and_fences_later_normal_client() {
++    let mut admission = ClientAdmissionState::default();
++
++    assert!(admission.claim_idle_replacement(CLAIM_OWNER, 0));
++    assert!(!admission.admit(CLIENT));
++    assert_eq!(admission.active_client_count(), 0);
++}
++
++#[test]
++fn active_client_denies_claim_without_mutation() {
++    let mut admission = ClientAdmissionState::default();
++
++    assert!(admission.admit(CLIENT));
++    assert!(!admission.claim_idle_replacement(CLAIM_OWNER, 0));
++    admission.remove_active_client();
++    assert!(admission.admit(CLIENT));
++}
++
++#[test]
++fn running_or_pending_turn_denies_claim_without_mutation() {
++    let mut admission = ClientAdmissionState::default();
++
++    assert!(!admission.claim_idle_replacement(CLAIM_OWNER, 1));
++    assert!(admission.admit(CLIENT));
++}
++
++#[test]
++fn daemon_and_backend_remain_admitted_after_claim() {
++    let mut admission = ClientAdmissionState::default();
++
++    assert!(admission.claim_idle_replacement(CLAIM_OWNER, 0));
++    assert!(admission.admit(DAEMON));
++    assert!(admission.admit(BACKEND));
++    assert_eq!(admission.active_client_count(), 0);
++}
++
++#[test]
++fn closing_active_client_decrements_count() {
++    let mut admission = ClientAdmissionState::default();
++
++    assert!(admission.admit(CLIENT));
++    assert_eq!(admission.active_client_count(), 1);
++    admission.remove_active_client();
++    assert_eq!(admission.active_client_count(), 0);
++}
++
++#[test]
++fn only_claim_owner_disconnect_releases_fence() {
++    let mut admission = ClientAdmissionState::default();
++    assert!(admission.claim_idle_replacement(CLAIM_OWNER, 0));
++    admission.release_idle_replacement_claim(ConnectionId(8));
++    assert!(!admission.admit(CLIENT));
++    admission.release_idle_replacement_claim(CLAIM_OWNER);
++    assert!(admission.admit(CLIENT));
++}
+diff --git a/codex-rs/app-server/src/request_processors/initialize_processor.rs b/codex-rs/app-server/src/request_processors/initialize_processor.rs
+index 2b9d9bbdd1..26b2bd44ab 100644
+--- a/codex-rs/app-server/src/request_processors/initialize_processor.rs
++++ b/codex-rs/app-server/src/request_processors/initialize_processor.rs
+@@ -1,5 +1,4 @@
+ use std::sync::atomic::AtomicBool;
+-use std::sync::atomic::AtomicUsize;
+ use std::sync::atomic::Ordering;
+ 
+ use axum::http::HeaderValue;
+@@ -11,11 +10,10 @@ use codex_login::default_client::set_default_client_residency_requirement;
+ use codex_login::default_client::set_default_originator;
+ 
+ use super::*;
++use crate::message_processor::ClientAdmissionState;
+ use crate::message_processor::ConnectionSessionState;
+ use crate::message_processor::InitializedConnectionSessionState;
+ 
+-const NON_ORIGINATING_CLIENT_NAMES: &[&str] = &["codex_app_server_daemon", "codex-backend"];
+-
+ #[derive(Clone)]
+ pub(crate) struct InitializeRequestProcessor {
+     outgoing: Arc<OutgoingMessageSender>,
+@@ -23,7 +21,7 @@ pub(crate) struct InitializeRequestProcessor {
+     config: Arc<Config>,
+     config_warnings: Arc<Vec<ConfigWarningNotification>>,
+     rpc_transport: AppServerRpcTransport,
+-    active_client_count: Arc<AtomicUsize>,
++    client_admission: Arc<Mutex<ClientAdmissionState>>,
+ }
+ 
+ impl InitializeRequestProcessor {
+@@ -33,7 +31,7 @@ impl InitializeRequestProcessor {
+         config: Arc<Config>,
+         config_warnings: Vec<ConfigWarningNotification>,
+         rpc_transport: AppServerRpcTransport,
+-        active_client_count: Arc<AtomicUsize>,
++        client_admission: Arc<Mutex<ClientAdmissionState>>,
+     ) -> Self {
+         Self {
+             outgoing,
+@@ -41,7 +39,7 @@ impl InitializeRequestProcessor {
+             config,
+             config_warnings: Arc::new(config_warnings),
+             rpc_transport,
+-            active_client_count,
++            client_admission,
+         }
+     }
+ 
+@@ -92,8 +90,12 @@ impl InitializeRequestProcessor {
+         }
+         let originator = name.clone();
+         let user_agent_suffix = format!("{name}; {version}");
+-        let mutates_global_identity = !NON_ORIGINATING_CLIENT_NAMES.contains(&name.as_str());
++        let mutates_global_identity = ClientAdmissionState::counts_as_active_client(&name);
+         let codex_home = self.config.codex_home.clone();
++        let mut admission = self.client_admission.lock().await;
++        if !admission.admit(&name) {
++            return Err(invalid_request("Server replacement has been claimed"));
++        }
+         if session
+             .initialize(InitializedConnectionSessionState {
+                 experimental_api_enabled,
+@@ -105,8 +107,12 @@ impl InitializeRequestProcessor {
+             })
+             .is_err()
+         {
++            if mutates_global_identity {
++                admission.remove_active_client();
++            }
+             return Err(invalid_request("Already initialized"));
+         }
++        drop(admission);
+ 
+         if mutates_global_identity {
+             // Only real client initialization may mutate process-global client metadata.
+@@ -138,10 +144,6 @@ impl InitializeRequestProcessor {
+             *suffix = Some(user_agent_suffix);
+         }
+ 
+-        if mutates_global_identity {
+-            self.active_client_count.fetch_add(1, Ordering::AcqRel);
+-        }
+-
+         let user_agent = get_codex_user_agent();
+         let response = InitializeResponse {
+             user_agent,
+diff --git a/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs b/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs
+index 28724e97bb..32f11ed069 100644
+--- a/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs
++++ b/codex-rs/app-server/tests/suite/v2/connection_handling_websocket.rs
+@@ -72,6 +72,11 @@ struct DaemonStatusResponse {
+     running_assistant_turn_count: usize,
+ }
+ 
++#[derive(Debug, Deserialize)]
++struct DaemonIdleClaimResponse {
++    claimed: bool,
++}
++
+ #[tokio::test]
+ async fn websocket_transport_routes_per_connection_handshake_and_responses() -> Result<()> {
+     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+@@ -153,6 +158,17 @@ async fn daemon_status_reports_only_initialized_active_clients() -> Result<()> {
+     send_daemon_status_request(&mut client, /*id*/ 200).await?;
+     let unauthorized = read_error_for_id(&mut client, /*id*/ 200).await?;
+     assert!(unauthorized.error.message.contains("unknown method"));
++    send_daemon_idle_claim_request(&mut client, /*id*/ 201).await?;
++    let unauthorized = read_error_for_id(&mut client, /*id*/ 201).await?;
++    assert!(unauthorized.error.message.contains("unknown method"));
++
++    send_daemon_idle_claim_request(&mut daemon, /*id*/ 102).await?;
++    assert!(
++        !read_daemon_idle_claim_response(&mut daemon, 102)
++            .await?
++            .claimed,
++        "active client denies idle replacement claim"
++    );
+ 
+     send_daemon_status_request(&mut daemon, /*id*/ 104).await?;
+     let status = read_daemon_status_response(&mut daemon, /*id*/ 104).await?;
+@@ -175,6 +191,32 @@ async fn daemon_status_reports_only_initialized_active_clients() -> Result<()> {
+     }
+     assert!(observed_zero, "active client count returns to zero");
+ 
++    send_daemon_idle_claim_request(&mut daemon, /*id*/ 116).await?;
++    assert!(
++        read_daemon_idle_claim_response(&mut daemon, 116)
++            .await?
++            .claimed,
++        "idle daemon grants replacement claim"
++    );
++    let mut blocked_client = connect_websocket(bind_addr).await?;
++    send_initialize_request(&mut blocked_client, /*id*/ 117, "blocked_client").await?;
++    let blocked = read_error_for_id(&mut blocked_client, /*id*/ 117).await?;
++    assert!(
++        blocked
++            .error
++            .message
++            .contains("replacement has been claimed")
++    );
++    let mut daemon_after_claim = connect_websocket(bind_addr).await?;
++    send_initialize_request(
++        &mut daemon_after_claim,
++        /*id*/ 118,
++        "codex_app_server_daemon",
++    )
++    .await?;
++    let _: InitializeResponse =
++        to_response(read_response_for_id(&mut daemon_after_claim, 118).await?)?;
++
+     process
+         .kill()
+         .await
+@@ -920,6 +962,19 @@ async fn send_daemon_status_request(stream: &mut WsClient, id: i64) -> Result<()
+     .await
+ }
+ 
++async fn send_daemon_idle_claim_request(stream: &mut WsClient, id: i64) -> Result<()> {
++    send_jsonrpc(
++        stream,
++        JSONRPCMessage::Request(JSONRPCRequest {
++            id: RequestId::Integer(id),
++            method: "internal/daemon/claimIdleReplacement".to_string(),
++            params: None,
++            trace: None,
++        }),
++    )
++    .await
++}
++
+ async fn read_daemon_status_response(
+     stream: &mut WsClient,
+     id: i64,
+@@ -927,6 +982,13 @@ async fn read_daemon_status_response(
+     to_response(read_response_for_id(stream, id).await?)
+ }
+ 
++async fn read_daemon_idle_claim_response(
++    stream: &mut WsClient,
++    id: i64,
++) -> Result<DaemonIdleClaimResponse> {
++    to_response(read_response_for_id(stream, id).await?)
++}
++
+ pub(super) async fn read_notification_for_method(
+     stream: &mut WsClient,
+     method: &str,

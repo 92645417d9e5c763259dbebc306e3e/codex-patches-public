@@ -1,0 +1,142 @@
+diff --git a/codex-rs/core/src/tools/code_mode/execute_spec.rs b/codex-rs/core/src/tools/code_mode/execute_spec.rs
+index 9987396556..30ee234b4e 100644
+--- a/codex-rs/core/src/tools/code_mode/execute_spec.rs
++++ b/codex-rs/core/src/tools/code_mode/execute_spec.rs
+@@ -3,6 +3,16 @@ use codex_tools::FreeformTool;
+ use codex_tools::FreeformToolFormat;
+ use codex_tools::ToolSpec;
+ use std::collections::BTreeMap;
++use std::path::Path;
++
++const CODE_MODE_EXEC_INSTRUCTIONS_RELATIVE_PATH: &str = "instructions/code-mode-exec.md";
++
++pub(crate) fn load_code_mode_exec_instructions(codex_home: &Path) -> Option<String> {
++    std::fs::read_to_string(codex_home.join(CODE_MODE_EXEC_INSTRUCTIONS_RELATIVE_PATH))
++        .ok()
++        .map(|contents| contents.trim().to_string())
++        .filter(|contents| !contents.is_empty())
++}
+ 
+ pub(crate) fn create_code_mode_tool(
+     enabled_tools: &[CodeModeToolDefinition],
+@@ -10,6 +20,7 @@ pub(crate) fn create_code_mode_tool(
+     namespace_descriptions: &BTreeMap<String, codex_code_mode::ToolNamespaceDescription>,
+     default_exec_yield_time_ms: u64,
+     code_mode_only: bool,
++    code_mode_exec_instructions: Option<&str>,
+ ) -> ToolSpec {
+     const CODE_MODE_FREEFORM_GRAMMAR: &str = r#"
+ start: pragma_source | plain_source
+@@ -21,15 +32,24 @@ NEWLINE: /\r?\n/
+ SOURCE: /[\s\S]+/
+ "#;
+ 
++    let mut description = codex_code_mode::build_exec_tool_description(
++        enabled_tools,
++        deferred_tools,
++        namespace_descriptions,
++        default_exec_yield_time_ms,
++        code_mode_only,
++    );
++    if let Some(instructions) = code_mode_exec_instructions
++        .map(str::trim)
++        .filter(|instructions| !instructions.is_empty())
++    {
++        description.push_str("\n\n");
++        description.push_str(instructions);
++    }
++
+     ToolSpec::Freeform(FreeformTool {
+         name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
+-        description: codex_code_mode::build_exec_tool_description(
+-            enabled_tools,
+-            deferred_tools,
+-            namespace_descriptions,
+-            default_exec_yield_time_ms,
+-            code_mode_only,
+-        ),
++        description,
+         format: FreeformToolFormat {
+             r#type: "grammar".to_string(),
+             syntax: "lark".to_string(),
+@@ -62,6 +82,7 @@ mod tests {
+                 &BTreeMap::new(),
+                 codex_code_mode::DEFAULT_EXEC_YIELD_TIME_MS,
+                 /*code_mode_only*/ true,
++                /*code_mode_exec_instructions*/ None,
+             ),
+             ToolSpec::Freeform(FreeformTool {
+                 name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
+@@ -89,4 +110,43 @@ SOURCE: /[\s\S]+/
+             })
+         );
+     }
++
++    #[test]
++    fn create_code_mode_tool_appends_editable_exec_guidance_in_both_modes() {
++        for code_mode_only in [false, true] {
++            let ToolSpec::Freeform(tool) = create_code_mode_tool(
++                &[],
++                &[],
++                &BTreeMap::new(),
++                codex_code_mode::DEFAULT_EXEC_YIELD_TIME_MS,
++                code_mode_only,
++                Some("Editable batching guidance."),
++            ) else {
++                panic!("code mode tool must remain freeform");
++            };
++            assert!(tool.description.contains("Editable batching guidance."));
++        }
++    }
++
++    #[test]
++    fn code_mode_exec_instructions_file_is_optional_and_empty_safe() {
++        let codex_home = tempfile::tempdir().expect("tempdir");
++        assert_eq!(load_code_mode_exec_instructions(codex_home.path()), None);
++
++        let instructions_dir = codex_home.path().join("instructions");
++        std::fs::create_dir_all(&instructions_dir).expect("create instructions dir");
++        std::fs::write(
++            instructions_dir.join("code-mode-exec.md"),
++            "  Batch independent calls.  \n",
++        )
++        .expect("write instructions");
++        assert_eq!(
++            load_code_mode_exec_instructions(codex_home.path()).as_deref(),
++            Some("Batch independent calls.")
++        );
++
++        std::fs::write(instructions_dir.join("code-mode-exec.md"), " \n")
++            .expect("write empty instructions");
++        assert_eq!(load_code_mode_exec_instructions(codex_home.path()), None);
++    }
+ }
+diff --git a/codex-rs/core/src/tools/spec_plan.rs b/codex-rs/core/src/tools/spec_plan.rs
+index c9dbba0d33..d53bc82054 100644
+--- a/codex-rs/core/src/tools/spec_plan.rs
++++ b/codex-rs/core/src/tools/spec_plan.rs
+@@ -4,6 +4,7 @@ use crate::environment_selection::TurnEnvironmentSnapshot;
+ use crate::session::turn_context::TurnContext;
+ use crate::tools::code_mode::default_exec_yield_time_override_ms;
+ use crate::tools::code_mode::execute_spec::create_code_mode_tool;
++use crate::tools::code_mode::execute_spec::load_code_mode_exec_instructions;
+ use crate::tools::context::ToolInvocation;
+ use crate::tools::effective_tool_mode;
+ use crate::tools::handlers::ApplyPatchHandler;
+@@ -503,6 +504,8 @@ fn build_code_mode_executors(
+     let default_exec_yield_time_ms =
+         default_exec_yield_time_override_ms(&turn_context.config.features)
+             .unwrap_or(codex_code_mode::DEFAULT_EXEC_YIELD_TIME_MS);
++    let code_mode_exec_instructions =
++        load_code_mode_exec_instructions(turn_context.config.codex_home.as_path());
+ 
+     vec![
+         Arc::new(CodeModeExecuteHandler::new(
+@@ -512,6 +515,7 @@ fn build_code_mode_executors(
+                 &namespace_descriptions,
+                 default_exec_yield_time_ms,
+                 tool_mode == ToolMode::CodeModeOnly,
++                code_mode_exec_instructions.as_deref(),
+             ),
+             code_mode_nested_tool_specs,
+         )),
