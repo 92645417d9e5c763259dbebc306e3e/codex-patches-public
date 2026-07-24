@@ -1,3 +1,85 @@
+diff --git a/codex-rs/app-server/src/request_processors/prompt_assistant_processor.rs b/codex-rs/app-server/src/request_processors/prompt_assistant_processor.rs
+index 45412973c7..60a009d586 100644
+--- a/codex-rs/app-server/src/request_processors/prompt_assistant_processor.rs
++++ b/codex-rs/app-server/src/request_processors/prompt_assistant_processor.rs
+@@ -29,7 +29,6 @@ use codex_protocol::models::ResponseItem;
+ use codex_protocol::openai_models::ModelInfo;
+ use codex_protocol::openai_models::ModelVisibility;
+ use codex_protocol::openai_models::ReasoningEffort;
+-use codex_protocol::protocol::AgentStatus;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::Op;
+ use codex_protocol::protocol::ThreadSettingsOverrides;
+@@ -114,15 +113,6 @@ impl PromptAssistantRequestProcessor {
+                 "Prompt Assistant is available only from the root session",
+             ));
+         }
+-        if matches!(
+-            parent.agent_status().await,
+-            AgentStatus::PendingInit | AgentStatus::Running
+-        ) {
+-            return Err(invalid_params(
+-                "Prompt Assistant cannot run while the parent turn is active",
+-            ));
+-        }
+-
+         let guardian_model = parent.guardian_review_model_id().await;
+         let models = eligible_models(
+             self.inner
+diff --git a/codex-rs/core/src/prompt_assistant.rs b/codex-rs/core/src/prompt_assistant.rs
+index 0164784253..642c6ee1c3 100644
+--- a/codex-rs/core/src/prompt_assistant.rs
++++ b/codex-rs/core/src/prompt_assistant.rs
+@@ -568,10 +568,22 @@ fn load_or_seed_instructions_sync(codex_home: &Path) -> Result<String> {
+ }
+ 
+ fn is_known_bundled_default(instructions: &str) -> bool {
++    let accidental_behavior_rule = "- Treat every distinct requested behavior, interaction, key binding, hook or automation contract, exception, and verification condition as material; verify that each remains explicit in the candidate before returning ready.\n";
++    let previous_default = DEFAULT_INSTRUCTIONS.replacen(
++        " and translate all natural-language prose to English",
++        "",
++        1,
++    );
++    let accidental_default = previous_default.replacen(
++        "- Remove filler, repetition",
++        &format!("{accidental_behavior_rule}- Remove filler, repetition"),
++        1,
++    );
+     matches!(
+         instructions,
+         OLD_DEFAULT_INSTRUCTIONS | PREVIOUS_REWRITE_ONLY_DEFAULT_INSTRUCTIONS
+-    )
++    ) || instructions == previous_default
++        || instructions == accidental_default
+ }
+ 
+ struct SeedLock(PathBuf, fs::File);
+@@ -788,8 +800,6 @@ mod tests {
+             "English ASCII",
+             "ATX headings",
+             "flat `- ` items at column one",
+-            "key binding",
+-            "hook or automation contract",
+             "one coherent rule on one physical line",
+             "numbered or nested lists, tables, or hard-wrapped coherent items",
+             "Front matter and fenced code may retain their owning syntax",
+diff --git a/codex-rs/core/src/prompt_assistant/default_instructions.md b/codex-rs/core/src/prompt_assistant/default_instructions.md
+index 1745f6a029..05ec6ac589 100644
+--- a/codex-rs/core/src/prompt_assistant/default_instructions.md
++++ b/codex-rs/core/src/prompt_assistant/default_instructions.md
+@@ -1,11 +1,10 @@
+ # Prompt Assistant
+ 
+-- Rewrite the newest raw user message into one complete, clear English Markdown prompt; earlier Prompt Assistant turns and projected parent messages are context only, are not revision commands, and must not change which message you rewrite.
++- Rewrite the newest raw user message into one complete, clear English Markdown prompt and translate all natural-language prose to English; earlier Prompt Assistant turns and projected parent messages are context only, are not revision commands, and must not change which message you rewrite.
+ 
+ # Fidelity
+ 
+ - Preserve the user's objective, facts, intended scope, constraints, authorization boundaries, exact literals, paths, commands, keys, quoted content, and meaningful Markdown structure.
+-- Treat every distinct requested behavior, interaction, key binding, hook or automation contract, exception, and verification condition as material; verify that each remains explicit in the candidate before returning ready.
+ - Remove filler, repetition, emotional phrasing, conversational noise, and unrelated material only when doing so does not remove a fact, constraint, authorization boundary, or intended nuance.
+ - Reorder and deduplicate material when it improves clarity.
+ - Do not broaden the objective, invent requirements, claim authorization, or remove material constraints.
 diff --git a/codex-rs/tui/src/app/app_server_event_targets.rs b/codex-rs/tui/src/app/app_server_event_targets.rs
 index 95ede3203a..b67992e727 100644
 --- a/codex-rs/tui/src/app/app_server_event_targets.rs
@@ -40,7 +122,7 @@ index 95ede3203a..b67992e727 100644
 +    }
  }
 diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
-index fbeccb65d6..e41d3c30b9 100644
+index fbeccb65d6..8a2945a409 100644
 --- a/codex-rs/tui/src/app/event_dispatch.rs
 +++ b/codex-rs/tui/src/app/event_dispatch.rs
 @@ -21,6 +21,38 @@ impl App {
@@ -82,8 +164,25 @@ index fbeccb65d6..e41d3c30b9 100644
              AppEvent::NewSession { name } => {
                  self.start_fresh_session_with_summary_hint(
                      tui, app_server, /*session_start_source*/ None,
+@@ -1128,6 +1160,16 @@ impl App {
+             AppEvent::OpenAllModelsPopup { models } => {
+                 self.chat_widget.open_all_models_popup(models);
+             }
++            AppEvent::OpenMainModelPopup { models } => {
++                self.chat_widget.open_model_popup_with_presets(models);
++            }
++            AppEvent::OpenPromptAssistantModelsPopup { models } => {
++                self.chat_widget.open_prompt_assistant_models_popup(models);
++            }
++            AppEvent::SelectPromptAssistantModel { model, effort } => {
++                self.chat_widget
++                    .select_prompt_assistant_model(model, effort);
++            }
+             AppEvent::OpenFullAccessConfirmation {
+                 preset,
+                 return_to_permissions,
 diff --git a/codex-rs/tui/src/app/input.rs b/codex-rs/tui/src/app/input.rs
-index 0a0e66dfab..ea9bdea07e 100644
+index 0a0e66dfab..31e2180196 100644
 --- a/codex-rs/tui/src/app/input.rs
 +++ b/codex-rs/tui/src/app/input.rs
 @@ -133,6 +133,14 @@ impl App {
@@ -114,7 +213,7 @@ index 0a0e66dfab..ea9bdea07e 100644
 +                    .prompt_assistant
 +                    .first()
 +                    .map(crate::key_hint::KeyBinding::display_label)
-+                    .unwrap_or_else(|| "Alt+P".to_string()),
++                    .unwrap_or_else(|| "Shift+Enter".to_string()),
 +            );
 +            self.chat_widget.open_prompt_assistant();
 +            return;
@@ -124,7 +223,7 @@ index 0a0e66dfab..ea9bdea07e 100644
              self.chat_widget.toggle_vim_mode_and_notify();
              return;
 diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
-index e25dbe482c..807721adba 100644
+index e25dbe482c..bcdad60f8d 100644
 --- a/codex-rs/tui/src/app_event.rs
 +++ b/codex-rs/tui/src/app_event.rs
 @@ -29,6 +29,8 @@ use codex_app_server_protocol::PluginMarketplaceEntry;
@@ -153,6 +252,29 @@ index e25dbe482c..807721adba 100644
      /// Open the agent picker for switching active threads.
      OpenAgentPicker,
      /// Switch the active thread to the selected agent.
+@@ -816,6 +828,22 @@ pub(crate) enum AppEvent {
+         models: Vec<ModelPreset>,
+     },
+ 
++    /// Open the ordinary conversation-model picker after choosing its `/model` scope.
++    OpenMainModelPopup {
++        models: Vec<ModelPreset>,
++    },
++
++    /// Open the Prompt Assistant model picker after choosing its `/model` scope.
++    OpenPromptAssistantModelsPopup {
++        models: Vec<ModelPreset>,
++    },
++
++    /// Apply a Prompt Assistant-only model selection.
++    SelectPromptAssistantModel {
++        model: String,
++        effort: ReasoningEffort,
++    },
++
+     /// Open the confirmation prompt before enabling full access mode.
+     OpenFullAccessConfirmation {
+         preset: ApprovalPreset,
 diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
 index 5b248541da..e0781b7c8e 100644
 --- a/codex-rs/tui/src/app_server_session.rs
@@ -204,10 +326,18 @@ index 5b248541da..e0781b7c8e 100644
      request_handle: AppServerRequestHandle,
      config: Config,
 diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
-index b2d91eb442..afbc31280f 100644
+index b2d91eb442..ab6e7e9a7e 100644
 --- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
 +++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
-@@ -427,6 +427,8 @@ pub(crate) struct ChatComposerConfig {
+@@ -220,6 +220,7 @@ use super::footer::context_window_line;
+ use super::footer::esc_hint_mode;
+ use super::footer::footer_height;
+ use super::footer::footer_hint_items_width;
++use super::footer::footer_line;
+ use super::footer::footer_line_width;
+ use super::footer::inset_footer_hint_area;
+ use super::footer::max_left_width_for_right;
+@@ -427,6 +428,8 @@ pub(crate) struct ChatComposerConfig {
      pub(crate) slash_commands_enabled: bool,
      /// Whether pasting a file path can attach local images.
      pub(crate) image_paste_enabled: bool,
@@ -216,7 +346,7 @@ index b2d91eb442..afbc31280f 100644
  }
  
  impl Default for ChatComposerConfig {
-@@ -435,6 +437,7 @@ impl Default for ChatComposerConfig {
+@@ -435,6 +438,7 @@ impl Default for ChatComposerConfig {
              popups_enabled: true,
              slash_commands_enabled: true,
              image_paste_enabled: true,
@@ -224,7 +354,7 @@ index b2d91eb442..afbc31280f 100644
          }
      }
  }
-@@ -449,6 +452,7 @@ impl ChatComposerConfig {
+@@ -449,6 +453,7 @@ impl ChatComposerConfig {
              popups_enabled: false,
              slash_commands_enabled: false,
              image_paste_enabled: false,
@@ -232,7 +362,7 @@ index b2d91eb442..afbc31280f 100644
          }
      }
  }
-@@ -523,6 +527,7 @@ struct ComposerDraft {
+@@ -523,6 +528,7 @@ struct ComposerDraft {
  #[derive(Clone, Debug, PartialEq)]
  pub(crate) struct ComposerDraftSnapshot {
      pub(crate) text: String,
@@ -240,7 +370,15 @@ index b2d91eb442..afbc31280f 100644
      pub(crate) text_elements: Vec<TextElement>,
      pub(crate) local_images: Vec<LocalImageAttachment>,
      pub(crate) remote_image_urls: Vec<String>,
-@@ -1091,6 +1096,9 @@ impl ChatComposer {
+@@ -616,6 +622,7 @@ impl ChatComposer {
+                 use_shift_enter_hint,
+                 mode: FooterMode::ComposerEmpty,
+                 hint_override: None,
++                supplemental_hint: None,
+                 plan_mode_nudge_visible: false,
+                 flash: None,
+                 context_window_percent: None,
+@@ -1091,6 +1098,9 @@ impl ChatComposer {
      /// In all cases, clears any paste-burst Enter suppression state so a real paste cannot affect
      /// the next user Enter key, then syncs popup state.
      pub fn handle_paste(&mut self, pasted: String) -> bool {
@@ -250,7 +388,7 @@ index b2d91eb442..afbc31280f 100644
          let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
          let pasted = sanitize_user_text(&pasted);
          let char_count = pasted.chars().count();
-@@ -1169,6 +1177,10 @@ impl ChatComposer {
+@@ -1169,6 +1179,10 @@ impl ChatComposer {
      /// are renumbered to `[Image #M+1]..[Image #N]` (where `M` is the number of
      /// remote images). Cursor is placed at the end after rebuilding elements.
      pub(crate) fn apply_external_edit(&mut self, text: String) {
@@ -261,7 +399,19 @@ index b2d91eb442..afbc31280f 100644
          self.draft.pending_pastes.clear();
          let (text, _) = self.imported_text_for_textarea(text, Vec::new());
  
-@@ -1403,11 +1415,14 @@ impl ChatComposer {
+@@ -1368,6 +1382,11 @@ impl ChatComposer {
+         self.footer.hint_override = items;
+     }
+ 
++    /// Add a lower-priority hint without replacing the composer's native footer.
++    pub(crate) fn set_footer_supplemental_hint(&mut self, items: Option<Vec<(String, String)>>) {
++        self.footer.supplemental_hint = items;
++    }
++
+     /// Updates whether the Plan-mode nudge replaces the ambient footer row.
+     ///
+     /// Returns `true` only when the rendered footer can change so callers can avoid scheduling
+@@ -1403,11 +1422,14 @@ impl ChatComposer {
          urls
      }
  
@@ -277,7 +427,7 @@ index b2d91eb442..afbc31280f 100644
      /// Replace the entire composer content with `text` and reset cursor.
      ///
      /// This is the "fresh draft" path: it clears pending paste payloads and
-@@ -1671,6 +1686,7 @@ impl ChatComposer {
+@@ -1671,6 +1693,7 @@ impl ChatComposer {
      pub(crate) fn draft_snapshot(&self) -> ComposerDraftSnapshot {
          ComposerDraftSnapshot {
              text: self.current_text(),
@@ -285,7 +435,7 @@ index b2d91eb442..afbc31280f 100644
              text_elements: self.text_elements(),
              local_images: self.local_images(),
              remote_image_urls: self.remote_image_urls(),
-@@ -1679,6 +1695,26 @@ impl ChatComposer {
+@@ -1679,6 +1702,26 @@ impl ChatComposer {
          }
      }
  
@@ -312,7 +462,7 @@ index b2d91eb442..afbc31280f 100644
      #[cfg(test)]
      pub(crate) fn local_image_paths(&self) -> Vec<PathBuf> {
          self.attachments.local_image_paths()
-@@ -1713,6 +1749,10 @@ impl ChatComposer {
+@@ -1713,6 +1756,10 @@ impl ChatComposer {
  
      /// Insert an attachment placeholder and track it for the next submission.
      pub fn attach_image(&mut self, path: PathBuf) {
@@ -323,7 +473,7 @@ index b2d91eb442..afbc31280f 100644
          self.attachments
              .attach_image(&mut self.draft.textarea, path);
      }
-@@ -1840,6 +1880,10 @@ impl ChatComposer {
+@@ -1840,6 +1887,10 @@ impl ChatComposer {
      }
  
      pub(crate) fn insert_str(&mut self, text: &str) {
@@ -334,7 +484,7 @@ index b2d91eb442..afbc31280f 100644
          self.draft.textarea.insert_str(text);
          self.sync_bash_mode_from_text();
          self.sync_popups();
-@@ -3410,9 +3454,11 @@ impl ChatComposer {
+@@ -3410,9 +3461,11 @@ impl ChatComposer {
              )
          };
          if history_up_pressed || history_down_pressed {
@@ -349,7 +499,7 @@ index b2d91eb442..afbc31280f 100644
              {
                  let replace_entry = if history_up_pressed {
                      self.history.navigate_up(&self.app_event_tx)
-@@ -3789,9 +3835,10 @@ impl ChatComposer {
+@@ -3789,9 +3842,10 @@ impl ChatComposer {
          } else {
              self.current_editable_at_token_range_with_options(/*allow_empty*/ false)
          };
@@ -363,7 +513,7 @@ index b2d91eb442..afbc31280f 100644
          // When browsing input history (shell-style Up/Down recall), skip all popup
          // synchronization so nothing steals focus from continued history navigation.
          if browsing_history {
-@@ -4182,9 +4229,13 @@ impl ChatComposer {
+@@ -4182,9 +4236,13 @@ impl ChatComposer {
          self.draft.input_enabled = enabled;
          self.draft.input_disabled_placeholder = if enabled { None } else { placeholder };
  
@@ -380,7 +530,93 @@ index b2d91eb442..afbc31280f 100644
          }
      }
  
-@@ -4784,7 +4835,9 @@ impl ChatComposer {
+@@ -4592,25 +4650,46 @@ impl ChatComposer {
+                             show_submit_hook_hint,
+                         )
+                     };
+-                    let right_line =
+-                        if let Some(label) = self.footer.side_conversation_context_label.as_ref() {
+-                            Some(side_conversation_context_line(label))
+-                        } else if let Some(line) = self.shell_mode_footer_line() {
+-                            Some(line)
+-                        } else if transition_active {
+-                            None
+-                        } else if status_line_active {
+-                            let full = self.mode_indicator_line(show_cycle_hint);
+-                            let compact = self.mode_indicator_line(/*show_cycle_hint*/ false);
+-                            let full_width = full.as_ref().map(|l| l.width() as u16).unwrap_or(0);
+-                            if can_show_left_with_context(hint_rect, left_width, full_width) {
+-                                full
+-                            } else {
+-                                compact
+-                            }
++                    let supplemental_line = self.footer.supplemental_hint.as_ref().map(|items| {
++                        let mut line = footer_line(
++                            &footer_props,
++                            left_mode_indicator,
++                            show_cycle_hint,
++                            show_shortcuts_hint,
++                            show_queue_hint,
++                            show_submit_hook_hint,
++                        );
++                        for (key, label) in items {
++                            line.spans.push(" ▪ ".dim());
++                            line.spans.push(key.clone().bold());
++                            line.spans.push(format!(" {label}").into());
++                        }
++                        line
++                    });
++                    if let Some(line) = supplemental_line.as_ref() {
++                        left_width = line.width() as u16;
++                    }
++                    let right_line = if supplemental_line.is_some() {
++                        None
++                    } else if let Some(label) = self.footer.side_conversation_context_label.as_ref()
++                    {
++                        Some(side_conversation_context_line(label))
++                    } else if let Some(line) = self.shell_mode_footer_line() {
++                        Some(line)
++                    } else if transition_active {
++                        None
++                    } else if status_line_active {
++                        let full = self.mode_indicator_line(show_cycle_hint);
++                        let compact = self.mode_indicator_line(/*show_cycle_hint*/ false);
++                        let full_width = full.as_ref().map(|l| l.width() as u16).unwrap_or(0);
++                        if can_show_left_with_context(hint_rect, left_width, full_width) {
++                            full
+                         } else {
+-                            Some(self.right_footer_line_with_context())
+-                        };
++                            compact
++                        }
++                    } else {
++                        Some(self.right_footer_line_with_context())
++                    };
+                     let right_width = right_line.as_ref().map(|l| l.width() as u16).unwrap_or(0);
+                     if status_line_active
+                         && let Some(max_left) = max_left_width_for_right(hint_rect, right_width)
+@@ -4624,8 +4703,9 @@ impl ChatComposer {
+                     }
+                     let can_show_left_and_context =
+                         can_show_left_with_context(hint_rect, left_width, right_width);
+-                    let has_override =
+-                        self.footer.flash_visible() || active_footer_hint_override.is_some();
++                    let has_override = self.footer.flash_visible()
++                        || active_footer_hint_override.is_some()
++                        || supplemental_line.is_some();
+                     let single_line_layout = if has_override || status_line_active {
+                         None
+                     } else {
+@@ -4709,6 +4789,8 @@ impl ChatComposer {
+                         }
+                     } else if let Some(items) = active_footer_hint_override {
+                         render_footer_hint_items(hint_rect, buf, items);
++                    } else if let Some(line) = supplemental_line {
++                        render_footer_line(hint_rect, buf, line);
+                     } else if status_line_active {
+                         if let Some(line) = truncated_status_line {
+                             render_footer_line(hint_rect, buf, line);
+@@ -4784,7 +4866,9 @@ impl ChatComposer {
  
          let mut state = self.draft.textarea_state.borrow_mut();
          let textarea_is_empty = self.draft.textarea.text().is_empty() && !self.draft.is_bash_mode;
@@ -391,7 +627,7 @@ index b2d91eb442..afbc31280f 100644
              if let Some(mask_char) = mask_char {
                  self.draft
                      .textarea
-@@ -4816,8 +4869,8 @@ impl ChatComposer {
+@@ -4816,8 +4900,8 @@ impl ChatComposer {
                  }
              }
          }
@@ -402,7 +638,7 @@ index b2d91eb442..afbc31280f 100644
                  self.placeholder_text.as_str().to_string()
              } else {
                  self.draft
-@@ -12618,4 +12671,30 @@ mod tests {
+@@ -12618,4 +12702,30 @@ mod tests {
              .unwrap();
          insta::assert_snapshot!("shutdown_in_progress", terminal.backend());
      }
@@ -434,7 +670,7 @@ index b2d91eb442..afbc31280f 100644
 +    }
  }
 diff --git a/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs b/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
-index eea6f22b93..a090480ba8 100644
+index eea6f22b93..1006228717 100644
 --- a/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
 +++ b/codex-rs/tui/src/bottom_pane/chat_composer/footer_state.rs
 @@ -1,5 +1,6 @@
@@ -453,7 +689,15 @@ index eea6f22b93..a090480ba8 100644
  
  pub(super) struct FooterState {
      pub(super) quit_shortcut_expires_at: Option<Instant>,
-@@ -54,7 +53,6 @@ impl FooterState {
+@@ -18,6 +17,7 @@ pub(super) struct FooterState {
+     pub(super) use_shift_enter_hint: bool,
+     pub(super) mode: FooterMode,
+     pub(super) hint_override: Option<Vec<(String, String)>>,
++    pub(super) supplemental_hint: Option<Vec<(String, String)>>,
+     pub(super) plan_mode_nudge_visible: bool,
+     pub(super) flash: Option<FooterFlash>,
+     pub(super) context_window_percent: Option<i64>,
+@@ -54,7 +54,6 @@ impl FooterState {
              .is_some_and(|flash| Instant::now() < flash.expires_at)
      }
  
@@ -477,8 +721,48 @@ index a0af332528..fea58c9da0 100644
      // ---------------------------------------------------------------------
      // Internal helpers
      // ---------------------------------------------------------------------
+diff --git a/codex-rs/tui/src/bottom_pane/footer.rs b/codex-rs/tui/src/bottom_pane/footer.rs
+index 21c81c2a34..65324ab760 100644
+--- a/codex-rs/tui/src/bottom_pane/footer.rs
++++ b/codex-rs/tui/src/bottom_pane/footer.rs
+@@ -872,6 +872,26 @@ pub(crate) fn footer_line_width(
+     .unwrap_or(0)
+ }
+ 
++pub(crate) fn footer_line(
++    props: &FooterProps,
++    collaboration_mode_indicator: Option<CollaborationModeIndicator>,
++    show_cycle_hint: bool,
++    show_shortcuts_hint: bool,
++    show_queue_hint: bool,
++    show_submit_hook_hint: bool,
++) -> Line<'static> {
++    footer_from_props_lines(
++        props,
++        collaboration_mode_indicator,
++        show_cycle_hint,
++        show_shortcuts_hint,
++        show_queue_hint,
++        show_submit_hook_hint,
++    )
++    .pop()
++    .unwrap_or_default()
++}
++
+ pub(crate) fn footer_hint_items_width(items: &[(String, String)]) -> u16 {
+     if items.is_empty() {
+         return 0;
+@@ -879,7 +899,7 @@ pub(crate) fn footer_hint_items_width(items: &[(String, String)]) -> u16 {
+     footer_hint_items_line(items).width() as u16
+ }
+ 
+-fn footer_hint_items_line(items: &[(String, String)]) -> Line<'static> {
++pub(crate) fn footer_hint_items_line(items: &[(String, String)]) -> Line<'static> {
+     let mut spans = Vec::with_capacity(items.len() * 4);
+     for (idx, (key, label)) in items.iter().enumerate() {
+         spans.push(" ".into());
 diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
-index 8ec98eb0e6..0c80d4ad68 100644
+index 8ec98eb0e6..3d9d1147f5 100644
 --- a/codex-rs/tui/src/bottom_pane/mod.rs
 +++ b/codex-rs/tui/src/bottom_pane/mod.rs
 @@ -677,6 +677,7 @@ impl BottomPane {
@@ -511,10 +795,15 @@ index 8ec98eb0e6..0c80d4ad68 100644
      #[cfg(test)]
      pub(crate) fn composer_text_elements(&self) -> Vec<TextElement> {
          self.composer.text_elements()
-@@ -908,6 +917,12 @@ impl BottomPane {
+@@ -908,6 +917,17 @@ impl BottomPane {
          self.request_redraw();
      }
  
++    pub(crate) fn set_footer_supplemental_hint(&mut self, items: Option<Vec<(String, String)>>) {
++        self.composer.set_footer_supplemental_hint(items);
++        self.request_redraw();
++    }
++
 +    pub(crate) fn show_footer_flash(&mut self, line: Line<'static>, duration: Duration) {
 +        self.composer.show_footer_flash(line, duration);
 +        self.request_redraw();
@@ -525,7 +814,7 @@ index 8ec98eb0e6..0c80d4ad68 100644
      pub(crate) fn set_plan_mode_nudge_visible(&mut self, visible: bool) {
          if self.composer.set_plan_mode_nudge_visible(visible) {
 diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
-index 08d236ef18..5bb960dc07 100644
+index 4111462f33..78d82da6e8 100644
 --- a/codex-rs/tui/src/chatwidget.rs
 +++ b/codex-rs/tui/src/chatwidget.rs
 @@ -386,6 +386,7 @@ mod notifications;
@@ -545,7 +834,7 @@ index 08d236ef18..5bb960dc07 100644
      codex_op_target: CodexOpTarget,
      bottom_pane: BottomPane,
      transcript: TranscriptState,
-@@ -709,6 +712,8 @@ pub(crate) struct ChatWidget {
+@@ -713,6 +716,8 @@ pub(crate) struct ChatWidget {
      input_queue: InputQueueState,
      /// Main chat-surface bindings resolved from `tui.keymap.chat`.
      chat_keymap: ChatKeymap,
@@ -555,7 +844,7 @@ index 08d236ef18..5bb960dc07 100644
      /// into the composer. This may differ from the first configured binding
      /// when the default set includes a terminal-specific fallback.
 diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
-index aeb0622bf8..34e3d0e82d 100644
+index 9528fa8cd1..8b123c2b71 100644
 --- a/codex-rs/tui/src/chatwidget/constructor.rs
 +++ b/codex-rs/tui/src/chatwidget/constructor.rs
 @@ -81,6 +81,12 @@ impl ChatWidget {
@@ -567,7 +856,7 @@ index aeb0622bf8..34e3d0e82d 100644
 +            .and_then(|keymap| keymap.composer.prompt_assistant.first())
 +            .or_else(|| default_keymap.composer.prompt_assistant.first())
 +            .map(crate::key_hint::KeyBinding::display_label)
-+            .unwrap_or_else(|| "Alt+P".to_string());
++            .unwrap_or_else(|| "Shift+Enter".to_string());
          let queued_message_edit_hint_binding = queued_message_edit_hint_binding(
              &chat_keymap.edit_queued_message,
              current_terminal_info,
@@ -634,30 +923,121 @@ index d8581e7af3..f454e571a7 100644
              // A paste just flushed; request an immediate redraw and skip this frame.
              self.request_redraw();
              true
-diff --git a/codex-rs/tui/src/chatwidget/model_shortcuts.rs b/codex-rs/tui/src/chatwidget/model_shortcuts.rs
-index 0e0658b59a..889920aaa6 100644
---- a/codex-rs/tui/src/chatwidget/model_shortcuts.rs
-+++ b/codex-rs/tui/src/chatwidget/model_shortcuts.rs
-@@ -28,6 +28,13 @@ impl ChatWidget {
-             return false;
-         }
- 
-+        if self.handle_prompt_assistant_model_shortcut(matches!(
-+            direction,
-+            ModelShortcutDirection::Next
-+        )) {
-+            return true;
+diff --git a/codex-rs/tui/src/chatwidget/model_popups.rs b/codex-rs/tui/src/chatwidget/model_popups.rs
+index b3b29e9662..1d4e51caba 100644
+--- a/codex-rs/tui/src/chatwidget/model_popups.rs
++++ b/codex-rs/tui/src/chatwidget/model_popups.rs
+@@ -29,7 +29,103 @@ impl ChatWidget {
+                 return;
+             }
+         };
+-        self.open_model_popup_with_presets(presets);
++        let prompt_models = self.prompt_assistant_model_presets(&presets);
++        if prompt_models.is_empty() {
++            self.open_model_popup_with_presets(presets);
++            return;
 +        }
 +
-         if self.blocks_direct_input {
-             self.add_error_message(PARENT_OWNED_INPUT_MESSAGE.to_string());
-             return true;
++        let main_models = presets.clone();
++        let items = vec![
++            SelectionItem {
++                name: "Main model".to_string(),
++                description: Some("Choose the model used by the main conversation.".to_string()),
++                actions: vec![Box::new(move |tx| {
++                    tx.send(AppEvent::OpenMainModelPopup {
++                        models: main_models.clone(),
++                    });
++                })],
++                dismiss_on_select: true,
++                ..Default::default()
++            },
++            SelectionItem {
++                name: "Prompt Assistant model".to_string(),
++                description: Some(
++                    "Choose the hidden model used only to translate and organize drafts."
++                        .to_string(),
++                ),
++                actions: vec![Box::new(move |tx| {
++                    tx.send(AppEvent::OpenPromptAssistantModelsPopup {
++                        models: prompt_models.clone(),
++                    });
++                })],
++                dismiss_on_select: true,
++                ..Default::default()
++            },
++        ];
++        let header = self.model_menu_header(
++            "Select Model Scope",
++            "Choose which model setting to change.",
++        );
++        self.bottom_pane.show_selection_view(SelectionViewParams {
++            footer_hint: Some(standard_popup_hint_line()),
++            items,
++            header,
++            ..Default::default()
++        });
++    }
++
++    fn prompt_assistant_model_presets(&self, presets: &[ModelPreset]) -> Vec<ModelPreset> {
++        let hidden = presets
++            .iter()
++            .filter(|preset| !preset.show_in_picker)
++            .cloned()
++            .collect::<Vec<_>>();
++        if hidden.is_empty() {
++            presets
++                .iter()
++                .find(|preset| preset.model.as_str() == self.current_model())
++                .cloned()
++                .into_iter()
++                .collect()
++        } else {
++            hidden
++        }
++    }
++
++    pub(crate) fn open_prompt_assistant_models_popup(&mut self, presets: Vec<ModelPreset>) {
++        let current = self.current_prompt_assistant_model();
++        let items = presets
++            .into_iter()
++            .map(|preset| {
++                let model = preset.model.clone();
++                let effort = preset.default_reasoning_effort.clone();
++                SelectionItem {
++                    name: model.clone(),
++                    description: (!preset.description.is_empty())
++                        .then_some(preset.description.clone()),
++                    is_current: current == Some(model.as_str()),
++                    actions: vec![Box::new(move |tx| {
++                        tx.send(AppEvent::SelectPromptAssistantModel {
++                            model: model.clone(),
++                            effort: effort.clone(),
++                        });
++                    })],
++                    dismiss_on_select: true,
++                    ..Default::default()
++                }
++            })
++            .collect();
++        let header = self.model_menu_header(
++            "Select Prompt Assistant Model",
++            "Only models hidden from the main picker are listed.",
++        );
++        self.bottom_pane.show_selection_view(SelectionViewParams {
++            footer_hint: Some(standard_popup_hint_line()),
++            items,
++            header,
++            ..Default::default()
++        });
+     }
+ 
+     fn model_menu_header(&self, title: &str, subtitle: &str) -> Box<dyn Renderable> {
 diff --git a/codex-rs/tui/src/chatwidget/prompt_assistant.rs b/codex-rs/tui/src/chatwidget/prompt_assistant.rs
 new file mode 100644
-index 0000000000..a4c8a3051d
+index 0000000000..0876643e82
 --- /dev/null
 +++ b/codex-rs/tui/src/chatwidget/prompt_assistant.rs
-@@ -0,0 +1,399 @@
+@@ -0,0 +1,329 @@
 +use codex_app_server_protocol::PromptAssistantInterruptParams;
 +use codex_app_server_protocol::PromptAssistantOutcome;
 +use codex_app_server_protocol::PromptAssistantProgressNotification;
@@ -684,6 +1064,24 @@ index 0000000000..a4c8a3051d
 +}
 +
 +impl ChatWidget {
++    pub(super) fn current_prompt_assistant_model(&self) -> Option<&str> {
++        self.prompt_assistant
++            .as_ref()
++            .map(|state| state.selected_model.as_str())
++    }
++
++    pub(crate) fn select_prompt_assistant_model(&mut self, model: String, effort: ReasoningEffort) {
++        let Some(thread_id) = self.thread_id else {
++            return;
++        };
++        let _ = self.prompt_assistant_selection_for_thread(&thread_id.to_string());
++        if let Some(state) = self.prompt_assistant.as_mut() {
++            state.selected_model = model;
++            state.selected_reasoning_effort = effort;
++        }
++        self.refresh_prompt_assistant_footer();
++    }
++
 +    pub(crate) fn set_prompt_assistant_root_thread(&mut self, root_thread: bool) {
 +        if self.prompt_assistant_root_thread == root_thread {
 +            return;
@@ -899,92 +1297,6 @@ index 0000000000..a4c8a3051d
 +        Some((model, effort))
 +    }
 +
-+    pub(super) fn handle_prompt_assistant_model_shortcut(&mut self, next: bool) -> bool {
-+        if !self.prompt_assistant_root_thread
-+            || self.bottom_pane.composer_is_empty()
-+            || self.bottom_pane.is_task_running()
-+        {
-+            return false;
-+        }
-+        let Some(thread_id) = self.thread_id else {
-+            return true;
-+        };
-+        let Some((current, _)) = self.prompt_assistant_selection_for_thread(&thread_id.to_string())
-+        else {
-+            return true;
-+        };
-+        let choices = self.prompt_assistant_models();
-+        let Some(current_index) = choices.iter().position(|preset| preset.model == current) else {
-+            return true;
-+        };
-+        let index = if next {
-+            (current_index + 1) % choices.len()
-+        } else {
-+            (current_index + choices.len() - 1) % choices.len()
-+        };
-+        if let Some(state) = self.prompt_assistant.as_mut()
-+            && let Some(model) = choices.get(index)
-+        {
-+            state.selected_model = model.model.clone();
-+            state.selected_reasoning_effort = model.default_reasoning_effort.clone();
-+        }
-+        self.refresh_prompt_assistant_footer();
-+        self.request_redraw();
-+        true
-+    }
-+
-+    pub(super) fn handle_prompt_assistant_reasoning_shortcut(&mut self, raise: bool) -> bool {
-+        if !self.prompt_assistant_root_thread
-+            || self.bottom_pane.composer_is_empty()
-+            || self.bottom_pane.is_task_running()
-+        {
-+            return false;
-+        }
-+        let Some(thread_id) = self.thread_id else {
-+            return true;
-+        };
-+        let Some((model, current)) =
-+            self.prompt_assistant_selection_for_thread(&thread_id.to_string())
-+        else {
-+            return true;
-+        };
-+        let Some(preset) = self
-+            .prompt_assistant_models()
-+            .into_iter()
-+            .find(|preset| preset.model == model)
-+        else {
-+            return true;
-+        };
-+        let choices = super::reasoning_shortcuts::reasoning_choices(&preset);
-+        let Some(index) = choices.iter().position(|effort| effort == &current) else {
-+            return true;
-+        };
-+        let next_index = if raise {
-+            index + 1
-+        } else {
-+            index.saturating_sub(1)
-+        };
-+        if let Some(next_effort) = choices.get(next_index).cloned()
-+            && let Some(state) = self.prompt_assistant.as_mut()
-+        {
-+            state.selected_reasoning_effort = next_effort;
-+            self.refresh_prompt_assistant_footer();
-+            self.request_redraw();
-+        }
-+        true
-+    }
-+
-+    fn prompt_assistant_models(&self) -> Vec<codex_protocol::openai_models::ModelPreset> {
-+        let models = match self.model_catalog.try_list_models() {
-+            Ok(models) => models,
-+            Err(err) => match err {},
-+        };
-+        let (hidden, listed): (Vec<_>, Vec<_>) = models
-+            .into_iter()
-+            .partition(|preset| !preset.show_in_picker);
-+        hidden.into_iter().chain(listed).collect()
-+    }
-+
 +    pub(super) fn refresh_prompt_assistant_footer(&mut self) {
 +        let hint = if !self.bottom_pane.is_task_running()
 +            && !self.prompt_assistant_active()
@@ -1000,12 +1312,10 @@ index 0000000000..a4c8a3051d
 +                    .and_then(|thread_id| {
 +                        self.prompt_assistant_selection_for_thread(&thread_id.to_string())
 +                    })
-+                    .map(|(model, effort)| {
++                    .map(|_| {
 +                        vec![(
 +                            self.prompt_assistant_binding_label.clone(),
-+                            format!(
-+                                "Prompt Assistant request: {model} {effort} - translate and organize"
-+                            ),
++                            "to translate and organize by Prompt Assistant".to_string(),
 +                        )]
 +                    })
 +            } else {
@@ -1014,7 +1324,7 @@ index 0000000000..a4c8a3051d
 +        } else {
 +            None
 +        };
-+        self.bottom_pane.set_footer_hint_override(hint);
++        self.bottom_pane.set_footer_supplemental_hint(hint);
 +    }
 +
 +    fn show_prompt_assistant_terminal_flash(&mut self, response: &PromptAssistantRewriteResponse) {
@@ -1058,7 +1368,7 @@ index 0000000000..a4c8a3051d
 +    }
 +}
 diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
-index c1f9891e55..5a2927e576 100644
+index 4a0b0ab453..1bbfb498e6 100644
 --- a/codex-rs/tui/src/chatwidget/protocol.rs
 +++ b/codex-rs/tui/src/chatwidget/protocol.rs
 @@ -29,6 +29,9 @@ impl ChatWidget {
@@ -1072,24 +1382,10 @@ index c1f9891e55..5a2927e576 100644
                  self.set_token_info(Some(token_usage_info_from_app_server(
                      notification.token_usage,
 diff --git a/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs b/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs
-index af5c14fc8e..7f042c2916 100644
+index af5c14fc8e..ab94295c09 100644
 --- a/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs
 +++ b/codex-rs/tui/src/chatwidget/reasoning_shortcuts.rs
-@@ -73,6 +73,13 @@ impl ChatWidget {
-             return false;
-         }
- 
-+        if self.handle_prompt_assistant_reasoning_shortcut(matches!(
-+            direction,
-+            ReasoningShortcutDirection::Raise
-+        )) {
-+            return true;
-+        }
-+
-         if self.blocks_direct_input {
-             self.add_error_message(PARENT_OWNED_INPUT_MESSAGE.to_string());
-             return true;
-@@ -188,7 +195,7 @@ impl ChatWidget {
+@@ -188,7 +188,7 @@ impl ChatWidget {
      }
  }
  
@@ -1098,11 +1394,36 @@ index af5c14fc8e..7f042c2916 100644
      let (mut choices, mut advanced_choices): (Vec<_>, Vec<_>) = preset
          .supported_reasoning_efforts
          .iter()
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__model_selection_popup.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__model_selection_popup.snap
+index d214ce2e3f..7197e9253b 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__model_selection_popup.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__model_selection_popup.snap
+@@ -2,15 +2,11 @@
+ source: tui/src/chatwidget/tests/popups_and_settings.rs
+ expression: popup
+ ---
+-  Select Model and Effort
+-  Access legacy models by running codex -m <model_name> or in your config.toml
++  Select Model Scope
++  Choose which model setting to change.
+ 
+-  1. gpt-5.6-sol (default)  Latest frontier agentic coding model.
+-  2. gpt-5.6-terra          Balanced agentic coding model for everyday work.
+-  3. gpt-5.6-luna           Fast and affordable agentic coding model.
+-  4. gpt-5.5                Frontier model for complex coding, research, and
+-                            real-world work.
+-› 5. gpt-5.2 (current)      Optimized for professional work and long-running
+-                            agents.
++› 1. Main model              Choose the model used by the main conversation.
++  2. Prompt Assistant model  Choose the hidden model used only to translate
++                             and organize drafts.
+ 
+   Press enter to confirm or esc to go back
 diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
-index 755dfe3ca4..29a4ae2006 100644
+index 755dfe3ca4..5cefb17ba4 100644
 --- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
 +++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
-@@ -4,6 +4,85 @@ use pretty_assertions::assert_eq;
+@@ -4,6 +4,105 @@ use pretty_assertions::assert_eq;
  const SAFETY_BUFFERING_HEADER_TEXT: &str =
      "Our systems are thinking a bit more about this request before responding.";
  
@@ -1155,7 +1476,7 @@ index 755dfe3ca4..29a4ae2006 100644
 +    let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
 +    let thread_id = ThreadId::new();
 +    chat.thread_id = Some(thread_id);
-+    let source = "保留 Tab 按键的行为。\n保留 hook 的说明。".to_string();
++    let source = "Organize this request while preserving its constraints.".to_string();
 +    chat.bottom_pane
 +        .set_composer_text(source.clone(), Vec::new(), Vec::new());
 +
@@ -1185,6 +1506,61 @@ index 755dfe3ca4..29a4ae2006 100644
 +    assert!(rendered.contains("cannot run while the parent turn is active"));
 +}
 +
++#[tokio::test]
++async fn prompt_assistant_footer_preserves_native_submit_hook_hints() {
++    let (mut chat, _rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.thread_id = Some(ThreadId::new());
++    chat.bottom_pane
++        .set_composer_text("rough source".to_string(), Vec::new(), Vec::new());
++    chat.refresh_prompt_assistant_footer();
++
++    let rendered = render_bottom_popup(&chat, /*width*/ 180);
++    assert!(
++        rendered.contains("enter to submit with UserPromptSubmit"),
++        "{rendered}"
++    );
++    assert!(rendered.contains("tab to submit without hook"), "{rendered}");
++    assert!(
++        rendered.contains("shift + enter to translate and organize by Prompt Assistant"),
++        "{rendered}"
++    );
++}
++
  #[tokio::test]
  async fn response_output_bytes_follow_the_active_request_lifecycle_without_history() {
      let (mut chat, mut rx, _ops) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/keymap.rs b/codex-rs/tui/src/keymap.rs
+index 6a7a7488a2..02bf8c75e4 100644
+--- a/codex-rs/tui/src/keymap.rs
++++ b/codex-rs/tui/src/keymap.rs
+@@ -977,7 +977,7 @@ impl RuntimeKeymap {
+                     plain(KeyCode::Char('?')),
+                     shift(KeyCode::Char('?'))
+                 ],
+-                prompt_assistant: default_bindings![alt(KeyCode::Char('p'))],
++                prompt_assistant: default_bindings![shift(KeyCode::Enter)],
+                 history_search_previous: default_bindings![ctrl(KeyCode::Char('r'))],
+                 history_search_next: default_bindings![ctrl(KeyCode::Char('s'))],
+             },
+@@ -986,7 +986,6 @@ impl RuntimeKeymap {
+                     ctrl(KeyCode::Char('j')),
+                     ctrl(KeyCode::Char('m')),
+                     plain(KeyCode::Enter),
+-                    shift(KeyCode::Enter),
+                     alt(KeyCode::Enter)
+                 ],
+                 move_left: default_bindings![plain(KeyCode::Left), ctrl(KeyCode::Char('b'))],
+@@ -2154,11 +2153,11 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn prompt_assistant_defaults_to_alt_p_and_rejects_app_conflicts() {
++    fn prompt_assistant_defaults_to_shift_enter_and_rejects_app_conflicts() {
+         let runtime = RuntimeKeymap::from_config(&TuiKeymap::default()).expect("default keymap");
+         assert_eq!(
+             runtime.composer.prompt_assistant,
+-            vec![key_hint::alt(KeyCode::Char('p'))]
++            vec![key_hint::shift(KeyCode::Enter)]
+         );
+ 
+         let mut keymap = TuiKeymap::default();
