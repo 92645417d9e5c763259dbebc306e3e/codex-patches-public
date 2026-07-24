@@ -1,0 +1,2472 @@
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index 139f880983..da8b7d07b3 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -1942,6 +1942,7 @@ dependencies = [
+  "tokio-tungstenite",
+  "tokio-util",
+  "tracing",
++ "tracing-test",
+  "tungstenite",
+  "url",
+  "uuid",
+diff --git a/codex-rs/app-server/src/config_manager_service_tests.rs b/codex-rs/app-server/src/config_manager_service_tests.rs
+index c88e1b1ece..ccbf1573d5 100644
+--- a/codex-rs/app-server/src/config_manager_service_tests.rs
++++ b/codex-rs/app-server/src/config_manager_service_tests.rs
+@@ -706,7 +706,7 @@ async fn invalid_user_value_rejected_even_if_overridden_by_managed() {
+ }
+ 
+ #[tokio::test]
+-async fn reserved_builtin_provider_override_rejected() {
++async fn unsupported_openai_provider_override_rejected() {
+     let tmp = tempdir().expect("tempdir");
+     std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "model = \"user\"\n").unwrap();
+ 
+@@ -720,19 +720,94 @@ async fn reserved_builtin_provider_override_rejected() {
+             expected_version: None,
+         })
+         .await
+-        .expect_err("should reject reserved provider override");
++        .expect_err("should reject unsupported OpenAI override");
+ 
+     assert_eq!(
+         error.write_error_code(),
+         Some(ConfigWriteErrorCode::ConfigValidationError)
+     );
+-    assert!(error.to_string().contains("reserved built-in provider IDs"));
+-    assert!(error.to_string().contains("`openai`"));
++    assert!(
++        error
++            .to_string()
++            .contains("model_providers.openai only supports changing")
++    );
++    assert!(error.to_string().contains("`name`"));
+ 
+     let contents = std::fs::read_to_string(tmp.path().join(CONFIG_TOML_FILE)).expect("read config");
+     assert_eq!(contents, "model = \"user\"\n");
+ }
+ 
++#[tokio::test]
++async fn reserved_builtin_provider_override_rejected() {
++    let tmp = tempdir().expect("tempdir");
++    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "model = \"user\"\n").unwrap();
++
++    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
++    let error = service
++        .write_value(ConfigValueWriteParams {
++            file_path: Some(tmp.path().join(CONFIG_TOML_FILE).display().to_string()),
++            key_path: "model_providers.ollama.name".to_string(),
++            value: serde_json::json!("Ollama Override"),
++            merge_strategy: MergeStrategy::Replace,
++            expected_version: None,
++        })
++        .await
++        .expect_err("should reject reserved provider override");
++
++    assert_eq!(
++        error.write_error_code(),
++        Some(ConfigWriteErrorCode::ConfigValidationError)
++    );
++    assert!(error.to_string().contains("reserved built-in provider IDs"));
++    assert!(error.to_string().contains("`ollama`"));
++}
++
++#[tokio::test]
++async fn openai_transport_overrides_allowed() {
++    let tmp = tempdir().expect("tempdir");
++    let config_path = tmp.path().join(CONFIG_TOML_FILE);
++    std::fs::write(&config_path, "model = \"user\"\n").unwrap();
++
++    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
++    for (field, value) in [
++        ("request_max_retries", serde_json::json!(3)),
++        ("stream_max_retries", serde_json::json!(30)),
++        ("stream_idle_timeout_ms", serde_json::json!(120_000)),
++        ("websocket_connect_timeout_ms", serde_json::json!(15_000)),
++        ("supports_websockets", serde_json::json!(false)),
++    ] {
++        service
++            .write_value(ConfigValueWriteParams {
++                file_path: Some(config_path.display().to_string()),
++                key_path: format!("model_providers.openai.{field}"),
++                value,
++                merge_strategy: MergeStrategy::Replace,
++                expected_version: None,
++            })
++            .await
++            .unwrap_or_else(|error| {
++                panic!("should allow OpenAI transport override {field}: {error}")
++            });
++    }
++
++    let contents = std::fs::read_to_string(config_path).expect("read config");
++    let config: TomlValue = toml::from_str(&contents).expect("parse config");
++    let openai = config
++        .get("model_providers")
++        .and_then(TomlValue::as_table)
++        .and_then(|providers| providers.get("openai"))
++        .and_then(TomlValue::as_table)
++        .expect("OpenAI provider overrides");
++
++    assert_eq!(openai.len(), 5);
++    assert_eq!(
++        openai
++            .get("supports_websockets")
++            .and_then(TomlValue::as_bool),
++        Some(false)
++    );
++}
++
+ #[tokio::test]
+ async fn write_value_rejects_feature_requirement_conflict() {
+     let tmp = tempdir().expect("tempdir");
+diff --git a/codex-rs/cli/src/doctor.rs b/codex-rs/cli/src/doctor.rs
+index e3bdc65778..97a4d14754 100644
+--- a/codex-rs/cli/src/doctor.rs
++++ b/codex-rs/cli/src/doctor.rs
+@@ -2482,7 +2482,8 @@ fn websocket_error_detail(err: &ApiError) -> String {
+         | ApiError::RateLimit(_)
+         | ApiError::InvalidRequest { .. }
+         | ApiError::CyberPolicy { .. }
+-        | ApiError::ServerOverloaded => format!("handshake error: {err}"),
++        | ApiError::ServerOverloaded
++        | ApiError::ResponseStreamDisconnected { .. } => format!("handshake error: {err}"),
+     }
+ }
+ 
+diff --git a/codex-rs/codex-api/Cargo.toml b/codex-rs/codex-api/Cargo.toml
+index 52ea20920e..0e0f07114e 100644
+--- a/codex-rs/codex-api/Cargo.toml
++++ b/codex-rs/codex-api/Cargo.toml
+@@ -38,6 +38,7 @@ pretty_assertions = { workspace = true }
+ tokio-test = { workspace = true }
+ wiremock = { workspace = true }
+ reqwest = { workspace = true }
++tracing-test = { workspace = true, features = ["no-env-filter"] }
+ 
+ [lints]
+ workspace = true
+diff --git a/codex-rs/codex-api/src/api_bridge.rs b/codex-rs/codex-api/src/api_bridge.rs
+index c825ab03c5..f05d7a0730 100644
+--- a/codex-rs/codex-api/src/api_bridge.rs
++++ b/codex-rs/codex-api/src/api_bridge.rs
+@@ -21,7 +21,8 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
+         ApiError::ContextWindowExceeded => CodexErr::ContextWindowExceeded,
+         ApiError::QuotaExceeded => CodexErr::QuotaExceeded,
+         ApiError::UsageNotIncluded => CodexErr::UsageNotIncluded,
+-        ApiError::Retryable { message, delay } => {
++        ApiError::Retryable { message, delay }
++        | ApiError::ResponseStreamDisconnected { message, delay } => {
+             let error = CodexErr::Stream(message);
+             match delay {
+                 Some(delay) => error.with_retry_delay(delay),
+diff --git a/codex-rs/codex-api/src/api_bridge_tests.rs b/codex-rs/codex-api/src/api_bridge_tests.rs
+index 391b4f5ea8..ede5d59ed1 100644
+--- a/codex-rs/codex-api/src/api_bridge_tests.rs
++++ b/codex-rs/codex-api/src/api_bridge_tests.rs
+@@ -24,6 +24,22 @@ fn map_api_error_preserves_retry_delay() {
+     assert_eq!(err.retry_delay(), Some(retry_delay));
+ }
+ 
++#[test]
++fn map_api_error_preserves_response_stream_disconnect_retry_delay() {
++    let delay = std::time::Duration::from_millis(250);
++
++    let err = map_api_error(ApiError::ResponseStreamDisconnected {
++        message: "socket closed".to_string(),
++        delay: Some(delay),
++    });
++
++    let CodexErr::Stream(message, actual_delay) = err else {
++        panic!("expected CodexErr::Stream, got {err:?}");
++    };
++    assert_eq!(message, "socket closed");
++    assert_eq!(actual_delay, Some(delay));
++}
++
+ #[test]
+ fn map_api_error_maps_server_overloaded_from_503_body() {
+     let body = serde_json::json!({
+diff --git a/codex-rs/codex-api/src/endpoint/responses_websocket.rs b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+index 7e13c11953..af3b23c7e8 100644
+--- a/codex-rs/codex-api/src/endpoint/responses_websocket.rs
++++ b/codex-rs/codex-api/src/endpoint/responses_websocket.rs
+@@ -38,7 +38,6 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+ use tracing::Instrument;
+ use tracing::Span;
+ use tracing::debug;
+-use tracing::error;
+ use tracing::info;
+ use tracing::instrument;
+ use tungstenite::extensions::ExtensionsConfig;
+@@ -513,7 +512,8 @@ async fn connect_websocket(
+             (stream, response)
+         }
+         Err(err) => {
+-            error!("failed to connect to websocket: {err}, url: {url}");
++            let err_text = err.to_string();
++            log_websocket_connect_failure(&err_text, &url);
+             return Err(map_ws_error(err, &url));
+         }
+     };
+@@ -555,6 +555,10 @@ fn websocket_config() -> WebSocketConfig {
+     config
+ }
+ 
++fn log_websocket_connect_failure(err_text: &str, url: &Url) {
++    debug!("failed to connect to websocket: {err_text}, url: {url}");
++}
++
+ fn map_ws_error(err: WsError, url: &Url) -> ApiError {
+     match err {
+         WsError::Http(response) => {
+@@ -572,9 +576,9 @@ fn map_ws_error(err: WsError, url: &Url) -> ApiError {
+             })
+         }
+         WsError::ConnectionClosed | WsError::AlreadyClosed => {
+-            ApiError::Stream("websocket closed".to_string())
++            ApiError::response_stream_disconnected("websocket closed")
+         }
+-        WsError::Io(err) => ApiError::Transport(TransportError::Network(err.to_string())),
++        WsError::Io(err) => ApiError::response_stream_disconnected(err.to_string()),
+         other => ApiError::Transport(TransportError::Network(other.to_string())),
+     }
+ }
+@@ -626,7 +630,7 @@ fn map_wrapped_websocket_error_event(
+             _ => None,
+         }
+     {
+-        return Some(ApiError::Retryable {
++        return Some(ApiError::ResponseStreamDisconnected {
+             message: error
+                 .message
+                 .clone()
+@@ -696,18 +700,20 @@ async fn run_websocket_response_stream(
+         let poll_start = Instant::now();
+         let response = tokio::time::timeout(idle_timeout, ws_stream.next())
+             .await
+-            .map_err(|_| ApiError::Stream("idle timeout waiting for websocket".into()));
++            .map_err(|_| {
++                ApiError::response_stream_disconnected("idle timeout waiting for websocket")
++            });
+         if let Some(t) = telemetry.as_ref() {
+             t.on_ws_event(&response, poll_start.elapsed());
+         }
+         let message = match response {
+             Ok(Some(Ok(msg))) => msg,
+             Ok(Some(Err(err))) => {
+-                return Err(ApiError::Stream(err.to_string()));
++                return Err(ApiError::response_stream_disconnected(err.to_string()));
+             }
+             Ok(None) => {
+-                return Err(ApiError::Stream(
+-                    "stream closed before response.completed".into(),
++                return Err(ApiError::response_stream_disconnected(
++                    "stream closed before response.completed",
+                 ));
+             }
+             Err(err) => {
+@@ -807,8 +813,8 @@ async fn run_websocket_response_stream(
+                 return Err(ApiError::Stream("unexpected binary websocket event".into()));
+             }
+             Message::Close(_) => {
+-                return Err(ApiError::Stream(
+-                    "websocket closed by server before response.completed".into(),
++                return Err(ApiError::response_stream_disconnected(
++                    "websocket closed by server before response.completed",
+                 ));
+             }
+             Message::Frame(_) => {}
+@@ -911,6 +917,7 @@ mod tests {
+     use serde_json::value::to_raw_value;
+     use std::collections::HashMap;
+     use std::sync::Arc;
++    use tracing_test::traced_test;
+ 
+     #[test]
+     fn direct_serialization_preserves_websocket_request_payload() {
+@@ -977,6 +984,50 @@ mod tests {
+         assert!(config.extensions.permessage_deflate.is_some());
+     }
+ 
++    #[test]
++    fn map_ws_error_io_eof_maps_retryable_disconnect() {
++        let url = Url::parse("wss://chatgpt.com/backend-api/codex/responses").expect("valid URL");
++        let error = WsError::Io(std::io::Error::new(
++            std::io::ErrorKind::UnexpectedEof,
++            "tls handshake eof",
++        ));
++
++        let api_error = map_ws_error(error, &url);
++        let ApiError::ResponseStreamDisconnected { message, delay } = api_error else {
++            panic!("expected retryable response stream disconnect");
++        };
++        assert!(message.contains("tls handshake eof"));
++        assert_eq!(delay, None);
++
++        let closed = map_ws_error(WsError::ConnectionClosed, &url);
++        assert!(matches!(
++            closed,
++            ApiError::ResponseStreamDisconnected { delay: None, .. }
++        ));
++    }
++
++    #[test]
++    #[traced_test]
++    fn websocket_connect_failure_uses_debug_noise() {
++        let url = Url::parse("wss://chatgpt.com/backend-api/codex/responses").expect("valid URL");
++
++        log_websocket_connect_failure("connection refused", &url);
++
++        logs_assert(|lines: &[&str]| {
++            let failure_log = lines
++                .iter()
++                .find(|line| line.contains("failed to connect to websocket: connection refused"))
++                .ok_or_else(|| "missing websocket connection failure debug log".to_string())?;
++            if !failure_log.contains("DEBUG") {
++                return Err("websocket connection failure was not logged as debug".to_string());
++            }
++            if failure_log.contains("ERROR") {
++                return Err("websocket connection failure was logged as error".to_string());
++            }
++            Ok(())
++        });
++    }
++
+     #[test]
+     fn parse_wrapped_websocket_error_event_maps_to_transport_http() {
+         let payload = json!({
+@@ -1085,8 +1136,8 @@ mod tests {
+             .expect("expected websocket error payload to be parsed");
+         let api_error = map_wrapped_websocket_error_event(wrapped_error, payload)
+             .expect("expected websocket error payload to map to ApiError");
+-        let ApiError::Retryable { message, delay } = api_error else {
+-            panic!("expected ApiError::Retryable");
++        let ApiError::ResponseStreamDisconnected { message, delay } = api_error else {
++            panic!("expected ApiError::ResponseStreamDisconnected");
+         };
+         assert_eq!(message, WEBSOCKET_CONNECTION_LIMIT_REACHED_MESSAGE);
+         assert_eq!(delay, None);
+diff --git a/codex-rs/codex-api/src/error.rs b/codex-rs/codex-api/src/error.rs
+index c6cb5fd405..97b9022b9b 100644
+--- a/codex-rs/codex-api/src/error.rs
++++ b/codex-rs/codex-api/src/error.rs
+@@ -12,6 +12,11 @@ pub enum ApiError {
+     Api { status: StatusCode, message: String },
+     #[error("stream error: {0}")]
+     Stream(String),
++    #[error("response stream disconnected before completion: {message}")]
++    ResponseStreamDisconnected {
++        message: String,
++        delay: Option<Duration>,
++    },
+     #[error("context window exceeded")]
+     ContextWindowExceeded,
+     #[error("quota exceeded")]
+@@ -33,6 +38,15 @@ pub enum ApiError {
+     ServerOverloaded,
+ }
+ 
++impl ApiError {
++    pub(crate) fn response_stream_disconnected(message: impl Into<String>) -> Self {
++        Self::ResponseStreamDisconnected {
++            message: message.into(),
++            delay: None,
++        }
++    }
++}
++
+ impl From<RateLimitError> for ApiError {
+     fn from(err: RateLimitError) -> Self {
+         Self::RateLimit(err.to_string())
+diff --git a/codex-rs/codex-api/src/sse/responses.rs b/codex-rs/codex-api/src/sse/responses.rs
+index 441d7bb3bf..68c082185f 100644
+--- a/codex-rs/codex-api/src/sse/responses.rs
++++ b/codex-rs/codex-api/src/sse/responses.rs
+@@ -510,19 +510,25 @@ async fn process_sse_with_treatment(
+             Ok(Some(Ok(sse))) => sse,
+             Ok(Some(Err(e))) => {
+                 debug!("SSE Error: {e:#}");
+-                let _ = tx_event.send(Err(ApiError::Stream(e.to_string()))).await;
++                let _ = tx_event
++                    .send(Err(ApiError::response_stream_disconnected(e.to_string())))
++                    .await;
+                 return;
+             }
+             Ok(None) => {
+-                let error = response_error.unwrap_or(ApiError::Stream(
+-                    "stream closed before response.completed".into(),
+-                ));
++                let error = response_error.unwrap_or_else(|| {
++                    ApiError::response_stream_disconnected(
++                        "stream closed before response.completed",
++                    )
++                });
+                 let _ = tx_event.send(Err(error)).await;
+                 return;
+             }
+             Err(_) => {
+                 let _ = tx_event
+-                    .send(Err(ApiError::Stream("idle timeout waiting for SSE".into())))
++                    .send(Err(ApiError::response_stream_disconnected(
++                        "idle timeout waiting for SSE",
++                    )))
+                     .await;
+                 return;
+             }
+@@ -880,8 +886,9 @@ mod tests {
+         assert_matches!(events[0], Ok(ResponseEvent::OutputItemDone(_)));
+ 
+         match &events[1] {
+-            Err(ApiError::Stream(msg)) => {
+-                assert_eq!(msg, "stream closed before response.completed")
++            Err(ApiError::ResponseStreamDisconnected { message, delay }) => {
++                assert_eq!(message, "stream closed before response.completed");
++                assert_eq!(*delay, None);
+             }
+             other => panic!("unexpected second event: {other:?}"),
+         }
+diff --git a/codex-rs/config/src/config_toml.rs b/codex-rs/config/src/config_toml.rs
+index 442105f3b7..124467c7a2 100644
+--- a/codex-rs/config/src/config_toml.rs
++++ b/codex-rs/config/src/config_toml.rs
+@@ -29,12 +29,14 @@ use crate::types::UriBasedFileOpener;
+ use crate::types::WindowsToml;
+ use codex_features::FeaturesToml;
+ use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
++use codex_model_provider_info::ConfiguredModelProvider;
+ use codex_model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
+ use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
+ use codex_model_provider_info::ModelProviderInfo;
+ use codex_model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
+ use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
+ use codex_model_provider_info::OPENAI_PROVIDER_ID;
++use codex_model_provider_info::validate_openai_provider_override;
+ use codex_protocol::config_types::AutoCompactTokenLimitScope;
+ use codex_protocol::config_types::ForcedLoginMethod;
+ use codex_protocol::config_types::Personality;
+@@ -277,10 +279,10 @@ pub struct ConfigToml {
+     /// to 127.0.0.1 (using `mcp_oauth_callback_port` when provided).
+     pub mcp_oauth_callback_url: Option<String>,
+ 
+-    /// User-defined provider entries that extend the built-in list. Built-in
+-    /// IDs cannot be overridden.
++    /// User-defined provider entries that extend the built-in list. The
++    /// built-in OpenAI provider accepts transport-only overrides.
+     #[serde(default, deserialize_with = "deserialize_model_providers")]
+-    pub model_providers: HashMap<String, ModelProviderInfo>,
++    pub model_providers: HashMap<String, ConfiguredModelProvider>,
+ 
+     /// Maximum number of bytes to include from an AGENTS.md project doc file.
+     #[serde(default = "default_project_doc_max_bytes")]
+@@ -899,12 +901,13 @@ fn project_config_for_lookup_key(
+ }
+ 
+ pub fn validate_reserved_model_provider_ids(
+-    model_providers: &HashMap<String, ModelProviderInfo>,
++    model_providers: &HashMap<String, ConfiguredModelProvider>,
+ ) -> Result<(), String> {
+     let mut conflicts = model_providers
+         .keys()
+         .filter(|key| {
+             key.as_str() != AMAZON_BEDROCK_PROVIDER_ID
++                && key.as_str() != OPENAI_PROVIDER_ID
+                 && RESERVED_MODEL_PROVIDER_IDS.contains(&key.as_str())
+         })
+         .map(|key| format!("`{key}`"))
+@@ -922,21 +925,24 @@ Built-in providers cannot be overridden. Rename your custom provider (for exampl
+ }
+ 
+ pub fn validate_model_providers(
+-    model_providers: &HashMap<String, ModelProviderInfo>,
++    model_providers: &HashMap<String, ConfiguredModelProvider>,
+ ) -> Result<(), String> {
+     validate_reserved_model_provider_ids(model_providers)?;
+     for (key, provider) in model_providers {
+-        if key != AMAZON_BEDROCK_PROVIDER_ID {
+-            if provider.aws.is_some() {
+-                return Err(format!(
+-                    "model_providers.{key}: provider aws is only supported for `{AMAZON_BEDROCK_PROVIDER_ID}`"
+-                ));
+-            }
+-            if provider.name.trim().is_empty() {
+-                return Err(format!(
+-                    "model_providers.{key}: provider name must not be empty"
+-                ));
+-            }
++        if key == OPENAI_PROVIDER_ID {
++            validate_openai_provider_override(provider)?;
++            continue;
++        }
++        if key != AMAZON_BEDROCK_PROVIDER_ID && provider.aws.is_some() {
++            return Err(format!(
++                "model_providers.{key}: provider aws is only supported for `{AMAZON_BEDROCK_PROVIDER_ID}`"
++            ));
++        }
++        let provider = ModelProviderInfo::from(provider.clone());
++        if key != AMAZON_BEDROCK_PROVIDER_ID && provider.name.trim().is_empty() {
++            return Err(format!(
++                "model_providers.{key}: provider name must not be empty"
++            ));
+         }
+         provider
+             .validate()
+@@ -947,11 +953,11 @@ pub fn validate_model_providers(
+ 
+ fn deserialize_model_providers<'de, D>(
+     deserializer: D,
+-) -> Result<HashMap<String, ModelProviderInfo>, D::Error>
++) -> Result<HashMap<String, ConfiguredModelProvider>, D::Error>
+ where
+     D: serde::Deserializer<'de>,
+ {
+-    let model_providers = HashMap::<String, ModelProviderInfo>::deserialize(deserializer)?;
++    let model_providers = HashMap::<String, ConfiguredModelProvider>::deserialize(deserializer)?;
+     validate_model_providers(&model_providers).map_err(serde::de::Error::custom)?;
+     Ok(model_providers)
+ }
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+index 9c523be2ab..9c99e5a52a 100644
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -841,6 +841,110 @@
+       },
+       "type": "object"
+     },
++    "ConfiguredModelProvider": {
++      "additionalProperties": false,
++      "description": "Presence-preserving provider fields read from `model_providers` in config.toml.\n\nRuntime provider behavior remains owned by [`ModelProviderInfo`]. This input adapter exists so a built-in provider override can distinguish omitted default-valued fields from explicit values.",
++      "properties": {
++        "auth": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/ModelProviderAuthInfo"
++            }
++          ],
++          "description": "Command-backed bearer-token configuration."
++        },
++        "aws": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/ModelProviderAwsAuthInfo"
++            }
++          ],
++          "description": "AWS SigV4 authentication configuration."
++        },
++        "base_url": {
++          "description": "Base URL for the provider's OpenAI-compatible API.",
++          "type": "string"
++        },
++        "env_http_headers": {
++          "additionalProperties": {
++            "type": "string"
++          },
++          "description": "HTTP headers sourced from environment variables.",
++          "type": "object"
++        },
++        "env_key": {
++          "description": "Environment variable that stores the provider API key.",
++          "type": "string"
++        },
++        "env_key_instructions": {
++          "description": "Instructions for obtaining the configured environment key.",
++          "type": "string"
++        },
++        "experimental_bearer_token": {
++          "description": "Direct bearer token; `env_key` is preferred.",
++          "type": "string"
++        },
++        "http_headers": {
++          "additionalProperties": {
++            "type": "string"
++          },
++          "description": "Static HTTP headers included with provider requests.",
++          "type": "object"
++        },
++        "name": {
++          "description": "Friendly display name.",
++          "type": "string"
++        },
++        "query_params": {
++          "additionalProperties": {
++            "type": "string"
++          },
++          "description": "Query parameters appended to the base URL.",
++          "type": "object"
++        },
++        "request_max_retries": {
++          "description": "Maximum request retry count.",
++          "format": "uint64",
++          "minimum": 0.0,
++          "type": "integer"
++        },
++        "requires_openai_auth": {
++          "description": "Whether the provider uses Codex authentication.",
++          "type": "boolean"
++        },
++        "stream_idle_timeout_ms": {
++          "description": "Response-stream idle timeout in milliseconds.",
++          "format": "uint64",
++          "minimum": 0.0,
++          "type": "integer"
++        },
++        "stream_max_retries": {
++          "description": "Maximum response-stream reconnect count.",
++          "format": "uint64",
++          "minimum": 0.0,
++          "type": "integer"
++        },
++        "supports_websockets": {
++          "description": "Whether the provider supports Responses over WebSocket.",
++          "type": "boolean"
++        },
++        "websocket_connect_timeout_ms": {
++          "description": "WebSocket connection timeout in milliseconds.",
++          "format": "uint64",
++          "minimum": 0.0,
++          "type": "integer"
++        },
++        "wire_api": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/WireApi"
++            }
++          ],
++          "description": "Wire protocol used by the provider."
++        }
++      },
++      "type": "object"
++    },
+     "CurrentTimeReminderConfigToml": {
+       "additionalProperties": false,
+       "properties": {
+@@ -5498,10 +5602,10 @@
+     },
+     "model_providers": {
+       "additionalProperties": {
+-        "$ref": "#/definitions/ModelProviderInfo"
++        "$ref": "#/definitions/ConfiguredModelProvider"
+       },
+       "default": {},
+-      "description": "User-defined provider entries that extend the built-in list. Built-in IDs cannot be overridden.",
++      "description": "User-defined provider entries that extend the built-in list. The built-in OpenAI provider accepts transport-only overrides.",
+       "type": "object"
+     },
+     "model_reasoning_effort": {
+@@ -5750,4 +5854,4 @@
+   },
+   "title": "ConfigToml",
+   "type": "object"
+-}
+\ No newline at end of file
++}
+diff --git a/codex-rs/core/src/client.rs b/codex-rs/core/src/client.rs
+index 5edf1254a8..112f96d4b8 100644
+--- a/codex-rs/core/src/client.rs
++++ b/codex-rs/core/src/client.rs
+@@ -167,6 +167,7 @@ const MEMORIES_SUMMARIZE_ENDPOINT: &str = "/memories/trace_summarize";
+ #[cfg(test)]
+ pub(crate) const WEBSOCKET_CONNECT_TIMEOUT: Duration =
+     Duration::from_millis(DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS);
++pub(crate) const WEBSOCKET_PREWARM_COMPLETION_TIMEOUT: Duration = Duration::from_secs(3);
+ 
+ pub(crate) struct CompactConversationRequestSettings {
+     pub(crate) effort: Option<ReasoningEffortConfig>,
+@@ -542,14 +543,20 @@ impl ModelClient {
+             .unwrap_or_else(std::sync::PoisonError::into_inner) = websocket_session;
+     }
+ 
++    pub(crate) fn reset_cached_websocket_session(&self) {
++        self.store_cached_websocket_session(WebsocketSession::default());
++    }
++
+     pub(crate) fn force_http_fallback(
+         &self,
+         session_telemetry: &SessionTelemetry,
+         _model_info: &ModelInfo,
+     ) -> bool {
+         let websocket_enabled = self.responses_websocket_enabled();
+-        let activated =
+-            websocket_enabled && !self.state.disable_websockets.swap(true, Ordering::Relaxed);
++        let fallback_allowed = self.state.provider.info().allows_websocket_http_fallback();
++        let activated = fallback_allowed
++            && websocket_enabled
++            && !self.state.disable_websockets.swap(true, Ordering::Relaxed);
+         if activated {
+             warn!("falling back to HTTP");
+             session_telemetry.counter(
+@@ -1822,18 +1829,37 @@ impl ModelClientSession {
+         {
+             Ok(WebsocketStreamOutcome::Stream(mut stream)) => {
+                 // Wait for the v2 warmup request to complete before sending the first turn request.
+-                while let Some(event) = stream.next().await {
+-                    match event {
+-                        Ok(ResponseEvent::Completed { .. }) => break,
+-                        Err(err) => return Err(err),
+-                        _ => {}
++                let completion =
++                    tokio::time::timeout(WEBSOCKET_PREWARM_COMPLETION_TIMEOUT, async {
++                        while let Some(event) = stream.next().await {
++                            match event {
++                                Ok(ResponseEvent::Completed { .. }) => break,
++                                Err(err) => return Err(err),
++                                _ => {}
++                            }
++                        }
++                        Ok(())
++                    })
++                    .await;
++                match completion {
++                    Ok(result) => result,
++                    Err(_) => {
++                        stream.cancel_and_wait().await;
++                        self.reset_websocket_session();
++                        Err(CodexErr::Stream(
++                            "websocket prewarm timed out waiting for response.completed"
++                                .to_string(),
++                            None,
++                        ))
+                     }
+                 }
+-                Ok(())
+             }
+             Ok(WebsocketStreamOutcome::FallbackToHttp) => {
+-                self.try_switch_fallback_transport(session_telemetry, model_info);
+-                Ok(())
++                if self.try_switch_fallback_transport(session_telemetry, model_info) {
++                    Ok(())
++                } else {
++                    Err(websocket_http_fallback_disabled())
++                }
+             }
+             Err(err) => Err(err),
+         }
+@@ -1881,7 +1907,9 @@ impl ModelClientSession {
+                     {
+                         WebsocketStreamOutcome::Stream(stream) => return Ok(stream),
+                         WebsocketStreamOutcome::FallbackToHttp => {
+-                            self.try_switch_fallback_transport(session_telemetry, model_info);
++                            if !self.try_switch_fallback_transport(session_telemetry, model_info) {
++                                return Err(websocket_http_fallback_disabled());
++                            }
+                         }
+                     }
+                 }
+@@ -1920,6 +1948,12 @@ impl ModelClientSession {
+     }
+ }
+ 
++fn websocket_http_fallback_disabled() -> CodexErr {
++    CodexErr::Stream(
++        "Responses WebSocket requested HTTP fallback, but HTTP fallback is disabled".to_string(),
++    )
++}
++
+ /// Stamp a ResponsesWsRequest with the current time.
+ ///
+ /// Meant to be called just before sending the request over the socket, to capture realistic
+@@ -2012,10 +2046,11 @@ where
+     let (tx_event, rx_event) =
+         mpsc::channel::<Result<ResponseEvent>>(RESPONSE_STREAM_CHANNEL_CAPACITY);
+     let (tx_last_response, rx_last_response) = oneshot::channel::<LastResponse>();
++    let (tx_mapper_terminated, rx_mapper_terminated) = oneshot::channel();
+     let consumer_dropped = CancellationToken::new();
+     let consumer_dropped_for_stream = consumer_dropped.clone();
+ 
+-    tokio::spawn(async move {
++    let mapper = async move {
+         let mut logged_error = false;
+         let mut tx_last_response = Some(tx_last_response);
+         let mut items_added: Vec<ResponseItem> = Vec::new();
+@@ -2133,12 +2168,17 @@ where
+             upstream_request_id,
+             &items_added,
+         );
++    };
++    tokio::spawn(async move {
++        mapper.await;
++        let _ = tx_mapper_terminated.send(());
+     });
+ 
+     (
+         ResponseStream {
+             rx_event,
+             consumer_dropped: consumer_dropped_for_stream,
++            mapper_terminated: Some(rx_mapper_terminated),
+         },
+         rx_last_response,
+     )
+diff --git a/codex-rs/core/src/client_common.rs b/codex-rs/core/src/client_common.rs
+index 54ad70daaa..e8b23a6715 100644
+--- a/codex-rs/core/src/client_common.rs
++++ b/codex-rs/core/src/client_common.rs
+@@ -11,6 +11,7 @@ use std::pin::Pin;
+ use std::task::Context;
+ use std::task::Poll;
+ use tokio::sync::mpsc;
++use tokio::sync::oneshot;
+ use tokio_util::sync::CancellationToken;
+ 
+ /// API request payload for a single model turn
+@@ -106,6 +107,18 @@ pub struct ResponseStream {
+     /// Signals the mapper task that the consumer stopped polling before the
+     /// provider stream reached its own terminal event.
+     pub(crate) consumer_dropped: CancellationToken,
++    /// Resolves after the mapper has observed cancellation and released the
++    /// provider stream.
++    pub(crate) mapper_terminated: Option<oneshot::Receiver<()>>,
++}
++
++impl ResponseStream {
++    pub(crate) async fn cancel_and_wait(mut self) {
++        self.consumer_dropped.cancel();
++        if let Some(mapper_terminated) = self.mapper_terminated.take() {
++            let _ = mapper_terminated.await;
++        }
++    }
+ }
+ 
+ impl Stream for ResponseStream {
+diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_remote_v2.rs
+index 61c1e50534..3c2f6570f0 100644
+--- a/codex-rs/core/src/compact_remote_v2.rs
++++ b/codex-rs/core/src/compact_remote_v2.rs
+@@ -56,9 +56,6 @@ use attempt::run_remote_compact_v2_attempt;
+ // Mirror the current /responses/compact retained-message default while the
+ // server-side path remains the reference implementation.
+ const RETAINED_MESSAGE_TOKEN_BUDGET: usize = 64_000;
+-// Compact attempts can run much longer than normal turns, so keep the per-transport
+-// retry budget smaller than the general Responses stream retry budget.
+-const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: u64 = 2;
+ 
+ pub(crate) async fn run_inline_remote_auto_compact_task(
+     sess: Arc<Session>,
+@@ -353,11 +350,7 @@ async fn run_remote_compaction_request_v2(
+     prompt: &Prompt,
+     responses_metadata: &CodexResponsesMetadata,
+ ) -> CodexResult<RemoteCompactionV2Output> {
+-    let max_retries = turn_context
+-        .provider
+-        .info()
+-        .stream_max_retries()
+-        .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
++    let max_retries = turn_context.provider.info().stream_max_retries();
+     let mut retries = 0;
+     loop {
+         let result = match client_session
+@@ -622,6 +615,7 @@ mod tests {
+         ResponseStream {
+             rx_event,
+             consumer_dropped: CancellationToken::new(),
++            mapper_terminated: None,
+         }
+     }
+ 
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index 2273efef42..f3b82f3697 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -1010,6 +1010,137 @@ supports_websockets = true
+     ));
+ }
+ 
++#[tokio::test]
++async fn load_config_applies_openai_websocket_override_with_custom_base_url() {
++    let cfg = toml::from_str::<ConfigToml>(
++        r#"
++openai_base_url = "http://127.0.0.1:18080/backend-api/codex"
++
++[model_providers.openai]
++supports_websockets = true
++"#,
++    )
++    .expect("OpenAI websocket override should deserialize");
++
++    let config = Config::load_from_base_config_with_overrides(
++        cfg,
++        ConfigOverrides::default(),
++        tempdir().expect("tempdir").abs(),
++    )
++    .await
++    .expect("load config");
++
++    assert_eq!(config.model_provider_id, "openai");
++    assert_eq!(
++        config.model_provider.base_url.as_deref(),
++        Some("http://127.0.0.1:18080/backend-api/codex")
++    );
++    assert!(config.model_provider.supports_websockets);
++}
++
++#[tokio::test]
++async fn load_config_accepts_disabled_openai_websocket_override() {
++    let cfg = toml::from_str::<ConfigToml>(
++        r#"
++[model_providers.openai]
++supports_websockets = false
++"#,
++    )
++    .expect("OpenAI websocket override should deserialize");
++
++    let config = Config::load_from_base_config_with_overrides(
++        cfg,
++        ConfigOverrides::default(),
++        tempdir().expect("tempdir").abs(),
++    )
++    .await
++    .expect("load config");
++
++    assert_eq!(config.model_provider_id, "openai");
++    assert!(!config.model_provider.supports_websockets);
++}
++
++#[tokio::test]
++async fn load_config_applies_openai_transport_overrides_without_enabling_custom_url_websockets() {
++    let cfg = toml::from_str::<ConfigToml>(
++        r#"
++openai_base_url = "http://127.0.0.1:18080/backend-api/codex"
++
++[model_providers.openai]
++request_max_retries = 3
++stream_max_retries = 7
++stream_idle_timeout_ms = 1234
++websocket_connect_timeout_ms = 4321
++"#,
++    )
++    .expect("OpenAI transport overrides should deserialize");
++
++    let config = Config::load_from_base_config_with_overrides(
++        cfg,
++        ConfigOverrides::default(),
++        tempdir().expect("tempdir").abs(),
++    )
++    .await
++    .expect("load config");
++
++    assert_eq!(config.model_provider_id, "openai");
++    assert_eq!(
++        config.model_provider.base_url.as_deref(),
++        Some("http://127.0.0.1:18080/backend-api/codex")
++    );
++    assert_eq!(config.model_provider.request_max_retries, Some(3));
++    assert_eq!(config.model_provider.stream_max_retries, Some(7));
++    assert_eq!(config.model_provider.stream_idle_timeout_ms, Some(1234));
++    assert_eq!(
++        config.model_provider.websocket_connect_timeout_ms,
++        Some(4321)
++    );
++    assert!(!config.model_provider.supports_websockets);
++    assert!(config.model_provider.requires_openai_auth);
++}
++
++#[test]
++fn load_config_rejects_each_unsupported_openai_provider_override() {
++    let unsupported: [(&str, &str); 12] = [
++        ("name", "name = \"\""),
++        ("base_url", "base_url = \"https://api.openai.com/v1\""),
++        ("env_key", "env_key = \"\""),
++        ("env_key_instructions", "env_key_instructions = \"\""),
++        (
++            "experimental_bearer_token",
++            "experimental_bearer_token = \"\"",
++        ),
++        ("auth", "auth = { command = \"print-token\" }"),
++        ("aws", "aws = {}"),
++        ("wire_api", "wire_api = \"responses\""),
++        ("query_params", "query_params = {}"),
++        ("http_headers", "http_headers = {}"),
++        ("env_http_headers", "env_http_headers = {}"),
++        ("requires_openai_auth", "requires_openai_auth = false"),
++    ];
++
++    for (field, value) in unsupported {
++        let input = format!("[model_providers.openai]\n{value}\n");
++        let err =
++            toml::from_str::<ConfigToml>(&input).expect_err("unsupported OpenAI provider override");
++        let message = err.to_string();
++        assert!(
++            message.contains("model_providers.openai only supports changing"),
++            "unexpected error for `{field}`: {message}"
++        );
++        assert!(
++            message.contains(&format!("`{field}`")),
++            "error should name `{field}`: {message}"
++        );
++        if field == "base_url" {
++            assert!(
++                message.contains("use `openai_base_url` for `base_url`"),
++                "base_url error should direct users to openai_base_url: {message}"
++            );
++        }
++    }
++}
++
+ #[test]
+ fn config_toml_deserializes_model_availability_nux() {
+     let toml = r#"
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index 14daf7648d..3cade6a346 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -85,7 +85,7 @@ use codex_model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
+ use codex_model_provider_info::ModelProviderInfo;
+ use codex_model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
+ use codex_model_provider_info::built_in_model_providers;
+-use codex_model_provider_info::merge_configured_model_providers;
++use codex_model_provider_info::merge_configured_model_provider_overrides;
+ use codex_models_manager::ModelsManagerConfig;
+ use codex_protocol::config_types::AltScreenMode;
+ use codex_protocol::config_types::AutoCompactTokenLimitScope;
+@@ -3630,7 +3630,10 @@ impl Config {
+             .filter(|value| !value.is_empty());
+ 
+         let model_providers =
+-            merge_configured_model_providers(built_in_model_providers(openai_base_url), cfg.model_providers)
++            merge_configured_model_provider_overrides(
++                built_in_model_providers(openai_base_url),
++                cfg.model_providers,
++            )
+                 .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?;
+ 
+         let model_provider_id = model_provider
+diff --git a/codex-rs/core/src/responses_retry.rs b/codex-rs/core/src/responses_retry.rs
+index 928b9a9cf5..8f3d3c45aa 100644
+--- a/codex-rs/core/src/responses_retry.rs
++++ b/codex-rs/core/src/responses_retry.rs
+@@ -1,12 +1,17 @@
+ //! Shared retry and transport fallback decisions for Responses requests.
+ 
+ use std::time::Duration;
++use std::time::SystemTime;
++use std::time::UNIX_EPOCH;
+ 
+ use crate::client::ModelClientSession;
+ use crate::session::session::Session;
+ use crate::session::turn_context::TurnContext;
+ use crate::util::backoff;
++use chrono::DateTime;
++use chrono::Local;
+ use codex_protocol::error::CodexErr;
++use codex_protocol::error::CodexErrorDetails;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::WarningEvent;
+ use tracing::warn;
+@@ -17,6 +22,96 @@ pub(crate) enum ResponsesStreamRequest {
+     RemoteCompactionV2,
+ }
+ 
++const STREAM_RETRY_MAX_BACKOFF_DELAY: Duration = Duration::from_secs(30);
++const EXTERNAL_LIMIT_CAPACITY_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
++const EXTERNAL_LIMIT_ACCOUNT_QUOTA_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum ExternalLimitRetryKind {
++    Capacity,
++    AccountQuota,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) struct ExternalLimitRetry {
++    pub(crate) kind: ExternalLimitRetryKind,
++    pub(crate) delay: Duration,
++    pub(crate) retry_at: SystemTime,
++}
++
++pub(crate) fn external_limit_retry_delay(err: &CodexErr) -> Option<Duration> {
++    external_limit_retry(err).map(|retry| retry.delay)
++}
++
++fn external_limit_retry(err: &CodexErr) -> Option<ExternalLimitRetry> {
++    external_limit_retry_at(err, SystemTime::now())
++}
++
++fn external_limit_retry_at(err: &CodexErr, now: SystemTime) -> Option<ExternalLimitRetry> {
++    let (kind, interval) = match err.details() {
++        CodexErrorDetails::ServerOverloaded => (
++            ExternalLimitRetryKind::Capacity,
++            EXTERNAL_LIMIT_CAPACITY_RETRY_INTERVAL,
++        ),
++        CodexErrorDetails::QuotaExceeded | CodexErrorDetails::UsageLimitReached(_) => (
++            ExternalLimitRetryKind::AccountQuota,
++            EXTERNAL_LIMIT_ACCOUNT_QUOTA_RETRY_INTERVAL,
++        ),
++        _ => return None,
++    };
++
++    let delay = delay_until_next_boundary(now, interval);
++    Some(ExternalLimitRetry {
++        kind,
++        delay,
++        retry_at: now + delay,
++    })
++}
++
++fn delay_until_next_boundary(now: SystemTime, interval: Duration) -> Duration {
++    let Ok(elapsed) = now.duration_since(UNIX_EPOCH) else {
++        return interval;
++    };
++    let interval_ms = interval.as_millis();
++    let elapsed_ms = elapsed.as_millis();
++    let remainder = elapsed_ms % interval_ms;
++    let delay_ms = if remainder == 0 {
++        interval_ms
++    } else {
++        interval_ms - remainder
++    };
++    Duration::from_millis(delay_ms.try_into().unwrap_or(u64::MAX))
++}
++
++fn format_retry_at_local_time(retry_at: SystemTime) -> String {
++    let retry_at: DateTime<Local> = retry_at.into();
++    retry_at.format("%H:%M").to_string()
++}
++
++fn external_limit_retry_warning(retry: ExternalLimitRetry) -> String {
++    let retry_at = format_retry_at_local_time(retry.retry_at);
++    match retry.kind {
++        ExternalLimitRetryKind::Capacity => format!(
++            "External capacity limit reached. Retrying at {retry_at} (next 5-minute boundary)."
++        ),
++        ExternalLimitRetryKind::AccountQuota => format!(
++            "Account quota limit reached. Retrying at {retry_at} (next 30-minute boundary)."
++        ),
++    }
++}
++
++pub(crate) fn sampling_error_is_retryable(
++    err: &CodexErr,
++    responses_websocket_enabled: bool,
++) -> bool {
++    match err.details() {
++        CodexErrorDetails::UnexpectedStatus(response) if response.status.is_client_error() => {
++            responses_websocket_enabled
++        }
++        _ => err.is_retryable(),
++    }
++}
++
+ /// Handles a retryable stream error and returns `Ok(())` when the caller should
+ /// retry the request loop.
+ pub(crate) async fn handle_retryable_response_stream_error(
+@@ -32,10 +127,37 @@ pub(crate) async fn handle_retryable_response_stream_error(
+         turn_context.model_info.automatic_limit_retry,
+         request,
+         &err,
+-    ) {
++    ) || (matches!(request, ResponsesStreamRequest::Sampling)
++        && max_retries == 0
++        && external_limit_retry_delay(&err).is_some())
++    {
+         return Err(err);
+     }
+ 
++    if matches!(request, ResponsesStreamRequest::Sampling)
++        && let Some(retry) = retryable_external_limit(
++            turn_context.model_info.automatic_limit_retry,
++            &err,
++            max_retries,
++        )
++    {
++        warn!(
++            error = %err,
++            retry_kind = ?retry.kind,
++            delay = ?retry.delay,
++            "external limit reached; retrying sampling request"
++        );
++        sess.send_event(
++            turn_context,
++            EventMsg::Warning(WarningEvent {
++                message: external_limit_retry_warning(retry),
++            }),
++        )
++        .await;
++        tokio::time::sleep(retry.delay).await;
++        return Ok(());
++    }
++
+     if *retries >= max_retries
+         && client_session.try_switch_fallback_transport(
+             &turn_context.session_telemetry,
+@@ -56,7 +178,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
+     if *retries < max_retries {
+         *retries += 1;
+         let retry_count = *retries;
+-        let delay = err.retry_delay().unwrap_or_else(|| backoff(retry_count));
++        let delay = stream_retry_delay(&err, retry_count);
+         log_retry(request, turn_context, &err, retry_count, max_retries, delay);
+ 
+         // In release builds, hide the first websocket retry notification to reduce noisy
+@@ -81,6 +203,23 @@ pub(crate) async fn handle_retryable_response_stream_error(
+     Err(err)
+ }
+ 
++fn stream_retry_delay(err: &CodexErr, retry_count: u64) -> Duration {
++    err.retry_delay()
++        .unwrap_or_else(|| backoff(retry_count))
++        .min(STREAM_RETRY_MAX_BACKOFF_DELAY)
++}
++
++fn retryable_external_limit(
++    automatic_limit_retry: bool,
++    err: &CodexErr,
++    max_retries: u64,
++) -> Option<ExternalLimitRetry> {
++    if !automatic_limit_retry || max_retries == 0 {
++        return None;
++    }
++    external_limit_retry(err)
++}
++
+ fn sampling_external_limit_should_surface(
+     automatic_limit_retry: bool,
+     request: ResponsesStreamRequest,
+@@ -89,8 +228,10 @@ fn sampling_external_limit_should_surface(
+     !automatic_limit_retry
+         && matches!(request, ResponsesStreamRequest::Sampling)
+         && matches!(
+-            err,
+-            CodexErr::ServerOverloaded | CodexErr::QuotaExceeded | CodexErr::UsageLimitReached(_)
++            err.details(),
++            CodexErrorDetails::ServerOverloaded
++                | CodexErrorDetails::QuotaExceeded
++                | CodexErrorDetails::UsageLimitReached(_)
+         )
+ }
+ 
+diff --git a/codex-rs/core/src/responses_retry_tests.rs b/codex-rs/core/src/responses_retry_tests.rs
+index 1720d47370..4e253180a7 100644
+--- a/codex-rs/core/src/responses_retry_tests.rs
++++ b/codex-rs/core/src/responses_retry_tests.rs
+@@ -1,10 +1,23 @@
++use super::EXTERNAL_LIMIT_ACCOUNT_QUOTA_RETRY_INTERVAL;
++use super::EXTERNAL_LIMIT_CAPACITY_RETRY_INTERVAL;
++use super::ExternalLimitRetry;
++use super::ExternalLimitRetryKind;
+ use super::ResponsesStreamRequest;
++use super::STREAM_RETRY_MAX_BACKOFF_DELAY;
++use super::external_limit_retry_at;
++use super::external_limit_retry_warning;
+ use super::log_retry;
++use super::retryable_external_limit;
+ use super::sampling_external_limit_should_surface;
++use super::stream_retry_delay;
+ use crate::session::tests::make_session_and_context;
+ use codex_protocol::error::CodexErr;
++use codex_protocol::error::UnexpectedResponseError;
+ use codex_protocol::error::UsageLimitReachedError;
++use http::StatusCode;
+ use std::time::Duration;
++use std::time::SystemTime;
++use std::time::UNIX_EPOCH;
+ use tracing_test::internal::MockWriter;
+ 
+ #[tokio::test]
+@@ -80,6 +93,128 @@ fn model_retry_flag_only_surfaces_sampling_external_limits() {
+     assert!(!sampling_external_limit_should_surface(
+         false,
+         ResponsesStreamRequest::Sampling,
+-        &CodexErr::Stream("disconnected".to_string(), None),
++        &CodexErr::Stream("disconnected".to_string()),
+     ));
+ }
++
++#[test]
++fn sampling_client_errors_retry_only_for_websocket_transport() {
++    let error = CodexErr::UnexpectedStatus(UnexpectedResponseError {
++        status: StatusCode::BAD_REQUEST,
++        body: String::new(),
++        user_message: None,
++        url: None,
++        cf_ray: None,
++        request_id: None,
++        identity_authorization_error: None,
++        identity_error_code: None,
++    });
++
++    assert!(super::sampling_error_is_retryable(&error, true));
++    assert!(!super::sampling_error_is_retryable(&error, false));
++}
++
++#[test]
++fn stream_retry_backoff_is_bounded_and_preserves_requested_delay() {
++    let automatic = CodexErr::Stream("disconnected".to_string());
++    let delays: Vec<Duration> = (1..=30)
++        .map(|retry_count| stream_retry_delay(&automatic, retry_count))
++        .collect();
++
++    assert!(
++        delays
++            .iter()
++            .all(|delay| *delay <= STREAM_RETRY_MAX_BACKOFF_DELAY)
++    );
++    assert_eq!(delays.last(), Some(&STREAM_RETRY_MAX_BACKOFF_DELAY));
++    let total: Duration = delays.into_iter().sum();
++    assert!(total <= Duration::from_secs(30 * 60));
++
++    let requested =
++        CodexErr::Stream("retry later".to_string()).with_retry_delay(Duration::from_secs(45));
++    assert_eq!(stream_retry_delay(&requested, 30), Duration::from_secs(45));
++}
++
++fn usage_limit_reached_error() -> CodexErr {
++    CodexErr::UsageLimitReached(UsageLimitReachedError {
++        plan_type: None,
++        resets_at: None,
++        rate_limits: None,
++        promo_message: None,
++        rate_limit_reached_type: None,
++    })
++}
++
++#[test]
++fn external_limit_errors_align_to_retry_boundaries() {
++    let now = UNIX_EPOCH + Duration::from_secs(6 * 60 * 60 + 21 * 60 + 10);
++
++    assert_eq!(
++        external_limit_retry_at(&CodexErr::ServerOverloaded, now),
++        Some(ExternalLimitRetry {
++            kind: ExternalLimitRetryKind::Capacity,
++            delay: Duration::from_secs(3 * 60 + 50),
++            retry_at: now + Duration::from_secs(3 * 60 + 50),
++        })
++    );
++    for err in [CodexErr::QuotaExceeded, usage_limit_reached_error()] {
++        assert_eq!(
++            external_limit_retry_at(&err, now),
++            Some(ExternalLimitRetry {
++                kind: ExternalLimitRetryKind::AccountQuota,
++                delay: Duration::from_secs(8 * 60 + 50),
++                retry_at: now + Duration::from_secs(8 * 60 + 50),
++            })
++        );
++    }
++    assert_eq!(
++        external_limit_retry_at(&CodexErr::UsageNotIncluded, now),
++        None
++    );
++
++    let boundary = UNIX_EPOCH + Duration::from_secs(6 * 60 * 60 + 30 * 60);
++    assert_eq!(
++        external_limit_retry_at(&CodexErr::ServerOverloaded, boundary)
++            .expect("capacity retry")
++            .delay,
++        EXTERNAL_LIMIT_CAPACITY_RETRY_INTERVAL
++    );
++    assert_eq!(
++        external_limit_retry_at(&CodexErr::QuotaExceeded, boundary)
++            .expect("quota retry")
++            .delay,
++        EXTERNAL_LIMIT_ACCOUNT_QUOTA_RETRY_INTERVAL
++    );
++}
++
++#[test]
++fn external_limit_retry_requires_model_opt_in_and_nonzero_budget() {
++    assert!(retryable_external_limit(true, &CodexErr::QuotaExceeded, 30).is_some());
++    assert_eq!(
++        retryable_external_limit(false, &CodexErr::QuotaExceeded, 30),
++        None
++    );
++    assert_eq!(
++        retryable_external_limit(true, &CodexErr::QuotaExceeded, 0),
++        None
++    );
++}
++
++#[test]
++fn boundary_retry_warning_messages_are_specific() {
++    let capacity = external_limit_retry_warning(ExternalLimitRetry {
++        kind: ExternalLimitRetryKind::Capacity,
++        delay: Duration::from_secs(230),
++        retry_at: SystemTime::now() + Duration::from_secs(230),
++    });
++    assert!(capacity.contains("External capacity limit reached"));
++    assert!(capacity.contains("next 5-minute boundary"));
++
++    let quota = external_limit_retry_warning(ExternalLimitRetry {
++        kind: ExternalLimitRetryKind::AccountQuota,
++        delay: Duration::from_secs(530),
++        retry_at: SystemTime::now() + Duration::from_secs(530),
++    });
++    assert!(quota.contains("Account quota limit reached"));
++    assert!(quota.contains("next 30-minute boundary"));
++}
+diff --git a/codex-rs/core/src/session/handlers.rs b/codex-rs/core/src/session/handlers.rs
+index e1bef1eef5..3072c34e5d 100644
+--- a/codex-rs/core/src/session/handlers.rs
++++ b/codex-rs/core/src/session/handlers.rs
+@@ -593,7 +593,7 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
+ 
+ async fn shutdown_session_runtime(sess: &Arc<Session>) {
+     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
+-        startup_prewarm.abort().await;
++        startup_prewarm.abort(&sess.services.model_client).await;
+     }
+     let _ = sess.conversation.shutdown().await;
+     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index cef3b43784..1b39730a6f 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -421,6 +421,58 @@ async fn regular_turn_emits_turn_started_with_trace_id_without_waiting_for_start
+     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+ }
+ 
++#[tokio::test]
++async fn startup_prewarm_abort_waits_for_session_drop_before_returning() {
++    struct DropSignal {
++        client_session: Option<crate::client::ModelClientSession>,
++        dropped: Arc<std::sync::atomic::AtomicBool>,
++    }
++
++    impl Drop for DropSignal {
++        fn drop(&mut self) {
++            drop(self.client_session.take());
++            self.dropped
++                .store(true, std::sync::atomic::Ordering::SeqCst);
++        }
++    }
++
++    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
++    let model_client = sess.services.model_client.clone();
++    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
++    let task_dropped = Arc::clone(&dropped);
++    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
++    let task = tokio::spawn(async move {
++        let mut drop_signal = DropSignal {
++            client_session: Some(model_client.new_session()),
++            dropped: task_dropped,
++        };
++        started_tx.send(()).expect("drop signal task should start");
++        std::future::pending::<()>().await;
++        Ok(drop_signal
++            .client_session
++            .take()
++            .expect("pending task should retain its client session"))
++    });
++    started_rx.await.expect("drop signal task should start");
++
++    tokio::time::timeout(
++        std::time::Duration::from_secs(1),
++        crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
++            task,
++            std::time::Instant::now(),
++            crate::client::WEBSOCKET_CONNECT_TIMEOUT,
++        )
++        .abort(&sess.services.model_client),
++    )
++    .await
++    .expect("startup prewarm abort should not hang");
++
++    assert!(
++        dropped.load(std::sync::atomic::Ordering::SeqCst),
++        "startup prewarm abort returned before its client session was dropped"
++    );
++}
++
+ #[tokio::test]
+ async fn request_mcp_server_elicitation_auto_accepts_when_auto_deny_is_enabled() {
+     let (session, turn_context, rx) = make_session_and_context_with_rx().await;
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index 082b217401..4f1cfd6071 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -40,7 +40,9 @@ use crate::plugins::build_plugin_injections;
+ use crate::responses_metadata::CodexResponsesMetadata;
+ use crate::responses_metadata::CodexResponsesRequestKind;
+ use crate::responses_retry::ResponsesStreamRequest;
++use crate::responses_retry::external_limit_retry_delay;
+ use crate::responses_retry::handle_retryable_response_stream_error;
++use crate::responses_retry::sampling_error_is_retryable;
+ use crate::session::PreviousTurnSettings;
+ use crate::session::TurnInput;
+ use crate::session::session::Session;
+@@ -1295,7 +1297,7 @@ async fn run_sampling_request(
+                     if let Some(rate_limits) = rate_limits {
+                         sess.update_rate_limits(&turn_context, *rate_limits).await;
+                     }
+-                    return Err(err);
++                    err
+                 }
+                 _ => err,
+             },
+@@ -1305,7 +1307,14 @@ async fn run_sampling_request(
+             original_input = Some(prompt.input);
+         }
+ 
+-        if !err.is_retryable() {
++        let automatic_external_limit_retry = turn_context.model_info.automatic_limit_retry
++            && external_limit_retry_delay(&err).is_some();
++        if !automatic_external_limit_retry
++            && !sampling_error_is_retryable(
++                &err,
++                sess.services.model_client.responses_websocket_enabled(),
++            )
++        {
+             return Err(err);
+         }
+ 
+diff --git a/codex-rs/core/src/session_startup_prewarm.rs b/codex-rs/core/src/session_startup_prewarm.rs
+index abffe19313..4220bf366b 100644
+--- a/codex-rs/core/src/session_startup_prewarm.rs
++++ b/codex-rs/core/src/session_startup_prewarm.rs
+@@ -11,7 +11,9 @@ use tracing::instrument;
+ use tracing::trace_span;
+ use tracing::warn;
+ 
++use crate::client::ModelClient;
+ use crate::client::ModelClientSession;
++use crate::client::WEBSOCKET_PREWARM_COMPLETION_TIMEOUT;
+ use crate::guardian::routes_approval_to_guardian;
+ use crate::responses_metadata::CodexResponsesRequestKind;
+ use crate::session::INITIAL_SUBMIT_ID;
+@@ -51,14 +53,23 @@ impl SessionStartupPrewarmHandle {
+         }
+     }
+ 
+-    pub(crate) async fn abort(self) {
+-        self.task.abort();
+-        let _ = self.task.await;
++    async fn abort_task_and_reset_cached_websocket_session(
++        task: AbortOnDropHandle<CodexResult<ModelClientSession>>,
++        model_client: &ModelClient,
++    ) {
++        task.abort();
++        let _ = task.await;
++        model_client.reset_cached_websocket_session();
++    }
++
++    pub(crate) async fn abort(self, model_client: &ModelClient) {
++        Self::abort_task_and_reset_cached_websocket_session(self.task, model_client).await;
+     }
+ 
+     #[instrument(name = "startup_prewarm.resolve", level = "trace", skip_all)]
+     async fn resolve(
+         self,
++        model_client: &ModelClient,
+         session_telemetry: &SessionTelemetry,
+         cancellation_token: &CancellationToken,
+     ) -> SessionStartupPrewarmResolution {
+@@ -80,7 +91,7 @@ impl SessionStartupPrewarmHandle {
+             } {
+                 Some(Ok(result)) => Self::resolution_from_join_result(result, started_at),
+                 Some(Err(_elapsed)) => {
+-                    task.abort();
++                    Self::abort_task_and_reset_cached_websocket_session(task, model_client).await;
+                     info!("startup websocket prewarm timed out before the first turn could use it");
+                     SessionStartupPrewarmResolution::Unavailable {
+                         status: "timed_out",
+@@ -88,7 +99,7 @@ impl SessionStartupPrewarmHandle {
+                     }
+                 }
+                 None => {
+-                    task.abort();
++                    Self::abort_task_and_reset_cached_websocket_session(task, model_client).await;
+                     session_telemetry.record_startup_phase(
+                         "startup_prewarm_resolve",
+                         resolve_started_at.elapsed(),
+@@ -196,7 +207,11 @@ impl Session {
+         }
+ 
+         let session_telemetry = self.services.session_telemetry.clone();
+-        let websocket_connect_timeout = self.provider().await.websocket_connect_timeout();
++        let websocket_prewarm_timeout = self
++            .provider()
++            .await
++            .websocket_connect_timeout()
++            .min(WEBSOCKET_PREWARM_COMPLETION_TIMEOUT);
+         let started_at = Instant::now();
+         let startup_prewarm_session = Arc::clone(self);
+         let startup_prewarm = tokio::spawn(
+@@ -226,7 +241,7 @@ impl Session {
+         self.set_session_startup_prewarm(SessionStartupPrewarmHandle::new(
+             startup_prewarm,
+             started_at,
+-            websocket_connect_timeout,
++            websocket_prewarm_timeout,
+         ))
+         .await;
+     }
+@@ -242,7 +257,11 @@ impl Session {
+             };
+         };
+         startup_prewarm
+-            .resolve(&self.services.session_telemetry, cancellation_token)
++            .resolve(
++                &self.services.model_client,
++                &self.services.session_telemetry,
++                cancellation_token,
++            )
+             .await
+     }
+ }
+diff --git a/codex-rs/core/tests/common/responses.rs b/codex-rs/core/tests/common/responses.rs
+index 2b0c178b80..c7bfdd3c35 100644
+--- a/codex-rs/core/tests/common/responses.rs
++++ b/codex-rs/core/tests/common/responses.rs
+@@ -1279,8 +1279,38 @@ pub async fn start_websocket_server(connections: Vec<Vec<Vec<Value>>>) -> WebSoc
+     start_websocket_server_with_headers(connections).await
+ }
+ 
++pub async fn start_websocket_server_with_event_delays(
++    connections: Vec<(Vec<Vec<Value>>, Option<Duration>)>,
++) -> WebSocketTestServer {
++    let connections = connections
++        .into_iter()
++        .map(|(requests, event_delay)| {
++            (
++                WebSocketConnectionConfig {
++                    requests,
++                    response_headers: Vec::new(),
++                    accept_delay: None,
++                    close_after_requests: true,
++                },
++                event_delay,
++            )
++        })
++        .collect();
++    start_websocket_server_inner(connections).await
++}
++
+ pub async fn start_websocket_server_with_headers(
+     connections: Vec<WebSocketConnectionConfig>,
++) -> WebSocketTestServer {
++    let connections = connections
++        .into_iter()
++        .map(|connection| (connection, None))
++        .collect();
++    start_websocket_server_inner(connections).await
++}
++
++async fn start_websocket_server_inner(
++    connections: Vec<(WebSocketConnectionConfig, Option<Duration>)>,
+ ) -> WebSocketTestServer {
+     let start = std::time::Instant::now();
+     let listener = TcpListener::bind("127.0.0.1:0")
+@@ -1314,7 +1344,7 @@ pub async fn start_websocket_server_with_headers(
+                 pending.front().cloned()
+             };
+ 
+-            let Some(connection) = connection else {
++            let Some((connection, event_delay)) = connection else {
+                 continue;
+             };
+ 
+@@ -1425,6 +1455,9 @@ pub async fn start_websocket_server_with_headers(
+                         .find_map(|event| event.get("delta").and_then(Value::as_str)),
+                 );
+                 for event in &request_events {
++                    if let Some(delay) = event_delay {
++                        tokio::time::sleep(delay).await;
++                    }
+                     let Ok(payload) = serde_json::to_string(event) else {
+                         continue;
+                     };
+diff --git a/codex-rs/core/tests/suite/agent_websocket.rs b/codex-rs/core/tests/suite/agent_websocket.rs
+index 00e2f84bbd..88b4fca684 100644
+--- a/codex-rs/core/tests/suite/agent_websocket.rs
++++ b/codex-rs/core/tests/suite/agent_websocket.rs
+@@ -11,6 +11,7 @@ use core_test_support::responses::ev_completed;
+ use core_test_support::responses::ev_response_created;
+ use core_test_support::responses::ev_shell_command_call;
+ use core_test_support::responses::start_websocket_server;
++use core_test_support::responses::start_websocket_server_with_event_delays;
+ use core_test_support::responses::start_websocket_server_with_headers;
+ use core_test_support::skip_if_no_network;
+ use core_test_support::test_codex::test_codex;
+@@ -204,6 +205,68 @@ async fn websocket_first_turn_uses_startup_prewarm_and_create() -> Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn websocket_first_turn_reconnects_after_startup_prewarm_timeout() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = start_websocket_server_with_event_delays(vec![
++        (
++            vec![
++                vec![
++                    ev_response_created("warm-timeout"),
++                    ev_assistant_message("warm-msg", "still warming"),
++                    ev_completed("warm-timeout"),
++                ],
++                vec![
++                    ev_response_created("stale-response"),
++                    ev_assistant_message("stale-msg", "stale"),
++                    ev_completed("stale-response"),
++                ],
++            ],
++            Some(Duration::from_millis(400)),
++        ),
++        (
++            vec![vec![
++                ev_response_created("resp-1"),
++                ev_assistant_message("msg-1", "hello"),
++                ev_completed("resp-1"),
++            ]],
++            None,
++        ),
++    ])
++    .await;
++
++    let mut builder = test_codex().with_config(|config| {
++        config.model_provider.websocket_connect_timeout_ms = Some(1_000);
++        config.model_provider.stream_max_retries = Some(0);
++    });
++    let test = builder.build_with_websocket_server(&server).await?;
++    let warmup = tokio::time::timeout(
++        Duration::from_secs(2),
++        server.wait_for_request(/*connection_index*/ 0, /*request_index*/ 0),
++    )
++    .await
++    .expect("startup prewarm request should arrive")
++    .body_json();
++    assert_eq!(warmup["type"].as_str(), Some("response.create"));
++    assert_eq!(warmup["generate"].as_bool(), Some(false));
++
++    test.submit_turn_with_policy("hello", test.config.legacy_sandbox_policy())
++        .await?;
++
++    assert_eq!(server.handshakes().len(), 2);
++    let connections = server.connections();
++    assert_eq!(connections.len(), 2);
++    assert_eq!(connections[0].len(), 1);
++    assert_eq!(connections[1].len(), 1);
++    let turn = connections[1][0].body_json();
++    assert_eq!(turn["type"].as_str(), Some("response.create"));
++    assert_eq!(turn.get("previous_response_id"), None);
++
++    server.shutdown().await;
++    Ok(())
++}
++
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn websocket_first_turn_handles_handshake_delay_with_startup_prewarm() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+diff --git a/codex-rs/core/tests/suite/client.rs b/codex-rs/core/tests/suite/client.rs
+index 218d6e22ed..7aea875b44 100644
+--- a/codex-rs/core/tests/suite/client.rs
++++ b/codex-rs/core/tests/suite/client.rs
+@@ -53,6 +53,8 @@ use codex_protocol::protocol::RolloutLine;
+ use codex_protocol::protocol::SessionMeta;
+ use codex_protocol::protocol::SessionMetaLine;
+ use codex_protocol::protocol::SessionSource;
++use codex_protocol::protocol::TurnAbortReason;
++use codex_protocol::protocol::WarningEvent;
+ use codex_protocol::user_input::UserInput;
+ use core_test_support::PathBufExt;
+ use core_test_support::TestCodexResponsesRequestKind;
+@@ -66,6 +68,7 @@ use core_test_support::responses::ev_function_call;
+ use core_test_support::responses::ev_message_item_added;
+ use core_test_support::responses::ev_output_text_delta;
+ use core_test_support::responses::ev_response_created;
++use core_test_support::responses::mount_response_sequence;
+ use core_test_support::responses::mount_sse_once;
+ use core_test_support::responses::mount_sse_once_match;
+ use core_test_support::responses::mount_sse_sequence;
+@@ -3543,7 +3546,9 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
+         .mount(&server)
+         .await;
+ 
+-    let mut builder = test_codex();
++    let mut builder = test_codex().with_config(|config| {
++        config.model_provider.stream_max_retries = Some(0);
++    });
+     let codex_fixture = builder.build(&server).await?;
+     let codex = codex_fixture.codex.clone();
+ 
+@@ -3612,6 +3617,68 @@ async fn usage_limit_error_emits_rate_limit_event() -> anyhow::Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn usage_limit_error_warns_and_waits_for_boundary_until_interrupted() -> anyhow::Result<()> {
++    skip_if_no_network!(Ok(()));
++    let server = MockServer::start().await;
++    let responses_mock = mount_response_sequence(
++        &server,
++        vec![ResponseTemplate::new(429).set_body_json(json!({
++            "error": {
++                "type": "usage_limit_reached",
++                "message": "limit reached",
++                "resets_at": 1704067242,
++                "plan_type": "pro"
++            }
++        }))],
++    )
++    .await;
++
++    let codex = test_codex()
++        .with_model("gpt-5.4")
++        .with_config(|config| {
++            config.model_provider.stream_max_retries = Some(1);
++        })
++        .build(&server)
++        .await?
++        .codex;
++    codex
++        .submit(Op::UserInput {
++            items: vec![UserInput::Text {
++                text: "hello".into(),
++                text_elements: Vec::new(),
++            }],
++            final_output_json_schema: None,
++            responsesapi_client_metadata: None,
++            additional_context: Default::default(),
++            thread_settings: Default::default(),
++        })
++        .await?;
++
++    let warning = wait_for_event(&codex, |msg| {
++        matches!(
++            msg,
++            EventMsg::Warning(WarningEvent { message })
++                if message.contains("next 30-minute boundary")
++        )
++    })
++    .await;
++    let EventMsg::Warning(WarningEvent { message }) = warning else {
++        unreachable!();
++    };
++    assert!(message.contains("Account quota limit reached"));
++
++    codex.submit(Op::Interrupt).await?;
++    let aborted = wait_for_event(&codex, |msg| matches!(msg, EventMsg::TurnAborted(_))).await;
++    let EventMsg::TurnAborted(aborted) = aborted else {
++        unreachable!();
++    };
++    assert_eq!(aborted.reason, TurnAbortReason::Interrupted);
++    assert_eq!(responses_mock.requests().len(), 1);
++
++    Ok(())
++}
++
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn context_window_error_records_model_window_without_synthetic_usage() -> anyhow::Result<()> {
+     skip_if_no_network!(Ok(()));
+diff --git a/codex-rs/core/tests/suite/client_websockets.rs b/codex-rs/core/tests/suite/client_websockets.rs
+index 988419dec8..4628a23bbe 100755
+--- a/codex-rs/core/tests/suite/client_websockets.rs
++++ b/codex-rs/core/tests/suite/client_websockets.rs
+@@ -47,6 +47,7 @@ use core_test_support::responses::ev_assistant_message;
+ use core_test_support::responses::ev_completed;
+ use core_test_support::responses::ev_response_created;
+ use core_test_support::responses::start_websocket_server;
++use core_test_support::responses::start_websocket_server_with_event_delays;
+ use core_test_support::responses::start_websocket_server_with_headers;
+ use core_test_support::responses_metadata as test_responses_metadata;
+ use core_test_support::skip_if_no_network;
+@@ -542,6 +543,65 @@ async fn responses_websocket_request_prewarm_reuses_connection() {
+     server.shutdown().await;
+ }
+ 
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn responses_websocket_prewarm_completion_timeout_resets_cached_session() {
++    skip_if_no_network!();
++
++    let server = start_websocket_server_with_event_delays(vec![
++        (
++            vec![vec![
++                ev_response_created("warm-timeout"),
++                ev_assistant_message("warm-msg", "still warming"),
++                ev_completed("warm-timeout"),
++            ]],
++            Some(Duration::from_millis(1_100)),
++        ),
++        (
++            vec![vec![
++                ev_response_created("resp-after-timeout"),
++                ev_completed("resp-after-timeout"),
++            ]],
++            None,
++        ),
++    ])
++    .await;
++
++    let harness = websocket_harness_with_options(&server, /*runtime_metrics_enabled*/ true).await;
++    let mut client_session = harness.client.new_session();
++    let prompt = prompt_with_input(vec![message_item("hello")]);
++    let responses_metadata = prewarm_metadata(&harness, /*turn_id*/ None);
++    let err = client_session
++        .prewarm_websocket(
++            &prompt,
++            &harness.model_info,
++            &harness.session_telemetry,
++            harness.effort.clone(),
++            harness.summary,
++            /*service_tier*/ None,
++            &responses_metadata,
++        )
++        .await
++        .expect_err("websocket prewarm should exceed its completion deadline");
++    assert!(matches!(
++        &err,
++        codex_protocol::error::CodexErr::Stream(message, None)
++            if message == "websocket prewarm timed out waiting for response.completed"
++    ));
++
++    stream_until_complete(&mut client_session, &harness, &prompt).await;
++
++    assert_eq!(server.handshakes().len(), 2);
++    let connections = server.connections();
++    assert_eq!(connections.len(), 2);
++    assert_eq!(connections[0].len(), 1);
++    assert_eq!(connections[1].len(), 1);
++    let follow_up = connections[1][0].body_json();
++    assert_eq!(follow_up["type"].as_str(), Some("response.create"));
++    assert_eq!(follow_up.get("previous_response_id"), None);
++
++    server.shutdown().await;
++}
++
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn responses_websocket_request_prewarm_uses_caller_supplied_metadata() {
+     skip_if_no_network!();
+diff --git a/codex-rs/core/tests/suite/compact_remote.rs b/codex-rs/core/tests/suite/compact_remote.rs
+index 4e3b8615f9..619a7132b6 100644
+--- a/codex-rs/core/tests/suite/compact_remote.rs
++++ b/codex-rs/core/tests/suite/compact_remote.rs
+@@ -1054,7 +1054,7 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result<()> {
++async fn remote_compact_v2_uses_provider_stream_retry_budget() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+     let harness = TestCodexHarness::with_builder(
+@@ -1063,7 +1063,7 @@ async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result
+             .with_config(|config| {
+                 let _ = config.features.enable(Feature::RemoteCompactionV2);
+                 config.model_provider.request_max_retries = Some(0);
+-                config.model_provider.stream_max_retries = Some(2);
++                config.model_provider.stream_max_retries = Some(3);
+             }),
+     )
+     .await?;
+@@ -1077,6 +1077,7 @@ async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result
+                 responses::ev_completed("resp-1"),
+             ])),
+             ResponseTemplate::new(500).set_body_string("first compact open failed"),
++            ResponseTemplate::new(500).set_body_string("second compact open failed"),
+             responses::sse_response(responses::sse(vec![serde_json::json!({
+                 "type": "response.output_item.done",
+                 "item": {
+@@ -1135,12 +1136,12 @@ async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result
+ 
+     let response_requests = responses_mock.requests();
+     assert_eq!(
+-        5,
++        6,
+         response_requests.len(),
+-        "expected initial turn, failed open, failed stream, compact retry, and follow-up turn"
++        "expected initial turn, three compact failures, compact success, and follow-up turn"
+     );
+ 
+-    for compact_request in &response_requests[1..=3] {
++    for compact_request in &response_requests[1..=4] {
+         assert_eq!("/v1/responses", compact_request.path());
+         assert!(
+             compact_request
+diff --git a/codex-rs/core/tests/suite/websocket_fallback.rs b/codex-rs/core/tests/suite/websocket_fallback.rs
+index cdf77694c2..3987dbb48d 100644
+--- a/codex-rs/core/tests/suite/websocket_fallback.rs
++++ b/codex-rs/core/tests/suite/websocket_fallback.rs
+@@ -46,6 +46,7 @@ async fn websocket_fallback_switches_to_http_on_upgrade_required_connect() -> Re
+     let mut builder = test_codex().with_config({
+         let base_url = format!("{}/v1", server.uri());
+         move |config| {
++            config.model_provider.name = "Custom".to_string();
+             config.model_provider.base_url = Some(base_url);
+             config.model_provider.wire_api = WireApi::Responses;
+             config.model_provider.supports_websockets = true;
+@@ -78,6 +79,47 @@ async fn websocket_fallback_switches_to_http_on_upgrade_required_connect() -> Re
+     Ok(())
+ }
+ 
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn openai_websocket_upgrade_failure_does_not_fallback_to_http() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = responses::start_mock_server().await;
++    Mock::given(method("GET"))
++        .and(path_regex(".*/responses$"))
++        .respond_with(ResponseTemplate::new(426))
++        .mount(&server)
++        .await;
++
++    let mut builder = test_codex().with_config({
++        let base_url = format!("{}/v1", server.uri());
++        move |config| {
++            config.model_provider.base_url = Some(base_url);
++            config.model_provider.wire_api = WireApi::Responses;
++            config.model_provider.supports_websockets = true;
++            config.model_provider.stream_max_retries = Some(0);
++            config.model_provider.request_max_retries = Some(0);
++        }
++    });
++    let test = builder.build(&server).await?;
++
++    test.submit_turn("hello").await?;
++
++    let requests = server.received_requests().await.unwrap_or_default();
++    let websocket_attempts = requests
++        .iter()
++        .filter(|req| req.method == Method::GET && req.url.path().ends_with("/responses"))
++        .count();
++    let http_attempts = requests
++        .iter()
++        .filter(|req| req.method == Method::POST && req.url.path().ends_with("/responses"))
++        .count();
++
++    assert!(websocket_attempts >= 1);
++    assert_eq!(http_attempts, 0);
++
++    Ok(())
++}
++
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+@@ -92,6 +134,7 @@ async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result
+     let mut builder = test_codex().with_config({
+         let base_url = format!("{}/v1", server.uri());
+         move |config| {
++            config.model_provider.name = "Custom".to_string();
+             config.model_provider.base_url = Some(base_url);
+             config.model_provider.wire_api = WireApi::Responses;
+             config.model_provider.supports_websockets = true;
+@@ -137,6 +180,7 @@ async fn websocket_fallback_hides_first_websocket_retry_stream_error() -> Result
+     let mut builder = test_codex().with_config({
+         let base_url = format!("{}/v1", server.uri());
+         move |config| {
++            config.model_provider.name = "Custom".to_string();
+             config.model_provider.base_url = Some(base_url);
+             config.model_provider.wire_api = WireApi::Responses;
+             config.model_provider.supports_websockets = true;
+@@ -222,6 +266,7 @@ async fn websocket_fallback_is_sticky_across_turns() -> Result<()> {
+     let mut builder = test_codex().with_config({
+         let base_url = format!("{}/v1", server.uri());
+         move |config| {
++            config.model_provider.name = "Custom".to_string();
+             config.model_provider.base_url = Some(base_url);
+             config.model_provider.wire_api = WireApi::Responses;
+             config.model_provider.supports_websockets = true;
+diff --git a/codex-rs/model-provider-info/src/lib.rs b/codex-rs/model-provider-info/src/lib.rs
+index 82fc5fc2a6..5e4e44fab9 100644
+--- a/codex-rs/model-provider-info/src/lib.rs
++++ b/codex-rs/model-provider-info/src/lib.rs
+@@ -24,7 +24,7 @@ use std::fmt;
+ use std::time::Duration;
+ 
+ const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
+-const DEFAULT_STREAM_MAX_RETRIES: u64 = 5;
++const DEFAULT_STREAM_MAX_RETRIES: u64 = 30;
+ const DEFAULT_REQUEST_MAX_RETRIES: u64 = 4;
+ pub const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS: u64 = 15_000;
+ /// Hard cap for user-configured `stream_max_retries`.
+@@ -35,6 +35,7 @@ const MAX_REQUEST_MAX_RETRIES: u64 = 100;
+ const OPENAI_PROVIDER_NAME: &str = "OpenAI";
+ const OPENAI_ACTOR_AUTHORIZATION_HEADER: &str = "x-openai-actor-authorization";
+ pub const OPENAI_PROVIDER_ID: &str = "openai";
++pub const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+ pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+ const AMAZON_BEDROCK_PROVIDER_NAME: &str = "Amazon Bedrock";
+ pub const AMAZON_BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
+@@ -143,6 +144,80 @@ pub struct ModelProviderInfo {
+     pub supports_standalone_web_search: bool,
+ }
+ 
++/// Presence-preserving provider fields read from `model_providers` in config.toml.
++///
++/// Runtime provider behavior remains owned by [`ModelProviderInfo`]. This input
++/// adapter exists so a built-in provider override can distinguish omitted
++/// default-valued fields from explicit values.
++#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, JsonSchema)]
++#[serde(deny_unknown_fields)]
++#[schemars(deny_unknown_fields)]
++pub struct ConfiguredModelProvider {
++    /// Friendly display name.
++    pub name: Option<String>,
++    /// Base URL for the provider's OpenAI-compatible API.
++    pub base_url: Option<String>,
++    /// Environment variable that stores the provider API key.
++    pub env_key: Option<String>,
++    /// Instructions for obtaining the configured environment key.
++    pub env_key_instructions: Option<String>,
++    /// Direct bearer token; `env_key` is preferred.
++    pub experimental_bearer_token: Option<String>,
++    /// Command-backed bearer-token configuration.
++    pub auth: Option<ModelProviderAuthInfo>,
++    /// AWS SigV4 authentication configuration.
++    pub aws: Option<ModelProviderAwsAuthInfo>,
++    /// Wire protocol used by the provider.
++    pub wire_api: Option<WireApi>,
++    /// Query parameters appended to the base URL.
++    pub query_params: Option<HashMap<String, String>>,
++    /// Static HTTP headers included with provider requests.
++    pub http_headers: Option<HashMap<String, String>>,
++    /// HTTP headers sourced from environment variables.
++    pub env_http_headers: Option<HashMap<String, String>>,
++    /// Maximum request retry count.
++    pub request_max_retries: Option<u64>,
++    /// Maximum response-stream reconnect count.
++    pub stream_max_retries: Option<u64>,
++    /// Response-stream idle timeout in milliseconds.
++    pub stream_idle_timeout_ms: Option<u64>,
++    /// WebSocket connection timeout in milliseconds.
++    pub websocket_connect_timeout_ms: Option<u64>,
++    /// Whether the provider uses Codex authentication.
++    pub requires_openai_auth: Option<bool>,
++    /// Whether the provider supports Responses over WebSocket.
++    pub supports_websockets: Option<bool>,
++    /// Whether the provider supports the standalone web-search endpoint.
++    pub supports_standalone_web_search: Option<bool>,
++}
++
++impl From<ConfiguredModelProvider> for ModelProviderInfo {
++    fn from(provider: ConfiguredModelProvider) -> Self {
++        Self {
++            name: provider.name.unwrap_or_default(),
++            base_url: provider.base_url,
++            env_key: provider.env_key,
++            env_key_instructions: provider.env_key_instructions,
++            experimental_bearer_token: provider.experimental_bearer_token,
++            auth: provider.auth,
++            aws: provider.aws,
++            wire_api: provider.wire_api.unwrap_or_default(),
++            query_params: provider.query_params,
++            http_headers: provider.http_headers,
++            env_http_headers: provider.env_http_headers,
++            request_max_retries: provider.request_max_retries,
++            stream_max_retries: provider.stream_max_retries,
++            stream_idle_timeout_ms: provider.stream_idle_timeout_ms,
++            websocket_connect_timeout_ms: provider.websocket_connect_timeout_ms,
++            requires_openai_auth: provider.requires_openai_auth.unwrap_or_default(),
++            supports_websockets: provider.supports_websockets.unwrap_or_default(),
++            supports_standalone_web_search: provider
++                .supports_standalone_web_search
++                .unwrap_or_default(),
++        }
++    }
++}
++
+ /// AWS SigV4 auth configuration for a model provider.
+ #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+ #[schemars(deny_unknown_fields)]
+@@ -254,7 +329,7 @@ impl ModelProviderInfo {
+         ) {
+             CHATGPT_CODEX_BASE_URL
+         } else {
+-            "https://api.openai.com/v1"
++            OPENAI_DEFAULT_BASE_URL
+         };
+         let base_url = self
+             .base_url
+@@ -405,6 +480,15 @@ impl ModelProviderInfo {
+         self.name == OPENAI_PROVIDER_NAME
+     }
+ 
++    /// Whether a failed Responses WebSocket session may switch to HTTP.
++    ///
++    /// The built-in OpenAI route keeps WebSocket transport failures visible
++    /// instead of silently changing transports. Other providers retain the
++    /// upstream fallback policy.
++    pub fn allows_websocket_http_fallback(&self) -> bool {
++        !self.is_openai()
++    }
++
+     pub fn uses_openai_actor_authorization(&self) -> bool {
+         !self.requires_openai_auth
+             && self.http_headers.as_ref().is_some_and(|headers| {
+@@ -439,7 +523,7 @@ pub fn built_in_model_providers(
+     openai_base_url: Option<String>,
+ ) -> HashMap<String, ModelProviderInfo> {
+     use ModelProviderInfo as P;
+-    let openai_provider = P::create_openai_provider(openai_base_url);
++    let openai_provider = openai_provider_with_url_transport_policy(openai_base_url);
+     let amazon_bedrock_provider = P::create_amazon_bedrock_provider(/*aws*/ None);
+ 
+     // We do not want to be in the business of adjucating which third-party
+@@ -463,6 +547,15 @@ pub fn built_in_model_providers(
+     .collect()
+ }
+ 
++fn openai_provider_with_url_transport_policy(base_url: Option<String>) -> ModelProviderInfo {
++    let supports_websockets = base_url
++        .as_deref()
++        .is_none_or(|base_url| base_url == OPENAI_DEFAULT_BASE_URL);
++    let mut provider = ModelProviderInfo::create_openai_provider(base_url);
++    provider.supports_websockets = supports_websockets;
++    provider
++}
++
+ /// Merge configured providers into the built-in provider catalog.
+ ///
+ /// Configured providers extend the built-in set. Built-in providers are not
+@@ -507,6 +600,102 @@ provider fields are not supported"
+     Ok(model_providers)
+ }
+ 
++/// Applies presence-sensitive local overrides, then delegates all ordinary
++/// provider merging to the upstream runtime-provider implementation.
++pub fn merge_configured_model_provider_overrides(
++    mut model_providers: HashMap<String, ModelProviderInfo>,
++    configured_model_providers: HashMap<String, ConfiguredModelProvider>,
++) -> Result<HashMap<String, ModelProviderInfo>, String> {
++    let mut ordinary_providers = HashMap::new();
++    for (key, provider) in configured_model_providers {
++        if key == OPENAI_PROVIDER_ID {
++            validate_openai_provider_override(&provider)?;
++            if let Some(openai) = model_providers.get_mut(OPENAI_PROVIDER_ID) {
++                overlay_openai_transport(openai, provider);
++            }
++        } else {
++            ordinary_providers.insert(key, provider.into());
++        }
++    }
++    merge_configured_model_providers(model_providers, ordinary_providers)
++}
++
++pub fn validate_openai_provider_override(provider: &ConfiguredModelProvider) -> Result<(), String> {
++    let mut unsupported = Vec::new();
++    if provider.name.is_some() {
++        unsupported.push("`name`");
++    }
++    if provider.base_url.is_some() {
++        unsupported.push("`base_url`");
++    }
++    if provider.env_key.is_some() {
++        unsupported.push("`env_key`");
++    }
++    if provider.env_key_instructions.is_some() {
++        unsupported.push("`env_key_instructions`");
++    }
++    if provider.experimental_bearer_token.is_some() {
++        unsupported.push("`experimental_bearer_token`");
++    }
++    if provider.auth.is_some() {
++        unsupported.push("`auth`");
++    }
++    if provider.aws.is_some() {
++        unsupported.push("`aws`");
++    }
++    if provider.wire_api.is_some() {
++        unsupported.push("`wire_api`");
++    }
++    if provider.query_params.is_some() {
++        unsupported.push("`query_params`");
++    }
++    if provider.http_headers.is_some() {
++        unsupported.push("`http_headers`");
++    }
++    if provider.env_http_headers.is_some() {
++        unsupported.push("`env_http_headers`");
++    }
++    if provider.requires_openai_auth.is_some() {
++        unsupported.push("`requires_openai_auth`");
++    }
++
++    if unsupported.is_empty() {
++        return Ok(());
++    }
++
++    let mut message = format!(
++        "model_providers.{OPENAI_PROVIDER_ID} only supports changing \
++`request_max_retries`, `stream_max_retries`, `stream_idle_timeout_ms`, \
++`websocket_connect_timeout_ms`, and `supports_websockets`; unsupported fields: {}",
++        unsupported.join(", ")
++    );
++    if provider.base_url.is_some() {
++        message.push_str("; use `openai_base_url` for `base_url`");
++    }
++    Err(message)
++}
++
++fn overlay_openai_transport(base: &mut ModelProviderInfo, provider: ConfiguredModelProvider) {
++    if let Some(value) = provider.request_max_retries {
++        base.request_max_retries = Some(value);
++    }
++    if let Some(value) = provider.stream_max_retries {
++        base.stream_max_retries = Some(value);
++    }
++    if let Some(value) = provider.stream_idle_timeout_ms {
++        base.stream_idle_timeout_ms = Some(value);
++    }
++    if let Some(value) = provider.websocket_connect_timeout_ms {
++        base.websocket_connect_timeout_ms = Some(value);
++    }
++    if let Some(value) = provider.supports_websockets {
++        base.supports_websockets = value;
++    }
++    if let Some(value) = provider.supports_standalone_web_search {
++        base.supports_standalone_web_search = value;
++    }
++}
++
+ pub fn create_oss_provider(default_provider_port: u16, wire_api: WireApi) -> ModelProviderInfo {
+     // These CODEX_OSS_ environment variables are experimental: we may
+     // switch to reading values from config.toml instead.
+diff --git a/codex-rs/model-provider-info/src/model_provider_info_tests.rs b/codex-rs/model-provider-info/src/model_provider_info_tests.rs
+index 354c7fc2b8..088b3da5fd 100644
+--- a/codex-rs/model-provider-info/src/model_provider_info_tests.rs
++++ b/codex-rs/model-provider-info/src/model_provider_info_tests.rs
+@@ -161,6 +161,127 @@ fn test_header_auth_uses_chatgpt_codex_base_url() {
+     assert_eq!(api_provider.base_url, CHATGPT_CODEX_BASE_URL);
+ }
+ 
++#[test]
++fn custom_openai_base_url_requires_explicit_websocket_opt_in() {
++    let canonical = built_in_model_providers(Some(OPENAI_DEFAULT_BASE_URL.to_string()))
++        .remove(OPENAI_PROVIDER_ID)
++        .expect("OpenAI provider");
++    let custom = built_in_model_providers(Some("http://127.0.0.1:12345/v1".to_string()))
++        .remove(OPENAI_PROVIDER_ID)
++        .expect("OpenAI provider");
++
++    assert!(canonical.supports_websockets);
++    assert!(!custom.supports_websockets);
++}
++
++#[test]
++fn default_stream_retry_budget_is_thirty_retries() {
++    let provider = ModelProviderInfo::default();
++
++    assert_eq!(
++        provider.stream_max_retries(),
++        30,
++        "30 retries allow 31 total stream attempts"
++    );
++}
++
++#[test]
++fn only_openai_disables_websocket_http_fallback() {
++    let openai = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
++    let mut custom = openai.clone();
++    custom.name = "Custom".to_string();
++
++    assert!(!openai.allows_websocket_http_fallback());
++    assert!(custom.allows_websocket_http_fallback());
++}
++
++#[test]
++fn configured_model_provider_preserves_explicit_default_values() {
++    let explicit = ConfiguredModelProvider {
++        name: Some(String::new()),
++        wire_api: Some(WireApi::Responses),
++        requires_openai_auth: Some(false),
++        supports_websockets: Some(false),
++        ..ConfiguredModelProvider::default()
++    };
++    let encoded = toml::to_string(&explicit).expect("serialize configured provider");
++    let decoded: ConfiguredModelProvider =
++        toml::from_str(&encoded).expect("deserialize configured provider");
++
++    assert_eq!(decoded, explicit);
++}
++
++#[test]
++fn configured_model_provider_rejects_unknown_fields() {
++    let err = toml::from_str::<ConfiguredModelProvider>("unknown = true")
++        .expect_err("configured providers should reject unknown fields");
++
++    assert!(err.to_string().contains("unknown field `unknown`"));
++}
++
++#[test]
++fn openai_transport_bridge_rejects_non_transport_fields() {
++    let configured = std::collections::HashMap::from([(
++        OPENAI_PROVIDER_ID.to_string(),
++        ConfiguredModelProvider {
++            name: Some("override".to_string()),
++            ..ConfiguredModelProvider::default()
++        },
++    )]);
++
++    let err = merge_configured_model_provider_overrides(
++        built_in_model_providers(/*openai_base_url*/ None),
++        configured,
++    )
++    .expect_err("OpenAI name override should be rejected");
++
++    assert!(err.contains("model_providers.openai only supports changing"));
++    assert!(err.contains("`name`"));
++}
++
++#[test]
++fn openai_transport_override_enables_custom_url_websockets() {
++    let configured = std::collections::HashMap::from([(
++        OPENAI_PROVIDER_ID.to_string(),
++        ConfiguredModelProvider {
++            request_max_retries: Some(3),
++            supports_websockets: Some(true),
++            ..ConfiguredModelProvider::default()
++        },
++    )]);
++
++    let providers = merge_configured_model_provider_overrides(
++        built_in_model_providers(Some("http://127.0.0.1:12345/v1".to_string())),
++        configured,
++    )
++    .expect("OpenAI transport override");
++    let openai = providers.get(OPENAI_PROVIDER_ID).expect("OpenAI provider");
++
++    assert_eq!(openai.request_max_retries, Some(3));
++    assert!(openai.supports_websockets);
++}
++
++#[test]
++fn omitted_openai_websocket_override_preserves_builtin_capability() {
++    let configured = std::collections::HashMap::from([(
++        OPENAI_PROVIDER_ID.to_string(),
++        ConfiguredModelProvider {
++            request_max_retries: Some(3),
++            ..ConfiguredModelProvider::default()
++        },
++    )]);
++
++    let providers = merge_configured_model_provider_overrides(
++        built_in_model_providers(/*openai_base_url*/ None),
++        configured,
++    )
++    .expect("OpenAI transport override");
++    let openai = providers.get(OPENAI_PROVIDER_ID).expect("OpenAI provider");
++
++    assert_eq!(openai.request_max_retries, Some(3));
++    assert!(openai.supports_websockets);
++}
++
+ #[test]
+ fn test_supports_remote_compaction_for_azure_name() {
+     let provider = ModelProviderInfo {
+diff --git a/codex-rs/response-debug-context/src/lib.rs b/codex-rs/response-debug-context/src/lib.rs
+index d9c186e02e..367d622e7d 100644
+--- a/codex-rs/response-debug-context/src/lib.rs
++++ b/codex-rs/response-debug-context/src/lib.rs
+@@ -75,6 +75,7 @@ pub fn telemetry_api_error_message(error: &ApiError) -> String {
+         ApiError::Transport(transport) => telemetry_transport_error_message(transport),
+         ApiError::Api { status, .. } => format!("api error {}", status.as_u16()),
+         ApiError::Stream(err) => err.to_string(),
++        ApiError::ResponseStreamDisconnected { message, .. } => message.to_string(),
+         ApiError::ContextWindowExceeded => "context window exceeded".to_string(),
+         ApiError::QuotaExceeded => "quota exceeded".to_string(),
+         ApiError::UsageNotIncluded => "usage not included".to_string(),
+@@ -152,6 +153,10 @@ mod tests {
+         let network = TransportError::Network("dns lookup failed".to_string());
+         let build = TransportError::Build("invalid header value".to_string());
+         let stream = ApiError::Stream("socket closed".to_string());
++        let disconnect = ApiError::ResponseStreamDisconnected {
++            message: "socket reset".to_string(),
++            delay: None,
++        };
+ 
+         assert_eq!(
+             telemetry_transport_error_message(&network),
+@@ -162,5 +167,6 @@ mod tests {
+             "invalid header value"
+         );
+         assert_eq!(telemetry_api_error_message(&stream), "socket closed");
++        assert_eq!(telemetry_api_error_message(&disconnect), "socket reset");
+     }
+ }

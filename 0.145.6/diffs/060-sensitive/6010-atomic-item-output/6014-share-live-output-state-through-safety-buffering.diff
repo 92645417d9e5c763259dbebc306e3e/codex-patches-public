@@ -1248,10 +1248,51 @@ index a451505dd3..e25dbe482c 100644
      /// Deliver a synthetic history lookup response to a specific thread channel.
      ThreadHistoryEntryResponse {
          thread_id: ThreadId,
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+index 91bc538630..efec557b04 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -175,7 +175,9 @@ impl StatusLineItem {
+             StatusLineItem::BranchChanges => {
+                 "Committed branch changes against the default branch (omitted when unavailable)"
+             }
+-            StatusLineItem::Status => "Compact session run-state text (Ready, Working, Thinking)",
++            StatusLineItem::Status => {
++                "Compact session run-state text (Ready, Working, Thinking, Responding)"
++            }
+             StatusLineItem::ResponsesStreamConnection => {
+                 "Current Responses stream connection latency or disconnect state (omitted when unavailable)"
+             }
+diff --git a/codex-rs/tui/src/bottom_pane/title_setup.rs b/codex-rs/tui/src/bottom_pane/title_setup.rs
+index 21eacaf166..7cafb671bd 100644
+--- a/codex-rs/tui/src/bottom_pane/title_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/title_setup.rs
+@@ -98,7 +98,7 @@ impl TerminalTitleItem {
+                 "Spinner while working, action-required message while blocked."
+             }
+             TerminalTitleItem::Status => {
+-                "Compact session run-state text (Ready, Working, Thinking)"
++                "Compact session run-state text (Ready, Working, Thinking, Responding)"
+             }
+             TerminalTitleItem::Thread => {
+                 "Current thread title with thread identifier when named; identifier only when unnamed"
 diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
-index a09f10d955..0e2d0ec04f 100644
+index a09f10d955..4993bdd198 100644
 --- a/codex-rs/tui/src/chatwidget.rs
 +++ b/codex-rs/tui/src/chatwidget.rs
+@@ -412,11 +412,11 @@ mod side;
+ use self::safety_buffering::SafetyBufferingState;
+ mod status_state;
+ mod windows_sandbox_prompts;
++use self::status_state::ModelOutputRunState;
+ use self::status_state::ResponsesStreamConnectionStatus;
+ use self::status_state::RetryCountdownStatus;
+ use self::status_state::StatusIndicatorState;
+ use self::status_state::StatusState;
+-use self::status_state::TerminalTitleStatusKind;
+ mod status_controls;
+ mod status_surfaces;
+ mod streaming;
 @@ -687,7 +687,6 @@ pub(crate) struct ChatWidget {
      // order.
      suppress_initial_user_message_submit: bool,
@@ -1260,6 +1301,38 @@ index a09f10d955..0e2d0ec04f 100644
      /// Main chat-surface bindings resolved from `tui.keymap.chat`.
      chat_keymap: ChatKeymap,
      /// Keybinding to show for popping the most-recently queued message back
+diff --git a/codex-rs/tui/src/chatwidget/command_lifecycle.rs b/codex-rs/tui/src/chatwidget/command_lifecycle.rs
+index 03ca9c80be..f3044cbd45 100644
+--- a/codex-rs/tui/src/chatwidget/command_lifecycle.rs
++++ b/codex-rs/tui/src/chatwidget/command_lifecycle.rs
+@@ -14,7 +14,7 @@ impl ChatWidget {
+         let cell = history_cell::new_unified_exec_interaction(wait.command_display, String::new());
+         self.app_event_tx
+             .send(AppEvent::InsertHistoryCell(Box::new(cell)));
+-        self.restore_reasoning_status_header();
++        self.restore_model_output_status_header();
+     }
+ 
+     pub(super) fn on_command_execution_started(&mut self, item: ThreadItem) {
+@@ -29,6 +29,7 @@ impl ChatWidget {
+         else {
+             return;
+         };
++        self.set_model_output_run_state(ModelOutputRunState::Working);
+         let (_command, parsed_cmd) = command_execution_command_and_parsed(command, command_actions);
+         self.flush_answer_stream_with_separator();
+         if is_unified_exec_source(*source) {
+@@ -93,8 +94,8 @@ impl ChatWidget {
+             self.bottom_pane.ensure_status_indicator();
+             self.bottom_pane
+                 .set_interrupt_hint_visible(/*visible*/ true);
+-            self.status_state.terminal_title_status_kind =
+-                TerminalTitleStatusKind::WaitingForBackgroundTerminal;
++            self.status_state.model_output_run_state =
++                ModelOutputRunState::WaitingForBackgroundTerminal;
+             self.set_status(
+                 "Waiting for background terminal".to_string(),
+                 command_display.clone(),
 diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
 index 87f2cb2759..478966ae6a 100644
 --- a/codex-rs/tui/src/chatwidget/constructor.rs
@@ -1328,8 +1401,21 @@ index 974d3f1831..c4d9bb98ed 100644
              if !render_before_submit {
                  self.on_user_message_display(
                      user_message_display_for_history(submitted_message, &history_record),
+diff --git a/codex-rs/tui/src/chatwidget/mcp_startup.rs b/codex-rs/tui/src/chatwidget/mcp_startup.rs
+index 4407e1b3e7..75af3754af 100644
+--- a/codex-rs/tui/src/chatwidget/mcp_startup.rs
++++ b/codex-rs/tui/src/chatwidget/mcp_startup.rs
+@@ -205,7 +205,7 @@ impl ChatWidget {
+         self.mcp_startup_pending_next_round_saw_starting = false;
+         self.update_task_running_state();
+         if self.bottom_pane.is_task_running() && mcp_startup_owned_status {
+-            self.restore_reasoning_status_header();
++            self.restore_model_output_status_header();
+         }
+         self.maybe_send_next_queued_input();
+         self.request_redraw();
 diff --git a/codex-rs/tui/src/chatwidget/safety_buffering.rs b/codex-rs/tui/src/chatwidget/safety_buffering.rs
-index 4ea59a2062..939abb8d11 100644
+index 4ea59a2062..05695bf9bf 100644
 --- a/codex-rs/tui/src/chatwidget/safety_buffering.rs
 +++ b/codex-rs/tui/src/chatwidget/safety_buffering.rs
 @@ -1,50 +1,41 @@
@@ -1388,7 +1474,7 @@ index 4ea59a2062..939abb8d11 100644
 +            }
 +        }
 +        if restore_status {
-+            self.restore_reasoning_status_header();
++            self.restore_model_output_status_header();
          }
      }
  
@@ -1455,7 +1541,8 @@ index 4ea59a2062..939abb8d11 100644
 -                self.bottom_pane
 -                    .dismiss_view_by_id(SAFETY_BUFFERING_PROMPT_VIEW_ID);
                  self.safety_buffering.active = None;
-                 self.restore_reasoning_status_header();
+-                self.restore_reasoning_status_header();
++                self.restore_model_output_status_header();
              }
              return;
          }
@@ -1641,8 +1728,283 @@ index 0000000000..991d10585c
 + Ask Codex to do anything
 +────────────────────────────────────────────────────────────────────────────────
 +  gpt-5.6-sol default ▪ /tmp/project
+diff --git a/codex-rs/tui/src/chatwidget/status_controls.rs b/codex-rs/tui/src/chatwidget/status_controls.rs
+index 6d0f07d2b2..a228a59fc2 100644
+--- a/codex-rs/tui/src/chatwidget/status_controls.rs
++++ b/codex-rs/tui/src/chatwidget/status_controls.rs
+@@ -7,6 +7,48 @@
+ use super::*;
+ 
+ impl ChatWidget {
++    fn configured_status_surface_uses_run_state(&self) -> bool {
++        self.config.tui_status_line.as_ref().is_some_and(|items| {
++            items
++                .iter()
++                .any(|item| item == "run-state" || item == "status")
++        }) || self
++            .config
++            .tui_terminal_title
++            .as_ref()
++            .is_some_and(|items| {
++                items
++                    .iter()
++                    .any(|item| item == "run-state" || item == "status")
++            })
++    }
++
++    fn status_header_is_generic_run_state(&self) -> bool {
++        matches!(
++            self.status_state.current_status.header.as_str(),
++            "Working" | "Thinking" | "Responding" | "Waiting"
++        ) || self.reasoning_header.as_deref()
++            == Some(self.status_state.current_status.header.as_str())
++    }
++
++    pub(super) fn set_model_output_run_state(&mut self, state: ModelOutputRunState) -> bool {
++        let update_status_header = self.status_header_is_generic_run_state();
++        self.status_state.model_output_run_state = state;
++        if update_status_header {
++            self.set_status_header(state.active_label().to_string())
++        } else if self.configured_status_surface_uses_run_state() {
++            self.refresh_status_surfaces();
++            false
++        } else {
++            false
++        }
++    }
++
++    pub(super) fn force_model_output_run_state(&mut self, state: ModelOutputRunState) -> bool {
++        self.status_state.model_output_run_state = state;
++        self.set_status_header(state.active_label().to_string())
++    }
++
+     /// Update the status indicator header and details.
+     ///
+     /// Passing `None` clears any existing details. Returns whether the visible status indicator
+@@ -40,16 +82,7 @@ impl ChatWidget {
+             StatusDetailsCapitalization::Preserve,
+             details_max_lines,
+         );
+-        let title_uses_status = self
+-            .config
+-            .tui_terminal_title
+-            .as_ref()
+-            .is_some_and(|items| {
+-                items
+-                    .iter()
+-                    .any(|item| item == "run-state" || item == "status")
+-            });
+-        if title_uses_status {
++        if self.configured_status_surface_uses_run_state() {
+             self.refresh_status_surfaces();
+         }
+         status_indicator_updated
+diff --git a/codex-rs/tui/src/chatwidget/status_state.rs b/codex-rs/tui/src/chatwidget/status_state.rs
+index 1b3b73ccaf..88c03b5c7c 100644
+--- a/codex-rs/tui/src/chatwidget/status_state.rs
++++ b/codex-rs/tui/src/chatwidget/status_state.rs
+@@ -39,17 +39,29 @@ impl StatusIndicatorState {
+     }
+ }
+ 
+-/// Compact runtime states that can be rendered into the terminal title.
++/// Compact runtime states shared by the mutable status row, status line, and terminal title.
+ ///
+ /// This is intentionally smaller than the full status-header vocabulary. The
+-/// title needs short, stable labels, so callers map richer lifecycle events
+-/// onto one of these buckets before rendering.
++/// shared surfaces need short, stable labels, so callers map richer lifecycle
++/// events onto one of these buckets before rendering.
+ #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+-pub(super) enum TerminalTitleStatusKind {
++pub(super) enum ModelOutputRunState {
+     Working,
+     WaitingForBackgroundTerminal,
+     #[default]
+     Thinking,
++    Responding,
++}
++
++impl ModelOutputRunState {
++    pub(super) fn active_label(self) -> &'static str {
++        match self {
++            Self::Working => "Working",
++            Self::WaitingForBackgroundTerminal => "Waiting",
++            Self::Thinking => "Thinking",
++            Self::Responding => "Responding",
++        }
++    }
+ }
+ 
+ #[derive(Clone, Debug, Default, PartialEq, Eq)]
+@@ -128,7 +140,7 @@ impl PendingGuardianReviewStatus {
+ pub(super) struct StatusState {
+     pub(super) current_status: StatusIndicatorState,
+     pub(super) pending_guardian_review_status: PendingGuardianReviewStatus,
+-    pub(super) terminal_title_status_kind: TerminalTitleStatusKind,
++    pub(super) model_output_run_state: ModelOutputRunState,
+     pub(super) retry_status_header: Option<String>,
+     pub(super) retry_countdown_status: Option<RetryCountdownStatus>,
+     pub(super) pending_status_indicator_restore: bool,
+@@ -139,7 +151,7 @@ impl Default for StatusState {
+         Self {
+             current_status: StatusIndicatorState::working(),
+             pending_guardian_review_status: PendingGuardianReviewStatus::default(),
+-            terminal_title_status_kind: TerminalTitleStatusKind::Working,
++            model_output_run_state: ModelOutputRunState::Working,
+             retry_status_header: None,
+             retry_countdown_status: None,
+             pending_status_indicator_restore: false,
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 9525d30263..94e49be474 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -22,7 +22,7 @@ use codex_protocol::models::PermissionProfile;
+ use codex_utils_sandbox_summary::summarize_permission_profile;
+ use ratatui::text::Span;
+ 
+-use super::status_state::TerminalTitleStatusKind;
++use super::status_state::ModelOutputRunState;
+ 
+ /// Items shown in the terminal title when the user has not configured a
+ /// custom selection. Intentionally minimal: activity indicator + project name.
+@@ -1115,21 +1115,13 @@ impl ChatWidget {
+             return "Starting".to_string();
+         }
+ 
+-        match self.status_state.terminal_title_status_kind {
+-            TerminalTitleStatusKind::Working if !self.bottom_pane.is_task_running() => {
+-                "Ready".to_string()
+-            }
+-            TerminalTitleStatusKind::WaitingForBackgroundTerminal
+-                if !self.bottom_pane.is_task_running() =>
+-            {
+-                "Ready".to_string()
+-            }
+-            TerminalTitleStatusKind::Thinking if !self.bottom_pane.is_task_running() => {
+-                "Ready".to_string()
+-            }
+-            TerminalTitleStatusKind::Working => "Working".to_string(),
+-            TerminalTitleStatusKind::WaitingForBackgroundTerminal => "Waiting".to_string(),
+-            TerminalTitleStatusKind::Thinking => "Thinking".to_string(),
++        if !self.bottom_pane.is_task_running() {
++            "Ready".to_string()
++        } else {
++            self.status_state
++                .model_output_run_state
++                .active_label()
++                .to_string()
+         }
+     }
+ 
+diff --git a/codex-rs/tui/src/chatwidget/streaming.rs b/codex-rs/tui/src/chatwidget/streaming.rs
+index 046344cf96..3ca4769f97 100644
+--- a/codex-rs/tui/src/chatwidget/streaming.rs
++++ b/codex-rs/tui/src/chatwidget/streaming.rs
+@@ -15,16 +15,19 @@ impl ChatWidget {
+         format!("{base_header} ▪ next retry in {remaining_secs}s ▪ ctrl+x reset retry budget")
+     }
+ 
+-    pub(super) fn restore_reasoning_status_header(&mut self) {
+-        if self.reasoning_header.is_none() {
+-            self.reasoning_header = extract_first_bold(&self.reasoning_buffer);
+-        }
+-        if let Some(header) = self.reasoning_header.clone() {
+-            self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Thinking;
+-            self.set_status_header(header);
+-        } else if self.bottom_pane.is_task_running() {
+-            self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Working;
+-            self.set_status_header(String::from("Working"));
++    pub(super) fn restore_model_output_status_header(&mut self) {
++        if self.bottom_pane.is_task_running() {
++            let state = match self.status_state.model_output_run_state {
++                ModelOutputRunState::WaitingForBackgroundTerminal => {
++                    if self.reasoning_buffer.is_empty() {
++                        ModelOutputRunState::Working
++                    } else {
++                        ModelOutputRunState::Thinking
++                    }
++                }
++                state => state,
++            };
++            self.force_model_output_run_state(state);
+         }
+     }
+ 
+@@ -229,9 +232,17 @@ impl ChatWidget {
+ 
+     pub(super) fn on_agent_reasoning_delta(&mut self, delta: String) {
+         // For reasoning deltas, do not stream to history. Accumulate the
+-        // current reasoning block and extract the first bold element
+-        // (between **/**) as the chunk header. Show this header as status.
++        // current reasoning block and retain its first bold element as
++        // transcript data while the shared status surfaces show `Thinking`.
+         self.reasoning_buffer.push_str(&delta);
++        if delta.is_empty() {
++            return;
++        }
++        if self.status_state.model_output_run_state != ModelOutputRunState::Thinking {
++            if !self.set_model_output_run_state(ModelOutputRunState::Thinking) {
++                self.request_redraw();
++            }
++        }
+ 
+         if self.safety_buffering_is_waiting() {
+             return;
+@@ -245,30 +256,10 @@ impl ChatWidget {
+         if self.reasoning_header.is_none() {
+             self.reasoning_header = extract_first_bold(&self.reasoning_buffer);
+         }
+-        let Some(header) = self.reasoning_header.as_deref() else {
+-            // Fallback while we don't yet have a bold header: leave existing header as-is.
+-            return;
+-        };
+-
+-        let status = &self.status_state.current_status;
+-        if self.status_state.terminal_title_status_kind == TerminalTitleStatusKind::Thinking
+-            && status.header == header
+-            && status.details.is_none()
+-            && status.details_max_lines == STATUS_DETAILS_DEFAULT_MAX_LINES
+-            && self
+-                .bottom_pane
+-                .status_widget()
+-                .is_none_or(|status| status.header() == header)
+-        {
+-            return;
+-        }
+-
+-        // Update the shimmer header to the extracted reasoning chunk header.
+-        let header = header.to_string();
+-        self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Thinking;
+-        if !self.set_status_header(header) {
+-            self.request_redraw();
+-        }
++        self.reasoning_header = self
++            .reasoning_header
++            .take()
++            .or_else(|| extract_first_bold(&self.reasoning_buffer));
+     }
+ 
+     pub(super) fn on_agent_reasoning_final(&mut self) {
+@@ -318,7 +309,7 @@ impl ChatWidget {
+         self.reasoning_summary_parts.clear();
+         self.status_state.remember_retry_status_header();
+         self.bottom_pane.ensure_status_indicator();
+-        self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Thinking;
++        self.status_state.model_output_run_state = ModelOutputRunState::Thinking;
+         let retry_at = retry_info
+             .as_ref()
+             .map(|info| Instant::now() + Duration::from_millis(info.retry_delay_ms));
+@@ -520,6 +511,7 @@ impl ChatWidget {
+     ) {
+         if !delta.is_empty() {
+             self.mark_safety_buffering_agent_message_started();
++            self.set_model_output_run_state(ModelOutputRunState::Responding);
+         }
+         if self
+             .stream_controller
 diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
-index 90c1011516..923ca070a5 100644
+index c4d0d16e33..af7efabe1d 100644
 --- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
 +++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
 @@ -67,14 +67,12 @@ fn configured_thread_session(thread_id: ThreadId) -> crate::session_state::Threa
@@ -1969,7 +2331,7 @@ index 18d830af02..1ee733b7ca 100644
              pending_steer_history_records: VecDeque::new(),
              pending_steer_compare_keys,
 diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
-index 7d99d02698..96507e6428 100644
+index 7d99d02698..872806bc9e 100644
 --- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
 +++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
 @@ -3463,30 +3463,6 @@ async fn status_line_uses_submitted_model_context_until_turn_completion() {
@@ -2003,11 +2365,206 @@ index 7d99d02698..96507e6428 100644
  #[tokio::test]
  async fn status_line_model_with_reasoning_plan_mode_footer_snapshot() {
      use ratatui::Terminal;
+@@ -4154,33 +4130,23 @@ async fn regular_commit_tick_clears_orphaned_plan_stream_tail() {
+ }
+ 
+ #[tokio::test]
+-async fn reasoning_delta_redraws_only_when_header_becomes_visible() {
++async fn reasoning_delta_uses_generic_thinking_status_without_title_updates() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+-    let (frame_requester, mut draw_rx) = FrameRequester::test_channel();
+-    chat.frame_requester = frame_requester;
++    chat.on_task_started();
+ 
+     chat.on_agent_reasoning_delta("still looking".to_string());
+-    assert!(matches!(
+-        draw_rx.try_recv(),
+-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+-    ));
+     assert_eq!(chat.reasoning_header, None);
++    assert_eq!(chat.current_status_header_for_test(), "Thinking");
+ 
+     chat.on_agent_reasoning_delta(" **Checking".to_string());
+-    assert!(matches!(
+-        draw_rx.try_recv(),
+-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+-    ));
++    assert_eq!(chat.current_status_header_for_test(), "Thinking");
+ 
+     chat.on_agent_reasoning_delta(" files**".to_string());
+-    assert!(draw_rx.try_recv().is_ok());
+     assert_eq!(chat.reasoning_header.as_deref(), Some("Checking files"));
++    assert_eq!(chat.current_status_header_for_test(), "Thinking");
+ 
+     chat.on_agent_reasoning_delta(" and preparing a response".to_string());
+-    assert!(matches!(
+-        draw_rx.try_recv(),
+-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+-    ));
++    assert_eq!(chat.current_status_header_for_test(), "Thinking");
+ }
+ 
+ #[tokio::test]
+@@ -4200,6 +4166,7 @@ async fn reasoning_delta_does_not_double_schedule_visible_status_redraw() {
+     chat.on_agent_reasoning_delta("**Checking files**".to_string());
+ 
+     assert_eq!(chat.reasoning_header.as_deref(), Some("Checking files"));
++    assert_eq!(chat.current_status_header_for_test(), "Thinking");
+     assert!(draw_rx.try_recv().is_ok());
+     assert!(matches!(
+         draw_rx.try_recv(),
+@@ -4208,7 +4175,7 @@ async fn reasoning_delta_does_not_double_schedule_visible_status_redraw() {
+ }
+ 
+ #[tokio::test]
+-async fn reasoning_delta_restores_recreated_status_indicator_header() {
++async fn reasoning_delta_restores_generic_thinking_status_indicator() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+     chat.on_task_started();
+     chat.on_agent_reasoning_delta("**Checking files**".to_string());
+@@ -4216,8 +4183,6 @@ async fn reasoning_delta_restores_recreated_status_indicator_header() {
+     chat.on_agent_message_delta("Preamble line\n".to_string());
+     chat.on_commit_tick();
+     drain_insert_history(&mut rx);
+-    assert!(!chat.bottom_pane.status_indicator_visible());
+-
+     begin_unified_exec_startup(&mut chat, "call-1", "proc-1", "sleep 2");
+     let status = chat
+         .bottom_pane
+@@ -4231,20 +4196,52 @@ async fn reasoning_delta_restores_recreated_status_indicator_header() {
+         .bottom_pane
+         .status_widget()
+         .expect("status indicator should remain visible");
+-    assert_eq!(status.header(), "Checking files");
++    assert_eq!(status.header(), "Thinking");
++}
+ 
+-    let width: u16 = 80;
+-    let height = chat.desired_height(width);
+-    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+-        .expect("create terminal");
+-    terminal.set_viewport_area(Rect::new(/*x*/ 0, /*y*/ 0, width, height));
+-    terminal
+-        .draw(|frame| chat.render(frame.area(), frame.buffer_mut()))
+-        .expect("draw restored reasoning status");
+-    assert_chatwidget_snapshot!(
+-        "reasoning_delta_restores_recreated_status_indicator",
+-        normalized_backend_snapshot(terminal.backend())
++#[tokio::test]
++async fn model_output_run_state_updates_status_line_independently() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.config.tui_status_line = Some(vec!["run-state".to_string()]);
++    chat.on_task_started();
++    assert_eq!(status_line_text(&chat), Some("Working".to_string()));
++
++    chat.on_agent_reasoning_delta("**Inspecting**".to_string());
++    assert_eq!(chat.current_status_header_for_test(), "Thinking");
++    assert_eq!(status_line_text(&chat), Some("Thinking".to_string()));
++
++    chat.on_agent_message_delta("answer".to_string());
++    assert_eq!(chat.current_status_header_for_test(), "Responding");
++    assert_eq!(status_line_text(&chat), Some("Responding".to_string()));
++
++    chat.on_patch_apply_begin(HashMap::new());
++    assert_eq!(chat.current_status_header_for_test(), "Working");
++    assert_eq!(status_line_text(&chat), Some("Working".to_string()));
++
++    chat.on_task_complete(None, None, /*from_replay*/ false);
++    assert_eq!(status_line_text(&chat), Some("Ready".to_string()));
++}
++
++#[tokio::test]
++async fn temporary_status_restores_latest_model_output_run_state() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.on_task_started();
++    chat.set_status(
++        "Reviewing approval request".to_string(),
++        Some("checking command policy".to_string()),
++        StatusDetailsCapitalization::Preserve,
++        /*details_max_lines*/ 1,
+     );
++
++    chat.on_agent_reasoning_delta("**Inspecting**".to_string());
++    assert_eq!(
++        chat.current_status_header_for_test(),
++        "Reviewing approval request"
++    );
++    assert_eq!(chat.run_state_status_text(), "Thinking");
++
++    chat.restore_model_output_status_header();
++    assert_eq!(chat.current_status_header_for_test(), "Thinking");
+ }
+ 
+ #[tokio::test]
+diff --git a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+index f2f91d9123..3ee6483ead 100644
+--- a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
++++ b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+@@ -8,6 +8,7 @@ use codex_utils_path_uri::LegacyAppPathString;
+ 
+ impl ChatWidget {
+     pub(super) fn on_patch_apply_begin(&mut self, changes: HashMap<PathBuf, FileChange>) {
++        self.set_model_output_run_state(ModelOutputRunState::Working);
+         self.add_to_history(history_cell::new_patch_event(changes, &self.config.cwd));
+     }
+ 
+@@ -21,6 +22,7 @@ impl ChatWidget {
+     }
+ 
+     pub(super) fn on_image_generation_begin(&mut self) {
++        self.set_model_output_run_state(ModelOutputRunState::Working);
+         self.flush_answer_stream_with_separator();
+         if self.bottom_pane.is_task_running() {
+             self.bottom_pane.ensure_status_indicator();
+@@ -53,6 +55,7 @@ impl ChatWidget {
+     }
+ 
+     pub(super) fn on_mcp_tool_call_started(&mut self, item: ThreadItem) {
++        self.set_model_output_run_state(ModelOutputRunState::Working);
+         self.defer_or_handle(
+             item,
+             InterruptManager::push_item_started,
+@@ -69,6 +72,7 @@ impl ChatWidget {
+     }
+ 
+     pub(super) fn on_web_search_begin(&mut self, call_id: String) {
++        self.set_model_output_run_state(ModelOutputRunState::Working);
+         self.flush_answer_stream_with_separator();
+         self.flush_active_cell();
+         self.transcript.active_cell = Some(Box::new(history_cell::new_active_web_search_call(
+@@ -275,11 +279,11 @@ impl ChatWidget {
+     }
+ 
+     pub(crate) fn start_context_compaction_status(&mut self) {
+-        self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Working;
++        self.status_state.model_output_run_state = ModelOutputRunState::Working;
+         self.add_to_history(history_cell::new_context_compaction_triggered_event(
+             self.context_compaction_trigger_usage(),
+         ));
+-        self.set_status_header(String::from("Working"));
++        self.force_model_output_run_state(ModelOutputRunState::Working);
+         self.request_redraw();
+     }
+ 
 diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
-index 6f0b568ca7..1d75105f26 100644
+index 6f0b568ca7..ba15071f5e 100644
 --- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
 +++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
-@@ -384,7 +384,6 @@ impl ChatWidget {
+@@ -92,9 +92,11 @@ impl ChatWidget {
+         self.status_state.pending_status_indicator_restore = false;
+         self.bottom_pane
+             .set_interrupt_hint_visible(/*visible*/ true);
+-        self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Working;
+         if self.mcp_startup_status.is_none() || !self.status_header_is_mcp_startup_owned() {
+-            self.set_status_header(String::from("Working"));
++            self.force_model_output_run_state(ModelOutputRunState::Working);
++        } else {
++            self.status_state.model_output_run_state = ModelOutputRunState::Working;
++            self.refresh_status_surfaces();
+         }
+         self.reasoning_summary_parts.clear();
+         self.reasoning_buffer.clear();
+@@ -384,7 +386,6 @@ impl ChatWidget {
          self.plan_stream_controller = None;
          self.request_pending_usage_output_insertion_after_stream_shutdown();
          self.status_state.pending_status_indicator_restore = false;
