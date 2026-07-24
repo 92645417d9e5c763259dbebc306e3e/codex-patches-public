@@ -1,0 +1,1039 @@
+diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
+index 879d43b8b2..8861ba1be4 100644
+--- a/codex-rs/app-server/Cargo.toml
++++ b/codex-rs/app-server/Cargo.toml
+@@ -92,6 +92,7 @@ clap = { workspace = true, features = ["derive"] }
+ futures = { workspace = true }
+ serde = { workspace = true, features = ["derive"] }
+ serde_json = { workspace = true }
++sha2 = { workspace = true }
+ tempfile = { workspace = true }
+ thiserror = { workspace = true }
+ time = { workspace = true }
+@@ -136,7 +137,6 @@ rmcp = { workspace = true, default-features = false, features = [
+     "transport-streamable-http-server",
+ ] }
+ serial_test = { workspace = true }
+-sha2 = { workspace = true }
+ shlex = { workspace = true }
+ tar = { workspace = true }
+ tokio-tungstenite = { workspace = true }
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 245ab9f6ef..400c62acfb 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -35,6 +35,7 @@ use crate::request_processors::MarketplaceRequestProcessor;
+ use crate::request_processors::McpRequestProcessor;
+ use crate::request_processors::PluginRequestProcessor;
+ use crate::request_processors::ProcessExecRequestProcessor;
++use crate::request_processors::PromptAssistantRequestProcessor;
+ use crate::request_processors::RemoteControlRequestProcessor;
+ use crate::request_processors::SearchRequestProcessor;
+ use crate::request_processors::ThreadGoalRequestProcessor;
+@@ -196,6 +197,7 @@ pub(crate) struct MessageProcessor {
+     marketplace_processor: MarketplaceRequestProcessor,
+     mcp_processor: McpRequestProcessor,
+     plugin_processor: PluginRequestProcessor,
++    prompt_assistant_processor: PromptAssistantRequestProcessor,
+     remote_control_processor: RemoteControlRequestProcessor,
+     search_processor: SearchRequestProcessor,
+     thread_goal_processor: ThreadGoalRequestProcessor,
+@@ -504,6 +506,8 @@ impl MessageProcessor {
+             on_effective_plugins_changed,
+         );
+         let remote_control_processor = RemoteControlRequestProcessor::new(remote_control_handle);
++        let prompt_assistant_processor =
++            PromptAssistantRequestProcessor::new(Arc::clone(&thread_manager), outgoing.clone());
+         let search_processor = SearchRequestProcessor::new(outgoing.clone());
+         let thread_goal_processor = ThreadGoalRequestProcessor::new(
+             Arc::clone(&thread_manager),
+@@ -601,6 +605,7 @@ impl MessageProcessor {
+             marketplace_processor,
+             mcp_processor,
+             plugin_processor,
++            prompt_assistant_processor,
+             remote_control_processor,
+             search_processor,
+             thread_goal_processor,
+@@ -894,6 +899,7 @@ impl MessageProcessor {
+     }
+ 
+     pub(crate) async fn shutdown_threads(&self) {
++        self.prompt_assistant_processor.shutdown().await;
+         self.thread_processor.shutdown_threads().await;
+     }
+ 
+@@ -902,6 +908,9 @@ impl MessageProcessor {
+         connection_id: ConnectionId,
+         session_state: &ConnectionSessionState,
+     ) {
++        self.prompt_assistant_processor
++            .connection_closed(connection_id)
++            .await;
+         if timeout(
+             CONNECTION_RPC_DRAIN_TIMEOUT,
+             session_state.rpc_gate.shutdown(),
+@@ -924,6 +933,9 @@ impl MessageProcessor {
+         connection_id: ConnectionId,
+         session_state: &ConnectionSessionState,
+     ) {
++        self.prompt_assistant_processor
++            .connection_closed(connection_id)
++            .await;
+         session_state.rpc_gate.cancel_and_shutdown().await;
+         self.finish_connection_closed(connection_id, session_state)
+             .await;
+@@ -1253,6 +1265,16 @@ impl MessageProcessor {
+                 .model_provider_capabilities_read()
+                 .await
+                 .map(|response| Some(response.into())),
++            ClientRequest::PromptAssistantRewrite { params, .. } => self
++                .prompt_assistant_processor
++                .rewrite(connection_id, params)
++                .await
++                .map(|response| Some(response.into())),
++            ClientRequest::PromptAssistantInterrupt { params, .. } => self
++                .prompt_assistant_processor
++                .interrupt(connection_id, params)
++                .await
++                .map(|response| Some(response.into())),
+             ClientRequest::ThreadStart { params, .. } => {
+                 self.thread_processor
+                     .thread_start(
+@@ -1307,14 +1329,34 @@ impl MessageProcessor {
+                     .await
+             }
+             ClientRequest::ThreadArchive { params, .. } => {
+-                self.thread_processor
++                let parent_thread_id = ThreadId::from_string(&params.thread_id).ok();
++                let result = self
++                    .thread_processor
+                     .thread_archive(request_id.clone(), params)
+-                    .await
++                    .await;
++                if result.is_ok()
++                    && let Some(parent_thread_id) = parent_thread_id
++                {
++                    self.prompt_assistant_processor
++                        .parent_removed(parent_thread_id)
++                        .await;
++                }
++                result
+             }
+             ClientRequest::ThreadDelete { params, .. } => {
+-                self.thread_processor
++                let parent_thread_id = ThreadId::from_string(&params.thread_id).ok();
++                let result = self
++                    .thread_processor
+                     .thread_delete(request_id.clone(), params)
+-                    .await
++                    .await;
++                if result.is_ok()
++                    && let Some(parent_thread_id) = parent_thread_id
++                {
++                    self.prompt_assistant_processor
++                        .parent_removed(parent_thread_id)
++                        .await;
++                }
++                result
+             }
+             ClientRequest::ThreadIncrementElicitation { params, .. } => {
+                 self.thread_processor
+@@ -1509,6 +1551,11 @@ impl MessageProcessor {
+                     .await
+             }
+             ClientRequest::TurnStart { params, .. } => {
++                if let Ok(thread_id) = ThreadId::from_string(&params.thread_id) {
++                    self.prompt_assistant_processor
++                        .parent_turn_started(thread_id)
++                        .await;
++                }
+                 self.turn_processor
+                     .turn_start(
+                         request_id.clone(),
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+index 7d47245be4..d3a2482604 100644
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -543,6 +543,7 @@ mod marketplace_processor;
+ mod mcp_processor;
+ mod plugins;
+ mod process_exec_processor;
++mod prompt_assistant_processor;
+ mod remote_control_processor;
+ mod search;
+ mod thread_fork_goal;
+@@ -565,6 +566,7 @@ pub(crate) use marketplace_processor::MarketplaceRequestProcessor;
+ pub(crate) use mcp_processor::McpRequestProcessor;
+ pub(crate) use plugins::PluginRequestProcessor;
+ pub(crate) use process_exec_processor::ProcessExecRequestProcessor;
++pub(crate) use prompt_assistant_processor::PromptAssistantRequestProcessor;
+ pub(crate) use remote_control_processor::RemoteControlRequestProcessor;
+ pub(crate) use search::SearchRequestProcessor;
+ pub(crate) use thread_goal_processor::ThreadGoalRequestProcessor;
+diff --git a/codex-rs/app-server/src/request_processors/prompt_assistant_processor.rs b/codex-rs/app-server/src/request_processors/prompt_assistant_processor.rs
+new file mode 100644
+index 0000000000..45412973c7
+--- /dev/null
++++ b/codex-rs/app-server/src/request_processors/prompt_assistant_processor.rs
+@@ -0,0 +1,860 @@
++use std::collections::HashMap;
++use std::sync::Arc;
++use std::time::Duration;
++
++use codex_app_server_protocol::JSONRPCErrorError;
++use codex_app_server_protocol::PromptAssistantInterruptParams;
++use codex_app_server_protocol::PromptAssistantInterruptResponse;
++use codex_app_server_protocol::PromptAssistantOutcome;
++use codex_app_server_protocol::PromptAssistantProgressNotification;
++use codex_app_server_protocol::PromptAssistantRewriteParams;
++use codex_app_server_protocol::PromptAssistantRewriteResponse;
++use codex_app_server_protocol::ServerNotification;
++use codex_app_server_protocol::TokenUsageBreakdown;
++use codex_core::CodexThread;
++use codex_core::PromptAssistantFrozenContext;
++use codex_core::PromptAssistantOutputStatus;
++use codex_core::ThreadManager;
++use codex_core::load_or_seed_prompt_assistant_instructions;
++use codex_core::parse_prompt_assistant_output;
++use codex_core::prompt_assistant_output_schema;
++use codex_core::prompt_assistant_projection_items;
++use codex_core::prompt_assistant_projection_update;
++use codex_core::prompt_assistant_usage_delta;
++use codex_core::validate_prompt_assistant_source_context_fit;
++use codex_protocol::ThreadId;
++use codex_protocol::models::ContentItem;
++use codex_protocol::models::MessagePhase;
++use codex_protocol::models::ResponseItem;
++use codex_protocol::openai_models::ModelInfo;
++use codex_protocol::openai_models::ModelVisibility;
++use codex_protocol::openai_models::ReasoningEffort;
++use codex_protocol::protocol::AgentStatus;
++use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::Op;
++use codex_protocol::protocol::ThreadSettingsOverrides;
++use codex_protocol::protocol::TokenUsage;
++use codex_protocol::user_input::UserInput;
++use tokio::sync::Mutex;
++use tokio::sync::Semaphore;
++use tokio::time::timeout;
++use tokio_util::sync::CancellationToken;
++
++use crate::error_code::invalid_params;
++use crate::outgoing_message::ConnectionId;
++use crate::outgoing_message::OutgoingMessageSender;
++
++const OPERATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
++const INTERRUPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
++
++#[derive(Clone)]
++pub(crate) struct PromptAssistantRequestProcessor {
++    inner: Arc<Inner>,
++}
++
++struct Inner {
++    thread_manager: Arc<ThreadManager>,
++    outgoing: Arc<OutgoingMessageSender>,
++    trunks: Mutex<HashMap<ThreadId, Arc<Trunk>>>,
++}
++
++struct Trunk {
++    child: Mutex<Option<Arc<CodexThread>>>,
++    synchronized_projection: Mutex<PromptAssistantFrozenContext>,
++    committed_turns: Mutex<Vec<ResponseItem>>,
++    active: Mutex<Option<ActiveRewrite>>,
++    rewrite_lock: Arc<Semaphore>,
++}
++
++struct ActiveRewrite {
++    connection_id: ConnectionId,
++    cancellation: CancellationToken,
++    completion: CancellationToken,
++}
++
++enum RewriteResult {
++    Ready(String, String),
++    Blocked(String, String),
++    Interrupted,
++    Failed(String),
++}
++
++impl PromptAssistantRequestProcessor {
++    pub(crate) fn new(
++        thread_manager: Arc<ThreadManager>,
++        outgoing: Arc<OutgoingMessageSender>,
++    ) -> Self {
++        Self {
++            inner: Arc::new(Inner {
++                thread_manager,
++                outgoing,
++                trunks: Mutex::new(HashMap::new()),
++            }),
++        }
++    }
++
++    pub(crate) async fn rewrite(
++        &self,
++        connection_id: ConnectionId,
++        params: PromptAssistantRewriteParams,
++    ) -> Result<PromptAssistantRewriteResponse, JSONRPCErrorError> {
++        if params.input.trim().is_empty() {
++            return Err(invalid_params("Prompt Assistant input must not be empty"));
++        }
++        let thread_id = parse_thread_id(&params.thread_id)?;
++        let parent = self
++            .inner
++            .thread_manager
++            .get_thread(thread_id)
++            .await
++            .map_err(|err| invalid_params(err.to_string()))?;
++        let config_snapshot = parent.config_snapshot().await;
++        if config_snapshot.session_source.is_non_root_agent() {
++            return Err(invalid_params(
++                "Prompt Assistant is available only from the root session",
++            ));
++        }
++        if matches!(
++            parent.agent_status().await,
++            AgentStatus::PendingInit | AgentStatus::Running
++        ) {
++            return Err(invalid_params(
++                "Prompt Assistant cannot run while the parent turn is active",
++            ));
++        }
++
++        let guardian_model = parent.guardian_review_model_id().await;
++        let models = eligible_models(
++            self.inner
++                .thread_manager
++                .get_models_manager()
++                .get_remote_models()
++                .await,
++            &guardian_model,
++        );
++        let (effective_model, effective_effort, fallback_from_model) = effective_selection(
++            &models,
++            &params.model,
++            &params.reasoning_effort,
++            &config_snapshot.model,
++            config_snapshot.reasoning_effort.as_ref(),
++        )?;
++        let model_context_limit = models
++            .iter()
++            .find(|model| model.slug == effective_model)
++            .and_then(ModelInfo::auto_compact_token_limit);
++        let trunk = self.trunk_for(thread_id).await;
++        let permit = Arc::clone(&trunk.rewrite_lock)
++            .try_acquire_owned()
++            .map_err(|_| invalid_params("Prompt Assistant rewrite is already active"))?;
++        let cancellation = CancellationToken::new();
++        let completion = CancellationToken::new();
++        {
++            let mut active = trunk.active.lock().await;
++            if active.is_some() {
++                return Err(invalid_params("Prompt Assistant rewrite is already active"));
++            }
++            *active = Some(ActiveRewrite {
++                connection_id,
++                cancellation: cancellation.clone(),
++                completion: completion.clone(),
++            });
++        }
++
++        let result = self
++            .run_rewrite(
++                thread_id,
++                connection_id,
++                &parent,
++                &trunk,
++                cancellation,
++                &params.input,
++                &effective_model,
++                effective_effort.clone(),
++                model_context_limit,
++            )
++            .await;
++        *trunk.active.lock().await = None;
++        completion.cancel();
++        drop(permit);
++
++        let (outcome, candidate, reason, usage) = result;
++        Ok(PromptAssistantRewriteResponse {
++            outcome,
++            candidate,
++            reason,
++            effective_model,
++            effective_reasoning_effort: effective_effort,
++            fallback_from_model,
++            usage,
++        })
++    }
++
++    pub(crate) async fn interrupt(
++        &self,
++        _connection_id: ConnectionId,
++        params: PromptAssistantInterruptParams,
++    ) -> Result<PromptAssistantInterruptResponse, JSONRPCErrorError> {
++        let thread_id = parse_thread_id(&params.thread_id)?;
++        let trunk = self
++            .inner
++            .trunks
++            .lock()
++            .await
++            .get(&thread_id)
++            .cloned()
++            .ok_or_else(|| invalid_params("Prompt Assistant has no active rewrite"))?;
++        if !cancel_active_rewrite(&trunk, |_| true).await {
++            return Err(invalid_params("Prompt Assistant has no active rewrite"));
++        }
++        Ok(PromptAssistantInterruptResponse::default())
++    }
++
++    pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
++        let trunks = self
++            .inner
++            .trunks
++            .lock()
++            .await
++            .values()
++            .cloned()
++            .collect::<Vec<_>>();
++        for trunk in trunks {
++            cancel_active_rewrite(&trunk, |active| active.connection_id == connection_id).await;
++        }
++    }
++
++    pub(crate) async fn parent_turn_started(&self, thread_id: ThreadId) {
++        if let Some(trunk) = self.inner.trunks.lock().await.get(&thread_id).cloned() {
++            cancel_active_rewrite(&trunk, |_| true).await;
++        }
++    }
++
++    pub(crate) async fn parent_removed(&self, thread_id: ThreadId) {
++        let trunk = self.inner.trunks.lock().await.remove(&thread_id);
++        if let Some(trunk) = trunk {
++            cancel_active_rewrite(&trunk, |_| true).await;
++            if let Some(child) = trunk.child.lock().await.take() {
++                let _ = child.shutdown_and_wait().await;
++            }
++        }
++    }
++
++    pub(crate) async fn shutdown(&self) {
++        let trunks = {
++            let mut trunks = self.inner.trunks.lock().await;
++            std::mem::take(&mut *trunks)
++        };
++        for (_, trunk) in trunks {
++            cancel_active_rewrite(&trunk, |_| true).await;
++            if let Some(child) = trunk.child.lock().await.take() {
++                let _ = child.shutdown_and_wait().await;
++            }
++        }
++    }
++
++    async fn trunk_for(&self, thread_id: ThreadId) -> Arc<Trunk> {
++        let mut trunks = self.inner.trunks.lock().await;
++        Arc::clone(trunks.entry(thread_id).or_insert_with(|| {
++            Arc::new(Trunk {
++                child: Mutex::new(None),
++                synchronized_projection: Mutex::new(PromptAssistantFrozenContext::default()),
++                committed_turns: Mutex::new(Vec::new()),
++                active: Mutex::new(None),
++                rewrite_lock: Arc::new(Semaphore::new(1)),
++            })
++        }))
++    }
++
++    async fn run_rewrite(
++        &self,
++        thread_id: ThreadId,
++        connection_id: ConnectionId,
++        parent: &Arc<CodexThread>,
++        trunk: &Arc<Trunk>,
++        cancellation: CancellationToken,
++        input: &str,
++        model: &str,
++        effort: ReasoningEffort,
++        model_context_limit: Option<i64>,
++    ) -> (
++        PromptAssistantOutcome,
++        Option<String>,
++        Option<String>,
++        Option<TokenUsageBreakdown>,
++    ) {
++        let child = match self
++            .child_for(thread_id, parent, trunk, model, effort.clone())
++            .await
++        {
++            Ok(child) => child,
++            Err(err) => return (PromptAssistantOutcome::Failed, None, Some(err), None),
++        };
++        if let Err(err) = self.sync_projection(parent, trunk, &child).await {
++            return (PromptAssistantOutcome::Failed, None, Some(err), None);
++        }
++        let active_context_tokens = match child.prompt_assistant_active_context_tokens().await {
++            Ok(tokens) => tokens,
++            Err(err) => {
++                return (
++                    PromptAssistantOutcome::Failed,
++                    None,
++                    Some(err.to_string()),
++                    None,
++                );
++            }
++        };
++        if let Err(err) = validate_prompt_assistant_source_context_fit(
++            input,
++            active_context_tokens,
++            model_context_limit,
++        ) {
++            return (
++                PromptAssistantOutcome::Failed,
++                None,
++                Some(err.to_string()),
++                None,
++            );
++        }
++        let usage_start = child
++            .token_usage_info()
++            .await
++            .map(|usage| usage.total_token_usage);
++        let child_config = child.config_snapshot().await;
++        if (child_config.model != model || child_config.reasoning_effort.as_ref() != Some(&effort))
++            && let Err(err) = child
++                .submit(Op::ThreadSettings {
++                    thread_settings: ThreadSettingsOverrides {
++                        model: Some(model.to_string()),
++                        effort: Some(Some(effort)),
++                        ..Default::default()
++                    },
++                })
++                .await
++        {
++            return (
++                PromptAssistantOutcome::Failed,
++                None,
++                Some(err.to_string()),
++                None,
++            );
++        }
++        let submitted_turn_id = match child
++            .submit(Op::UserInput {
++                items: vec![UserInput::Text {
++                    text: input.to_string(),
++                    text_elements: Vec::new(),
++                }],
++                final_output_json_schema: Some(prompt_assistant_output_schema()),
++                responsesapi_client_metadata: None,
++                additional_context: Default::default(),
++                thread_settings: Default::default(),
++            })
++            .await
++        {
++            Ok(turn_id) => turn_id,
++            Err(err) => {
++                return (
++                    PromptAssistantOutcome::Failed,
++                    None,
++                    Some(err.to_string()),
++                    None,
++                );
++            }
++        };
++        let terminal_cancellation = cancellation.clone();
++        let mut result = match timeout(
++            OPERATION_TIMEOUT,
++            self.consume_events(
++                thread_id,
++                connection_id,
++                &child,
++                cancellation,
++                &submitted_turn_id,
++            ),
++        )
++        .await
++        {
++            Ok(result) => result,
++            Err(_) => {
++                let _ = child.submit(Op::Interrupt).await;
++                let _ = timeout(
++                    INTERRUPT_DRAIN_TIMEOUT,
++                    self.consume_events(
++                        thread_id,
++                        connection_id,
++                        &child,
++                        CancellationToken::new(),
++                        &submitted_turn_id,
++                    ),
++                )
++                .await;
++                RewriteResult::Failed("Prompt Assistant operation timed out".to_string())
++            }
++        };
++        if terminal_cancellation.is_cancelled() {
++            result = RewriteResult::Interrupted;
++        }
++        let usage_end = child
++            .token_usage_info()
++            .await
++            .map(|usage| usage.total_token_usage);
++        let usage = rewrite_usage_delta(usage_start, usage_end);
++        match result {
++            RewriteResult::Ready(candidate, output) => {
++                self.record_committed_turn(trunk, input, &output).await;
++                (PromptAssistantOutcome::Ready, Some(candidate), None, usage)
++            }
++            RewriteResult::Blocked(reason, output) => {
++                self.record_committed_turn(trunk, input, &output).await;
++                (PromptAssistantOutcome::Blocked, None, Some(reason), usage)
++            }
++            RewriteResult::Interrupted => (PromptAssistantOutcome::Interrupted, None, None, usage),
++            RewriteResult::Failed(reason) => {
++                (PromptAssistantOutcome::Failed, None, Some(reason), usage)
++            }
++        }
++    }
++
++    async fn child_for(
++        &self,
++        thread_id: ThreadId,
++        parent: &Arc<CodexThread>,
++        trunk: &Arc<Trunk>,
++        model: &str,
++        effort: ReasoningEffort,
++    ) -> Result<Arc<CodexThread>, String> {
++        if let Some(child) = trunk.child.lock().await.as_ref() {
++            return Ok(Arc::clone(child));
++        }
++        let config = parent.config().await;
++        let instructions = load_or_seed_prompt_assistant_instructions(config.codex_home.as_path())
++            .await
++            .map_err(|err| err.to_string())?;
++        let child = self
++            .inner
++            .thread_manager
++            .start_prompt_assistant_child(thread_id, model, Some(effort), &instructions)
++            .await
++            .map_err(|err| err.to_string())?
++            .thread;
++        *trunk.child.lock().await = Some(Arc::clone(&child));
++        Ok(child)
++    }
++
++    async fn sync_projection(
++        &self,
++        parent: &Arc<CodexThread>,
++        trunk: &Arc<Trunk>,
++        child: &Arc<CodexThread>,
++    ) -> Result<(), String> {
++        let current = parent.prompt_assistant_context_snapshot().await;
++        let mut synchronized = trunk.synchronized_projection.lock().await;
++        match prompt_assistant_projection_update(&synchronized, &current) {
++            codex_core::PromptAssistantProjectionUpdate::Append(entries) if !entries.is_empty() => {
++                child
++                    .inject_response_items(prompt_assistant_projection_items(&entries))
++                    .await
++                    .map_err(|err| err.to_string())?;
++            }
++            codex_core::PromptAssistantProjectionUpdate::Replace(entries) => {
++                let history = replacement_history(
++                    prompt_assistant_projection_items(&entries),
++                    trunk.committed_turns.lock().await.clone(),
++                );
++                child
++                    .replace_prompt_assistant_history(history)
++                    .await
++                    .map_err(|err| err.to_string())?;
++            }
++            _ => {}
++        }
++        *synchronized = current;
++        Ok(())
++    }
++
++    async fn record_committed_turn(&self, trunk: &Arc<Trunk>, input: &str, output: &str) {
++        trunk.committed_turns.lock().await.extend([
++            ResponseItem::Message {
++                id: None,
++                role: "user".to_string(),
++                content: vec![ContentItem::InputText {
++                    text: input.to_string(),
++                }],
++                phase: None,
++                internal_chat_message_metadata_passthrough: None,
++            },
++            ResponseItem::Message {
++                id: None,
++                role: "assistant".to_string(),
++                content: vec![ContentItem::OutputText {
++                    text: output.to_string(),
++                }],
++                phase: Some(MessagePhase::FinalAnswer),
++                internal_chat_message_metadata_passthrough: None,
++            },
++        ]);
++    }
++
++    async fn consume_events(
++        &self,
++        thread_id: ThreadId,
++        connection_id: ConnectionId,
++        child: &Arc<CodexThread>,
++        cancellation: CancellationToken,
++        submitted_turn_id: &str,
++    ) -> RewriteResult {
++        let mut received_bytes: u64 = 0;
++        let mut interrupt_sent = false;
++        loop {
++            tokio::select! {
++                () = cancellation.cancelled(), if !interrupt_sent => {
++                    interrupt_sent = true;
++                    let _ = child.submit(Op::Interrupt).await;
++                }
++                event = child.next_event() => {
++                    let event = match event { Ok(event) => event, Err(err) => return RewriteResult::Failed(err.to_string()) };
++                    match event.msg {
++                        EventMsg::ResponseOutputBytesDelta(delta) if delta.byte_count > 0 => {
++                            received_bytes = received_bytes.saturating_add(delta.byte_count);
++                            self.inner.outgoing.send_server_notification_to_connections(&[connection_id], ServerNotification::PromptAssistantProgress(PromptAssistantProgressNotification { thread_id: thread_id.to_string(), received_bytes })).await;
++                        }
++                        EventMsg::TurnComplete(complete) if complete.turn_id == submitted_turn_id => {
++                            if let Some(error) = complete.error { return RewriteResult::Failed(error.message); }
++                            let Some(output) = complete.last_agent_message else { return RewriteResult::Failed("Prompt Assistant completed without output".to_string()); };
++                            let raw_output = output.clone();
++                            return match parse_prompt_assistant_output(&output) {
++                                Ok(output) if output.status == PromptAssistantOutputStatus::Ready => RewriteResult::Ready(output.candidate.expect("validated ready candidate"), raw_output),
++                                Ok(output) => RewriteResult::Blocked(output.reason.expect("validated blocked reason"), raw_output),
++                                Err(err) => RewriteResult::Failed(err.to_string()),
++                            };
++                        }
++                        EventMsg::TurnAborted(aborted) if aborted.turn_id.as_deref() == Some(submitted_turn_id) => return RewriteResult::Interrupted,
++                        EventMsg::ExecApprovalRequest(_) | EventMsg::ApplyPatchApprovalRequest(_) | EventMsg::McpToolCallBegin(_) | EventMsg::McpToolCallEnd(_) => {
++                            let _ = child.submit(Op::Interrupt).await;
++                            return RewriteResult::Failed("Prompt Assistant isolation violation".to_string());
++                        }
++                        _ => {}
++                    }
++                }
++            }
++        }
++    }
++}
++
++fn replacement_history(
++    projected_parent: Vec<ResponseItem>,
++    committed_turns: Vec<ResponseItem>,
++) -> Vec<ResponseItem> {
++    projected_parent
++        .into_iter()
++        .chain(committed_turns)
++        .collect()
++}
++
++fn rewrite_usage_delta(
++    start: Option<TokenUsage>,
++    end: Option<TokenUsage>,
++) -> Option<TokenUsageBreakdown> {
++    start
++        .zip(end)
++        .map(|(start, end)| prompt_assistant_usage_delta(&start, &end).into())
++}
++
++async fn cancel_active_rewrite(
++    trunk: &Trunk,
++    predicate: impl FnOnce(&ActiveRewrite) -> bool,
++) -> bool {
++    let cancellation = {
++        let active = trunk.active.lock().await;
++        active
++            .as_ref()
++            .filter(|active| predicate(active))
++            .map(|active| (active.cancellation.clone(), active.completion.clone()))
++    };
++    let Some((cancellation, completion)) = cancellation else {
++        return false;
++    };
++    cancellation.cancel();
++    let _ = timeout(INTERRUPT_DRAIN_TIMEOUT, completion.cancelled()).await;
++    true
++}
++
++fn parse_thread_id(value: &str) -> Result<ThreadId, JSONRPCErrorError> {
++    ThreadId::from_string(value).map_err(|err| invalid_params(err.to_string()))
++}
++
++fn eligible_models(mut models: Vec<ModelInfo>, guardian_model: &str) -> Vec<ModelInfo> {
++    models
++        .retain(|model| model.visibility != ModelVisibility::None && model.slug != guardian_model);
++    models.sort_by_key(|model| {
++        (
++            matches!(model.visibility, ModelVisibility::List),
++            model.priority,
++        )
++    });
++    models
++}
++
++fn supports_effort(model: &ModelInfo, effort: &ReasoningEffort) -> bool {
++    model.default_reasoning_level.as_ref() == Some(effort)
++        || model
++            .supported_reasoning_levels
++            .iter()
++            .any(|preset| &preset.effort == effort)
++}
++
++fn effective_selection(
++    models: &[ModelInfo],
++    requested_model: &str,
++    requested_effort: &ReasoningEffort,
++    current_model: &str,
++    current_effort: Option<&ReasoningEffort>,
++) -> Result<(String, ReasoningEffort, Option<String>), JSONRPCErrorError> {
++    if let Some(model) = models
++        .iter()
++        .find(|model| model.slug == requested_model)
++        .filter(|model| supports_effort(model, requested_effort))
++    {
++        return Ok((model.slug.clone(), requested_effort.clone(), None));
++    }
++    let model = models
++        .iter()
++        .find(|model| model.slug == current_model)
++        .or_else(|| models.first())
++        .ok_or_else(|| {
++            invalid_params("Prompt Assistant has no eligible model after Guardian exclusion")
++        })?;
++    let effort = current_effort
++        .filter(|effort| supports_effort(model, effort))
++        .cloned()
++        .or_else(|| model.default_reasoning_level.clone())
++        .or_else(|| {
++            model
++                .supported_reasoning_levels
++                .first()
++                .map(|preset| preset.effort.clone())
++        })
++        .unwrap_or(ReasoningEffort::Medium);
++    Ok((
++        model.slug.clone(),
++        effort,
++        Some(requested_model.to_string()),
++    ))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use codex_protocol::config_types::ReasoningSummary;
++    use codex_protocol::openai_models::ConfigShellToolType;
++    use codex_protocol::openai_models::ReasoningEffortPreset;
++    use codex_protocol::openai_models::TruncationPolicyConfig;
++    use codex_protocol::openai_models::default_input_modalities;
++
++    fn model_info(
++        slug: &str,
++        visibility: ModelVisibility,
++        priority: i32,
++        default_reasoning_level: Option<ReasoningEffort>,
++        supported_reasoning_levels: &[ReasoningEffort],
++    ) -> ModelInfo {
++        ModelInfo {
++            slug: slug.to_string(),
++            display_name: slug.to_string(),
++            description: Some(format!("{slug} description")),
++            default_reasoning_level,
++            supported_reasoning_levels: supported_reasoning_levels
++                .iter()
++                .cloned()
++                .map(|effort| ReasoningEffortPreset {
++                    description: format!("{effort} reasoning"),
++                    effort,
++                })
++                .collect(),
++            shell_type: ConfigShellToolType::ShellCommand,
++            visibility,
++            supported_in_api: true,
++            priority,
++            additional_speed_tiers: Vec::new(),
++            service_tiers: Vec::new(),
++            default_service_tier: None,
++            availability_nux: None,
++            upgrade: None,
++            base_instructions: "base instructions".to_string(),
++            model_messages: None,
++            include_skills_usage_instructions: false,
++            supports_reasoning_summary_parameter: true,
++            automatic_limit_retry: true,
++            default_reasoning_summary: ReasoningSummary::Auto,
++            support_verbosity: false,
++            default_verbosity: None,
++            apply_patch_tool_type: None,
++            web_search_tool_type: Default::default(),
++            truncation_policy: TruncationPolicyConfig::bytes(10_000),
++            supports_parallel_tool_calls: false,
++            supports_image_detail_original: false,
++            context_window: Some(272_000),
++            max_context_window: None,
++            auto_compact_token_limit: None,
++            comp_hash: None,
++            effective_context_window_percent: 95,
++            experimental_supported_tools: Vec::new(),
++            input_modalities: default_input_modalities(),
++            used_fallback_model_metadata: false,
++            supports_search_tool: false,
++            use_responses_lite: false,
++            auto_review_model_override: None,
++            tool_mode: None,
++            multi_agent_version: None,
++        }
++    }
++
++    fn message(role: &str, text: &str) -> ResponseItem {
++        ResponseItem::Message {
++            id: None,
++            role: role.to_string(),
++            content: vec![ContentItem::InputText {
++                text: text.to_string(),
++            }],
++            phase: None,
++            internal_chat_message_metadata_passthrough: None,
++        }
++    }
++
++    #[test]
++    fn replacement_history_keeps_projected_parent_before_committed_rewrites() {
++        let history = replacement_history(
++            vec![message("user", "parent")],
++            vec![message("user", "source"), message("assistant", "output")],
++        );
++        let texts = history
++            .iter()
++            .map(|item| match item {
++                ResponseItem::Message { content, .. } => match &content[0] {
++                    ContentItem::InputText { text } => text.as_str(),
++                    _ => unreachable!(),
++                },
++                _ => unreachable!(),
++            })
++            .collect::<Vec<_>>();
++        assert_eq!(texts, ["parent", "source", "output"]);
++    }
++
++    #[test]
++    fn eligible_models_excludes_unavailable_and_guardian_models_and_sorts_picker_models_last() {
++        let models = eligible_models(
++            vec![
++                model_info(
++                    "picker-later",
++                    ModelVisibility::List,
++                    20,
++                    Some(ReasoningEffort::Medium),
++                    &[ReasoningEffort::Medium],
++                ),
++                model_info(
++                    "guardian",
++                    ModelVisibility::Hide,
++                    1,
++                    Some(ReasoningEffort::Medium),
++                    &[ReasoningEffort::Medium],
++                ),
++                model_info(
++                    "unavailable",
++                    ModelVisibility::None,
++                    0,
++                    Some(ReasoningEffort::Medium),
++                    &[ReasoningEffort::Medium],
++                ),
++                model_info(
++                    "hidden",
++                    ModelVisibility::Hide,
++                    30,
++                    Some(ReasoningEffort::Medium),
++                    &[ReasoningEffort::Medium],
++                ),
++                model_info(
++                    "picker-first",
++                    ModelVisibility::List,
++                    10,
++                    Some(ReasoningEffort::Medium),
++                    &[ReasoningEffort::Medium],
++                ),
++            ],
++            "guardian",
++        );
++
++        assert_eq!(
++            models
++                .iter()
++                .map(|model| model.slug.as_str())
++                .collect::<Vec<_>>(),
++            ["hidden", "picker-first", "picker-later"]
++        );
++    }
++
++    #[test]
++    fn effective_selection_uses_supported_request_and_falls_back_to_current_model_defaults() {
++        let models = vec![
++            model_info(
++                "fallback",
++                ModelVisibility::List,
++                0,
++                Some(ReasoningEffort::Low),
++                &[ReasoningEffort::Low, ReasoningEffort::High],
++            ),
++            model_info(
++                "requested",
++                ModelVisibility::List,
++                1,
++                Some(ReasoningEffort::Medium),
++                &[ReasoningEffort::Medium, ReasoningEffort::High],
++            ),
++        ];
++
++        assert_eq!(
++            effective_selection(
++                &models,
++                "requested",
++                &ReasoningEffort::High,
++                "fallback",
++                Some(&ReasoningEffort::Low),
++            )
++            .expect("supported request"),
++            (
++                "requested".to_string(),
++                ReasoningEffort::High,
++                /*fallback_from_model*/ None,
++            )
++        );
++        assert_eq!(
++            effective_selection(
++                &models,
++                "requested",
++                &ReasoningEffort::Low,
++                "fallback",
++                Some(&ReasoningEffort::High),
++            )
++            .expect("fallback selection"),
++            (
++                "fallback".to_string(),
++                ReasoningEffort::High,
++                Some("requested".to_string()),
++            )
++        );
++    }
++
++    #[test]
++    fn usage_is_absent_when_either_accounting_snapshot_is_missing() {
++        let usage = TokenUsage {
++            input_tokens: 1,
++            cached_input_tokens: 0,
++            cache_write_input_tokens: 0,
++            output_tokens: 1,
++            reasoning_output_tokens: 0,
++            total_tokens: 2,
++        };
++        assert_eq!(rewrite_usage_delta(None, Some(usage.clone())), None);
++        assert_eq!(rewrite_usage_delta(Some(usage), None), None);
++    }
++}
