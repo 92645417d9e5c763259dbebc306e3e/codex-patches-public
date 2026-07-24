@@ -19,35 +19,51 @@ index a197caeb04..fd136ec082 100644
              thread_id: "thread-child".to_string(),
              turn_id: "turn-1".to_string(),
 diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
-index 4993bdd198..83d23b0723 100644
+index 4993bdd198..4362436aa7 100644
 --- a/codex-rs/tui/src/chatwidget.rs
 +++ b/codex-rs/tui/src/chatwidget.rs
-@@ -647,6 +647,8 @@ pub(crate) struct ChatWidget {
+@@ -647,6 +647,12 @@ pub(crate) struct ChatWidget {
      reasoning_header: Option<String>,
      // Preserves reasoning-summary part boundaries for transcript-only recording.
      reasoning_summary_parts: Vec<String>,
 +    // Buffers every reasoning item in one model response until its exact usage arrives at the tail.
 +    pending_atomic_reasoning_items: Vec<(String, Vec<String>)>,
++    // Tracks the live reasoning item lifecycle before exact response usage is available.
++    atomic_reasoning_response_active: bool,
++    // Preserves live final-answer order while reasoning items wait for exact response usage.
++    pending_atomic_final_answers: Vec<(AgentMessageItem, String)>,
      status_state: StatusState,
      review: ReviewState,
      // Active hook runs render in a dedicated live cell so they can run alongside tools.
 diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
-index 478966ae6a..189bae304d 100644
+index 478966ae6a..929b09e33f 100644
 --- a/codex-rs/tui/src/chatwidget/constructor.rs
 +++ b/codex-rs/tui/src/chatwidget/constructor.rs
-@@ -187,6 +187,7 @@ impl ChatWidget {
+@@ -187,6 +187,9 @@ impl ChatWidget {
              reasoning_buffer: String::new(),
              reasoning_header: None,
              reasoning_summary_parts: Vec::new(),
 +            pending_atomic_reasoning_items: Vec::new(),
++            atomic_reasoning_response_active: false,
++            pending_atomic_final_answers: Vec::new(),
              status_state: StatusState::default(),
              review: ReviewState::default(),
              active_hook_cell: None,
 diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
-index dfa4cdb256..d4aa44c4f9 100644
+index dfa4cdb256..4d97b9157b 100644
 --- a/codex-rs/tui/src/chatwidget/protocol.rs
 +++ b/codex-rs/tui/src/chatwidget/protocol.rs
-@@ -420,7 +420,13 @@ impl ChatWidget {
+@@ -371,6 +371,9 @@ impl ChatWidget {
+                     self.agent_message_phases.remove(&id);
+                 }
+             }
++            ThreadItem::Reasoning { .. } if !from_replay => {
++                self.atomic_reasoning_response_active = true;
++            }
+             ThreadItem::CollabAgentToolCall {
+                 id,
+                 tool,
+@@ -420,7 +423,13 @@ impl ChatWidget {
                          });
                  self.handle_context_compaction_item(duration_ms, render_source);
              }
@@ -142,8 +158,25 @@ index d97ba1c8fa..f04c26d3e1 100644
              }
              item @ ThreadItem::CommandExecution {
                  status: codex_app_server_protocol::CommandExecutionStatus::InProgress,
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__final_reasoning_then_message_without_deltas_are_rendered.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__final_reasoning_then_message_without_deltas_are_rendered.snap
+index e8553475a9..a31bf61bfc 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__final_reasoning_then_message_without_deltas_are_rendered.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__final_reasoning_then_message_without_deltas_are_rendered.snap
+@@ -1,5 +1,10 @@
+ ---
+-source: tui/src/chatwidget/tests.rs
++source: tui/src/chatwidget/tests/status_and_layout.rs
++assertion_line: 4002
+ expression: combined
+ ---
+-▪ Here is the result.
++▪ No reasoning summary ▪ 1 tokens
++
++────────────────────────────────────────────────────────────────────────────────
++ Here is the result.                                                            
++────────────────────────────────────────────────────────────────────────────────
 diff --git a/codex-rs/tui/src/chatwidget/streaming.rs b/codex-rs/tui/src/chatwidget/streaming.rs
-index 3ca4769f97..b02c55aab8 100644
+index 3ca4769f97..9ab635cbf7 100644
 --- a/codex-rs/tui/src/chatwidget/streaming.rs
 +++ b/codex-rs/tui/src/chatwidget/streaming.rs
 @@ -262,8 +262,25 @@ impl ChatWidget {
@@ -173,7 +206,7 @@ index 3ca4769f97..b02c55aab8 100644
          if !self.reasoning_buffer.is_empty() {
              self.reasoning_summary_parts
                  .push(std::mem::take(&mut self.reasoning_buffer));
-@@ -279,6 +296,23 @@ impl ChatWidget {
+@@ -279,6 +296,25 @@ impl ChatWidget {
          self.request_redraw();
      }
  
@@ -192,12 +225,14 @@ index 3ca4769f97..b02c55aab8 100644
 +        for cell in cells {
 +            self.add_boxed_history(cell);
 +        }
++        self.atomic_reasoning_response_active = false;
++        self.flush_pending_atomic_final_answers();
 +    }
 +
      pub(super) fn on_reasoning_section_break(&mut self) {
          // Start a new reasoning block for header extraction and accumulate transcript.
          if !self.reasoning_buffer.is_empty() {
-@@ -307,6 +341,7 @@ impl ChatWidget {
+@@ -307,6 +343,7 @@ impl ChatWidget {
          self.reasoning_buffer.clear();
          self.reasoning_header = None;
          self.reasoning_summary_parts.clear();
@@ -205,6 +240,39 @@ index 3ca4769f97..b02c55aab8 100644
          self.status_state.remember_retry_status_header();
          self.bottom_pane.ensure_status_indicator();
          self.status_state.model_output_run_state = ModelOutputRunState::Thinking;
+@@ -371,6 +408,32 @@ impl ChatWidget {
+         item: AgentMessageItem,
+         turn_id: &str,
+         from_replay: bool,
++    ) {
++        if !from_replay
++            && self.atomic_reasoning_response_active
++            && matches!(item.phase, Some(MessagePhase::FinalAnswer) | None)
++        {
++            self.transcript.last_completed_agent_message =
++                Some((turn_id.to_string(), item.id.clone()));
++            self.pending_atomic_final_answers
++                .push((item, turn_id.to_string()));
++            return;
++        }
++        self.commit_agent_message_item_completed(item, turn_id, from_replay);
++    }
++
++    pub(super) fn flush_pending_atomic_final_answers(&mut self) {
++        let pending = std::mem::take(&mut self.pending_atomic_final_answers);
++        for (item, turn_id) in pending {
++            self.commit_agent_message_item_completed(item, &turn_id, /*from_replay*/ false);
++        }
++    }
++
++    fn commit_agent_message_item_completed(
++        &mut self,
++        item: AgentMessageItem,
++        turn_id: &str,
++        from_replay: bool,
+     ) {
+         self.transcript.last_completed_agent_message = Some((turn_id.to_string(), item.id.clone()));
+         let mut message = String::new();
 diff --git a/codex-rs/tui/src/chatwidget/tests/helpers.rs b/codex-rs/tui/src/chatwidget/tests/helpers.rs
 index 55259bff5c..f3f1644d44 100644
 --- a/codex-rs/tui/src/chatwidget/tests/helpers.rs
@@ -218,7 +286,7 @@ index 55259bff5c..f3f1644d44 100644
          }),
          /*replay_kind*/ None,
 diff --git a/codex-rs/tui/src/chatwidget/tests/history_replay.rs b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
-index 478c2e6e1a..58ec9f2b89 100644
+index 478c2e6e1a..0db4dc8255 100644
 --- a/codex-rs/tui/src/chatwidget/tests/history_replay.rs
 +++ b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
 @@ -1084,6 +1084,7 @@ async fn replayed_reasoning_item_preserves_summary_parts_and_hides_raw_reasoning
@@ -263,7 +331,7 @@ index 478c2e6e1a..58ec9f2b89 100644
              },
          }),
          /*replay_kind*/ None,
-@@ -1320,6 +1327,84 @@ async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
+@@ -1320,6 +1327,194 @@ async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
      assert_eq!(rendered.matches("Summary only").count(), 1);
  }
  
@@ -345,10 +413,120 @@ index 478c2e6e1a..58ec9f2b89 100644
 +    );
 +}
 +
++#[tokio::test]
++async fn live_final_answer_waits_for_deferred_reasoning_usage() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.show_welcome_banner = false;
++
++    chat.handle_server_notification(
++        ServerNotification::ItemStarted(ItemStartedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            started_at_ms: 0,
++            item: AppServerThreadItem::Reasoning {
++                id: "rs_first".to_string(),
++                summary: Vec::new(),
++                content: Vec::new(),
++                reasoning_output_tokens: None,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            completed_at_ms: 0,
++            item: AppServerThreadItem::AgentMessage {
++                id: "final-1".to_string(),
++                text: "Final answer".to_string(),
++                phase: Some(MessagePhase::FinalAnswer),
++                memory_citation: None,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++    assert!(drain_insert_history(&mut rx).is_empty());
++
++    for (id, summary, reasoning_output_tokens) in [
++        ("rs_first", "**First head**", None),
++        ("rs_tail", "**Tail head**", Some(42)),
++    ] {
++        chat.handle_server_notification(
++            ServerNotification::ItemCompleted(ItemCompletedNotification {
++                thread_id: "thread-1".to_string(),
++                turn_id: "turn-1".to_string(),
++                completed_at_ms: 0,
++                item: AppServerThreadItem::Reasoning {
++                    id: id.to_string(),
++                    summary: vec![summary.to_string()],
++                    content: Vec::new(),
++                    reasoning_output_tokens,
++                },
++            }),
++            /*replay_kind*/ None,
++        );
++    }
++
++    let rendered = drain_insert_history(&mut rx)
++        .into_iter()
++        .map(|lines| lines_to_single_string(&lines))
++        .collect::<Vec<_>>();
++    assert_eq!(rendered.len(), 3);
++    assert!(rendered[0].contains("First head"));
++    assert!(rendered[0].contains("42 tokens"));
++    assert!(rendered[1].contains("Tail head"));
++    assert!(rendered[2].contains("Final answer"));
++}
++
++#[tokio::test]
++async fn live_final_answer_without_reasoning_flushes_on_turn_completion() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.show_welcome_banner = false;
++
++    let final_item = AppServerThreadItem::AgentMessage {
++        id: "final-1".to_string(),
++        text: "Final answer".to_string(),
++        phase: Some(MessagePhase::FinalAnswer),
++        memory_citation: None,
++    };
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            completed_at_ms: 0,
++            item: final_item.clone(),
++        }),
++        /*replay_kind*/ None,
++    );
++    let rendered = drain_insert_history(&mut rx);
++    assert_eq!(rendered.len(), 1);
++    assert!(lines_to_single_string(&rendered[0]).contains("Final answer"));
++
++    chat.handle_server_notification(
++        ServerNotification::TurnCompleted(TurnCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn: AppServerTurn {
++                id: "turn-1".to_string(),
++                items_view: codex_app_server_protocol::TurnItemsView::Summary,
++                items: vec![final_item],
++                status: AppServerTurnStatus::Completed,
++                error: None,
++                started_at: None,
++                completed_at: None,
++                duration_ms: None,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++
++    assert!(drain_insert_history(&mut rx).is_empty());
++}
++
  #[tokio::test]
  async fn live_reasoning_summary_drops_empty_parts_without_losing_content() {
      let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-@@ -1382,6 +1467,7 @@ async fn live_reasoning_summary_drops_empty_parts_without_losing_content() {
+@@ -1382,6 +1577,7 @@ async fn live_reasoning_summary_drops_empty_parts_without_losing_content() {
                      "**Checking tests**\n\n<!-- -->".to_string(),
                  ],
                  content: Vec::new(),
@@ -356,7 +534,7 @@ index 478c2e6e1a..58ec9f2b89 100644
              },
          }),
          /*replay_kind*/ None,
-@@ -1393,7 +1479,7 @@ async fn live_reasoning_summary_drops_empty_parts_without_losing_content() {
+@@ -1393,7 +1589,7 @@ async fn live_reasoning_summary_drops_empty_parts_without_losing_content() {
          }
          other => panic!("expected InsertHistoryCell, got {other:?}"),
      };
@@ -366,17 +544,37 @@ index 478c2e6e1a..58ec9f2b89 100644
  
  #[tokio::test]
 diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
-index ba15071f5e..a81aefc893 100644
+index ba15071f5e..6ef117ec7d 100644
 --- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
 +++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
-@@ -99,6 +99,7 @@ impl ChatWidget {
+@@ -99,6 +99,9 @@ impl ChatWidget {
              self.refresh_status_surfaces();
          }
          self.reasoning_summary_parts.clear();
 +        self.pending_atomic_reasoning_items.clear();
++        self.atomic_reasoning_response_active = false;
++        self.pending_atomic_final_answers.clear();
          self.reasoning_buffer.clear();
          self.reasoning_header = None;
          self.set_ambient_pet_notification(
+@@ -139,6 +142,8 @@ impl ChatWidget {
+             .unwrap_or_default();
+         let had_visible_answer = !notification_response.is_empty();
+         self.transcript.saw_copy_source_this_turn = false;
++        self.atomic_reasoning_response_active = false;
++        self.flush_pending_atomic_final_answers();
+         // If a stream is currently active, finalize it.
+         self.flush_answer_stream_with_separator();
+         if let Some(mut controller) = self.plan_stream_controller.take() {
+@@ -384,6 +389,8 @@ impl ChatWidget {
+         self.adaptive_chunking.reset();
+         self.stream_controller = None;
+         self.plan_stream_controller = None;
++        self.atomic_reasoning_response_active = false;
++        self.pending_atomic_final_answers.clear();
+         self.request_pending_usage_output_insertion_after_stream_shutdown();
+         self.status_state.pending_status_indicator_restore = false;
+         self.request_status_line_branch_refresh();
 diff --git a/codex-rs/tui/src/history_cell/messages.rs b/codex-rs/tui/src/history_cell/messages.rs
 index cb8b326c1f..b059d35c1b 100644
 --- a/codex-rs/tui/src/history_cell/messages.rs
