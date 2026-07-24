@@ -1,0 +1,619 @@
+diff --git a/codex-rs/app-server/src/request_processors/turn_processor.rs b/codex-rs/app-server/src/request_processors/turn_processor.rs
+index eee0b0ae27..85f8dabf66 100644
+--- a/codex-rs/app-server/src/request_processors/turn_processor.rs
++++ b/codex-rs/app-server/src/request_processors/turn_processor.rs
+@@ -572,18 +572,32 @@ impl TurnRequestProcessor {
+             additional_context,
+             thread_settings,
+         };
+-        let turn_id = thread
+-            .submit_user_input_with_client_user_message_id(
++        let turn_id = Uuid::now_v7().to_string();
++        let (turn_start_guard, resolved_turn_id) = self
++            .thread_watch_manager
++            .note_turn_starting(&thread_id.to_string(), &turn_id)
++            .await;
++        match thread
++            .submit_user_input_with_id_and_resolver(
++                turn_id.clone(),
+                 turn_op,
+                 self.request_trace_context(&request_id).await,
+                 client_user_message_id,
++                resolved_turn_id,
+             )
+             .await
+-            .map_err(|err| {
++        {
++            Ok(submitted_turn_id) => {
++                debug_assert_eq!(submitted_turn_id, turn_id);
++                turn_start_guard.commit();
++            }
++            Err(err) => {
++                turn_start_guard.rollback().await;
+                 let error = internal_error(format!("failed to start turn: {err}"));
+                 self.track_error_response(&request_id, &error, /*error_type*/ None);
+-                error
+-            })?;
++                return Err(error);
++            }
++        }
+ 
+         if turn_has_input {
+             let config_snapshot = thread.config_snapshot().await;
+diff --git a/codex-rs/app-server/src/thread_status.rs b/codex-rs/app-server/src/thread_status.rs
+index be5f2445c6..b357597372 100644
+--- a/codex-rs/app-server/src/thread_status.rs
++++ b/codex-rs/app-server/src/thread_status.rs
+@@ -11,6 +11,7 @@ use codex_protocol::ThreadId;
+ use std::collections::HashMap;
+ use std::collections::HashSet;
+ use std::sync::Arc;
++use std::sync::OnceLock;
+ use std::sync::atomic::AtomicU64;
+ use std::sync::atomic::Ordering;
+ use tokio::sync::Mutex;
+@@ -30,38 +31,33 @@ pub(crate) struct PendingTurnStartGuard {
+     manager: ThreadWatchManager,
+     thread_id: String,
+     token: u64,
+-    resolved: bool,
++    finalized: bool,
+     handle: tokio::runtime::Handle,
+ }
+ 
+ impl PendingTurnStartGuard {
+-    pub(crate) async fn started(mut self, turn_id: &str) {
+-        self.manager
+-            .resolve_pending_turn_start(&self.thread_id, self.token, Some(turn_id))
+-            .await;
+-        self.resolved = true;
++    pub(crate) fn commit(mut self) {
++        self.finalized = true;
+     }
+ 
+     pub(crate) async fn rollback(mut self) {
+         self.manager
+-            .resolve_pending_turn_start(&self.thread_id, self.token, None)
++            .remove_pending_turn_start(&self.thread_id, self.token)
+             .await;
+-        self.resolved = true;
++        self.finalized = true;
+     }
+ }
+ 
+ impl Drop for PendingTurnStartGuard {
+     fn drop(&mut self) {
+-        if self.resolved {
++        if self.finalized {
+             return;
+         }
+         let manager = self.manager.clone();
+         let thread_id = self.thread_id.clone();
+         let token = self.token;
+         self.handle.spawn(async move {
+-            manager
+-                .resolve_pending_turn_start(&thread_id, token, None)
+-                .await;
++            manager.remove_pending_turn_start(&thread_id, token).await;
+         });
+     }
+ }
+@@ -196,7 +192,7 @@ impl ThreadWatchManager {
+             runtime.running_turn_ids.insert(turn_id.clone());
+             runtime
+                 .pending_turn_starts
+-                .retain(|_, pending_turn_id| pending_turn_id != &turn_id);
++                .retain(|_, pending| !pending.matches_turn(&turn_id));
+             runtime.has_system_error = false;
+         })
+         .await;
+@@ -251,33 +247,39 @@ impl ThreadWatchManager {
+         &self,
+         thread_id: &str,
+         turn_id: &str,
+-    ) -> PendingTurnStartGuard {
++    ) -> (PendingTurnStartGuard, Arc<OnceLock<String>>) {
+         let token = self
+             .next_pending_turn_start_token
+             .fetch_add(1, Ordering::Relaxed);
+         let turn_id = turn_id.to_string();
++        let resolved_turn_id = Arc::new(OnceLock::new());
++        let resolved_turn_id_for_state = Arc::clone(&resolved_turn_id);
+         self.update_runtime_for_thread(thread_id, move |runtime| {
+-            runtime.pending_turn_starts.insert(token, turn_id);
++            runtime.pending_turn_starts.insert(
++                token,
++                PendingTurnStart {
++                    expected_turn_id: turn_id,
++                    resolved_turn_id: resolved_turn_id_for_state,
++                },
++            );
+             runtime.has_system_error = false;
+         })
+         .await;
+-        PendingTurnStartGuard {
+-            manager: self.clone(),
+-            thread_id: thread_id.to_string(),
+-            token,
+-            resolved: false,
+-            handle: tokio::runtime::Handle::current(),
+-        }
++        (
++            PendingTurnStartGuard {
++                manager: self.clone(),
++                thread_id: thread_id.to_string(),
++                token,
++                finalized: false,
++                handle: tokio::runtime::Handle::current(),
++            },
++            resolved_turn_id,
++        )
+     }
+ 
+-    async fn resolve_pending_turn_start(&self, thread_id: &str, token: u64, turn_id: Option<&str>) {
+-        let turn_id = turn_id.map(str::to_string);
++    async fn remove_pending_turn_start(&self, thread_id: &str, token: u64) {
+         self.update_runtime_for_thread(thread_id, move |runtime| {
+-            if runtime.pending_turn_starts.remove(&token).is_some()
+-                && let Some(turn_id) = turn_id
+-            {
+-                runtime.running_turn_ids.insert(turn_id);
+-            }
++            runtime.pending_turn_starts.remove(&token);
+         })
+         .await;
+     }
+@@ -515,7 +517,7 @@ impl ThreadWatchState {
+ struct RuntimeFacts {
+     is_loaded: bool,
+     running_turn_ids: HashSet<String>,
+-    pending_turn_starts: HashMap<u64, String>,
++    pending_turn_starts: HashMap<u64, PendingTurnStart>,
+     pending_permission_requests: u32,
+     pending_user_input_requests: u32,
+     has_system_error: bool,
+@@ -529,7 +531,7 @@ impl RuntimeFacts {
+     fn finish_turn(&mut self, turn_id: &str) {
+         self.running_turn_ids.remove(turn_id);
+         self.pending_turn_starts
+-            .retain(|_, pending_turn_id| pending_turn_id != turn_id);
++            .retain(|_, pending| !pending.matches_turn(turn_id));
+     }
+ 
+     fn clear_pending_requests_if_idle(&mut self) {
+@@ -540,6 +542,22 @@ impl RuntimeFacts {
+     }
+ }
+ 
++#[derive(Clone)]
++struct PendingTurnStart {
++    expected_turn_id: String,
++    resolved_turn_id: Arc<OnceLock<String>>,
++}
++
++impl PendingTurnStart {
++    fn matches_turn(&self, turn_id: &str) -> bool {
++        self.expected_turn_id == turn_id
++            || self
++                .resolved_turn_id
++                .get()
++                .is_some_and(|resolved_turn_id| resolved_turn_id == turn_id)
++    }
++}
++
+ fn loaded_thread_status(runtime: &RuntimeFacts) -> ThreadStatus {
+     if !runtime.is_loaded {
+         return ThreadStatus::NotLoaded;
+@@ -825,14 +843,20 @@ mod tests {
+         manager
+             .note_turn_started(INTERACTIVE_THREAD_ID, "old")
+             .await;
+-        let pending = manager
++        let (pending, resolved_turn_id) = manager
+             .note_turn_starting(INTERACTIVE_THREAD_ID, "new")
+             .await;
+         manager
+             .note_turn_completed(INTERACTIVE_THREAD_ID, "old", false)
+             .await;
+         assert_eq!(manager.running_turn_count().await, 1);
+-        pending.started("new").await;
++        resolved_turn_id
++            .set("new".to_string())
++            .expect("pending turn should resolve once");
++        pending.commit();
++        manager
++            .note_turn_started(INTERACTIVE_THREAD_ID, "new")
++            .await;
+         manager
+             .note_turn_completed(INTERACTIVE_THREAD_ID, "old", false)
+             .await;
+@@ -849,7 +873,7 @@ mod tests {
+         manager
+             .note_turn_started(INTERACTIVE_THREAD_ID, "old")
+             .await;
+-        let pending = manager
++        let (pending, resolved_turn_id) = manager
+             .note_turn_starting(INTERACTIVE_THREAD_ID, "new")
+             .await;
+         manager
+@@ -861,7 +885,13 @@ mod tests {
+             .await;
+         assert_eq!(manager.running_turn_count().await, 1);
+ 
+-        pending.started("new").await;
++        resolved_turn_id
++            .set("new".to_string())
++            .expect("pending turn should resolve once");
++        pending.commit();
++        manager
++            .note_turn_started(INTERACTIVE_THREAD_ID, "new")
++            .await;
+         manager
+             .note_system_error(
+                 INTERACTIVE_THREAD_ID,
+@@ -879,10 +909,10 @@ mod tests {
+     #[tokio::test]
+     async fn pending_turn_start_rollback_is_isolated() {
+         let manager = ThreadWatchManager::new();
+-        let first = manager
++        let (first, _) = manager
+             .note_turn_starting(INTERACTIVE_THREAD_ID, "first")
+             .await;
+-        let second = manager
++        let (second, _) = manager
+             .note_turn_starting(INTERACTIVE_THREAD_ID, "second")
+             .await;
+         first.rollback().await;
+@@ -894,7 +924,7 @@ mod tests {
+     #[tokio::test]
+     async fn dropped_pending_turn_start_guard_cleans_up_its_token() {
+         let manager = ThreadWatchManager::new();
+-        let guard = manager
++        let (guard, _) = manager
+             .note_turn_starting(INTERACTIVE_THREAD_ID, "turn")
+             .await;
+         assert_eq!(manager.running_turn_count().await, 1);
+diff --git a/codex-rs/core/src/codex_delegate.rs b/codex-rs/core/src/codex_delegate.rs
+index 12b82987a1..76db725ec0 100644
+--- a/codex-rs/core/src/codex_delegate.rs
++++ b/codex-rs/core/src/codex_delegate.rs
+@@ -262,6 +262,7 @@ pub(crate) async fn run_codex_thread_one_shot(
+                         op: Op::Shutdown {},
+                         client_user_message_id: None,
+                         trace: None,
++                        resolved_turn_id: None,
+                     })
+                     .await;
+                 child_cancel.cancel();
+diff --git a/codex-rs/core/src/codex_delegate_tests.rs b/codex-rs/core/src/codex_delegate_tests.rs
+index d1bebf5620..f8c75669bd 100644
+--- a/codex-rs/core/src/codex_delegate_tests.rs
++++ b/codex-rs/core/src/codex_delegate_tests.rs
+@@ -175,6 +175,7 @@ async fn forward_ops_preserves_submission_trace_context() {
+             ),
+             tracestate: Some("vendor=state".to_string()),
+         }),
++        resolved_turn_id: None,
+     };
+     tx_ops.send(submission.clone()).await.unwrap();
+     drop(tx_ops);
+diff --git a/codex-rs/core/src/codex_thread.rs b/codex-rs/core/src/codex_thread.rs
+index 27ba2bc70f..fda28fd5f1 100644
+--- a/codex-rs/core/src/codex_thread.rs
++++ b/codex-rs/core/src/codex_thread.rs
+@@ -54,6 +54,7 @@ use std::collections::BTreeMap;
+ use std::collections::HashMap;
+ use std::path::PathBuf;
+ use std::sync::Arc;
++use std::sync::OnceLock;
+ use tokio::sync::Mutex;
+ use tokio::sync::watch;
+ use tokio_util::sync::CancellationToken;
+@@ -294,6 +295,30 @@ impl CodexThread {
+             .await
+     }
+ 
++    pub async fn submit_user_input_with_id_and_resolver(
++        &self,
++        id: String,
++        op: Op,
++        trace: Option<W3cTraceContext>,
++        client_user_message_id: Option<String>,
++        resolved_turn_id: Arc<OnceLock<String>>,
++    ) -> CodexResult<String> {
++        self.session
++            .services
++            .agent_control
++            .ensure_execution_capacity_for_op(self.session.thread_id(), &op)
++            .await?;
++        self.io
++            .submit_user_input_with_id_and_resolver(
++                id,
++                op,
++                trace,
++                client_user_message_id,
++                resolved_turn_id,
++            )
++            .await
++    }
++
+     /// Persist whether this thread is eligible for future memory generation.
+     pub async fn set_thread_memory_mode(&self, mode: ThreadMemoryMode) -> anyhow::Result<()> {
+         self.session.set_thread_memory_mode(mode).await
+diff --git a/codex-rs/core/src/session/handlers.rs b/codex-rs/core/src/session/handlers.rs
+index 0a0b4d1ad3..47c8f8fa27 100644
+--- a/codex-rs/core/src/session/handlers.rs
++++ b/codex-rs/core/src/session/handlers.rs
+@@ -54,6 +54,7 @@ use codex_rmcp_client::ElicitationAction;
+ use codex_rmcp_client::ElicitationResponse;
+ use serde_json::Value;
+ use std::sync::Arc;
++use std::sync::OnceLock;
+ use tracing::debug;
+ use tracing::info;
+ use tracing::warn;
+@@ -83,8 +84,9 @@ pub async fn user_input_or_turn(
+     sub_id: String,
+     op: Op,
+     client_user_message_id: Option<String>,
++    resolved_turn_id: Option<Arc<OnceLock<String>>>,
+ ) {
+-    user_input_or_turn_inner(sess, sub_id, op, client_user_message_id).await;
++    user_input_or_turn_inner(sess, sub_id, op, client_user_message_id, resolved_turn_id).await;
+ }
+ 
+ pub async fn update_thread_settings(
+@@ -178,6 +180,7 @@ pub(super) async fn user_input_or_turn_inner(
+     sub_id: String,
+     op: Op,
+     client_user_message_id: Option<String>,
++    resolved_turn_id: Option<Arc<OnceLock<String>>>,
+ ) {
+     let Op::UserInput {
+         items,
+@@ -220,10 +223,16 @@ pub(super) async fn user_input_or_turn_inner(
+         )
+         .await
+     {
+-        Ok(_) => {
++        Ok(active_turn_id) => {
++            if let Some(resolver) = resolved_turn_id {
++                let _ = resolver.set(active_turn_id);
++            }
+             current_context.session_telemetry.user_prompt(&items);
+         }
+         Err(SteerInputError::NoActiveTurn(items)) => {
++            if let Some(resolver) = resolved_turn_id {
++                let _ = resolver.set(sub_id.clone());
++            }
+             if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
+                 current_context
+                     .turn_metadata_state
+@@ -750,8 +759,14 @@ pub(super) async fn submission_loop(
+                     false
+                 }
+                 Op::UserInput { .. } => {
+-                    user_input_or_turn(&sess, sub.id.clone(), sub.op, sub.client_user_message_id)
+-                        .await;
++                    user_input_or_turn(
++                        &sess,
++                        sub.id.clone(),
++                        sub.op,
++                        sub.client_user_message_id,
++                        sub.resolved_turn_id,
++                    )
++                    .await;
+                     false
+                 }
+                 Op::ThreadSettings { thread_settings } => {
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 550183394d..dd175e1cbc 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -6,6 +6,7 @@ use std::fmt::Debug;
+ use std::path::Path;
+ use std::path::PathBuf;
+ use std::sync::Arc;
++use std::sync::OnceLock;
+ use std::sync::atomic::AtomicU64;
+ use std::time::SystemTime;
+ use std::time::UNIX_EPOCH;
+@@ -800,6 +801,7 @@ impl SessionIo {
+             op,
+             client_user_message_id: None,
+             trace,
++            resolved_turn_id: None,
+         };
+         self.submit_with_id(sub).await?;
+         Ok(id)
+@@ -818,6 +820,27 @@ impl SessionIo {
+             op,
+             client_user_message_id,
+             trace,
++            resolved_turn_id: None,
++        };
++        self.submit_with_id(sub).await?;
++        Ok(id)
++    }
++
++    pub(crate) async fn submit_user_input_with_id_and_resolver(
++        &self,
++        id: String,
++        op: Op,
++        trace: Option<W3cTraceContext>,
++        client_user_message_id: Option<String>,
++        resolved_turn_id: Arc<OnceLock<String>>,
++    ) -> CodexResult<String> {
++        debug_assert!(matches!(op, Op::UserInput { .. }));
++        let sub = Submission {
++            id: id.clone(),
++            op,
++            client_user_message_id,
++            trace,
++            resolved_turn_id: Some(resolved_turn_id),
+         };
+         self.submit_with_id(sub).await?;
+         Ok(id)
+@@ -1238,6 +1261,7 @@ impl Session {
+                 thread_settings: Default::default(),
+             },
+             /*client_user_message_id*/ None,
++            /*resolved_turn_id*/ None,
+         )
+         .await;
+     }
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index 9b894b9ea3..47afa604a9 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -6815,6 +6815,7 @@ async fn submit_with_id_captures_current_span_trace_context() {
+             op: Op::Interrupt,
+             client_user_message_id: None,
+             trace: None,
++            resolved_turn_id: None,
+         })
+         .await
+         .expect("submit should succeed");
+@@ -6887,6 +6888,7 @@ fn submission_dispatch_span_prefers_submission_trace_context() {
+             op: Op::Interrupt,
+             client_user_message_id: None,
+             trace: Some(submission_trace),
++            resolved_turn_id: None,
+         })
+     });
+ 
+@@ -6914,6 +6916,7 @@ fn submission_dispatch_span_uses_debug_for_realtime_audio() {
+         }),
+         client_user_message_id: None,
+         trace: None,
++        resolved_turn_id: None,
+     });
+ 
+     assert_eq!(
+@@ -6944,6 +6947,65 @@ fn op_kind_for_input_and_context_ops() {
+     );
+ }
+ 
++fn resolved_turn_test_input() -> Op {
++    Op::UserInput {
++        items: vec![UserInput::Text {
++            text: "hello".to_string(),
++            text_elements: Vec::new(),
++        }],
++        final_output_json_schema: None,
++        responsesapi_client_metadata: None,
++        additional_context: Default::default(),
++        thread_settings: Default::default(),
++    }
++}
++
++#[tokio::test]
++async fn user_input_resolves_new_turn_submission_id() {
++    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
++    let resolved_turn_id = Arc::new(OnceLock::new());
++
++    handlers::user_input_or_turn_inner(
++        &session,
++        "sub-new".to_string(),
++        resolved_turn_test_input(),
++        /*client_user_message_id*/ None,
++        Some(Arc::clone(&resolved_turn_id)),
++    )
++    .await;
++
++    assert_eq!(resolved_turn_id.get().map(String::as_str), Some("sub-new"));
++    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
++}
++
++#[tokio::test]
++async fn user_input_resolves_active_steer_turn_id() {
++    let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
++    session
++        .spawn_task(
++            Arc::clone(&turn_context),
++            Vec::new(),
++            NeverEndingTask {
++                kind: TaskKind::Regular,
++                listen_to_cancellation_token: false,
++            },
++        )
++        .await;
++    let resolved_turn_id = Arc::new(OnceLock::new());
++
++    handlers::user_input_or_turn_inner(
++        &session,
++        "steer-submission".to_string(),
++        resolved_turn_test_input(),
++        /*client_user_message_id*/ None,
++        Some(Arc::clone(&resolved_turn_id)),
++    )
++    .await;
++
++    assert_eq!(resolved_turn_id.get(), Some(&turn_context.sub_id));
++    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
++}
++
+ #[tokio::test]
+ async fn user_turn_updates_approvals_reviewer() {
+     let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
+@@ -6978,6 +7040,7 @@ async fn user_turn_updates_approvals_reviewer() {
+             },
+         },
+         /*client_user_message_id*/ None,
++        /*resolved_turn_id*/ None,
+     )
+     .await;
+ 
+@@ -7265,6 +7328,7 @@ async fn spawn_task_turn_span_inherits_dispatch_trace_context() {
+         op: Op::Interrupt,
+         client_user_message_id: None,
+         trace: Some(submission_trace.clone()),
++        resolved_turn_id: None,
+     });
+     let dispatch_span_id = dispatch_span.context().span().span_context().span_id();
+ 
+diff --git a/codex-rs/mcp-server/src/codex_tool_runner.rs b/codex-rs/mcp-server/src/codex_tool_runner.rs
+index 0e9131b234..b2fbe28717 100644
+--- a/codex-rs/mcp-server/src/codex_tool_runner.rs
++++ b/codex-rs/mcp-server/src/codex_tool_runner.rs
+@@ -119,6 +119,7 @@ pub async fn run_codex_tool_session(
+         },
+         client_user_message_id: None,
+         trace: None,
++        resolved_turn_id: None,
+     };
+ 
+     if let Err(e) = thread.submit_with_id(submission).await {
+diff --git a/codex-rs/mcp-server/src/message_processor.rs b/codex-rs/mcp-server/src/message_processor.rs
+index 2a13a4d61f..1fe3e700be 100644
+--- a/codex-rs/mcp-server/src/message_processor.rs
++++ b/codex-rs/mcp-server/src/message_processor.rs
+@@ -561,6 +561,7 @@ impl MessageProcessor {
+                 op: codex_protocol::protocol::Op::Interrupt,
+                 client_user_message_id: None,
+                 trace: None,
++                resolved_turn_id: None,
+             })
+             .await
+         {
+diff --git a/codex-rs/protocol/src/protocol.rs b/codex-rs/protocol/src/protocol.rs
+index 5e0a703759..faa4821153 100644
+--- a/codex-rs/protocol/src/protocol.rs
++++ b/codex-rs/protocol/src/protocol.rs
+@@ -11,6 +11,7 @@ use std::path::Path;
+ use std::path::PathBuf;
+ use std::str::FromStr;
+ use std::sync::Arc;
++use std::sync::OnceLock;
+ use std::time::Duration;
+ 
+ use strum_macros::EnumIter;
+@@ -192,6 +193,8 @@ pub struct Submission {
+     pub client_user_message_id: Option<String>,
+     /// Optional W3C trace carrier propagated across async submission handoffs.
+     pub trace: Option<W3cTraceContext>,
++    /// Receives the turn that ultimately accepts this user input.
++    pub resolved_turn_id: Option<Arc<OnceLock<String>>>,
+ }
+ 
+ #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]

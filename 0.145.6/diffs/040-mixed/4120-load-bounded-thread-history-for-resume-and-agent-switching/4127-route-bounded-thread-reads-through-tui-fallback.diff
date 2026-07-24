@@ -1,0 +1,95 @@
+diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
+index ca5b3df962..ca43f7fdff 100644
+--- a/codex-rs/tui/src/app/session_lifecycle.rs
++++ b/codex-rs/tui/src/app/session_lifecycle.rs
+@@ -343,7 +343,11 @@ impl App {
+                     "failed to resume live thread for selection; falling back to thread/read"
+                 );
+                 let (thread, turns) = match app_server
+-                    .thread_read(thread_id, /*include_turns*/ true)
++                    .thread_read_with_history_window(
++                        thread_id,
++                        /*include_turns*/ true,
++                        Some(codex_app_server_protocol::ThreadHistoryWindow::SinceLatestCompaction),
++                    )
+                     .await
+                 {
+                     Ok(thread) => {
+diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+index 4168236b8d..afd152ada9 100644
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -778,16 +778,23 @@ impl AppServerSession {
+         &mut self,
+         thread_id: ThreadId,
+         include_turns: bool,
++    ) -> Result<Thread> {
++        self.thread_read_with_history_window(thread_id, include_turns, None)
++            .await
++    }
++
++    pub(crate) async fn thread_read_with_history_window(
++        &mut self,
++        thread_id: ThreadId,
++        include_turns: bool,
++        history_window: Option<ThreadHistoryWindow>,
+     ) -> Result<Thread> {
+         let request_id = self.next_request_id();
+         let response: ThreadReadResponse = self
+             .client
+             .request_typed(ClientRequest::ThreadRead {
+                 request_id,
+-                params: ThreadReadParams {
+-                    thread_id: thread_id.to_string(),
+-                    include_turns,
+-                },
++                params: thread_read_params(thread_id, include_turns, history_window),
+             })
+             .await
+             .wrap_err("thread/read failed during TUI session lookup")?;
+@@ -1430,6 +1437,18 @@ fn model_preset_from_api_model(model: ApiModel) -> ModelPreset {
+     }
+ }
+ 
++fn thread_read_params(
++    thread_id: ThreadId,
++    include_turns: bool,
++    history_window: Option<ThreadHistoryWindow>,
++) -> ThreadReadParams {
++    let params = ThreadReadParams::new(thread_id.to_string(), include_turns);
++    match history_window {
++        Some(history_window) => params.with_history_window(history_window),
++        None => params,
++    }
++}
++
+ fn approvals_reviewer_override_from_config(
+     config: &Config,
+ ) -> Option<codex_app_server_protocol::ApprovalsReviewer> {
+@@ -1988,6 +2007,26 @@ mod tests {
+     use pretty_assertions::assert_eq;
+     use tempfile::TempDir;
+ 
++    #[test]
++    fn bounded_thread_read_params_request_latest_model_context() {
++        let thread_id =
++            ThreadId::from_string("00000000-0000-4000-8000-000000000123").expect("valid thread id");
++
++        assert_eq!(
++            serde_json::to_value(thread_read_params(
++                thread_id,
++                /*include_turns*/ true,
++                Some(ThreadHistoryWindow::SinceLatestCompaction),
++            ))
++            .expect("params should serialize"),
++            serde_json::json!({
++                "threadId": thread_id.to_string(),
++                "includeTurns": true,
++                "historyWindow": "sinceLatestCompaction",
++            })
++        );
++    }
++
+     #[test]
+     fn user_prompt_submit_context_is_present_only_when_requested() {
+         assert!(user_prompt_submit_hook_context(false).is_none());

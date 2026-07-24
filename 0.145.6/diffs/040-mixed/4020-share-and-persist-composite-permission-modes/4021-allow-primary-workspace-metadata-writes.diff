@@ -1,0 +1,145 @@
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index 1067c0cdc9..e9552112e3 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -2858,6 +2858,30 @@ async fn explicit_builtin_workspace_profile_ignores_legacy_workspace_write_setti
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn builtin_workspace_profile_writes_primary_workspace_metadata() -> std::io::Result<()> {
++    let codex_home = TempDir::new()?;
++    let cwd = TempDir::new()?;
++    let config = Config::load_from_base_config_with_overrides(
++        ConfigToml {
++            default_permissions: Some(BUILT_IN_PERMISSION_PROFILE_WORKSPACE.to_string()),
++            ..Default::default()
++        },
++        ConfigOverrides {
++            cwd: Some(cwd.path().to_path_buf()),
++            ..Default::default()
++        },
++        codex_home.abs(),
++    )
++    .await?;
++    let policy = config.permissions.file_system_sandbox_policy();
++
++    for relative in [".git/config", ".agents/config.toml", ".codex/config.toml"] {
++        assert!(policy.can_write_path_with_cwd(&cwd.path().join(relative), cwd.path()));
++    }
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn default_permissions_profile_can_extend_builtin_workspace() -> std::io::Result<()> {
+     let codex_home = TempDir::new()?;
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index e5aa3253fd..14daf7648d 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -3476,7 +3476,17 @@ impl Config {
+             dedupe_absolute_paths(&mut configured_workspace_roots);
+             file_system_sandbox_policy = file_system_sandbox_policy
+                 .with_materialized_project_roots_for_workspace_roots(&configured_workspace_roots);
+-            let permission_profile = if let Some(permission_profile) =
++            let uses_local_workspace_bridge = default_permissions == BUILT_IN_WORKSPACE_PROFILE;
++            if uses_local_workspace_bridge {
++                file_system_sandbox_policy = file_system_sandbox_policy
++                    .with_writable_workspace_metadata(&resolved_cwd);
++            }
++            let permission_profile = if uses_local_workspace_bridge {
++                PermissionProfile::from_runtime_permissions(
++                    &file_system_sandbox_policy,
++                    network_sandbox_policy,
++                )
++            } else if let Some(permission_profile) =
+                 builtin_permission_profile(default_permissions, builtin_workspace_write_settings)
+             {
+                 permission_profile
+diff --git a/codex-rs/protocol/src/models.rs b/codex-rs/protocol/src/models.rs
+index 51e22d10fd..eaea9ef3fd 100644
+--- a/codex-rs/protocol/src/models.rs
++++ b/codex-rs/protocol/src/models.rs
+@@ -389,6 +389,20 @@ impl PermissionProfile {
+         )
+     }
+ 
++    /// Local workspace profile used by this CLI's permission selector.
++    pub fn local_workspace_write(workspace_root: &AbsolutePathBuf) -> Self {
++        let file_system = FileSystemSandboxPolicy::workspace_write(
++            &[],
++            /*exclude_tmpdir_env_var*/ false,
++            /*exclude_slash_tmp*/ false,
++        )
++        .with_writable_workspace_metadata(workspace_root);
++        Self::Managed {
++            file_system: ManagedFileSystemPermissions::from_sandbox_policy(&file_system),
++            network: NetworkSandboxPolicy::Restricted,
++        }
++    }
++
+     /// Managed workspace-write filesystem access with the legacy
+     /// `sandbox_workspace_write` knobs applied directly to the profile.
+     ///
+@@ -2571,6 +2585,30 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn local_workspace_profile_writes_workspace_metadata_without_changing_upstream_profile() {
++        let workspace = tempdir().expect("workspace");
++        let workspace_root =
++            AbsolutePathBuf::from_absolute_path(workspace.path()).expect("absolute workspace");
++        let upstream = PermissionProfile::workspace_write()
++            .materialize_project_roots_with_workspace_roots(std::slice::from_ref(&workspace_root));
++        let local = PermissionProfile::local_workspace_write(&workspace_root)
++            .materialize_project_roots_with_workspace_roots(std::slice::from_ref(&workspace_root));
++        let upstream_policy = upstream.to_runtime_permissions().0;
++        let local_policy = local.to_runtime_permissions().0;
++
++        for relative in [".git/config", ".agents/config.toml", ".codex/config.toml"] {
++            assert!(
++                !upstream_policy
++                    .can_write_path_with_cwd(&workspace.path().join(relative), workspace.path())
++            );
++            assert!(
++                local_policy
++                    .can_write_path_with_cwd(&workspace.path().join(relative), workspace.path())
++            );
++        }
++    }
++
+     #[test]
+     fn permission_profile_round_trip_preserves_disabled_sandbox() -> Result<()> {
+         let cwd = tempdir()?;
+diff --git a/codex-rs/protocol/src/permissions.rs b/codex-rs/protocol/src/permissions.rs
+index 977fb80f40..a4065cf9ea 100644
+--- a/codex-rs/protocol/src/permissions.rs
++++ b/codex-rs/protocol/src/permissions.rs
+@@ -620,6 +620,26 @@ impl FileSystemSandboxPolicy {
+         FileSystemSandboxPolicy::restricted(entries)
+     }
+ 
++    /// Retains workspace-write scope while allowing metadata writes in one root.
++    pub fn with_writable_workspace_metadata(mut self, workspace_root: &AbsolutePathBuf) -> Self {
++        if !matches!(self.kind, FileSystemSandboxKind::Restricted) {
++            return self;
++        }
++        self.entries
++            .extend(
++                PROTECTED_METADATA_PATH_NAMES
++                    .iter()
++                    .map(|name| FileSystemSandboxEntry {
++                        path: FileSystemPath::Path {
++                            path: workspace_root.join(name),
++                        },
++                        access: FileSystemAccessMode::Write,
++                        missing_path_behavior: None,
++                    }),
++            );
++        self
++    }
++
+     /// Converts a legacy sandbox policy into an equivalent filesystem policy
+     /// after resolving cwd-sensitive legacy defaults for the provided cwd.
+     ///

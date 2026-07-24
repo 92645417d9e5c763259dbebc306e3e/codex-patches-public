@@ -1,0 +1,90 @@
+diff --git a/codex-rs/tui/src/app/input.rs b/codex-rs/tui/src/app/input.rs
+index dcd88dfb82..0a0e66dfab 100644
+--- a/codex-rs/tui/src/app/input.rs
++++ b/codex-rs/tui/src/app/input.rs
+@@ -5,9 +5,50 @@
+ 
+ use super::*;
+ use crate::app_backtrack::SIDE_EDIT_PREVIOUS_UNAVAILABLE_MESSAGE;
++use crate::codex_socket::HelperEditorResult;
++
++#[derive(Debug, PartialEq, Eq)]
++enum HelperEditorAction {
++    Apply(String),
++    FallBack,
++}
++
++fn helper_editor_action(result: HelperEditorResult) -> HelperEditorAction {
++    match result {
++        HelperEditorResult::Edited(text) => HelperEditorAction::Apply(text.trim_end().to_string()),
++        HelperEditorResult::Unavailable
++        | HelperEditorResult::Disabled
++        | HelperEditorResult::Empty => HelperEditorAction::FallBack,
++    }
++}
+ 
+ impl App {
+     pub(super) async fn launch_external_editor(&mut self, tui: &mut tui::Tui) {
++        let seed = self.chat_widget.composer_text_with_pending();
++        let session_id = self.chat_widget.thread_id().map(|id| id.to_string());
++        let helper_result = tui
++            .with_restored(|| async {
++                crate::codex_socket::edit_with_helper(&seed, session_id.as_deref()).await
++            })
++            .await;
++
++        match helper_result.map(helper_editor_action) {
++            Ok(HelperEditorAction::Apply(new_text)) => {
++                self.reset_external_editor_state(tui);
++                self.chat_widget.apply_external_edit(new_text);
++                return;
++            }
++            Ok(HelperEditorAction::FallBack) => {}
++            Err(err) => {
++                self.reset_external_editor_state(tui);
++                self.chat_widget
++                    .add_to_history(history_cell::new_error_event(format!(
++                        "Failed to open helper editor: {err}",
++                    )));
++                return;
++            }
++        }
++
+         let editor_cmd = match external_editor::resolve_editor_command() {
+             Ok(cmd) => cmd,
+             Err(external_editor::EditorError::MissingEditor) => {
+@@ -29,7 +70,6 @@ impl App {
+             }
+         };
+ 
+-        let seed = self.chat_widget.composer_text_with_pending();
+         let editor_result = tui
+             .with_restored(|| async { external_editor::run_editor(&seed, &editor_cmd).await })
+             .await;
+@@ -298,6 +338,26 @@ impl App {
+ #[cfg(test)]
+ mod tests {
+     use super::super::test_support::make_test_app;
++    use super::*;
++
++    #[test]
++    fn helper_editor_applies_nonempty_content_and_trims_its_tail() {
++        assert_eq!(
++            helper_editor_action(HelperEditorResult::Edited("edited\n\n".to_string())),
++            HelperEditorAction::Apply("edited".to_string())
++        );
++    }
++
++    #[test]
++    fn helper_editor_falls_back_for_optional_absence_states() {
++        for result in [
++            HelperEditorResult::Unavailable,
++            HelperEditorResult::Disabled,
++            HelperEditorResult::Empty,
++        ] {
++            assert_eq!(helper_editor_action(result), HelperEditorAction::FallBack);
++        }
++    }
+ 
+     #[tokio::test]
+     async fn app_keymap_shortcuts_are_disabled_while_keymap_view_is_active() {

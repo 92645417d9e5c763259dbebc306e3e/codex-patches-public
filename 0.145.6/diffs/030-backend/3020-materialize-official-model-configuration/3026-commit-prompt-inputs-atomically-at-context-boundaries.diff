@@ -1,0 +1,2879 @@
+diff --git a/codex-rs/core/src/agents_md_manager.rs b/codex-rs/core/src/agents_md_manager.rs
+index 0218f2b16b..c38441cdb3 100644
+--- a/codex-rs/core/src/agents_md_manager.rs
++++ b/codex-rs/core/src/agents_md_manager.rs
+@@ -2,53 +2,156 @@ use crate::agents_md::LoadedAgentsMd;
+ use crate::agents_md::load_project_instructions;
+ use crate::config::Config;
+ use crate::environment_selection::TurnEnvironmentSnapshot;
++use codex_extension_api::LoadedUserInstructions;
+ use codex_extension_api::UserInstructions;
++use codex_extension_api::UserInstructionsProvider;
+ use codex_protocol::protocol::TurnEnvironmentSelection;
+ use std::sync::Arc;
+-use tokio::sync::Mutex;
++use std::sync::Mutex;
+ 
+ /// Owns the inputs and cached result of AGENTS.md discovery for a session.
+ pub(crate) struct AgentsMdManager {
+-    user_instructions: Option<UserInstructions>,
+-    cache: Mutex<AgentsMdCache>,
++    user_instructions_provider: Option<Arc<dyn UserInstructionsProvider>>,
++    state: Mutex<AgentsMdState>,
+ }
+ 
+ #[derive(Default)]
+-struct AgentsMdCache {
++struct AgentsMdState {
++    user_instructions: Option<UserInstructions>,
+     selections: Option<Vec<TurnEnvironmentSelection>>,
+     loaded: Option<Arc<LoadedAgentsMd>>,
++    revision: u64,
++}
++
++pub(crate) struct PendingAgentsMdRefresh {
++    user_instructions: Option<UserInstructions>,
++    selections: Vec<TurnEnvironmentSelection>,
++    loaded: Option<Arc<LoadedAgentsMd>>,
++    warnings: Vec<String>,
++}
++
++impl PendingAgentsMdRefresh {
++    pub(crate) fn loaded(&self) -> Option<Arc<LoadedAgentsMd>> {
++        self.loaded.clone()
++    }
+ }
+ 
+ impl AgentsMdManager {
+-    pub(crate) fn new(user_instructions: Option<UserInstructions>) -> Self {
++    pub(crate) fn new(
++        user_instructions: Option<UserInstructions>,
++        user_instructions_provider: Option<Arc<dyn UserInstructionsProvider>>,
++    ) -> Self {
+         Self {
+-            user_instructions: user_instructions
+-                .filter(|instructions| !instructions.text.trim().is_empty()),
+-            cache: Mutex::new(AgentsMdCache::default()),
++            user_instructions_provider,
++            state: Mutex::new(AgentsMdState {
++                user_instructions: user_instructions
++                    .filter(|instructions| !instructions.text.trim().is_empty()),
++                ..Default::default()
++            }),
+         }
+     }
+ 
+     #[tracing::instrument(name = "agents_md.refresh", skip_all)]
+     pub(crate) async fn refresh(&self, config: &Config, environments: &TurnEnvironmentSnapshot) {
++        self.refresh_inner(config, environments).await;
++    }
++
++    pub(crate) async fn stage_context_boundary_refresh(
++        &self,
++        config: &Config,
++        environments: &TurnEnvironmentSnapshot,
++    ) -> PendingAgentsMdRefresh {
++        let loaded = if let Some(provider) = self.user_instructions_provider.as_ref() {
++            provider.load_user_instructions().await
++        } else {
++            LoadedUserInstructions {
++                instructions: self
++                    .state
++                    .lock()
++                    .unwrap_or_else(std::sync::PoisonError::into_inner)
++                    .user_instructions
++                    .clone(),
++                warnings: Vec::new(),
++            }
++        };
++        let user_instructions = loaded
++            .instructions
++            .clone()
++            .filter(|instructions| !instructions.text.trim().is_empty());
+         let selections = environments.to_selections();
+-        if self.cache.lock().await.selections.as_ref() == Some(&selections) {
+-            return;
++        let project_instructions =
++            load_project_instructions(config, user_instructions.clone(), environments)
++                .await
++                .map(Arc::new);
++        PendingAgentsMdRefresh {
++            user_instructions,
++            selections,
++            loaded: project_instructions,
++            warnings: loaded.warnings,
+         }
++    }
++
++    pub(crate) fn commit_context_boundary_refresh<T>(
++        &self,
++        refresh: PendingAgentsMdRefresh,
++        commit: impl FnOnce() -> T,
++    ) -> (T, Vec<String>) {
++        let mut state = self
++            .state
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        state.user_instructions = refresh.user_instructions;
++        state.selections = Some(refresh.selections);
++        state.loaded = refresh.loaded;
++        state.revision = state.revision.wrapping_add(1);
++        let output = commit();
++        (output, refresh.warnings)
++    }
++
++    async fn refresh_inner(&self, config: &Config, environments: &TurnEnvironmentSnapshot) {
++        let selections = environments.to_selections();
++        loop {
++            let (user_instructions, revision) = {
++                let state = self
++                    .state
++                    .lock()
++                    .unwrap_or_else(std::sync::PoisonError::into_inner);
++                if state.selections.as_ref() == Some(&selections) {
++                    return;
++                }
++                (state.user_instructions.clone(), state.revision)
++            };
+ 
+-        let loaded =
+-            load_project_instructions(config, self.user_instructions.clone(), environments)
++            let loaded = load_project_instructions(config, user_instructions, environments)
+                 .await
+                 .map(Arc::new);
+-        let mut cache = self.cache.lock().await;
+-        cache.selections = Some(selections);
+-        cache.loaded = loaded;
++            let mut state = self
++                .state
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner);
++            if state.revision != revision {
++                continue;
++            }
++            state.selections = Some(selections);
++            state.loaded = loaded;
++            state.revision = state.revision.wrapping_add(1);
++            return;
++        }
+     }
+ 
+-    pub(crate) async fn get_loaded(&self) -> Option<Arc<LoadedAgentsMd>> {
+-        self.cache.lock().await.loaded.clone()
++    pub(crate) fn get_loaded(&self) -> Option<Arc<LoadedAgentsMd>> {
++        self.state
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .loaded
++            .clone()
+     }
+ 
+     pub(crate) fn user_instructions(&self) -> Option<UserInstructions> {
+-        self.user_instructions.clone()
++        self.state
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .user_instructions
++            .clone()
+     }
+ }
+diff --git a/codex-rs/core/src/agents_md_tests.rs b/codex-rs/core/src/agents_md_tests.rs
+index 8bb628d9da..b39fd854a0 100644
+--- a/codex-rs/core/src/agents_md_tests.rs
++++ b/codex-rs/core/src/agents_md_tests.rs
+@@ -1,4 +1,5 @@
+ use super::*;
++use crate::agents_md_manager::AgentsMdManager;
+ use crate::config::ConfigBuilder;
+ use crate::context::ContextualUserFragment;
+ use crate::environment_selection::TurnEnvironmentSnapshot;
+@@ -18,7 +19,10 @@ use codex_exec_server::FileSystemSandboxContext;
+ use codex_exec_server::LOCAL_FS;
+ use codex_exec_server::ReadDirectoryEntry;
+ use codex_exec_server::RemoveOptions;
++use codex_extension_api::LoadUserInstructionsFuture;
++use codex_extension_api::LoadedUserInstructions;
+ use codex_extension_api::UserInstructions;
++use codex_extension_api::UserInstructionsProvider;
+ use codex_features::Feature;
+ use codex_utils_absolute_path::AbsolutePathBuf;
+ use codex_utils_path_uri::PathUri;
+@@ -283,6 +287,17 @@ struct TestConfig {
+     user_instructions: Option<UserInstructions>,
+ }
+ 
++struct StaticUserInstructionsProvider {
++    loaded: LoadedUserInstructions,
++}
++
++impl UserInstructionsProvider for StaticUserInstructionsProvider {
++    fn load_user_instructions(&self) -> LoadUserInstructionsFuture<'_> {
++        let loaded = self.loaded.clone();
++        Box::pin(async move { loaded })
++    }
++}
++
+ impl Deref for TestConfig {
+     type Target = Config;
+ 
+@@ -1040,6 +1055,123 @@ async fn merges_existing_instructions_with_agents_md() {
+     assert_eq!(res, expected);
+ }
+ 
++#[tokio::test]
++async fn context_boundary_without_provider_retains_global_and_refreshes_project() {
++    let tmp = tempfile::tempdir().expect("tempdir");
++    fs::write(tmp.path().join("AGENTS.md"), "old project instructions").unwrap();
++    let config = make_config(
++        &tmp,
++        /*limit*/ 4096,
++        Some("inherited global instructions"),
++    )
++    .await;
++    let environments = resolved_local_environments([("local", config.config.cwd.clone())]);
++    let manager = AgentsMdManager::new(config.user_instructions.clone(), None);
++
++    manager.refresh(&config.config, &environments).await;
++    assert_eq!(
++        manager.get_loaded().expect("initial instructions").text(),
++        format!("inherited global instructions{AGENTS_MD_SEPARATOR}old project instructions")
++    );
++
++    fs::write(tmp.path().join("AGENTS.md"), "new project instructions").unwrap();
++    let pending_refresh = manager
++        .stage_context_boundary_refresh(&config.config, &environments)
++        .await;
++
++    assert_eq!(
++        pending_refresh
++            .loaded()
++            .expect("staged instructions")
++            .text(),
++        format!("inherited global instructions{AGENTS_MD_SEPARATOR}new project instructions")
++    );
++    assert_eq!(
++        manager
++            .get_loaded()
++            .expect("live instructions before commit")
++            .text(),
++        format!("inherited global instructions{AGENTS_MD_SEPARATOR}old project instructions"),
++        "staging must not change the live context snapshot"
++    );
++    let ((), warnings) = manager.commit_context_boundary_refresh(pending_refresh, || ());
++    assert!(warnings.is_empty());
++    assert_eq!(
++        manager
++            .user_instructions()
++            .expect("inherited global instructions")
++            .text,
++        "inherited global instructions"
++    );
++    assert_eq!(
++        manager.get_loaded().expect("refreshed instructions").text(),
++        format!("inherited global instructions{AGENTS_MD_SEPARATOR}new project instructions")
++    );
++}
++
++#[tokio::test]
++async fn context_boundary_provider_refresh_is_staged_until_commit() {
++    let tmp = tempfile::tempdir().expect("tempdir");
++    fs::write(tmp.path().join("AGENTS.md"), "project instructions").unwrap();
++    let config = make_config(&tmp, /*limit*/ 4096, Some("old global instructions")).await;
++    let provider = Arc::new(StaticUserInstructionsProvider {
++        loaded: LoadedUserInstructions {
++            instructions: Some(UserInstructions {
++                text: "new global instructions".to_string(),
++                source: config.config.codex_home.join("new-AGENTS.md"),
++            }),
++            warnings: Vec::new(),
++        },
++    });
++    let environments = resolved_local_environments([("local", config.config.cwd.clone())]);
++    let manager = AgentsMdManager::new(config.user_instructions.clone(), Some(provider));
++
++    manager.refresh(&config.config, &environments).await;
++    let pending_refresh = manager
++        .stage_context_boundary_refresh(&config.config, &environments)
++        .await;
++
++    assert_eq!(
++        pending_refresh
++            .loaded()
++            .expect("staged instructions")
++            .text(),
++        format!("new global instructions{AGENTS_MD_SEPARATOR}project instructions")
++    );
++    assert_eq!(
++        manager
++            .user_instructions()
++            .expect("live global instructions before commit")
++            .text,
++        "old global instructions"
++    );
++    assert_eq!(
++        manager
++            .get_loaded()
++            .expect("live instructions before commit")
++            .text(),
++        format!("old global instructions{AGENTS_MD_SEPARATOR}project instructions")
++    );
++
++    let (committed, warnings) = manager.commit_context_boundary_refresh(pending_refresh, || true);
++    assert!(committed);
++    assert!(warnings.is_empty());
++    assert_eq!(
++        manager
++            .user_instructions()
++            .expect("live global instructions after commit")
++            .text,
++        "new global instructions"
++    );
++    assert_eq!(
++        manager
++            .get_loaded()
++            .expect("live instructions after commit")
++            .text(),
++        format!("new global instructions{AGENTS_MD_SEPARATOR}project instructions")
++    );
++}
++
+ #[tokio::test]
+ async fn multiple_environment_docs_use_labeled_layout_and_preserve_source_order() {
+     let primary = tempfile::tempdir().expect("primary tempdir");
+diff --git a/codex-rs/core/src/codex_delegate.rs b/codex-rs/core/src/codex_delegate.rs
+index aa3a6d932f..c82c6062c2 100644
+--- a/codex-rs/core/src/codex_delegate.rs
++++ b/codex-rs/core/src/codex_delegate.rs
+@@ -101,6 +101,7 @@ pub(crate) async fn run_codex_thread_interactive(
+         config,
+         allow_provider_model_fallback: false,
+         user_instructions,
++        user_instructions_provider: None,
+         installation_id: parent_session.installation_id.clone(),
+         auth_manager,
+         models_manager,
+diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
+index 622ac8b668..e23f11e726 100644
+--- a/codex-rs/core/src/compact.rs
++++ b/codex-rs/core/src/compact.rs
+@@ -12,6 +12,7 @@ use crate::hook_runtime::run_pre_compact_hooks;
+ use crate::responses_metadata::CodexResponsesMetadata;
+ use crate::responses_metadata::CodexResponsesRequestKind;
+ use crate::responses_metadata::CompactionTurnMetadata;
++use crate::session::PendingInstructionInputsRefresh;
+ #[cfg(test)]
+ use crate::session::PreviousTurnSettings;
+ use crate::session::session::Session;
+@@ -82,9 +83,16 @@ pub(crate) struct CompactedHistoryMetadata {
+     pub(crate) window_ids: AutoCompactWindowIds,
+ }
+ 
++pub(crate) struct CompactionContextBoundary {
++    pub(crate) turn_context: Arc<TurnContext>,
++    pub(crate) initial_context_injection: InitialContextInjection,
++}
++
+ pub(crate) async fn build_compaction_initial_context(
+     sess: &Session,
++    _turn_context: &TurnContext,
+     initial_context_injection: &InitialContextInjection,
++    instruction_refresh: &PendingInstructionInputsRefresh,
+ ) -> (Vec<ResponseItem>, Option<Arc<WorldState>>) {
+     // Return the rendered state with its items so history and its baseline stay identical.
+     match initial_context_injection {
+@@ -92,13 +100,18 @@ pub(crate) async fn build_compaction_initial_context(
+             world_state,
+             step_context,
+         } => {
++            let loaded_agents_md = instruction_refresh.loaded_agents_md();
++            let world_state =
++                Arc::new(world_state.clone_with_agents_md(loaded_agents_md.as_deref()));
+             let items = sess
+-                .build_initial_context_with_world_state(
++                .build_initial_context_with_world_state_and_mcp(
+                     step_context.turn.as_ref(),
+                     world_state.as_ref(),
++                    step_context.mcp.as_ref(),
++                    Some(instruction_refresh),
+                 )
+                 .await;
+-            (items, Some(Arc::clone(world_state)))
++            (items, Some(world_state))
+         }
+         InitialContextInjection::DoNotInject => (Vec::new(), None),
+     }
+@@ -111,10 +124,10 @@ pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bo
+ pub(crate) async fn run_inline_auto_compact_task(
+     sess: Arc<Session>,
+     turn_context: Arc<TurnContext>,
+-    initial_context_injection: InitialContextInjection,
++    context_boundary: CompactionContextBoundary,
+     reason: CompactionReason,
+     phase: CompactionPhase,
+-) -> CodexResult<()> {
++) -> CodexResult<Option<Arc<WorldState>>> {
+     let prompt = turn_context
+         .config
+         .compact_prompt
+@@ -130,14 +143,13 @@ pub(crate) async fn run_inline_auto_compact_task(
+     run_compact_task_inner(
+         sess,
+         turn_context,
++        context_boundary,
+         input,
+-        initial_context_injection,
+         CompactionTrigger::Auto,
+         reason,
+         phase,
+     )
+-    .await?;
+-    Ok(())
++    .await
+ }
+ 
+ pub(crate) async fn run_compact_task(
+@@ -155,9 +167,12 @@ pub(crate) async fn run_compact_task(
+     sess.send_event(&turn_context, start_event).await;
+     run_compact_task_inner(
+         sess.clone(),
+-        turn_context,
++        Arc::clone(&turn_context),
++        CompactionContextBoundary {
++            turn_context,
++            initial_context_injection: InitialContextInjection::DoNotInject,
++        },
+         input,
+-        InitialContextInjection::DoNotInject,
+         CompactionTrigger::Manual,
+         CompactionReason::UserRequested,
+         CompactionPhase::StandaloneTurn,
+@@ -169,12 +184,12 @@ pub(crate) async fn run_compact_task(
+ async fn run_compact_task_inner(
+     sess: Arc<Session>,
+     turn_context: Arc<TurnContext>,
++    context_boundary: CompactionContextBoundary,
+     input: Vec<UserInput>,
+-    initial_context_injection: InitialContextInjection,
+     trigger: CompactionTrigger,
+     reason: CompactionReason,
+     phase: CompactionPhase,
+-) -> CodexResult<()> {
++) -> CodexResult<Option<Arc<WorldState>>> {
+     let compaction_metadata =
+         CompactionTurnMetadata::new(trigger, reason, CompactionImplementation::Responses, phase);
+     let attempt = CompactionAnalyticsAttempt::begin(
+@@ -205,8 +220,8 @@ async fn run_compact_task_inner(
+     let result = run_compact_task_inner_impl(
+         Arc::clone(&sess),
+         Arc::clone(&turn_context),
++        context_boundary,
+         input,
+-        initial_context_injection,
+         compaction_metadata,
+     )
+     .await;
+@@ -234,16 +249,20 @@ async fn run_compact_task_inner(
+             CompactionAnalyticsDetails::default(),
+         )
+         .await;
+-    result.map(|_| ())
++    result.map(|(_, world_state)| world_state)
+ }
+ 
+ async fn run_compact_task_inner_impl(
+     sess: Arc<Session>,
+     turn_context: Arc<TurnContext>,
++    context_boundary: CompactionContextBoundary,
+     input: Vec<UserInput>,
+-    initial_context_injection: InitialContextInjection,
+     compaction_metadata: CompactionTurnMetadata,
+-) -> CodexResult<String> {
++) -> CodexResult<(String, Option<Arc<WorldState>>)> {
++    let CompactionContextBoundary {
++        turn_context: context_boundary_turn_context,
++        initial_context_injection,
++    } = context_boundary;
+     let base_instructions = sess
+         .resolve_base_instructions_for_context_boundary(turn_context.as_ref())
+         .await;
+@@ -359,10 +378,18 @@ async fn run_compact_task_inner_impl(
+         // belongs to this compaction turn.
+         summary_item.set_turn_id_if_missing(&turn_context.sub_id);
+     }
++    let (_environments, instruction_refresh) = sess
++        .stage_instruction_inputs_for_context_boundary(context_boundary_turn_context.as_ref())
++        .await;
+     let (window_number, window_ids) = sess.advance_auto_compact_window().await;
+ 
+-    let (initial_context, world_state_baseline) =
+-        build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
++    let (initial_context, world_state_baseline) = build_compaction_initial_context(
++        sess.as_ref(),
++        context_boundary_turn_context.as_ref(),
++        &initial_context_injection,
++        &instruction_refresh,
++    )
++    .await;
+     if !initial_context.is_empty() {
+         new_history =
+             insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
+@@ -370,12 +397,14 @@ async fn run_compact_task_inner_impl(
+     let reference_context_item = match initial_context_injection {
+         InitialContextInjection::DoNotInject => None,
+         InitialContextInjection::BeforeLastUserMessage { .. } => {
+-            Some(turn_context.to_turn_context_item())
++            Some(context_boundary_turn_context.to_turn_context_item())
+         }
+     };
++    let refreshed_world_state = world_state_baseline.clone();
+     sess.replace_compacted_history(
+         new_history,
+         reference_context_item,
++        instruction_refresh,
+         world_state_baseline,
+         CompactedHistoryMetadata {
+             message: summary_text,
+@@ -384,7 +413,8 @@ async fn run_compact_task_inner_impl(
+         },
+     )
+     .await;
+-    sess.recompute_token_usage(&turn_context).await;
++    sess.recompute_token_usage(&context_boundary_turn_context)
++        .await;
+ 
+     sess.emit_turn_item_completed(&turn_context, compaction_item)
+         .await;
+@@ -392,7 +422,7 @@ async fn run_compact_task_inner_impl(
+         message: "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.".to_string(),
+     });
+     sess.send_event(&turn_context, warning).await;
+-    Ok(summary_suffix)
++    Ok((summary_suffix, refreshed_world_state))
+ }
+ 
+ pub(crate) struct CompactionAnalyticsAttempt {
+diff --git a/codex-rs/core/src/compact_remote.rs b/codex-rs/core/src/compact_remote.rs
+index 26e783026f..9f274d1995 100644
+--- a/codex-rs/core/src/compact_remote.rs
++++ b/codex-rs/core/src/compact_remote.rs
+@@ -4,6 +4,7 @@ use std::sync::OnceLock;
+ use crate::compact::CompactedHistoryMetadata;
+ use crate::compact::CompactionAnalyticsAttempt;
+ use crate::compact::CompactionAnalyticsDetails;
++use crate::compact::CompactionContextBoundary;
+ use crate::compact::InitialContextInjection;
+ use crate::compact::build_compaction_initial_context;
+ use crate::compact::compaction_status_from_result;
+@@ -18,6 +19,7 @@ use crate::hook_runtime::PreCompactHookOutcome;
+ use crate::hook_runtime::run_post_compact_hooks;
+ use crate::hook_runtime::run_pre_compact_hooks;
+ use crate::responses_metadata::CompactionTurnMetadata;
++use crate::session::PendingInstructionInputsRefresh;
+ use crate::session::session::Session;
+ use crate::session::step_context::StepContext;
+ use crate::session::turn_context::TurnContext;
+@@ -51,11 +53,11 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
+     sess: Arc<Session>,
+     step_context: Arc<StepContext>,
+     fallback_step_context: Option<Arc<StepContext>>,
++    context_boundary: CompactionContextBoundary,
+     turn_state: Arc<OnceLock<String>>,
+-    initial_context_injection: InitialContextInjection,
+     reason: CompactionReason,
+     phase: CompactionPhase,
+-) -> CodexResult<()> {
++) -> CodexResult<Option<Arc<WorldState>>> {
+     let compaction_metadata = CompactionTurnMetadata::new(
+         CompactionTrigger::Auto,
+         reason,
+@@ -66,12 +68,11 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
+         &sess,
+         &step_context,
+         fallback_step_context.as_ref(),
++        &context_boundary,
+         Some(turn_state),
+-        initial_context_injection,
+         compaction_metadata,
+     )
+-    .await?;
+-    Ok(())
++    .await
+ }
+ 
+ pub(crate) async fn run_remote_compact_task(
+@@ -101,8 +102,11 @@ pub(crate) async fn run_remote_compact_task(
+         &sess,
+         &step_context,
+         /*fallback_step_context*/ None,
++        &CompactionContextBoundary {
++            turn_context,
++            initial_context_injection: InitialContextInjection::DoNotInject,
++        },
+         /*turn_state*/ None,
+-        InitialContextInjection::DoNotInject,
+         compaction_metadata,
+     )
+     .await?;
+@@ -113,10 +117,10 @@ async fn run_remote_compact_task_inner(
+     sess: &Arc<Session>,
+     step_context: &Arc<StepContext>,
+     fallback_step_context: Option<&Arc<StepContext>>,
++    context_boundary: &CompactionContextBoundary,
+     turn_state: Option<Arc<OnceLock<String>>>,
+-    initial_context_injection: InitialContextInjection,
+     compaction_metadata: CompactionTurnMetadata,
+-) -> CodexResult<()> {
++) -> CodexResult<Option<Arc<WorldState>>> {
+     let turn_context = &step_context.turn;
+     let trigger = compaction_metadata.trigger();
+     let reason = compaction_metadata.reason();
+@@ -155,8 +159,8 @@ async fn run_remote_compact_task_inner(
+         sess,
+         step_context,
+         fallback_step_context,
++        context_boundary,
+         turn_state,
+-        initial_context_injection,
+         compaction_metadata,
+         &mut analytics_details,
+     )
+@@ -175,26 +179,30 @@ async fn run_remote_compact_task_inner(
+     attempt
+         .track(sess.as_ref(), status, codex_error, analytics_details)
+         .await;
+-    if let Err(err) = result {
+-        sess.track_turn_codex_error(turn_context, &err);
+-        let event = EventMsg::Error(
+-            err.to_error_event(Some("Error running remote compact task".to_string())),
+-        );
+-        sess.send_event(turn_context, event).await;
+-        return Err(err);
++    match result {
++        Ok(world_state) => Ok(world_state),
++        Err(err) => {
++            sess.track_turn_codex_error(turn_context, &err);
++            let event = EventMsg::Error(
++                err.to_error_event(Some("Error running remote compact task".to_string())),
++            );
++            sess.send_event(turn_context, event).await;
++            Err(err)
++        }
+     }
+-    Ok(())
+ }
+ 
+ async fn run_remote_compact_task_inner_impl(
+     sess: &Arc<Session>,
+     step_context: &Arc<StepContext>,
+     fallback_step_context: Option<&Arc<StepContext>>,
++    context_boundary: &CompactionContextBoundary,
+     turn_state: Option<Arc<OnceLock<String>>>,
+-    initial_context_injection: InitialContextInjection,
+     compaction_metadata: CompactionTurnMetadata,
+     analytics_details: &mut CompactionAnalyticsDetails,
+-) -> CodexResult<()> {
++) -> CodexResult<Option<Arc<WorldState>>> {
++    let context_boundary_turn_context = &context_boundary.turn_context;
++    let initial_context_injection = &context_boundary.initial_context_injection;
+     let turn_context = &step_context.turn;
+     let context_compaction_item = ContextCompactionItem::new();
+     let compaction_id = context_compaction_item.id.clone();
+@@ -262,14 +270,23 @@ async fn run_remote_compact_task_inner_impl(
+         new_history,
+         trace_input_history,
+     } = attempt;
++    let (_environments, instruction_refresh) = sess
++        .stage_instruction_inputs_for_context_boundary(context_boundary_turn_context.as_ref())
++        .await;
+     let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
+-    let (new_history, world_state_baseline) =
+-        process_compacted_history(sess.as_ref(), new_history, &initial_context_injection).await;
++    let (new_history, world_state_baseline) = process_compacted_history(
++        sess.as_ref(),
++        context_boundary_turn_context.as_ref(),
++        new_history,
++        initial_context_injection,
++        &instruction_refresh,
++    )
++    .await;
+ 
+     let reference_context_item = match initial_context_injection {
+         InitialContextInjection::DoNotInject => None,
+         InitialContextInjection::BeforeLastUserMessage { .. } => {
+-            Some(compaction_turn_context.to_turn_context_item())
++            Some(context_boundary_turn_context.to_turn_context_item())
+         }
+     };
+     // Install is the semantic boundary where the compact endpoint's output becomes live
+@@ -281,9 +298,11 @@ async fn run_remote_compact_task_inner_impl(
+             replacement_history: &new_history,
+         });
+     }
++    let refreshed_world_state = world_state_baseline.clone();
+     sess.replace_compacted_history(
+         new_history,
+         reference_context_item,
++        instruction_refresh,
+         world_state_baseline,
+         CompactedHistoryMetadata {
+             message: String::new(),
+@@ -292,23 +311,31 @@ async fn run_remote_compact_task_inner_impl(
+         },
+     )
+     .await;
+-    sess.recompute_token_usage(compaction_turn_context).await;
++    sess.recompute_token_usage(context_boundary_turn_context)
++        .await;
+ 
+     sess.emit_turn_item_completed(compaction_turn_context, compaction_item)
+         .await;
+-    Ok(())
++    Ok(refreshed_world_state)
+ }
+ 
+ pub(crate) async fn process_compacted_history(
+     sess: &Session,
++    turn_context: &TurnContext,
+     mut compacted_history: Vec<ResponseItem>,
+     initial_context_injection: &InitialContextInjection,
++    instruction_refresh: &PendingInstructionInputsRefresh,
+ ) -> (Vec<ResponseItem>, Option<Arc<WorldState>>) {
+     // Mid-turn compaction is the only path that must inject initial context above the last user
+     // message in the replacement history. Pre-turn compaction instead injects context after the
+     // compaction item, but mid-turn compaction keeps the compaction item last for model training.
+-    let (initial_context, world_state_baseline) =
+-        build_compaction_initial_context(sess, initial_context_injection).await;
++    let (initial_context, world_state_baseline) = build_compaction_initial_context(
++        sess,
++        turn_context,
++        initial_context_injection,
++        instruction_refresh,
++    )
++    .await;
+ 
+     compacted_history.retain(should_keep_compacted_history_item);
+     (
+diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_remote_v2.rs
+index 034dd10e2a..61c1e50534 100644
+--- a/codex-rs/core/src/compact_remote_v2.rs
++++ b/codex-rs/core/src/compact_remote_v2.rs
+@@ -7,12 +7,14 @@ use crate::client_common::ResponseEvent;
+ use crate::compact::CompactedHistoryMetadata;
+ use crate::compact::CompactionAnalyticsAttempt;
+ use crate::compact::CompactionAnalyticsDetails;
++use crate::compact::CompactionContextBoundary;
+ use crate::compact::InitialContextInjection;
+ use crate::compact::compaction_status_from_result;
+ use crate::compact_model_fallback::record_model_fallback;
+ use crate::compact_model_fallback::should_retry_with_current_model;
+ use crate::compact_remote::process_compacted_history;
+ use crate::compact_remote::should_keep_compacted_history_item;
++use crate::context::world_state::WorldState;
+ use crate::hook_runtime::PostCompactHookOutcome;
+ use crate::hook_runtime::PreCompactHookOutcome;
+ use crate::hook_runtime::run_post_compact_hooks;
+@@ -62,11 +64,11 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
+     sess: Arc<Session>,
+     step_context: Arc<StepContext>,
+     fallback_step_context: Option<Arc<StepContext>>,
++    context_boundary: CompactionContextBoundary,
+     client_session: &mut ModelClientSession,
+-    initial_context_injection: InitialContextInjection,
+     reason: CompactionReason,
+     phase: CompactionPhase,
+-) -> CodexResult<()> {
++) -> CodexResult<Option<Arc<WorldState>>> {
+     let compaction_metadata = CompactionTurnMetadata::new(
+         CompactionTrigger::Auto,
+         reason,
+@@ -77,8 +79,8 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
+         &sess,
+         &step_context,
+         fallback_step_context.as_ref(),
++        &context_boundary,
+         Some(client_session),
+-        initial_context_injection,
+         compaction_metadata,
+     )
+     .await
+@@ -111,21 +113,25 @@ pub(crate) async fn run_remote_compact_task(
+         &sess,
+         &step_context,
+         /*fallback_step_context*/ None,
++        &CompactionContextBoundary {
++            turn_context,
++            initial_context_injection: InitialContextInjection::DoNotInject,
++        },
+         /*client_session*/ None,
+-        InitialContextInjection::DoNotInject,
+         compaction_metadata,
+     )
+-    .await
++    .await?;
++    Ok(())
+ }
+ 
+ async fn run_remote_compact_task_inner(
+     sess: &Arc<Session>,
+     step_context: &Arc<StepContext>,
+     fallback_step_context: Option<&Arc<StepContext>>,
++    context_boundary: &CompactionContextBoundary,
+     client_session: Option<&mut ModelClientSession>,
+-    initial_context_injection: InitialContextInjection,
+     compaction_metadata: CompactionTurnMetadata,
+-) -> CodexResult<()> {
++) -> CodexResult<Option<Arc<WorldState>>> {
+     let turn_context = &step_context.turn;
+     let trigger = compaction_metadata.trigger();
+     let reason = compaction_metadata.reason();
+@@ -164,8 +170,8 @@ async fn run_remote_compact_task_inner(
+         sess,
+         step_context,
+         fallback_step_context,
++        context_boundary,
+         client_session,
+-        initial_context_injection,
+         compaction_metadata,
+         &mut analytics_details,
+     )
+@@ -185,7 +191,7 @@ async fn run_remote_compact_task_inner(
+         .track(sess.as_ref(), status, codex_error, analytics_details)
+         .await;
+     match result {
+-        Ok(()) => Ok(()),
++        Ok(world_state) => Ok(world_state),
+         Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => Err(err),
+         Err(err) => {
+             sess.track_turn_codex_error(turn_context, &err);
+@@ -202,11 +208,13 @@ async fn run_remote_compact_task_inner_impl(
+     sess: &Arc<Session>,
+     step_context: &Arc<StepContext>,
+     fallback_step_context: Option<&Arc<StepContext>>,
++    context_boundary: &CompactionContextBoundary,
+     mut client_session: Option<&mut ModelClientSession>,
+-    initial_context_injection: InitialContextInjection,
+     compaction_metadata: CompactionTurnMetadata,
+     analytics_details: &mut CompactionAnalyticsDetails,
+-) -> CodexResult<()> {
++) -> CodexResult<Option<Arc<WorldState>>> {
++    let context_boundary_turn_context = &context_boundary.turn_context;
++    let initial_context_injection = &context_boundary.initial_context_injection;
+     let turn_context = &step_context.turn;
+     let context_compaction_item = ContextCompactionItem::new();
+     let compaction_id = context_compaction_item.id.clone();
+@@ -286,15 +294,23 @@ async fn run_remote_compact_task_inner_impl(
+     let (compacted_history, retained_images) =
+         build_v2_compacted_history(&prompt_input, compaction_output);
+     analytics_details.retained_image_count = Some(retained_images);
++    let (_environments, instruction_refresh) = sess
++        .stage_instruction_inputs_for_context_boundary(context_boundary_turn_context.as_ref())
++        .await;
+     let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
+-    let (new_history, world_state_baseline) =
+-        process_compacted_history(sess.as_ref(), compacted_history, &initial_context_injection)
+-            .await;
++    let (new_history, world_state_baseline) = process_compacted_history(
++        sess.as_ref(),
++        context_boundary_turn_context.as_ref(),
++        compacted_history,
++        initial_context_injection,
++        &instruction_refresh,
++    )
++    .await;
+ 
+     let reference_context_item = match initial_context_injection {
+         InitialContextInjection::DoNotInject => None,
+         InitialContextInjection::BeforeLastUserMessage { .. } => {
+-            Some(compaction_turn_context.to_turn_context_item())
++            Some(context_boundary_turn_context.to_turn_context_item())
+         }
+     };
+     if let Some(trace_input_history) = trace_input_history.as_deref() {
+@@ -303,9 +319,11 @@ async fn run_remote_compact_task_inner_impl(
+             replacement_history: &new_history,
+         });
+     }
++    let refreshed_world_state = world_state_baseline.clone();
+     sess.replace_compacted_history(
+         new_history,
+         reference_context_item,
++        instruction_refresh,
+         world_state_baseline,
+         CompactedHistoryMetadata {
+             message: String::new(),
+@@ -314,11 +332,12 @@ async fn run_remote_compact_task_inner_impl(
+         },
+     )
+     .await;
+-    sess.recompute_token_usage(compaction_turn_context).await;
++    sess.recompute_token_usage(context_boundary_turn_context)
++        .await;
+ 
+     sess.emit_turn_item_completed(compaction_turn_context, compaction_item)
+         .await;
+-    Ok(())
++    Ok(refreshed_world_state)
+ }
+ 
+ struct RemoteCompactionV2Output {
+diff --git a/codex-rs/core/src/compact_tests.rs b/codex-rs/core/src/compact_tests.rs
+index 6a1a7c40ec..0895e6b0ef 100644
+--- a/codex-rs/core/src/compact_tests.rs
++++ b/codex-rs/core/src/compact_tests.rs
+@@ -12,6 +12,7 @@ async fn process_compacted_history_with_test_session(
+     previous_turn_settings: Option<&PreviousTurnSettings>,
+ ) -> (Vec<ResponseItem>, Vec<ResponseItem>) {
+     let (session, turn_context) = crate::session::tests::make_session_and_context().await;
++    let session = Arc::new(session);
+     let turn_context = Arc::new(turn_context);
+     session
+         .set_previous_turn_settings(previous_turn_settings.cloned())
+@@ -19,17 +20,26 @@ async fn process_compacted_history_with_test_session(
+     let step_context =
+         crate::session::step_context::StepContext::for_test(Arc::clone(&turn_context));
+     let world_state = Arc::new(session.build_world_state_for_step(&step_context).await);
+-    let initial_context = session
+-        .build_initial_context_with_world_state(&turn_context, world_state.as_ref())
+-        .await;
+     let initial_context_injection = InitialContextInjection::BeforeLastUserMessage {
+         world_state,
+         step_context,
+     };
++    let (_environments, instruction_refresh) = session
++        .stage_instruction_inputs_for_context_boundary(turn_context.as_ref())
++        .await;
++    let (initial_context, _) = build_compaction_initial_context(
++        session.as_ref(),
++        turn_context.as_ref(),
++        &initial_context_injection,
++        &instruction_refresh,
++    )
++    .await;
+     let (refreshed, _) = crate::compact_remote::process_compacted_history(
+-        &session,
++        session.as_ref(),
++        turn_context.as_ref(),
+         compacted_history,
+         &initial_context_injection,
++        &instruction_refresh,
+     )
+     .await;
+     (refreshed, initial_context)
+diff --git a/codex-rs/core/src/compact_token_budget.rs b/codex-rs/core/src/compact_token_budget.rs
+index 1e47496638..8eb7ae445b 100644
+--- a/codex-rs/core/src/compact_token_budget.rs
++++ b/codex-rs/core/src/compact_token_budget.rs
+@@ -1,6 +1,5 @@
+ use std::sync::Arc;
+ 
+-use crate::compact::InitialContextInjection;
+ use crate::context::world_state::WorldState;
+ use crate::hook_runtime::PostCompactHookOutcome;
+ use crate::hook_runtime::PreCompactHookOutcome;
+@@ -37,11 +36,19 @@ pub(crate) async fn run_manual_compact_task(
+     sess.send_event(&turn_context, start_event).await;
+ 
+     // Manual compaction runs outside run_turn, so it captures its own current step.
++    let cancellation_token = CancellationToken::new();
+     let step_context = sess
+-        .capture_step_context(Arc::clone(&turn_context), &CancellationToken::new())
++        .capture_step_context(Arc::clone(&turn_context), &cancellation_token)
+         .await?;
+-    let world_state = Arc::new(sess.build_world_state_for_step(&step_context).await);
+-    run_compact_task_inner(&sess, &step_context, world_state, CompactionTrigger::Manual).await
++    run_compact_task_inner(
++        &sess,
++        &step_context,
++        &turn_context,
++        CompactionTrigger::Manual,
++        &cancellation_token,
++    )
++    .await?;
++    Ok(())
+ }
+ 
+ /// Runs token-budget inline auto-compaction as a normal compaction lifecycle.
+@@ -52,23 +59,26 @@ pub(crate) async fn run_manual_compact_task(
+ pub(crate) async fn run_inline_auto_compact_task(
+     sess: Arc<Session>,
+     step_context: Arc<StepContext>,
+-    initial_context_injection: InitialContextInjection,
+-) -> CodexResult<()> {
+-    let world_state = match initial_context_injection {
+-        InitialContextInjection::BeforeLastUserMessage { world_state, .. } => world_state,
+-        InitialContextInjection::DoNotInject => {
+-            Arc::new(sess.build_world_state_for_step(&step_context).await)
+-        }
+-    };
+-    run_compact_task_inner(&sess, &step_context, world_state, CompactionTrigger::Auto).await
++    context_boundary_turn_context: Arc<TurnContext>,
++    cancellation_token: &CancellationToken,
++) -> CodexResult<Option<Arc<WorldState>>> {
++    run_compact_task_inner(
++        &sess,
++        &step_context,
++        &context_boundary_turn_context,
++        CompactionTrigger::Auto,
++        cancellation_token,
++    )
++    .await
+ }
+ 
+ async fn run_compact_task_inner(
+     sess: &Arc<Session>,
+     step_context: &Arc<StepContext>,
+-    world_state: Arc<WorldState>,
++    context_boundary_turn_context: &Arc<TurnContext>,
+     trigger: CompactionTrigger,
+-) -> CodexResult<()> {
++    cancellation_token: &CancellationToken,
++) -> CodexResult<Option<Arc<WorldState>>> {
+     let turn_context = &step_context.turn;
+     let pre_compact_outcome = run_pre_compact_hooks(sess, turn_context, trigger).await;
+     match pre_compact_outcome {
+@@ -79,8 +89,12 @@ async fn run_compact_task_inner(
+     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+     sess.emit_turn_item_started(turn_context, &compaction_item)
+         .await;
+-    sess.start_new_context_window(step_context, world_state)
+-        .await;
++    let (_, world_state) = sess
++        .start_new_context_window(
++            Arc::clone(context_boundary_turn_context),
++            cancellation_token,
++        )
++        .await?;
+     sess.emit_turn_item_completed(turn_context, compaction_item)
+         .await;
+ 
+@@ -89,5 +103,5 @@ async fn run_compact_task_inner(
+         return Err(CodexErr::TurnAborted);
+     }
+ 
+-    Ok(())
++    Ok(Some(world_state))
+ }
+diff --git a/codex-rs/core/src/context/world_state/mod.rs b/codex-rs/core/src/context/world_state/mod.rs
+index 609a124aee..087ccf5be4 100644
+--- a/codex-rs/core/src/context/world_state/mod.rs
++++ b/codex-rs/core/src/context/world_state/mod.rs
+@@ -26,6 +26,7 @@ use sha1::Digest;
+ use sha1::Sha1;
+ use std::collections::BTreeMap;
+ use std::fmt;
++use std::sync::Arc;
+ 
+ pub(crate) use agents_md::AgentsMdState;
+ pub(crate) use apps_instructions::AppsInstructionsState;
+@@ -251,7 +252,7 @@ fn hash_component(hasher: &mut Sha1, value: &str) {
+ /// Live model-visible state, keyed by the same stable section IDs used in rollouts.
+ #[derive(Default)]
+ pub(crate) struct WorldState {
+-    sections: IndexMap<&'static str, Box<dyn ErasedWorldStateSection>>,
++    sections: IndexMap<&'static str, Arc<dyn ErasedWorldStateSection>>,
+ }
+ 
+ /// Compact comparison state for each model-visible world-state section.
+@@ -296,7 +297,7 @@ impl WorldState {
+             !self.sections.contains_key(id),
+             "duplicate world-state section ID: {id}"
+         );
+-        self.sections.insert(id, Box::new(section));
++        self.sections.insert(id, Arc::new(section));
+     }
+ 
+     pub(crate) fn add_extension_section(&mut self, section: WorldStateSectionContribution) {
+@@ -306,7 +307,24 @@ impl WorldState {
+             "duplicate world-state section ID: {id}"
+         );
+         self.sections
+-            .insert(id, Box::new(ExtensionWorldStateSection(section)));
++            .insert(id, Arc::new(ExtensionWorldStateSection(section)));
++    }
++
++    pub(crate) fn clone_with_agents_md(
++        &self,
++        loaded: Option<&crate::agents_md::LoadedAgentsMd>,
++    ) -> Self {
++        let mut state = Self {
++            sections: self.sections.clone(),
++        };
++        let previous = state
++            .sections
++            .insert(AgentsMdState::ID, Arc::new(AgentsMdState::new(loaded)));
++        assert!(
++            previous.is_some(),
++            "world state must include the AGENTS.md section"
++        );
++        state
+     }
+ 
+     pub(crate) fn snapshot(&self) -> WorldStateSnapshot {
+diff --git a/codex-rs/core/src/context/world_state/world_state_tests.rs b/codex-rs/core/src/context/world_state/world_state_tests.rs
+index 97e1ead64e..5948faddaa 100644
+--- a/codex-rs/core/src/context/world_state/world_state_tests.rs
++++ b/codex-rs/core/src/context/world_state/world_state_tests.rs
+@@ -1,4 +1,5 @@
+ use super::*;
++use crate::agents_md::LoadedAgentsMd;
+ use pretty_assertions::assert_eq;
+ use serde::Deserialize;
+ use serde::Serialize;
+@@ -92,6 +93,40 @@ fn snapshot_uses_stable_section_ids_and_omits_null_fields() {
+     );
+ }
+ 
++#[test]
++fn replacing_agents_md_preserves_other_sections_and_order() {
++    let previous_agents = LoadedAgentsMd::from_text_for_testing("previous instructions");
++    let current_agents = LoadedAgentsMd::from_text_for_testing("current instructions");
++    let mut previous = WorldState::default();
++    previous.add_section(AgentsMdState::new(Some(&previous_agents)));
++    previous.add_section(TestSection {
++        value: "stable".to_string(),
++        optional: None,
++        array: Vec::new(),
++    });
++
++    let current = previous.clone_with_agents_md(Some(&current_agents));
++
++    assert_eq!(
++        previous.sections.keys().copied().collect::<Vec<_>>(),
++        current.sections.keys().copied().collect::<Vec<_>>()
++    );
++    assert_eq!(
++        json!({
++            "agents_md": {"text": "previous instructions"},
++            "test": {"value": "stable", "array": []}
++        }),
++        previous.snapshot().into_value()
++    );
++    assert_eq!(
++        json!({
++            "agents_md": {"text": "current instructions"},
++            "test": {"value": "stable", "array": []}
++        }),
++        current.snapshot().into_value()
++    );
++}
++
+ #[test]
+ fn render_diff_restores_the_typed_section_snapshot() {
+     let mut previous = WorldState::default();
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index bfe2db7419..54b4451b8e 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -16,6 +16,8 @@ use crate::agent::agent_status_from_event;
+ use crate::agent::status::is_final;
+ use crate::agent_communication::AgentCommunicationContext;
+ use crate::agent_communication::AgentCommunicationKind;
++use crate::agents_md::LoadedAgentsMd;
++use crate::agents_md_manager::PendingAgentsMdRefresh;
+ use crate::attestation::AttestationProvider;
+ use crate::audio_preparation::prepare_response_items as prepare_audio_response_items;
+ use crate::build_available_skills;
+@@ -418,6 +420,8 @@ pub(crate) struct SessionSpawnArgs {
+     pub(crate) config: Config,
+     pub(crate) allow_provider_model_fallback: bool,
+     pub(crate) user_instructions: LoadedUserInstructions,
++    pub(crate) user_instructions_provider:
++        Option<Arc<dyn codex_extension_api::UserInstructionsProvider>>,
+     pub(crate) installation_id: String,
+     pub(crate) auth_manager: Arc<AuthManager>,
+     pub(crate) models_manager: SharedModelsManager,
+@@ -513,6 +517,7 @@ impl Session {
+             mut config,
+             allow_provider_model_fallback,
+             user_instructions,
++            user_instructions_provider,
+             installation_id,
+             auth_manager,
+             models_manager,
+@@ -710,6 +715,7 @@ impl Session {
+             session_configuration,
+             config.clone(),
+             user_instructions,
++            user_instructions_provider,
+             installation_id,
+             auth_manager.clone(),
+             models_manager.clone(),
+@@ -955,6 +961,18 @@ fn push_prompt_fragment(
+     }
+ }
+ 
++pub(crate) struct PendingInstructionInputsRefresh {
++    base_instructions: BaseInstructions,
++    base_instructions_model_info: ModelInfo,
++    agents_md: PendingAgentsMdRefresh,
++}
++
++impl PendingInstructionInputsRefresh {
++    pub(crate) fn loaded_agents_md(&self) -> Option<Arc<LoadedAgentsMd>> {
++        self.agents_md.loaded()
++    }
++}
++
+ impl Session {
+     pub(crate) async fn app_server_client_metadata(&self) -> AppServerClientMetadata {
+         let state = self.state.lock().await;
+@@ -1245,27 +1263,46 @@ impl Session {
+         }
+     }
+ 
+-    /// Resolves request-local instructions without changing the active session.
++    /// Resolves instructions for a supplied turn context without publishing them.
+     ///
+-    /// Previous-model compaction can retry with the current model, so each attempt must resolve
+-    /// from its own turn context instead of sharing the session-level value.
++    /// Compaction attempts resolve from their attempt context, while a successful context-boundary
++    /// refresh stages from the active context and publishes through the shared commit gate.
+     pub(crate) async fn resolve_base_instructions_for_context_boundary(
+         &self,
+         turn_context: &TurnContext,
+     ) -> BaseInstructions {
+-        let text = if let Some(base_instructions) = turn_context.config.base_instructions.clone() {
+-            base_instructions
++        self.resolve_base_instructions_and_model_info_for_context_boundary(turn_context)
++            .await
++            .0
++    }
++
++    async fn resolve_base_instructions_and_model_info_for_context_boundary(
++        &self,
++        turn_context: &TurnContext,
++    ) -> (BaseInstructions, ModelInfo) {
++        if let Some(base_instructions) = turn_context.config.base_instructions.clone() {
++            (
++                BaseInstructions {
++                    text: base_instructions,
++                },
++                turn_context.model_info.clone(),
++            )
+         } else {
+-            self.services
++            let model_info = self
++                .services
+                 .models_manager
+                 .get_model_info(
+                     turn_context.collaboration_mode().model(),
+                     &turn_context.config.to_models_manager_config(),
+                 )
+-                .await
+-                .get_model_instructions(turn_context.personality)
+-        };
+-        BaseInstructions { text }
++                .await;
++            (
++                BaseInstructions {
++                    text: model_info.get_model_instructions(turn_context.personality),
++                },
++                model_info,
++            )
++        }
+     }
+ 
+     // Merges connector IDs into the session-level explicit connector selection.
+@@ -1582,7 +1619,6 @@ impl Session {
+         self.services
+             .agents_md_manager
+             .get_loaded()
+-            .await
+             .as_ref()
+             .map_or_else(Vec::new, |instructions| instructions.sources().collect())
+     }
+@@ -3030,7 +3066,23 @@ impl Session {
+             .agents_md_manager
+             .refresh(&turn_context.config, &environments)
+             .await;
+-        let loaded_agents_md = self.services.agents_md_manager.get_loaded().await;
++        let loaded_agents_md = self.services.agents_md_manager.get_loaded();
++        self.capture_step_context_with_inputs(
++            turn_context,
++            environments,
++            loaded_agents_md,
++            cancellation_token,
++        )
++        .await
++    }
++
++    async fn capture_step_context_with_inputs(
++        self: &Arc<Self>,
++        turn_context: Arc<TurnContext>,
++        environments: TurnEnvironmentSnapshot,
++        loaded_agents_md: Option<Arc<LoadedAgentsMd>>,
++        cancellation_token: &CancellationToken,
++    ) -> CodexResult<Arc<StepContext>> {
+         let selected_capability_roots = self
+             .resolve_selected_capability_roots_for_step(&environments)
+             .await;
+@@ -3066,6 +3118,48 @@ impl Session {
+         }))
+     }
+ 
++    pub(crate) async fn stage_instruction_inputs_for_context_boundary(
++        &self,
++        turn_context: &TurnContext,
++    ) -> (TurnEnvironmentSnapshot, PendingInstructionInputsRefresh) {
++        let (base_instructions, base_instructions_model_info) = self
++            .resolve_base_instructions_and_model_info_for_context_boundary(turn_context)
++            .await;
++        let environments = turn_context.environments.refresh_readiness();
++        let agents_md = self
++            .services
++            .agents_md_manager
++            .stage_context_boundary_refresh(&turn_context.config, &environments)
++            .await;
++        (
++            environments,
++            PendingInstructionInputsRefresh {
++                base_instructions,
++                base_instructions_model_info,
++                agents_md,
++            },
++        )
++    }
++
++    pub(crate) async fn build_context_boundary_world_state(
++        self: &Arc<Self>,
++        turn_context: Arc<TurnContext>,
++        environments: TurnEnvironmentSnapshot,
++        refresh: &PendingInstructionInputsRefresh,
++        cancellation_token: &CancellationToken,
++    ) -> CodexResult<(Arc<StepContext>, Arc<WorldState>)> {
++        let step_context = self
++            .capture_step_context_with_inputs(
++                turn_context,
++                environments,
++                refresh.agents_md.loaded(),
++                cancellation_token,
++            )
++            .await?;
++        let world_state = Arc::new(self.build_world_state_for_step(step_context.as_ref()).await);
++        Ok((step_context, world_state))
++    }
++
+     pub(crate) async fn record_inter_agent_communication(
+         &self,
+         turn_context: &TurnContext,
+@@ -3171,6 +3265,7 @@ impl Session {
+         &self,
+         items: Vec<ResponseItem>,
+         reference_context_item: Option<TurnContextItem>,
++        instruction_refresh: PendingInstructionInputsRefresh,
+         world_state_baseline: Option<Arc<WorldState>>,
+         metadata: CompactedHistoryMetadata,
+     ) {
+@@ -3188,14 +3283,31 @@ impl Session {
+         };
+         // Compaction starts a new history window, so its WorldState baseline must be full.
+         let mut world_state_item = None;
++        let refresh_warnings;
++        let PendingInstructionInputsRefresh {
++            base_instructions,
++            base_instructions_model_info: _,
++            agents_md,
++        } = instruction_refresh;
+         {
+             let mut state = self.state.lock().await;
+-            state.replace_history(items, reference_context_item.clone());
+-            if let Some(world_state) = world_state_baseline {
+-                let snapshot = world_state.snapshot();
+-                world_state_item = Some(WorldStateItem::full(snapshot.clone().into_value()));
+-                state.history.set_world_state_baseline(snapshot);
+-            }
++            let ((), warnings) = self
++                .services
++                .agents_md_manager
++                .commit_context_boundary_refresh(agents_md, || {
++                    state.session_configuration.base_instructions = base_instructions.text;
++                    state.replace_history(items, reference_context_item.clone());
++                    if let Some(world_state) = world_state_baseline {
++                        let snapshot = world_state.snapshot();
++                        world_state_item =
++                            Some(WorldStateItem::full(snapshot.clone().into_value()));
++                        state.history.set_world_state_baseline(snapshot);
++                    }
++                });
++            refresh_warnings = warnings;
++        }
++        for warning in refresh_warnings {
++            warn!("failed to refresh user instructions at context boundary: {warning}");
+         }
+ 
+         self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
+@@ -3325,10 +3437,25 @@ impl Session {
+         items
+     }
+ 
++    #[cfg(test)]
+     pub(crate) async fn build_initial_context_with_world_state(
+         &self,
+         turn_context: &TurnContext,
+         world_state: &WorldState,
++    ) -> Vec<ResponseItem> {
++        let mcp = codex_mcp::McpBinding::empty(Arc::new(
++            self.runtime_mcp_config(&turn_context.config).await,
++        ));
++        self.build_initial_context_with_world_state_and_mcp(turn_context, world_state, &mcp, None)
++            .await
++    }
++
++    pub(crate) async fn build_initial_context_with_world_state_and_mcp(
++        &self,
++        turn_context: &TurnContext,
++        world_state: &WorldState,
++        _mcp: &codex_mcp::McpBinding,
++        instruction_refresh: Option<&PendingInstructionInputsRefresh>,
+     ) -> Vec<ResponseItem> {
+         let mut developer_sections = Vec::<String>::with_capacity(8);
+         let mut contextual_user_sections = Vec::<String>::with_capacity(2);
+@@ -3342,6 +3469,15 @@ impl Session {
+                 state.auto_compact_window_ids(),
+             )
+         };
++        let (base_instructions, base_instructions_model_info) = instruction_refresh.map_or_else(
++            || (base_instructions, &turn_context.model_info),
++            |refresh| {
++                (
++                    refresh.base_instructions.text.clone(),
++                    &refresh.base_instructions_model_info,
++                )
++            },
++        );
+         if let Some(model_switch_message) =
+             crate::context_manager::updates::build_model_instructions_update_item(
+                 previous_turn_settings.as_ref(),
+@@ -3363,7 +3499,7 @@ impl Session {
+         if self.features.enabled(Feature::Personality)
+             && let Some(personality) = turn_context.personality
+         {
+-            let model_info = turn_context.model_info.clone();
++            let model_info = base_instructions_model_info.clone();
+             let has_baked_personality = model_info.supports_personality()
+                 && base_instructions == model_info.get_model_instructions(Some(personality));
+             if !has_baked_personality
+@@ -3625,24 +3761,40 @@ impl Session {
+     }
+ 
+     pub(crate) async fn start_new_context_window(
+-        &self,
+-        step_context: &StepContext,
+-        world_state: Arc<WorldState>,
+-    ) -> u64 {
+-        let turn_context = step_context.turn.as_ref();
++        self: &Arc<Self>,
++        turn_context: Arc<TurnContext>,
++        cancellation_token: &CancellationToken,
++    ) -> CodexResult<(u64, Arc<WorldState>)> {
++        let (environments, instruction_refresh) = self
++            .stage_instruction_inputs_for_context_boundary(turn_context.as_ref())
++            .await;
+         let window = {
+             let mut state = self.state.lock().await;
+             state.start_new_context_window()
+         };
+         let (window_number, window_ids) = window;
++        let (step_context, world_state) = self
++            .build_context_boundary_world_state(
++                Arc::clone(&turn_context),
++                environments,
++                &instruction_refresh,
++                cancellation_token,
++            )
++            .await?;
+         let context_items = self
+-            .build_initial_context_with_world_state(turn_context, world_state.as_ref())
++            .build_initial_context_with_world_state_and_mcp(
++                turn_context.as_ref(),
++                world_state.as_ref(),
++                step_context.mcp.as_ref(),
++                Some(&instruction_refresh),
++            )
+             .await;
+         let turn_context_item = turn_context.to_turn_context_item();
+         self.replace_compacted_history(
+             context_items,
+             Some(turn_context_item),
+-            Some(world_state),
++            instruction_refresh,
++            Some(Arc::clone(&world_state)),
+             CompactedHistoryMetadata {
+                 message: String::new(),
+                 window_number,
+@@ -3650,8 +3802,8 @@ impl Session {
+             },
+         )
+         .await;
+-        self.recompute_token_usage(turn_context).await;
+-        window_number
++        self.recompute_token_usage(turn_context.as_ref()).await;
++        Ok((window_number, world_state))
+     }
+ 
+     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
+@@ -3689,7 +3841,12 @@ impl Session {
+         // Full initial context resets the baseline; later turns persist only its changes.
+         let (mut context_items, world_state_item) = if should_inject_full_context {
+             let context_items = self
+-                .build_initial_context_with_world_state(turn_context, world_state.as_ref())
++                .build_initial_context_with_world_state_and_mcp(
++                    turn_context,
++                    world_state.as_ref(),
++                    step_context.mcp.as_ref(),
++                    None,
++                )
+                 .await;
+             let snapshot = world_state.snapshot();
+             self.state
+diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
+index 41c24df898..4b555fdaa0 100644
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -491,6 +491,7 @@ impl Session {
+         mut session_configuration: SessionConfiguration,
+         config: Arc<Config>,
+         user_instructions: Option<codex_extension_api::UserInstructions>,
++        user_instructions_provider: Option<Arc<dyn codex_extension_api::UserInstructionsProvider>>,
+         installation_id: String,
+         auth_manager: Arc<AuthManager>,
+         models_manager: SharedModelsManager,
+@@ -930,7 +931,10 @@ impl Session {
+             ));
+             turn_environments.update_selections(session_configuration.environment_selections());
+             let resolved_environments = turn_environments.snapshot().await;
+-            let agents_md_manager = Arc::new(AgentsMdManager::new(user_instructions));
++            let agents_md_manager = Arc::new(AgentsMdManager::new(
++                user_instructions,
++                user_instructions_provider,
++            ));
+             let plugin_skill_warmup = warm_plugins_and_skills_for_session_init(
+                 Arc::clone(&config),
+                 Arc::clone(&plugins_manager),
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index 6c32a30c07..1ca9c4dd8a 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -2,6 +2,7 @@ use super::turn_context::TurnEnvironment;
+ use super::*;
+ use crate::agents_md_manager::AgentsMdManager;
+ use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
++use crate::compact::CompactedHistoryMetadata;
+ use crate::config::ConfigBuilder;
+ use crate::config::ConfigOverrides;
+ use crate::config::test_config;
+@@ -119,6 +120,8 @@ use codex_protocol::models::BaseInstructions;
+ use codex_protocol::models::ContentItem;
+ use codex_protocol::models::InternalChatMessageMetadataPassthrough;
+ use codex_protocol::models::ResponseItem;
++use codex_protocol::openai_models::ModelInstructionsVariables;
++use codex_protocol::openai_models::ModelMessages;
+ use codex_protocol::protocol::AskForApproval;
+ use codex_protocol::protocol::CodexErrorInfo;
+ use codex_protocol::protocol::CompactedItem;
+@@ -2422,7 +2425,7 @@ async fn recompute_token_usage_uses_session_base_instructions() {
+ }
+ 
+ #[tokio::test]
+-async fn context_boundary_resolve_uses_current_catalog_without_publishing() {
++async fn context_boundary_stage_resolves_current_catalog_instructions_without_publishing() {
+     let (session, turn_context) = make_session_and_context().await;
+     assert!(turn_context.config.base_instructions.is_none());
+     let expected = session
+@@ -2440,11 +2443,11 @@ async fn context_boundary_resolve_uses_current_catalog_without_publishing() {
+             "STALE_CONTEXT_BOUNDARY_INSTRUCTIONS".to_string();
+     }
+ 
+-    let resolved = session
+-        .resolve_base_instructions_for_context_boundary(&turn_context)
++    let (_, staged) = session
++        .stage_instruction_inputs_for_context_boundary(&turn_context)
+         .await;
+ 
+-    assert_eq!(resolved.text, expected);
++    assert_eq!(staged.base_instructions.text, expected);
+     assert_eq!(
+         session.get_base_instructions().await.text,
+         "STALE_CONTEXT_BOUNDARY_INSTRUCTIONS"
+@@ -2452,7 +2455,68 @@ async fn context_boundary_resolve_uses_current_catalog_without_publishing() {
+ }
+ 
+ #[tokio::test]
+-async fn context_boundary_resolve_prefers_explicit_config_without_publishing() {
++async fn context_boundary_overlay_refresh_stays_staged_until_successful_publication() {
++    let codex_home = tempfile::tempdir().expect("create temp dir");
++    let (session, turn_context, _rx) = make_session_and_context_with_auth_config_home_and_rx(
++        CodexAuth::from_api_key("Test API Key"),
++        Vec::new(),
++        codex_home.path(),
++        |config| {
++            config
++                .features
++                .enable(Feature::Personality)
++                .expect("test config should allow feature update");
++            config.personality = Some(Personality::Friendly);
++        },
++    )
++    .await;
++    let original = session.get_base_instructions().await;
++    let overlay_dir = codex_home.path().join("instructions");
++    std::fs::create_dir_all(&overlay_dir).expect("create instructions overlay directory");
++    std::fs::write(
++        overlay_dir.join(format!("{}.md", turn_context.collaboration_mode().model())),
++        "LATEST_CONTEXT_BOUNDARY_OVERLAY\n{{ personality }}",
++    )
++    .expect("write instructions overlay");
++
++    let (_, staged) = session
++        .stage_instruction_inputs_for_context_boundary(turn_context.as_ref())
++        .await;
++
++    assert!(
++        staged
++            .base_instructions
++            .text
++            .contains("LATEST_CONTEXT_BOUNDARY_OVERLAY")
++    );
++    assert_eq!(session.get_base_instructions().await, original);
++
++    let (window_number, window_ids) = session.advance_auto_compact_window().await;
++    session
++        .replace_compacted_history(
++            Vec::new(),
++            /*reference_context_item*/ None,
++            staged,
++            /*world_state_baseline*/ None,
++            CompactedHistoryMetadata {
++                message: String::new(),
++                window_number,
++                window_ids,
++            },
++        )
++        .await;
++
++    assert!(
++        session
++            .get_base_instructions()
++            .await
++            .text
++            .contains("LATEST_CONTEXT_BOUNDARY_OVERLAY")
++    );
++}
++
++#[tokio::test]
++async fn context_boundary_stage_prefers_explicit_config_instructions_without_publishing() {
+     let (session, mut turn_context) = make_session_and_context().await;
+     let explicit = "EXPLICIT_CONTEXT_BOUNDARY_INSTRUCTIONS";
+     let mut config = turn_context.config.as_ref().clone();
+@@ -2472,6 +2536,74 @@ async fn context_boundary_resolve_prefers_explicit_config_without_publishing() {
+         session.get_base_instructions().await.text,
+         "STALE_CONTEXT_BOUNDARY_INSTRUCTIONS"
+     );
++
++    let (_, staged) = session
++        .stage_instruction_inputs_for_context_boundary(&turn_context)
++        .await;
++    assert_eq!(staged.base_instructions.text, explicit);
++    assert_eq!(
++        session.get_base_instructions().await.text,
++        "STALE_CONTEXT_BOUNDARY_INSTRUCTIONS"
++    );
++}
++
++#[tokio::test]
++async fn context_boundary_personality_uses_model_info_for_staged_base_instructions() {
++    let (session, turn_context, _rx) = make_session_and_context_with_auth_and_config_and_rx(
++        CodexAuth::from_api_key("Test API Key"),
++        Vec::new(),
++        |config| {
++            config
++                .features
++                .enable(Feature::Personality)
++                .expect("test config should allow feature update");
++            config.personality = Some(Personality::Friendly);
++        },
++    )
++    .await;
++    let mut turn_context = Arc::try_unwrap(turn_context).expect("unique turn context");
++    let model_messages = |label: &str| ModelMessages {
++        instructions_template: Some(format!("BASE_{label}\n{{{{ personality }}}}")),
++        instructions_variables: Some(ModelInstructionsVariables {
++            personality_default: Some(format!("{label}_DEFAULT")),
++            personality_friendly: Some(format!("{label}_FRIENDLY")),
++            personality_pragmatic: Some(format!("{label}_PRAGMATIC")),
++        }),
++        approvals: None,
++        auto_review: None,
++        permissions: None,
++    };
++    turn_context.model_info.model_messages = Some(model_messages("OLD"));
++    let mut refreshed_model_info = turn_context.model_info.clone();
++    refreshed_model_info.model_messages = Some(model_messages("NEW"));
++    let turn_context = Arc::new(turn_context);
++
++    let (_, mut refresh) = session
++        .stage_instruction_inputs_for_context_boundary(&turn_context)
++        .await;
++    refresh.base_instructions = BaseInstructions {
++        text: refreshed_model_info.get_model_instructions(Some(Personality::Friendly)),
++    };
++    refresh.base_instructions_model_info = refreshed_model_info;
++    assert!(refresh.base_instructions.text.contains("NEW_FRIENDLY"));
++
++    let step_context = StepContext::for_test(Arc::clone(&turn_context));
++    let world_state = session.build_world_state_for_step(&step_context).await;
++    let initial_context = session
++        .build_initial_context_with_world_state_and_mcp(
++            &turn_context,
++            &world_state,
++            step_context.mcp.as_ref(),
++            Some(&refresh),
++        )
++        .await;
++    let developer_texts = developer_input_texts(&initial_context);
++
++    assert!(
++        developer_texts
++            .iter()
++            .all(|text| !text.contains("<personality_spec>") && !text.contains("OLD_FRIENDLY"))
++    );
+ }
+ 
+ #[tokio::test]
+@@ -2963,15 +3095,10 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
+     .await;
+     let rollout_path =
+         attach_thread_persistence(Arc::get_mut(&mut session).expect("unique session")).await;
+-    let step_context = session
+-        .capture_step_context(Arc::clone(&turn_context), &CancellationToken::new())
++    session
++        .start_new_context_window(Arc::clone(&turn_context), &CancellationToken::new())
+         .await
+         .expect("a fresh cancellation token cannot be cancelled");
+-    let world_state = Arc::new(session.build_world_state_for_step(&step_context).await);
+-
+-    session
+-        .start_new_context_window(&step_context, world_state)
+-        .await;
+ 
+     let live_history = session.clone_history().await;
+     assert!(!live_history.raw_items().is_empty());
+@@ -5313,6 +5440,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
+         session_configuration,
+         Arc::clone(&config),
+         /*user_instructions*/ None,
++        /*user_instructions_provider*/ None,
+         "11111111-1111-4111-8111-111111111111".to_string(),
+         auth_manager,
+         models_manager,
+@@ -5498,7 +5626,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+         guardian_rejection_circuit_breaker: Mutex::new(Default::default()),
+         runtime_handle: tokio::runtime::Handle::current(),
+         skills_service,
+-        agents_md_manager: Arc::new(AgentsMdManager::new(/*user_instructions*/ None)),
++        agents_md_manager: Arc::new(AgentsMdManager::new(
++            /*user_instructions*/ None, /*user_instructions_provider*/ None,
++        )),
+         plugins_manager,
+         mcp_manager,
+         extensions: Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
+@@ -5701,6 +5831,7 @@ async fn make_session_with_config_and_rx(
+         session_configuration,
+         Arc::clone(&config),
+         /*user_instructions*/ None,
++        /*user_instructions_provider*/ None,
+         "11111111-1111-4111-8111-111111111111".to_string(),
+         auth_manager,
+         models_manager,
+@@ -5810,6 +5941,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
+         session_configuration,
+         Arc::clone(&config),
+         /*user_instructions*/ None,
++        /*user_instructions_provider*/ None,
+         "11111111-1111-4111-8111-111111111111".to_string(),
+         auth_manager,
+         models_manager,
+@@ -7665,7 +7797,9 @@ where
+         guardian_rejection_circuit_breaker: Mutex::new(Default::default()),
+         runtime_handle: tokio::runtime::Handle::current(),
+         skills_service,
+-        agents_md_manager: Arc::new(AgentsMdManager::new(/*user_instructions*/ None)),
++        agents_md_manager: Arc::new(AgentsMdManager::new(
++            /*user_instructions*/ None, /*user_instructions_provider*/ None,
++        )),
+         plugins_manager,
+         mcp_manager,
+         extensions: Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
+diff --git a/codex-rs/core/src/session/tests/guardian_tests.rs b/codex-rs/core/src/session/tests/guardian_tests.rs
+index 2ce44e0e9b..15c0d057cd 100644
+--- a/codex-rs/core/src/session/tests/guardian_tests.rs
++++ b/codex-rs/core/src/session/tests/guardian_tests.rs
+@@ -528,6 +528,7 @@ async fn guardian_allows_unified_exec_additional_permissions_requests_past_polic
+ #[tokio::test]
+ async fn process_compacted_history_preserves_separate_guardian_developer_message() {
+     let (session, mut turn_context) = make_session_and_context().await;
++    let session = Arc::new(session);
+     let guardian_policy = "guardian policy".to_string();
+     let guardian_source =
+         SessionSource::SubAgent(SubAgentSource::Other(GUARDIAN_REVIEWER_NAME.to_string()));
+@@ -545,9 +546,13 @@ async fn process_compacted_history_preserves_separate_guardian_developer_message
+         world_state,
+         step_context,
+     };
++    let (_environments, instruction_refresh) = session
++        .stage_instruction_inputs_for_context_boundary(turn_context.as_ref())
++        .await;
+ 
+     let (refreshed, _) = crate::compact_remote::process_compacted_history(
+-        &session,
++        session.as_ref(),
++        turn_context.as_ref(),
+         vec![
+             ResponseItem::Message {
+                 id: None,
+@@ -569,6 +574,7 @@ async fn process_compacted_history_preserves_separate_guardian_developer_message
+             },
+         ],
+         &initial_context_injection,
++        &instruction_refresh,
+     )
+     .await;
+ 
+@@ -731,6 +737,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
+         config,
+         allow_provider_model_fallback: false,
+         user_instructions: Default::default(),
++        user_instructions_provider: None,
+         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
+         auth_manager,
+         models_manager,
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index a425affb19..8a63252291 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -9,6 +9,7 @@ use crate::client::ModelClientSession;
+ use crate::client_common::Prompt;
+ use crate::client_common::ResponseEvent;
+ use crate::collect_explicit_skill_mentions;
++use crate::compact::CompactionContextBoundary;
+ use crate::compact::InitialContextInjection;
+ use crate::compact::run_inline_auto_compact_task;
+ use crate::compact::should_use_remote_compact_task;
+@@ -16,6 +17,7 @@ use crate::compact_remote::run_inline_remote_auto_compact_task;
+ use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
+ use crate::connectors;
+ use crate::context::ContextualUserFragment;
++use crate::context::world_state::WorldState;
+ use crate::environment_selection::TurnEnvironmentSnapshot;
+ use crate::feedback_tags;
+ use crate::hook_runtime::inspect_pending_input;
+@@ -392,27 +394,38 @@ pub(crate) async fn run_turn(
+ 
+                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
+                 if should_roll_over {
+-                    if let Err(err) = run_auto_compact(
++                    let refreshed_world_state = match run_auto_compact(
+                         &sess,
+                         Arc::clone(&step_context),
+                         /*fallback_step_context*/ None,
+-                        &mut client_session,
+-                        InitialContextInjection::BeforeLastUserMessage {
+-                            world_state: Arc::clone(&world_state),
+-                            step_context: Arc::clone(&step_context),
++                        CompactionContextBoundary {
++                            turn_context: Arc::clone(&turn_context),
++                            initial_context_injection:
++                                InitialContextInjection::BeforeLastUserMessage {
++                                    world_state: Arc::clone(&world_state),
++                                    step_context: Arc::clone(&step_context),
++                                },
+                         },
++                        &mut client_session,
+                         CompactionReason::ContextLimit,
+                         CompactionPhase::MidTurn,
++                        &cancellation_token,
+                     )
+                     .await
+                     {
+-                        if matches!(err.details(), CodexErrorDetails::TurnAborted) {
+-                            return Err(err);
++                        Ok(world_state) => world_state,
++                        Err(err) => {
++                            if matches!(err.details(), CodexErrorDetails::TurnAborted) {
++                                return Err(err);
++                            }
++                            let error = err.to_codex_protocol_error();
++                            sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
++                                .await;
++                            return Ok(None);
+                         }
+-                        let error = err.to_codex_protocol_error();
+-                        sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
+-                            .await;
+-                        return Ok(None);
++                    };
++                    if let Some(refreshed_world_state) = refreshed_world_state {
++                        world_state = refreshed_world_state;
+                     }
+                     if run_pending_session_start_hooks(&sess, &turn_context).await {
+                         return Ok(None);
+@@ -863,10 +876,14 @@ async fn run_pre_sampling_compact(
+             sess,
+             step_context,
+             /*fallback_step_context*/ None,
++            CompactionContextBoundary {
++                turn_context: Arc::clone(turn_context),
++                initial_context_injection: InitialContextInjection::DoNotInject,
++            },
+             client_session,
+-            InitialContextInjection::DoNotInject,
+             CompactionReason::ContextLimit,
+             CompactionPhase::PreTurn,
++            cancellation_token,
+         )
+         .await?;
+     }
+@@ -945,10 +962,14 @@ async fn maybe_run_previous_model_inline_compact(
+             sess,
+             step_context,
+             fallback_step_context,
++            CompactionContextBoundary {
++                turn_context: Arc::clone(turn_context),
++                initial_context_injection: InitialContextInjection::DoNotInject,
++            },
+             client_session,
+-            InitialContextInjection::DoNotInject,
+             CompactionReason::CompHashChanged,
+             CompactionPhase::PreTurn,
++            cancellation_token,
+         )
+         .await?;
+         return Ok(());
+@@ -993,10 +1014,14 @@ async fn maybe_run_previous_model_inline_compact(
+             sess,
+             step_context,
+             fallback_step_context,
++            CompactionContextBoundary {
++                turn_context: Arc::clone(turn_context),
++                initial_context_injection: InitialContextInjection::DoNotInject,
++            },
+             client_session,
+-            InitialContextInjection::DoNotInject,
+             CompactionReason::ModelDownshift,
+             CompactionPhase::PreTurn,
++            cancellation_token,
+         )
+         .await?;
+     }
+@@ -1012,23 +1037,24 @@ async fn run_auto_compact(
+     sess: &Arc<Session>,
+     step_context: Arc<StepContext>,
+     fallback_step_context: Option<Arc<StepContext>>,
++    context_boundary: CompactionContextBoundary,
+     client_session: &mut ModelClientSession,
+-    initial_context_injection: InitialContextInjection,
+     reason: CompactionReason,
+     phase: CompactionPhase,
+-) -> CodexResult<()> {
++    cancellation_token: &CancellationToken,
++) -> CodexResult<Option<Arc<WorldState>>> {
+     let turn_context = &step_context.turn;
+     let _profile_guard = turn_context.turn_timing_state.begin_compaction();
+     if turn_context.config.features.enabled(Feature::TokenBudget) {
+         // Compaction is the reset request, so force a new context window
+         // instead of consuming a pending `new_context` tool request.
+-        crate::compact_token_budget::run_inline_auto_compact_task(
++        return crate::compact_token_budget::run_inline_auto_compact_task(
+             Arc::clone(sess),
+             step_context,
+-            initial_context_injection,
++            context_boundary.turn_context,
++            cancellation_token,
+         )
+-        .await?;
+-        return Ok(());
++        .await;
+     }
+ 
+     if should_use_remote_compact_task(turn_context.provider.info()) {
+@@ -1042,17 +1068,16 @@ async fn run_auto_compact(
+                 "remote_v2",
+                 /*manual*/ false,
+             );
+-            run_inline_remote_auto_compact_task_v2(
++            return run_inline_remote_auto_compact_task_v2(
+                 Arc::clone(sess),
+                 step_context,
+                 fallback_step_context,
++                context_boundary,
+                 client_session,
+-                initial_context_injection,
+                 reason,
+                 phase,
+             )
+-            .await?;
+-            return Ok(());
++            .await;
+         }
+         emit_compact_metric(
+             &sess.services.session_telemetry,
+@@ -1063,12 +1088,12 @@ async fn run_auto_compact(
+             Arc::clone(sess),
+             step_context,
+             fallback_step_context,
++            context_boundary,
+             client_session.turn_state(),
+-            initial_context_injection,
+             reason,
+             phase,
+         )
+-        .await?;
++        .await
+     } else {
+         emit_compact_metric(
+             &sess.services.session_telemetry,
+@@ -1078,13 +1103,12 @@ async fn run_auto_compact(
+         run_inline_auto_compact_task(
+             Arc::clone(sess),
+             Arc::clone(turn_context),
+-            initial_context_injection,
++            context_boundary,
+             reason,
+             phase,
+         )
+-        .await?;
++        .await
+     }
+-    Ok(())
+ }
+ 
+ pub(super) fn collect_explicit_app_ids_from_skill_items(
+diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
+index 105505c1a4..1e1f737331 100644
+--- a/codex-rs/core/src/thread_manager.rs
++++ b/codex-rs/core/src/thread_manager.rs
+@@ -1630,6 +1630,8 @@ impl ThreadManagerState {
+         let user_instructions = self
+             .user_instructions_for_spawn(&session_source, parent_thread_id, forked_from_thread_id)
+             .await;
++        let user_instructions_provider = (!session_source.is_non_root_agent())
++            .then(|| Arc::clone(&self.user_instructions_provider));
+         let parent_rollout_thread_trace = self
+             .parent_rollout_thread_trace_for_source(&session_source, &initial_history)
+             .await;
+@@ -1655,6 +1657,7 @@ impl ThreadManagerState {
+             config,
+             allow_provider_model_fallback,
+             user_instructions,
++            user_instructions_provider,
+             installation_id: self.installation_id.clone(),
+             auth_manager,
+             models_manager: Arc::clone(&self.models_manager),
+diff --git a/codex-rs/core/tests/suite/agents_md.rs b/codex-rs/core/tests/suite/agents_md.rs
+index 188be19ed1..18b6de9df6 100644
+--- a/codex-rs/core/tests/suite/agents_md.rs
++++ b/codex-rs/core/tests/suite/agents_md.rs
+@@ -7,7 +7,9 @@ use codex_exec_server::LOCAL_ENVIRONMENT_ID;
+ use codex_exec_server::REMOTE_ENVIRONMENT_ID;
+ use codex_features::Feature;
+ use codex_home::CodexHomeUserInstructionsProvider;
++use codex_protocol::items::TurnItem;
+ use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::ItemCompletedEvent;
+ use codex_protocol::protocol::Op;
+ use codex_protocol::protocol::RolloutItem;
+ use codex_protocol::protocol::RolloutLine;
+@@ -1054,13 +1056,24 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()>
+         GLOBAL_AGENTS_FILENAME,
+         OLD_GLOBAL_INSTRUCTIONS,
+     )?;
++    let instructions_provider = Arc::new(RecordingUserInstructionsProvider::new(Arc::new(
++        CodexHomeUserInstructionsProvider::new(AbsolutePathBuf::try_from(
++            home.path().to_path_buf(),
++        )?),
++    )));
+     let mut builder = test_codex()
+         .with_home(Arc::clone(&home))
++        .with_user_instructions_provider(instructions_provider.clone())
+         .with_config(|config| {
+             let _ = config.features.enable(Feature::Collab);
++            config
++                .features
++                .enable(Feature::TokenBudget)
++                .expect("test config should allow token budget");
+             let _ = config.features.disable(Feature::EnableRequestCompression);
+         });
+     let test = builder.build(&server).await?;
++    assert_eq!(instructions_provider.load_count(), 1);
+ 
+     // Assert the parent reports the creation-time source before spawning.
+     assert_eq!(
+@@ -1084,6 +1097,11 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()>
+         .await
+         .map_err(|_| anyhow!("timed out waiting for the subagent thread"))??;
+     let child_thread = test.thread_manager.get_thread(child_thread_id).await?;
++    assert_eq!(
++        instructions_provider.load_count(),
++        1,
++        "subagent creation must inherit the parent snapshot without reloading the root provider"
++    );
+     let spawn_request = spawn_mock.single_request();
+     let child_request = tokio::time::timeout(Duration::from_secs(10), async {
+         loop {
+@@ -1101,6 +1119,55 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()>
+     .await
+     .map_err(|_| anyhow!("timed out waiting for the subagent request"))?;
+ 
++    wait_for_event(&child_thread, |event| {
++        matches!(event, EventMsg::TurnComplete(_))
++    })
++    .await;
++    let compact_submission_id = child_thread.submit(Op::Compact).await?;
++    let compact_turn_id = loop {
++        let event = child_thread.next_event().await?;
++        if event.id != compact_submission_id {
++            continue;
++        }
++        match event.msg {
++            EventMsg::TurnStarted(event) => break event.turn_id,
++            EventMsg::Error(error) => {
++                return Err(anyhow!("subagent compaction failed to start: {error:?}"));
++            }
++            _ => {}
++        }
++    };
++    let mut saw_compaction_item = false;
++    loop {
++        let event = child_thread.next_event().await?;
++        if event.id != compact_submission_id {
++            continue;
++        }
++        match event.msg {
++            EventMsg::ItemCompleted(ItemCompletedEvent {
++                turn_id,
++                item: TurnItem::ContextCompaction(_),
++                ..
++            }) if turn_id == compact_turn_id => saw_compaction_item = true,
++            EventMsg::TurnComplete(event) if event.turn_id == compact_turn_id => {
++                assert!(
++                    saw_compaction_item,
++                    "subagent token-budget compaction must install a context boundary"
++                );
++                break;
++            }
++            EventMsg::Error(error) => {
++                return Err(anyhow!("subagent compaction failed: {error:?}"));
++            }
++            _ => {}
++        }
++    }
++    assert_eq!(
++        instructions_provider.load_count(),
++        1,
++        "subagent context boundaries must not reload the root provider"
++    );
++
+     // Assert parent and child report and render the parent's creation-time snapshot exactly once.
+     let expected_fragment = expected_provider_only_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
+     assert_single_instruction_fragment(&seed_request, &expected_fragment);
+diff --git a/codex-rs/core/tests/suite/compact.rs b/codex-rs/core/tests/suite/compact.rs
+index 3694f3bba0..4fcd710b31 100644
+--- a/codex-rs/core/tests/suite/compact.rs
++++ b/codex-rs/core/tests/suite/compact.rs
+@@ -4,10 +4,12 @@ use codex_core::compact::SUMMARIZATION_PROMPT;
+ use codex_core::compact::SUMMARY_PREFIX;
+ use codex_core::config::Config;
+ use codex_features::Feature;
++use codex_home::CodexHomeUserInstructionsProvider;
+ use codex_login::CodexAuth;
+ use codex_model_provider_info::ModelProviderInfo;
+ use codex_model_provider_info::built_in_model_providers;
+ use codex_models_manager::bundled_models_response;
++use codex_models_manager::manager::RefreshStrategy;
+ use codex_protocol::config_types::AutoCompactTokenLimitScope;
+ use codex_protocol::items::TurnItem;
+ use codex_protocol::models::PermissionProfile;
+@@ -36,6 +38,7 @@ use core_test_support::responses::ev_reasoning_item;
+ use core_test_support::responses::mount_models_once;
+ use core_test_support::responses::strip_response_item_ids_from_json;
+ use core_test_support::skip_if_no_network;
++use core_test_support::test_codex::RecordingUserInstructionsProvider;
+ use core_test_support::test_codex::local_selections;
+ use core_test_support::test_codex::test_codex;
+ use core_test_support::test_codex::turn_permission_fields;
+@@ -90,6 +93,7 @@ const GLOBAL_AGENTS_FILENAME: &str = "AGENTS.md";
+ const GLOBAL_AGENTS_OVERRIDE_FILENAME: &str = "AGENTS.override.md";
+ const NEW_GLOBAL_INSTRUCTIONS: &str = "new global instructions";
+ const OLD_GLOBAL_INSTRUCTIONS: &str = "old global instructions";
++const NEW_MODEL_INSTRUCTIONS: &str = "NEW_CONTEXT_BOUNDARY_MODEL_INSTRUCTIONS";
+ const REMOTE_V2_SUMMARY: &str = "global-instructions-remote-v2-summary";
+ 
+ pub(super) const COMPACT_WARNING_MESSAGE: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
+@@ -311,6 +315,47 @@ fn write_global_file(
+     Ok(path.abs())
+ }
+ 
++async fn submit_compact_and_wait(
++    codex: &Arc<codex_core::CodexThread>,
++    expect_error: bool,
++) -> Result<Option<String>> {
++    let submission_id = codex.submit(Op::Compact).await?;
++    let turn_id = loop {
++        let event = codex.next_event().await?;
++        if event.id != submission_id {
++            continue;
++        }
++        match event.msg {
++            EventMsg::TurnStarted(event) => break event.turn_id,
++            EventMsg::Error(error) => {
++                return Err(anyhow!("compact failed before TurnStarted: {error:?}"));
++            }
++            _ => {}
++        }
++    };
++    let mut error_message = None;
++    loop {
++        let event = codex.next_event().await?;
++        if event.id != submission_id {
++            continue;
++        }
++        match event.msg {
++            EventMsg::Error(error) => error_message = Some(error.message),
++            EventMsg::TurnComplete(event) if event.turn_id == turn_id => break,
++            EventMsg::TurnAborted(event) => {
++                return Err(anyhow!("compact turn aborted: {event:?}"));
++            }
++            _ => {}
++        }
++    }
++    if error_message.is_some() != expect_error {
++        return Err(anyhow!(
++            "compact error expectation mismatch: expected={expect_error} observed={error_message:?}"
++        ));
++    }
++    Ok(error_message)
++}
++
+ fn instruction_fragments(request: &responses::ResponsesRequest) -> Vec<String> {
+     request
+         .message_input_texts("user")
+@@ -2327,6 +2372,10 @@ async fn pre_sampling_compact_runs_when_comp_hash_changes() {
+         requests[1].body_json()["instructions"].as_str(),
+         Some(previous_instructions)
+     );
++    assert_eq!(
++        requests[2].body_json()["instructions"].as_str(),
++        Some(next_instructions)
++    );
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+@@ -2488,6 +2537,10 @@ async fn pre_sampling_compact_falls_back_from_retired_previous_model_after_renam
+         requests[2].body_json()["instructions"].as_str(),
+         Some(renamed_instructions)
+     );
++    assert_eq!(
++        requests[3].body_json()["instructions"].as_str(),
++        Some(renamed_instructions)
++    );
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+@@ -2854,6 +2907,10 @@ async fn pre_sampling_legacy_remote_compact_falls_back_after_previous_model_inva
+         compact_requests[1].body_json()["instructions"].as_str(),
+         Some(next_instructions)
+     );
++    assert_eq!(
++        requests[1].body_json()["instructions"].as_str(),
++        Some(next_instructions)
++    );
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+@@ -5218,7 +5275,7 @@ async fn snapshot_request_shape_manual_compact_without_previous_user_messages()
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn manual_compaction_keeps_the_creation_time_global_instructions() -> Result<()> {
++async fn manual_compaction_refreshes_global_instructions_after_success() -> Result<()> {
+     // Set up an initial turn, a manual compaction response, and a post-compaction turn.
+     let server = responses::start_mock_server().await;
+     let response_mock = responses::mount_sse_sequence(
+@@ -5246,15 +5303,22 @@ async fn manual_compaction_keeps_the_creation_time_global_instructions() -> Resu
+         GLOBAL_AGENTS_FILENAME,
+         OLD_GLOBAL_INSTRUCTIONS,
+     )?;
+-    let provider = local_compaction_provider(&server);
++    let instructions_provider = Arc::new(RecordingUserInstructionsProvider::new(Arc::new(
++        CodexHomeUserInstructionsProvider::new(AbsolutePathBuf::try_from(
++            home.path().to_path_buf(),
++        )?),
++    )));
++    let model_provider = local_compaction_provider(&server);
+ 
+     // Create the thread with the old global source loaded into its instruction snapshot.
+     let mut builder = test_codex()
+         .with_home(Arc::clone(&home))
++        .with_user_instructions_provider(instructions_provider.clone())
+         .with_config(move |config| {
+-            config.model_provider = provider;
++            config.model_provider = model_provider;
+         });
+     let test = builder.build(&server).await?;
++    assert_eq!(instructions_provider.load_count(), 1);
+ 
+     // Assert the pre-compaction source list points at the creation-time file.
+     assert_eq!(
+@@ -5272,21 +5336,19 @@ async fn manual_compaction_keeps_the_creation_time_global_instructions() -> Resu
+     )?;
+     assert_eq!(source, rewritten_source);
+ 
+-    test.codex.submit(Op::Compact).await?;
+-    wait_for_event(&test.codex, |event| {
+-        matches!(event, EventMsg::TurnComplete(_))
+-    })
+-    .await;
++    submit_compact_and_wait(&test.codex, /*expect_error*/ false).await?;
++    assert_eq!(instructions_provider.load_count(), 2);
+     test.submit_turn("after compact").await?;
+ 
+-    // Assert ordinary and compact turns keep the old rendering even though the reported source
+-    // path now contains new text.
++    // The compact request summarizes the old window; the next full context uses the reloaded file.
+     let requests = response_mock.requests();
+     assert_eq!(requests.len(), 3);
+-    let expected_fragment = expected_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
+-    assert_single_instruction_fragment(&requests[0], &expected_fragment);
+-    assert_single_instruction_fragment(&requests[1], &expected_fragment);
+-    assert_single_instruction_fragment(&requests[2], &expected_fragment);
++    let old_fragment = expected_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
++    let new_fragment = expected_instruction_fragment(NEW_GLOBAL_INSTRUCTIONS);
++    assert_single_instruction_fragment(&requests[0], &old_fragment);
++    assert_single_instruction_fragment(&requests[1], &old_fragment);
++    assert_single_instruction_fragment(&requests[2], &new_fragment);
++    assert_eq!(instructions_provider.load_count(), 2);
+     assert_eq!(
+         test.codex.instruction_sources().await,
+         vec![PathUri::from_abs_path(&source)],
+@@ -5297,7 +5359,212 @@ async fn manual_compaction_keeps_the_creation_time_global_instructions() -> Resu
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn mid_turn_compaction_keeps_the_creation_time_global_instructions() -> Result<()> {
++async fn remote_v1_compaction_refreshes_global_instructions_after_success() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = responses::start_mock_server().await;
++    let model = "gpt-5.4";
++    let response_mock = responses::mount_sse_sequence(
++        &server,
++        vec![
++            responses::sse(vec![
++                responses::ev_response_created("remote-v1-initial-response"),
++                responses::ev_completed("remote-v1-initial-response"),
++            ]),
++            responses::sse(vec![
++                responses::ev_response_created("remote-v1-follow-up-response"),
++                responses::ev_completed("remote-v1-follow-up-response"),
++            ]),
++        ],
++    )
++    .await;
++    let compact_mock = responses::mount_compact_user_history_with_summary_once(
++        &server,
++        "REMOTE_V1_COMPACTED_SUMMARY",
++    )
++    .await;
++    let home = Arc::new(TempDir::new()?);
++    let old_source = write_global_file(
++        home.as_ref(),
++        GLOBAL_AGENTS_FILENAME,
++        OLD_GLOBAL_INSTRUCTIONS,
++    )?;
++    let instructions_provider = Arc::new(RecordingUserInstructionsProvider::new(Arc::new(
++        CodexHomeUserInstructionsProvider::new(AbsolutePathBuf::try_from(
++            home.path().to_path_buf(),
++        )?),
++    )));
++    let mut builder = test_codex()
++        .with_home(Arc::clone(&home))
++        .with_user_instructions_provider(instructions_provider.clone())
++        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
++        .with_model(model)
++        .with_config(|config| {
++            let _ = config.features.disable(Feature::RemoteCompactionV2);
++        });
++    let test = builder.build(&server).await?;
++    assert_eq!(instructions_provider.load_count(), 1);
++    let models_manager = test.thread_manager.get_models_manager();
++
++    test.submit_turn("before remote v1 compaction").await?;
++    let initial_instructions = response_mock.single_request().instructions_text();
++    assert_ne!(initial_instructions, NEW_MODEL_INSTRUCTIONS);
++    let new_source = write_global_file(
++        home.as_ref(),
++        GLOBAL_AGENTS_OVERRIDE_FILENAME,
++        NEW_GLOBAL_INSTRUCTIONS,
++    )?;
++    assert_ne!(old_source, new_source);
++    let new_models_mock = mount_models_once(
++        &server,
++        ModelsResponse {
++            models: vec![with_base_instructions(
++                model_info_with_optional_comp_hash(model, /*comp_hash*/ None),
++                NEW_MODEL_INSTRUCTIONS,
++            )],
++        },
++    )
++    .await;
++    let _ = models_manager
++        .list_models(
++            RefreshStrategy::Online,
++            codex_core::test_support::default_http_client_factory(),
++        )
++        .await;
++    assert_eq!(new_models_mock.requests().len(), 1);
++    submit_compact_and_wait(&test.codex, /*expect_error*/ false).await?;
++    assert_eq!(instructions_provider.load_count(), 2);
++    test.submit_turn("after remote v1 compaction").await?;
++
++    let requests = response_mock.requests();
++    assert_eq!(requests.len(), 2);
++    let old_fragment = expected_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
++    let new_fragment = expected_instruction_fragment(NEW_GLOBAL_INSTRUCTIONS);
++    assert_single_instruction_fragment(&requests[0], &old_fragment);
++    assert_single_instruction_fragment(&requests[1], &new_fragment);
++    assert_eq!(requests[0].instructions_text(), initial_instructions);
++    assert_eq!(requests[1].instructions_text(), NEW_MODEL_INSTRUCTIONS);
++    assert_eq!(instructions_provider.load_count(), 2);
++    let compact_request = compact_mock.single_request();
++    let compact_body = compact_request.body_json().to_string();
++    assert!(compact_body.contains(OLD_GLOBAL_INSTRUCTIONS));
++    assert!(!compact_body.contains(NEW_GLOBAL_INSTRUCTIONS));
++    assert_eq!(compact_request.instructions_text(), NEW_MODEL_INSTRUCTIONS);
++    assert_eq!(
++        test.codex.instruction_sources().await,
++        vec![PathUri::from_abs_path(&new_source)],
++        "remote-v1 success should publish the refreshed preferred source"
++    );
++
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn failed_remote_compaction_does_not_refresh_global_instructions() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = responses::start_mock_server().await;
++    let model = "gpt-5.4";
++    let response_mock = responses::mount_sse_sequence(
++        &server,
++        vec![
++            responses::sse(vec![
++                responses::ev_response_created("remote-failure-initial-response"),
++                responses::ev_completed("remote-failure-initial-response"),
++            ]),
++            responses::sse(vec![
++                responses::ev_response_created("remote-failure-follow-up-response"),
++                responses::ev_completed("remote-failure-follow-up-response"),
++            ]),
++        ],
++    )
++    .await;
++    let compact_mock = responses::mount_compact_json_once(
++        &server,
++        json!({ "output": "invalid compact payload shape" }),
++    )
++    .await;
++    let home = Arc::new(TempDir::new()?);
++    let old_source = write_global_file(
++        home.as_ref(),
++        GLOBAL_AGENTS_FILENAME,
++        OLD_GLOBAL_INSTRUCTIONS,
++    )?;
++    let instructions_provider = Arc::new(RecordingUserInstructionsProvider::new(Arc::new(
++        CodexHomeUserInstructionsProvider::new(AbsolutePathBuf::try_from(
++            home.path().to_path_buf(),
++        )?),
++    )));
++    let mut builder = test_codex()
++        .with_home(Arc::clone(&home))
++        .with_user_instructions_provider(instructions_provider.clone())
++        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
++        .with_model(model)
++        .with_config(|config| {
++            let _ = config.features.disable(Feature::RemoteCompactionV2);
++        });
++    let test = builder.build(&server).await?;
++    assert_eq!(instructions_provider.load_count(), 1);
++    let models_manager = test.thread_manager.get_models_manager();
++
++    test.submit_turn("before failed remote compaction").await?;
++    let initial_instructions = response_mock.single_request().instructions_text();
++    assert_ne!(initial_instructions, NEW_MODEL_INSTRUCTIONS);
++    let new_source = write_global_file(
++        home.as_ref(),
++        GLOBAL_AGENTS_OVERRIDE_FILENAME,
++        NEW_GLOBAL_INSTRUCTIONS,
++    )?;
++    assert_ne!(old_source, new_source);
++    let new_models_mock = mount_models_once(
++        &server,
++        ModelsResponse {
++            models: vec![with_base_instructions(
++                model_info_with_optional_comp_hash(model, /*comp_hash*/ None),
++                NEW_MODEL_INSTRUCTIONS,
++            )],
++        },
++    )
++    .await;
++    let _ = models_manager
++        .list_models(
++            RefreshStrategy::Online,
++            codex_core::test_support::default_http_client_factory(),
++        )
++        .await;
++    assert_eq!(new_models_mock.requests().len(), 1);
++    let error_message = submit_compact_and_wait(&test.codex, /*expect_error*/ true)
++        .await?
++        .expect("failed compaction should emit an error");
++    assert!(error_message.contains("Error running remote compact task"));
++    assert_eq!(compact_mock.requests().len(), 1);
++    assert_eq!(
++        compact_mock.single_request().instructions_text(),
++        NEW_MODEL_INSTRUCTIONS
++    );
++    assert_eq!(instructions_provider.load_count(), 1);
++    assert_eq!(
++        test.codex.instruction_sources().await,
++        vec![PathUri::from_abs_path(&old_source)],
++        "failed compaction must retain the live creation-time source"
++    );
++
++    test.submit_turn("after failed remote compaction").await?;
++    let requests = response_mock.requests();
++    assert_eq!(requests.len(), 2);
++    let old_fragment = expected_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
++    assert_single_instruction_fragment(&requests[0], &old_fragment);
++    assert_single_instruction_fragment(&requests[1], &old_fragment);
++    for request in &requests {
++        assert_eq!(request.instructions_text(), initial_instructions);
++    }
++    assert_eq!(instructions_provider.load_count(), 1);
++
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn mid_turn_compaction_refreshes_global_instructions_after_success() -> Result<()> {
+     // Set up a turn that crosses the auto-compaction limit and a post-compaction response.
+     let server = responses::start_mock_server().await;
+     let response_mock = responses::mount_sse_sequence(
+@@ -5324,17 +5591,28 @@ async fn mid_turn_compaction_keeps_the_creation_time_global_instructions() -> Re
+         GLOBAL_AGENTS_FILENAME,
+         OLD_GLOBAL_INSTRUCTIONS,
+     )?;
+-    let provider = local_compaction_provider(&server);
++    let instructions_provider = Arc::new(RecordingUserInstructionsProvider::new(Arc::new(
++        CodexHomeUserInstructionsProvider::new(AbsolutePathBuf::try_from(
++            home.path().to_path_buf(),
++        )?),
++    )));
++    let model_provider = local_compaction_provider(&server);
+ 
+     // Create the thread with the old global source loaded into its instruction snapshot.
+     let mut builder = test_codex()
+         .with_home(Arc::clone(&home))
++        .with_user_instructions_provider(instructions_provider.clone())
+         .with_config(move |config| {
+-            config.model_provider = provider;
++            config.model_provider = model_provider;
+             config.model_context_window = Some(100);
+             config.model_auto_compact_token_limit = Some(90);
++            config
++                .features
++                .enable(Feature::DeferredExecutor)
++                .expect("test config should allow deferred executor");
+         });
+     let test = builder.build(&server).await?;
++    assert_eq!(instructions_provider.load_count(), 1);
+ 
+     // Assert the pre-compaction source list points at the creation-time file.
+     assert_eq!(
+@@ -5352,25 +5630,26 @@ async fn mid_turn_compaction_keeps_the_creation_time_global_instructions() -> Re
+     assert_ne!(source, new_source);
+     test.submit_turn("trigger mid-turn compaction").await?;
+ 
+-    // Assert the initial, compact, and resumed requests all keep the old snapshot and source.
++    // The compact request summarizes the old window; the resumed request injects the new source.
+     let requests = response_mock.requests();
+     assert_eq!(requests.len(), 3);
+-    let expected_fragment = expected_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
+-    assert_single_instruction_fragment(&requests[0], &expected_fragment);
+-    assert_single_instruction_fragment(&requests[1], &expected_fragment);
+-    assert_single_instruction_fragment(&requests[2], &expected_fragment);
++    let old_fragment = expected_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
++    let new_fragment = expected_instruction_fragment(NEW_GLOBAL_INSTRUCTIONS);
++    assert_single_instruction_fragment(&requests[0], &old_fragment);
++    assert_single_instruction_fragment(&requests[1], &old_fragment);
++    assert_single_instruction_fragment(&requests[2], &new_fragment);
++    assert_eq!(instructions_provider.load_count(), 2);
+     assert_eq!(
+         test.codex.instruction_sources().await,
+-        vec![PathUri::from_abs_path(&source)],
+-        "thread retains the creation-time global source after mid-turn compaction"
++        vec![PathUri::from_abs_path(&new_source)],
++        "thread reports the refreshed global source after mid-turn compaction"
+     );
+ 
+     Ok(())
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_mutation()
+--> Result<()> {
++async fn remote_v2_compaction_refreshes_global_instructions_after_success() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+ 
+     // Set up an ordinary turn, a remote-v2 compact response, and a post-compaction turn.
+@@ -5400,13 +5679,20 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
+         GLOBAL_AGENTS_FILENAME,
+         OLD_GLOBAL_INSTRUCTIONS,
+     )?;
++    let instructions_provider = Arc::new(RecordingUserInstructionsProvider::new(Arc::new(
++        CodexHomeUserInstructionsProvider::new(AbsolutePathBuf::try_from(
++            home.path().to_path_buf(),
++        )?),
++    )));
+     let mut builder = test_codex()
+         .with_home(Arc::clone(&home))
++        .with_user_instructions_provider(instructions_provider.clone())
+         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+         .with_config(|config| {
+             let _ = config.features.enable(Feature::RemoteCompactionV2);
+         });
+     let test = builder.build(&server).await?;
++    assert_eq!(instructions_provider.load_count(), 1);
+ 
+     // Materialize the old snapshot, rewrite the selected file in place, and compact remotely.
+     test.submit_turn("before remote v2 compaction").await?;
+@@ -5416,22 +5702,20 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
+         NEW_GLOBAL_INSTRUCTIONS,
+     )?;
+     assert_eq!(source, rewritten_source);
+-    test.codex.submit(Op::Compact).await?;
+-    wait_for_event(&test.codex, |event| {
+-        matches!(event, EventMsg::TurnComplete(_))
+-    })
+-    .await;
++    submit_compact_and_wait(&test.codex, /*expect_error*/ false).await?;
++    assert_eq!(instructions_provider.load_count(), 2);
+     test.submit_turn("after remote v2 compaction").await?;
+     test.codex.flush_rollout().await?;
+ 
+-    // Assert the compact request, installed replacement history, and follow-up all keep the
+-    // creation-time item despite the file-backed source now containing new text.
++    // The compact request summarizes the old window; the next full context uses the reloaded file.
+     let requests = response_mock.requests();
+     assert_eq!(requests.len(), 3);
+     let old_fragment = expected_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);
++    let new_fragment = expected_instruction_fragment(NEW_GLOBAL_INSTRUCTIONS);
+     assert_single_instruction_fragment(&requests[0], &old_fragment);
+     assert_single_instruction_fragment(&requests[1], &old_fragment);
+-    assert_single_instruction_fragment(&requests[2], &old_fragment);
++    assert_single_instruction_fragment(&requests[2], &new_fragment);
++    assert_eq!(instructions_provider.load_count(), 2);
+     assert_eq!(
+         requests[1].input().last(),
+         Some(&json!({"type": "compaction_trigger"})),
+@@ -5464,6 +5748,7 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
+     let resumed_cwd = test.config.cwd.clone();
+     let mut resume_builder = test_codex()
+         .with_home(Arc::clone(&home))
++        .with_user_instructions_provider(instructions_provider.clone())
+         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+         .with_config(move |config| {
+             config.cwd = resumed_cwd;
+@@ -5472,21 +5757,16 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
+     let resumed = resume_builder
+         .resume(&server, Arc::clone(&home), rollout_path)
+         .await?;
++    assert_eq!(instructions_provider.load_count(), 3);
+     resumed
+         .submit_turn("after remote v2 compaction cold resume")
+         .await?;
++    assert_eq!(instructions_provider.load_count(), 3);
+ 
+-    // Cold resume replays the persisted old context, then appends the newly loaded instructions as
+-    // an explicit replacement.
++    // Cold resume replays the persisted post-compaction context without duplicating instructions.
+     let requests = response_mock.requests();
+     assert_eq!(requests.len(), 4);
+-    let replacement_fragment = expected_instruction_fragment(&format!(
+-        "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{NEW_GLOBAL_INSTRUCTIONS}"
+-    ));
+-    assert_eq!(
+-        instruction_fragments(&requests[3]),
+-        vec![old_fragment.clone(), replacement_fragment]
+-    );
++    assert_eq!(instruction_fragments(&requests[3]), vec![new_fragment]);
+     let resumed_input = requests[3].input();
+     assert_eq!(
+         resumed_input.get(..replacement_history.len()),
+diff --git a/codex-rs/core/tests/suite/snapshots/all__suite__compact_resume_fork__rollback_followup_turn_trims_context_updates.snap b/codex-rs/core/tests/suite/snapshots/all__suite__compact_resume_fork__rollback_followup_turn_trims_context_updates.snap
+index 925a810a43..a8eae93d5a 100644
+--- a/codex-rs/core/tests/suite/snapshots/all__suite__compact_resume_fork__rollback_followup_turn_trims_context_updates.snap
++++ b/codex-rs/core/tests/suite/snapshots/all__suite__compact_resume_fork__rollback_followup_turn_trims_context_updates.snap
+@@ -9,7 +9,9 @@ Scenario: rollback trims pre-turn override context updates before the follow-up
+ 01:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+ 02:message/user:turn 1 user
+ 03:message/assistant:turn 1 assistant
+-04:message/developer:<collaboration_mode>ROLLED_BACK_DEV_INSTRUCTIONS</collaboration_mode>
++04:message/developer[2]:
++    [01] <PERMISSIONS_INSTRUCTIONS>
++    [02] <collaboration_mode>ROLLED_BACK_DEV_INSTRUCTIONS</collaboration_mode>
+ 05:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
+ 06:message/user:turn 2 user
+ 
+@@ -18,6 +20,8 @@ Scenario: rollback trims pre-turn override context updates before the follow-up
+ 01:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+ 02:message/user:turn 1 user
+ 03:message/assistant:turn 1 assistant
+-04:message/developer:<collaboration_mode>ROLLED_BACK_DEV_INSTRUCTIONS</collaboration_mode>
++04:message/developer[2]:
++    [01] <PERMISSIONS_INSTRUCTIONS>
++    [02] <collaboration_mode>ROLLED_BACK_DEV_INSTRUCTIONS</collaboration_mode>
+ 05:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
+ 06:message/user:follow-up user
+diff --git a/codex-rs/core/tests/suite/snapshots/all__suite__model_visible_layout__model_visible_layout_resume_override_matches_rollout_model.snap b/codex-rs/core/tests/suite/snapshots/all__suite__model_visible_layout__model_visible_layout_resume_override_matches_rollout_model.snap
+index 7b91b52cdf..3faed43ae7 100644
+--- a/codex-rs/core/tests/suite/snapshots/all__suite__model_visible_layout__model_visible_layout_resume_override_matches_rollout_model.snap
++++ b/codex-rs/core/tests/suite/snapshots/all__suite__model_visible_layout__model_visible_layout_resume_override_matches_rollout_model.snap
+@@ -18,5 +18,6 @@ Scenario: First post-resume turn where pre-turn override sets model to rollout m
+ 01:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+ 02:message/user:seed resume history
+ 03:message/assistant:recorded before resume
+-04:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
+-05:message/user:first resumed turn after model override
++04:message/developer:<PERMISSIONS_INSTRUCTIONS>
++05:message/user:<ENVIRONMENT_CONTEXT:cwd=PRETURN_CONTEXT_DIFF_CWD>
++06:message/user:first resumed turn after model override
+diff --git a/codex-rs/core/tests/suite/snapshots/all__suite__token_budget__token_budget_new_context_window_tool_full_context.snap b/codex-rs/core/tests/suite/snapshots/all__suite__token_budget__token_budget_new_context_window_tool_full_context.snap
+index 16e7ddac77..a4fdc6cdd0 100644
+--- a/codex-rs/core/tests/suite/snapshots/all__suite__token_budget__token_budget_new_context_window_tool_full_context.snap
++++ b/codex-rs/core/tests/suite/snapshots/all__suite__token_budget__token_budget_new_context_window_tool_full_context.snap
+@@ -1,5 +1,6 @@
+ ---
+ source: core/tests/suite/token_budget.rs
++assertion_line: 1143
+ expression: snapshot
+ ---
+ Scenario: New context window tool installs fresh full context before the next follow-up request.
+@@ -9,6 +10,8 @@ Scenario: New context window tool installs fresh full context before the next fo
+     [01] <SKILLS_INSTRUCTIONS>
+     [02] <context_window>\nThread id: <THREAD_ID>\nFirst context window id: <FIRST_WINDOW_ID>\nCurrent context window id: <WINDOW_ID>\nPrevious context window id: <FIRST_WINDOW_ID>\n</context_window>
+     [03] <PERMISSIONS_INSTRUCTIONS>
+-01:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
++01:message/user[2]:
++    [01] <AGENTS_MD>
++    [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
+ 02:function_call/update_plan
+ 03:function_call_output:Plan updated
+diff --git a/codex-rs/core/tests/suite/token_budget.rs b/codex-rs/core/tests/suite/token_budget.rs
+index 38c7c47e53..aa6a4d383d 100644
+--- a/codex-rs/core/tests/suite/token_budget.rs
++++ b/codex-rs/core/tests/suite/token_budget.rs
+@@ -3,6 +3,7 @@ use codex_config::types::McpServerConfig;
+ use codex_config::types::McpServerTransportConfig;
+ use codex_core::config::TokenBudgetConfig;
+ use codex_features::Feature;
++use codex_home::CodexHomeUserInstructionsProvider;
+ use codex_model_provider_info::built_in_model_providers;
+ use codex_protocol::config_types::AutoCompactTokenLimitScope;
+ use codex_protocol::items::TurnItem;
+@@ -34,6 +35,7 @@ use core_test_support::responses::sse;
+ use core_test_support::responses::start_mock_server;
+ use core_test_support::skip_if_no_network;
+ use core_test_support::stdio_server_bin;
++use core_test_support::test_codex::RecordingUserInstructionsProvider;
+ use core_test_support::test_codex::local;
+ use core_test_support::test_codex::test_codex;
+ use core_test_support::wait_for_event;
+@@ -44,7 +46,9 @@ use serde_json::Value;
+ use serde_json::json;
+ use std::collections::HashMap;
+ use std::path::Path;
++use std::sync::Arc;
+ use std::time::Duration;
++use tempfile::TempDir;
+ 
+ const CONFIGURED_CONTEXT_WINDOW: i64 = 128_000;
+ const AUTO_COMPACT_FALLBACK_PROMPT: &str = "Save the important state before rollover.";
+@@ -1058,7 +1062,14 @@ async fn new_context_tool_skips_auto_compact_fallback() -> Result<()> {
+         ],
+     )
+     .await;
++    let home = Arc::new(TempDir::new()?);
++    std::fs::write(home.path().join("AGENTS.md"), "OLD_TOKEN_BUDGET_AGENTS")?;
++    let provider = Arc::new(RecordingUserInstructionsProvider::new(Arc::new(
++        CodexHomeUserInstructionsProvider::new(home.path().to_path_buf().try_into()?),
++    )));
+     let test = test_codex()
++        .with_home(Arc::clone(&home))
++        .with_user_instructions_provider(provider.clone())
+         .with_config(|config| {
+             config.model_context_window = Some(10_000);
+             config.token_budget = Some(TokenBudgetConfig {
+@@ -1073,6 +1084,11 @@ async fn new_context_tool_skips_auto_compact_fallback() -> Result<()> {
+         })
+         .build(&server)
+         .await?;
++    assert_eq!(provider.load_count(), 1);
++    std::fs::write(
++        home.path().join("AGENTS.override.md"),
++        "NEW_TOKEN_BUDGET_AGENTS",
++    )?;
+ 
+     test.submit_turn("request new context window").await?;
+ 
+@@ -1100,6 +1116,13 @@ async fn new_context_tool_skips_auto_compact_fallback() -> Result<()> {
+         Some(initial_window_id.as_str())
+     );
+     assert_ne!(new_window_id, initial_window_id);
++    assert!(requests[0].body_contains_text("OLD_TOKEN_BUDGET_AGENTS"));
++    assert!(!requests[0].body_contains_text("NEW_TOKEN_BUDGET_AGENTS"));
++    for request in &requests[1..] {
++        assert!(request.body_contains_text("NEW_TOKEN_BUDGET_AGENTS"));
++        assert!(!request.body_contains_text("OLD_TOKEN_BUDGET_AGENTS"));
++    }
++    assert_eq!(provider.load_count(), 2);
+     assert!(
+         !requests[2].body_contains_text("request new context window"),
+         "new_context should drop the prior window history before continuing the turn"
+diff --git a/codex-rs/ext/extension-api/src/user_instructions.rs b/codex-rs/ext/extension-api/src/user_instructions.rs
+index d5fd63c197..79e4ed61b1 100644
+--- a/codex-rs/ext/extension-api/src/user_instructions.rs
++++ b/codex-rs/ext/extension-api/src/user_instructions.rs
+@@ -23,7 +23,7 @@ pub struct UserInstructions {
+ pub struct LoadedUserInstructions {
+     /// Loaded instructions, or `None` when the provider has no applicable text.
+     pub instructions: Option<UserInstructions>,
+-    /// Recoverable loading problems that should be surfaced during startup.
++    /// Recoverable loading problems to surface when the candidate snapshot is committed.
+     pub warnings: Vec<String>,
+ }
+ 
+@@ -31,11 +31,11 @@ pub struct LoadedUserInstructions {
+ pub type LoadUserInstructionsFuture<'a> =
+     Pin<Box<dyn Future<Output = LoadedUserInstructions> + Send + 'a>>;
+ 
+-/// Loads the user instructions that apply when a root thread runtime starts.
++/// Loads the user instructions that apply to a root thread runtime.
+ ///
+ /// Implementations should return any recoverable loading problems as warnings
+ /// while still returning usable fallback instructions when available.
+ pub trait UserInstructionsProvider: Send + Sync {
+-    /// Loads the snapshot to use for a newly created root runtime.
++    /// Loads a candidate snapshot at creation and while preparing context boundaries.
+     fn load_user_instructions(&self) -> LoadUserInstructionsFuture<'_>;
+ }

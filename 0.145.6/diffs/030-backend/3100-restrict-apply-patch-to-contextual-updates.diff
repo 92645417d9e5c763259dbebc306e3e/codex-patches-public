@@ -1,0 +1,1776 @@
+diff --git a/codex-rs/apply-patch/src/invocation.rs b/codex-rs/apply-patch/src/invocation.rs
+index 8ac2084e4f..2896d7063c 100644
+--- a/codex-rs/apply-patch/src/invocation.rs
++++ b/codex-rs/apply-patch/src/invocation.rs
+@@ -393,6 +393,7 @@ fn extract_apply_patch_from_bash(
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::UpdateFileChunk;
+     use crate::unified_diff_from_chunks;
+     use assert_matches::assert_matches;
+     use codex_exec_server::LOCAL_FS;
+@@ -434,20 +435,26 @@ mod tests {
+ 
+     fn heredoc_script(prefix: &str) -> String {
+         format!(
+-            "{prefix}apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: foo\n+hi\n*** End Patch\nPATCH"
++            "{prefix}apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: foo\n@@\n-old\n+hi\n*** End Patch\nPATCH"
+         )
+     }
+ 
+     fn heredoc_script_ps(prefix: &str, suffix: &str) -> String {
+         format!(
+-            "{prefix}apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: foo\n+hi\n*** End Patch\nPATCH{suffix}"
++            "{prefix}apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: foo\n@@\n-old\n+hi\n*** End Patch\nPATCH{suffix}"
+         )
+     }
+ 
+-    fn expected_single_add() -> Vec<Hunk> {
+-        vec![Hunk::AddFile {
++    fn expected_single_update() -> Vec<Hunk> {
++        vec![Hunk::UpdateFile {
+             path: PathBuf::from("foo"),
+-            contents: "hi\n".to_string(),
++            move_path: None,
++            chunks: vec![UpdateFileChunk {
++                change_context: None,
++                old_lines: vec!["old".to_string()],
++                new_lines: vec!["hi".to_string()],
++                is_end_of_file: false,
++            }],
+         }]
+     }
+ 
+@@ -469,7 +476,7 @@ mod tests {
+         match maybe_parse_apply_patch(&args, cwd) {
+             MaybeApplyPatch::Body(ApplyPatchArgs { hunks, workdir, .. }) => {
+                 assert_eq!(workdir.as_deref(), expected_workdir);
+-                assert_eq!(hunks, expected_single_add());
++                assert_eq!(hunks, expected_single_update());
+             }
+             result => panic!("expected MaybeApplyPatch::Body got {result:?}"),
+         }
+@@ -494,7 +501,8 @@ mod tests {
+ 
+     #[tokio::test]
+     async fn test_implicit_patch_single_arg_is_error() {
+-        let patch = "*** Begin Patch\n*** Add File: foo\n+hi\n*** End Patch".to_string();
++        let patch =
++            "*** Begin Patch\n*** Update File: foo\n@@\n-old\n+hi\n*** End Patch".to_string();
+         let args = vec![patch];
+         let dir = tempdir().unwrap();
+         assert_matches!(
+@@ -511,7 +519,7 @@ mod tests {
+ 
+     #[tokio::test]
+     async fn test_implicit_patch_bash_script_is_error() {
+-        let script = "*** Begin Patch\n*** Add File: foo\n+hi\n*** End Patch";
++        let script = "*** Begin Patch\n*** Update File: foo\n@@\n-old\n+hi\n*** End Patch";
+         let args = args_bash(script);
+         let dir = tempdir().unwrap();
+         assert_matches!(
+@@ -531,7 +539,9 @@ mod tests {
+         let args = strs_to_strings(&[
+             "apply_patch",
+             r#"*** Begin Patch
+-*** Add File: foo
++*** Update File: foo
++@@
++-old
+ +hi
+ *** End Patch
+ "#,
+@@ -542,13 +552,7 @@ mod tests {
+             &PathUri::parse("file:///workspace").expect("valid POSIX test cwd"),
+         ) {
+             MaybeApplyPatch::Body(ApplyPatchArgs { hunks, .. }) => {
+-                assert_eq!(
+-                    hunks,
+-                    vec![Hunk::AddFile {
+-                        path: PathBuf::from("foo"),
+-                        contents: "hi\n".to_string()
+-                    }]
+-                );
++                assert_eq!(hunks, expected_single_update());
+             }
+             result => panic!("expected MaybeApplyPatch::Body got {result:?}"),
+         }
+@@ -559,7 +563,9 @@ mod tests {
+         let args = strs_to_strings(&[
+             "applypatch",
+             r#"*** Begin Patch
+-*** Add File: foo
++*** Update File: foo
++@@
++-old
+ +hi
+ *** End Patch
+ "#,
+@@ -570,13 +576,7 @@ mod tests {
+             &PathUri::parse("file:///workspace").expect("valid POSIX test cwd"),
+         ) {
+             MaybeApplyPatch::Body(ApplyPatchArgs { hunks, .. }) => {
+-                assert_eq!(
+-                    hunks,
+-                    vec![Hunk::AddFile {
+-                        path: PathBuf::from("foo"),
+-                        contents: "hi\n".to_string()
+-                    }]
+-                );
++                assert_eq!(hunks, expected_single_update());
+             }
+             result => panic!("expected MaybeApplyPatch::Body got {result:?}"),
+         }
+@@ -601,7 +601,9 @@ mod tests {
+             "-lc",
+             r#"applypatch <<'PATCH'
+ *** Begin Patch
+-*** Add File: foo
++*** Update File: foo
++@@
++-old
+ +hi
+ *** End Patch
+ PATCH"#,
+@@ -613,13 +615,7 @@ PATCH"#,
+         ) {
+             MaybeApplyPatch::Body(ApplyPatchArgs { hunks, workdir, .. }) => {
+                 assert_eq!(workdir, None);
+-                assert_eq!(
+-                    hunks,
+-                    vec![Hunk::AddFile {
+-                        path: PathBuf::from("foo"),
+-                        contents: "hi\n".to_string()
+-                    }]
+-                );
++                assert_eq!(hunks, expected_single_update());
+             }
+             result => panic!("expected MaybeApplyPatch::Body got {result:?}"),
+         }
+@@ -864,7 +860,7 @@ PATCH"#,
+     }
+ 
+     #[tokio::test]
+-    async fn test_apply_patch_resolves_move_path_with_effective_cwd() {
++    async fn test_apply_patch_rejects_move_path_before_effective_cwd_verification() {
+         let session_dir = tempdir().unwrap();
+         let worktree_rel = "alt";
+         let worktree_dir = session_dir.path().join(worktree_rel);
+@@ -893,36 +889,16 @@ PATCH"#,
+             /*sandbox*/ None,
+         )
+         .await;
+-        let action = match result {
+-            MaybeApplyPatchVerified::Body(action) => action,
+-            other => panic!("expected verified body, got {other:?}"),
+-        };
+-
+-        assert_eq!(
+-            action.cwd.to_abs_path().unwrap().as_path(),
+-            worktree_dir.as_path()
+-        );
+-
+-        let source_path = PathUri::from_host_native_path(worktree_dir.join(source_name))
+-            .expect("absolute test path");
+-        let change = action
+-            .changes()
+-            .get(&source_path)
+-            .expect("source file change present");
+-
+-        match change {
+-            ApplyPatchFileChange::Update { move_path, .. } => {
+-                let expected_move_path =
+-                    PathUri::from_host_native_path(worktree_dir.join(dest_name))
+-                        .expect("absolute test path");
+-                assert_eq!(move_path.as_ref(), Some(&expected_move_path));
+-            }
+-            other => panic!("expected update change, got {other:?}"),
+-        }
++        assert!(matches!(
++            result,
++            MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ParseError(_))
++        ));
++        assert_eq!(fs::read_to_string(source_path).unwrap(), "before\n");
++        assert!(!worktree_dir.join(dest_name).exists());
+     }
+ 
+     #[tokio::test]
+-    async fn test_unreadable_destinations_still_verify() {
++    async fn test_unsupported_operations_reject_before_unreadable_destination_verification() {
+         let session_dir = tempdir().unwrap();
+         fs::write(session_dir.path().join("binary.dat"), [0xff, 0xfe, 0xfd]).unwrap();
+         let cwd = PathUri::from_host_native_path(session_dir.path()).expect("absolute test path");
+@@ -945,13 +921,16 @@ PATCH"#,
+             )
+             .await;
+ 
+-            assert!(matches!(result, MaybeApplyPatchVerified::Body(_)));
++            assert!(matches!(
++                result,
++                MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ParseError(_))
++            ));
+         }
+     }
+ 
+     #[cfg(unix)]
+     #[tokio::test]
+-    async fn test_delete_symlink_still_verifies() {
++    async fn test_delete_symlink_is_rejected_before_verification() {
+         use std::os::unix::fs::symlink;
+ 
+         let session_dir = tempdir().unwrap();
+@@ -974,6 +953,10 @@ PATCH"#,
+         )
+         .await;
+ 
+-        assert!(matches!(result, MaybeApplyPatchVerified::Body(_)));
++        assert!(matches!(
++            result,
++            MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ParseError(_))
++        ));
++        assert!(fs::symlink_metadata(session_dir.path().join("link.txt")).is_ok());
+     }
+ }
+diff --git a/codex-rs/apply-patch/src/lib.rs b/codex-rs/apply-patch/src/lib.rs
+index 81536f4a9d..034d4655cb 100644
+--- a/codex-rs/apply-patch/src/lib.rs
++++ b/codex-rs/apply-patch/src/lib.rs
+@@ -899,7 +899,7 @@ mod tests {
+     }
+ 
+     #[tokio::test]
+-    async fn test_add_file_hunk_creates_file_with_contents() {
++    async fn test_add_file_hunk_is_rejected_without_creating_file() {
+         let dir = tempdir().unwrap();
+         let path = dir.path().join("add.txt");
+         let patch = wrap_patch(&format!(
+@@ -910,7 +910,7 @@ mod tests {
+         ));
+         let mut stdout = Vec::new();
+         let mut stderr = Vec::new();
+-        apply_patch(
++        let failure = apply_patch(
+             &patch,
+             &PathUri::from_host_native_path(dir.path()).expect("absolute test path"),
+             &mut stdout,
+@@ -919,43 +919,28 @@ mod tests {
+             /*sandbox*/ None,
+         )
+         .await
+-        .unwrap();
+-        // Verify expected stdout and stderr outputs.
+-        let stdout_str = String::from_utf8(stdout).unwrap();
+-        let stderr_str = String::from_utf8(stderr).unwrap();
+-        let expected_out = format!(
+-            "Success. Updated the following files:\nA {}\n",
+-            path.display()
++        .expect_err("Add File must be rejected");
++        assert!(stdout.is_empty());
++        assert!(
++            String::from_utf8(stderr)
++                .unwrap()
++                .contains("Add File is unsupported")
+         );
+-        assert_eq!(stdout_str, expected_out);
+-        assert_eq!(stderr_str, "");
+-        let contents = fs::read_to_string(path).unwrap();
+-        assert_eq!(contents, "ab\ncd\n");
++        assert_eq!(failure.delta(), &AppliedPatchDelta::default());
++        assert!(!path.exists());
+     }
+ 
+     #[tokio::test]
+-    async fn test_apply_patch_hunks_accept_relative_and_absolute_paths() {
++    async fn test_update_hunks_accept_relative_and_absolute_paths() {
+         let dir = tempdir().unwrap();
+         let cwd = PathUri::from_host_native_path(dir.path()).expect("absolute test path");
+-        let relative_add = dir.path().join("relative-add.txt");
+-        let absolute_add = dir.path().join("absolute-add.txt");
+-        let relative_delete = dir.path().join("relative-delete.txt");
+-        let absolute_delete = dir.path().join("absolute-delete.txt");
+         let relative_update = dir.path().join("relative-update.txt");
+         let absolute_update = dir.path().join("absolute-update.txt");
+-        fs::write(&relative_delete, "delete relative\n").unwrap();
+-        fs::write(&absolute_delete, "delete absolute\n").unwrap();
+         fs::write(&relative_update, "relative old\n").unwrap();
+         fs::write(&absolute_update, "absolute old\n").unwrap();
+ 
+         let patch = wrap_patch(&format!(
+-            r#"*** Add File: relative-add.txt
+-+relative add
+-*** Add File: {}
+-+absolute add
+-*** Delete File: relative-delete.txt
+-*** Delete File: {}
+-*** Update File: relative-update.txt
++            r#"*** Update File: relative-update.txt
+ @@
+ -relative old
+ +relative new
+@@ -963,8 +948,6 @@ mod tests {
+ @@
+ -absolute old
+ +absolute new"#,
+-            absolute_add.display(),
+-            absolute_delete.display(),
+             absolute_update.display(),
+         ));
+         let mut stdout = Vec::new();
+@@ -981,10 +964,6 @@ mod tests {
+         .await
+         .unwrap();
+ 
+-        assert_eq!(fs::read_to_string(&relative_add).unwrap(), "relative add\n");
+-        assert_eq!(fs::read_to_string(&absolute_add).unwrap(), "absolute add\n");
+-        assert!(!relative_delete.exists());
+-        assert!(!absolute_delete.exists());
+         assert_eq!(
+             fs::read_to_string(&relative_update).unwrap(),
+             "relative new\n"
+@@ -997,23 +976,21 @@ mod tests {
+         assert_eq!(
+             String::from_utf8(stdout).unwrap(),
+             format!(
+-                "Success. Updated the following files:\nA relative-add.txt\nA {}\nM relative-update.txt\nM {}\nD relative-delete.txt\nD {}\n",
+-                absolute_add.display(),
++                "Success. Updated the following files:\nM relative-update.txt\nM {}\n",
+                 absolute_update.display(),
+-                absolute_delete.display(),
+             )
+         );
+     }
+ 
+     #[tokio::test]
+-    async fn test_delete_file_hunk_removes_file() {
++    async fn test_delete_file_hunk_is_rejected_without_removing_file() {
+         let dir = tempdir().unwrap();
+         let path = dir.path().join("del.txt");
+         fs::write(&path, "x").unwrap();
+         let patch = wrap_patch(&format!("*** Delete File: {}", path.display()));
+         let mut stdout = Vec::new();
+         let mut stderr = Vec::new();
+-        apply_patch(
++        let failure = apply_patch(
+             &patch,
+             &PathUri::from_host_native_path(dir.path()).expect("absolute test path"),
+             &mut stdout,
+@@ -1022,16 +999,15 @@ mod tests {
+             /*sandbox*/ None,
+         )
+         .await
+-        .unwrap();
+-        let stdout_str = String::from_utf8(stdout).unwrap();
+-        let stderr_str = String::from_utf8(stderr).unwrap();
+-        let expected_out = format!(
+-            "Success. Updated the following files:\nD {}\n",
+-            path.display()
++        .expect_err("Delete File must be rejected");
++        assert!(stdout.is_empty());
++        assert!(
++            String::from_utf8(stderr)
++                .unwrap()
++                .contains("Delete File is unsupported")
+         );
+-        assert_eq!(stdout_str, expected_out);
+-        assert_eq!(stderr_str, "");
+-        assert!(!path.exists());
++        assert_eq!(failure.delta(), &AppliedPatchDelta::default());
++        assert_eq!(fs::read_to_string(path).unwrap(), "x");
+     }
+ 
+     #[tokio::test]
+@@ -1073,7 +1049,7 @@ mod tests {
+     }
+ 
+     #[tokio::test]
+-    async fn test_update_file_hunk_can_move_file() {
++    async fn test_move_to_is_rejected_without_changing_source_or_destination() {
+         let dir = tempdir().unwrap();
+         let src = dir.path().join("src.txt");
+         let dest = dir.path().join("dst.txt");
+@@ -1089,7 +1065,8 @@ mod tests {
+         ));
+         let mut stdout = Vec::new();
+         let mut stderr = Vec::new();
+-        apply_patch(
++        fs::write(&dest, "destination\n").unwrap();
++        let failure = apply_patch(
+             &patch,
+             &PathUri::from_host_native_path(dir.path()).expect("absolute test path"),
+             &mut stdout,
+@@ -1098,26 +1075,21 @@ mod tests {
+             /*sandbox*/ None,
+         )
+         .await
+-        .unwrap();
+-        // Validate move semantics and expected stdout/stderr.
+-        let stdout_str = String::from_utf8(stdout).unwrap();
+-        let stderr_str = String::from_utf8(stderr).unwrap();
+-        let expected_out = format!(
+-            "Success. Updated the following files:\nM {}\n",
+-            dest.display()
++        .expect_err("Move to must be rejected");
++        assert!(stdout.is_empty());
++        assert!(
++            String::from_utf8(stderr)
++                .unwrap()
++                .contains("Move to is unsupported")
+         );
+-        assert_eq!(stdout_str, expected_out);
+-        assert_eq!(stderr_str, "");
+-        assert!(!src.exists());
+-        let contents = fs::read_to_string(&dest).unwrap();
+-        assert_eq!(contents, "line2\n");
++        assert_eq!(failure.delta(), &AppliedPatchDelta::default());
++        assert_eq!(fs::read_to_string(&src).unwrap(), "line\n");
++        assert_eq!(fs::read_to_string(&dest).unwrap(), "destination\n");
+     }
+ 
+     #[cfg(unix)]
+     #[tokio::test]
+-    async fn test_failed_move_returns_committed_destination_delta() {
+-        use std::os::unix::fs::PermissionsExt;
+-
++    async fn test_rejected_move_does_not_write_destination_in_locked_source_directory() {
+         let dir = tempdir().unwrap();
+         let source_dir = dir.path().join("locked");
+         let dest_dir = dir.path().join("out");
+@@ -1126,8 +1098,6 @@ mod tests {
+         let src = source_dir.join("src.txt");
+         let dest = dest_dir.join("dst.txt");
+         fs::write(&src, "line\n").unwrap();
+-        fs::set_permissions(&source_dir, fs::Permissions::from_mode(0o555)).unwrap();
+-
+         let patch = wrap_patch(
+             "*** Update File: locked/src.txt\n*** Move to: out/dst.txt\n@@\n-line\n+line2",
+         );
+@@ -1142,30 +1112,16 @@ mod tests {
+             /*sandbox*/ None,
+         )
+         .await
+-        .expect_err("source removal should fail after destination write");
+-
+-        fs::set_permissions(&source_dir, fs::Permissions::from_mode(0o755)).unwrap();
+-
++        .expect_err("Move to must be rejected before filesystem access");
++        assert!(stdout.is_empty());
+         assert!(
+             String::from_utf8(stderr)
+                 .unwrap()
+-                .contains(&format!("Failed to remove original {}", src.display()))
+-        );
+-        assert_eq!(
+-            failure.delta(),
+-            &AppliedPatchDelta::new(
+-                vec![AppliedPatchChange {
+-                    path: PathUri::from_host_native_path(&dest).expect("absolute destination path"),
+-                    change: AppliedPatchFileChange::Add {
+-                        content: "line2\n".to_string(),
+-                        overwritten_content: None,
+-                    },
+-                }],
+-                /*exact*/ true,
+-            )
++                .contains("Move to is unsupported")
+         );
+-        assert_eq!(fs::read_to_string(src).unwrap(), "line\n");
+-        assert_eq!(fs::read_to_string(dest).unwrap(), "line2\n");
++        assert_eq!(failure.delta(), &AppliedPatchDelta::default());
++        assert_eq!(fs::read_to_string(&src).unwrap(), "line\n");
++        assert!(!dest.exists());
+     }
+ 
+     /// Verify that a single `Update File` hunk with multiple change chunks can update different
+@@ -1631,21 +1587,16 @@ g
+         );
+     }
+ 
+-    #[cfg(unix)]
+     #[tokio::test]
+-    async fn test_apply_patch_fails_on_write_error() {
+-        use std::os::unix::fs::PermissionsExt;
+-
++    async fn test_update_file_populates_confirmed_empty_file() {
+         let dir = tempdir().unwrap();
+-        let locked_dir = dir.path().join("locked");
+-        fs::create_dir(&locked_dir).unwrap();
+-        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o555)).unwrap();
+-
+-        let patch = wrap_patch("*** Add File: locked/new.txt\n+after");
++        let path = dir.path().join("new.txt");
++        fs::write(&path, "").unwrap();
++        let patch = wrap_patch("*** Update File: new.txt\n@@\n+after");
+ 
+         let mut stdout = Vec::new();
+         let mut stderr = Vec::new();
+-        let result = apply_patch(
++        let delta = apply_patch(
+             &patch,
+             &PathUri::from_host_native_path(dir.path()).expect("absolute test path"),
+             &mut stdout,
+@@ -1653,16 +1604,14 @@ g
+             LOCAL_FS.as_ref(),
+             /*sandbox*/ None,
+         )
+-        .await;
+-        let failure = result.expect_err("write should fail");
+-
+-        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755)).unwrap();
+-
+-        assert!(!failure.delta().is_exact());
++        .await
++        .expect("pure-addition Update File should populate an existing empty file");
++        assert!(delta.is_exact());
++        assert_eq!(fs::read_to_string(path).unwrap(), "after\n");
+     }
+ 
+     #[tokio::test]
+-    async fn test_unreadable_destinations_return_inexact_delta() {
++    async fn test_unsupported_operations_do_not_read_unreadable_destination() {
+         let dir = tempdir().unwrap();
+         let path = dir.path().join("binary.dat");
+         fs::write(dir.path().join("source.txt"), "before\n").unwrap();
+@@ -1675,7 +1624,7 @@ g
+             fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+             let mut stdout = Vec::new();
+             let mut stderr = Vec::new();
+-            let delta = apply_patch(
++            let failure = apply_patch(
+                 &patch,
+                 &cwd,
+                 &mut stdout,
+@@ -1684,15 +1633,20 @@ g
+                 /*sandbox*/ None,
+             )
+             .await
+-            .unwrap();
++            .expect_err("unsupported operation must fail before reading the destination");
+ 
+-            assert!(!delta.is_exact());
++            assert_eq!(failure.delta(), &AppliedPatchDelta::default());
++            assert_eq!(fs::read(&path).unwrap(), [0xff, 0xfe, 0xfd]);
++            assert_eq!(
++                fs::read_to_string(dir.path().join("source.txt")).unwrap(),
++                "before\n"
++            );
+         }
+     }
+ 
+     #[cfg(unix)]
+     #[tokio::test]
+-    async fn test_delete_symlink_returns_inexact_delta() {
++    async fn test_delete_symlink_is_rejected_without_removing_link() {
+         use std::os::unix::fs::symlink;
+ 
+         let dir = tempdir().unwrap();
+@@ -1702,7 +1656,7 @@ g
+ 
+         let mut stdout = Vec::new();
+         let mut stderr = Vec::new();
+-        let delta = apply_patch(
++        let failure = apply_patch(
+             &patch,
+             &PathUri::from_host_native_path(dir.path()).expect("absolute test path"),
+             &mut stdout,
+@@ -1711,8 +1665,9 @@ g
+             /*sandbox*/ None,
+         )
+         .await
+-        .unwrap();
++        .expect_err("Delete File must be rejected before reading the link target");
+ 
+-        assert!(!delta.is_exact());
++        assert_eq!(failure.delta(), &AppliedPatchDelta::default());
++        assert!(fs::symlink_metadata(dir.path().join("link.txt")).is_ok());
+     }
+ }
+diff --git a/codex-rs/apply-patch/src/parser.rs b/codex-rs/apply-patch/src/parser.rs
+index ec2d97c477..56721f4c90 100644
+--- a/codex-rs/apply-patch/src/parser.rs
++++ b/codex-rs/apply-patch/src/parser.rs
+@@ -8,14 +8,9 @@
+ //! environment_id: "*** Environment ID: " filename LF
+ //! end_patch: "*** End Patch" LF?
+ //!
+-//! hunk: add_hunk | delete_hunk | update_hunk
+-//! add_hunk: "*** Add File: " filename LF add_line+
+-//! delete_hunk: "*** Delete File: " filename LF
+-//! update_hunk: "*** Update File: " filename LF change_move? change?
++//! hunk: update_hunk
++//! update_hunk: "*** Update File: " filename LF change?
+ //! filename: /(.+)/
+-//! add_line: "+" /(.+)/ LF -> line
+-//!
+-//! change_move: "*** Move to: " filename LF
+ //! change: (change_context | change_line)+ eof_line?
+ //! change_context: ("@@" | "@@ " /(.+)/) LF
+ //! change_line: ("+" | "-" | " ") /(.+)/ LF
+@@ -44,6 +39,29 @@ pub(crate) const EOF_MARKER: &str = "*** End of File";
+ pub(crate) const CHANGE_CONTEXT_MARKER: &str = "@@ ";
+ pub(crate) const EMPTY_CHANGE_CONTEXT_MARKER: &str = "@@";
+ 
++pub(crate) fn reject_unsupported_operation(
++    line: &str,
++    line_number: usize,
++) -> Result<(), ParseError> {
++    let trimmed = line.trim();
++    let operation = [
++        (ADD_FILE_MARKER.trim_end(), "Add File"),
++        (DELETE_FILE_MARKER.trim_end(), "Delete File"),
++        (MOVE_TO_MARKER.trim_end(), "Move to"),
++    ]
++    .into_iter()
++    .find_map(|(marker, operation)| trimmed.starts_with(marker).then_some(operation));
++    if let Some(operation) = operation {
++        return Err(InvalidHunkError {
++            message: format!(
++                "{operation} is unsupported; apply_patch accepts only contextual Update File hunks"
++            ),
++            line_number,
++        });
++    }
++    Ok(())
++}
++
+ /// Currently, the only OpenAI model that knowingly requires lenient parsing is
+ /// gpt-4.1. While we could try to require everyone to pass in a strictness
+ /// param when invoking apply_patch, it is a pain to thread it through all of
+@@ -181,6 +199,9 @@ fn parse_patch_text(patch: &str, mode: ParseMode) -> Result<ApplyPatchArgs, Pars
+         ParseMode::Strict => check_patch_boundaries_strict(&lines)?,
+         ParseMode::Lenient => check_patch_boundaries_lenient(&lines)?,
+     };
++    for (line_number, line) in patch_lines.iter().enumerate() {
++        reject_unsupported_operation(line, line_number + 1)?;
++    }
+ 
+     let patch = patch_lines.join("\n");
+     let mut parser = StreamingPatchParser::default();
+@@ -283,13 +304,13 @@ fn test_parse_patch() {
+                 "*** End Patch"
+             ),
+             ParseMode::Strict
+-        )
+-        .unwrap()
+-        .hunks,
+-        vec![AddFile {
+-            path: PathBuf::from("foo"),
+-            contents: "hi\n".to_string()
+-        }]
++        ),
++        Err(InvalidHunkError {
++            message:
++                "Add File is unsupported; apply_patch accepts only contextual Update File hunks"
++                    .to_string(),
++            line_number: 2,
++        })
+     );
+     assert_eq!(
+         parse_patch_text(
+@@ -327,28 +348,13 @@ fn test_parse_patch() {
+              +    return 123\n\
+              *** End Patch",
+             ParseMode::Strict
+-        )
+-        .unwrap()
+-        .hunks,
+-        vec![
+-            AddFile {
+-                path: PathBuf::from("path/add.py"),
+-                contents: "abc\ndef\n".to_string()
+-            },
+-            DeleteFile {
+-                path: PathBuf::from("path/delete.py")
+-            },
+-            UpdateFile {
+-                path: PathBuf::from("path/update.py"),
+-                move_path: Some(PathBuf::from("path/update2.py")),
+-                chunks: vec![UpdateFileChunk {
+-                    change_context: Some("def f():".to_string()),
+-                    old_lines: vec!["    pass".to_string()],
+-                    new_lines: vec!["    return 123".to_string()],
+-                    is_end_of_file: false
+-                }]
+-            }
+-        ]
++        ),
++        Err(InvalidHunkError {
++            message:
++                "Add File is unsupported; apply_patch accepts only contextual Update File hunks"
++                    .to_string(),
++            line_number: 2,
++        })
+     );
+     // Update hunk followed by another hunk (Add File).
+     assert_eq!(
+@@ -361,25 +367,13 @@ fn test_parse_patch() {
+              +content\n\
+              *** End Patch",
+             ParseMode::Strict
+-        )
+-        .unwrap()
+-        .hunks,
+-        vec![
+-            UpdateFile {
+-                path: PathBuf::from("file.py"),
+-                move_path: None,
+-                chunks: vec![UpdateFileChunk {
+-                    change_context: None,
+-                    old_lines: vec![],
+-                    new_lines: vec!["line".to_string()],
+-                    is_end_of_file: false
+-                }],
+-            },
+-            AddFile {
+-                path: PathBuf::from("other.py"),
+-                contents: "content\n".to_string()
+-            }
+-        ]
++        ),
++        Err(InvalidHunkError {
++            message:
++                "Add File is unsupported; apply_patch accepts only contextual Update File hunks"
++                    .to_string(),
++            line_number: 5,
++        })
+     );
+ 
+     // Update hunk without an explicit @@ header for the first chunk should parse.
+@@ -408,6 +402,37 @@ fn test_parse_patch() {
+     );
+ }
+ 
++#[test]
++fn test_parse_patch_rejects_unsafe_operations_before_mixed_updates() {
++    for (patch, operation, line_number) in [
++        (
++            "*** Begin Patch\n  *** Add File: unsafe.txt  \n+unsafe\n*** End Patch",
++            "Add File",
++            2,
++        ),
++        (
++            "*** Begin Patch\n*** Update File: safe.txt\n@@\n-old\n+new\n*** Delete File: unsafe.txt\n*** End Patch",
++            "Delete File",
++            6,
++        ),
++        (
++            "*** Begin Patch\n*** Update File: safe.txt\n*** Move to: unsafe.txt\n@@\n-old\n+new\n*** End Patch",
++            "Move to",
++            3,
++        ),
++    ] {
++        assert_eq!(
++            parse_patch_text(patch, ParseMode::Strict),
++            Err(InvalidHunkError {
++                message: format!(
++                    "{operation} is unsupported; apply_patch accepts only contextual Update File hunks"
++                ),
++                line_number,
++            })
++        );
++    }
++}
++
+ #[test]
+ fn test_parse_patch_preserves_end_of_file_marker() {
+     let patch =
+@@ -433,21 +458,20 @@ fn test_parse_patch_preserves_end_of_file_marker() {
+ }
+ 
+ #[test]
+-fn test_parse_patch_accepts_relative_and_absolute_hunk_paths() {
++fn test_parse_patch_accepts_relative_and_absolute_update_paths() {
+     let dir = tempfile::tempdir().unwrap();
+-    let absolute_delete = dir.path().join("absolute-delete.py").abs();
+     let absolute_update = dir.path().join("absolute-update.py").abs();
+     let patch_text = format!(
+         r#"*** Begin Patch
+-*** Add File: relative-add.py
+-+content
+-*** Delete File: {}
++*** Update File: relative-update.py
++@@
++-old
+++new
+ *** Update File: {}
+ @@
+ -old
+ +new
+ *** End Patch"#,
+-        absolute_delete.display(),
+         absolute_update.display()
+     );
+ 
+@@ -456,12 +480,15 @@ fn test_parse_patch_accepts_relative_and_absolute_hunk_paths() {
+             .unwrap()
+             .hunks,
+         vec![
+-            AddFile {
+-                path: PathBuf::from("relative-add.py"),
+-                contents: "content\n".to_string()
+-            },
+-            DeleteFile {
+-                path: absolute_delete.to_path_buf()
++            UpdateFile {
++                path: PathBuf::from("relative-update.py"),
++                move_path: None,
++                chunks: vec![UpdateFileChunk {
++                    change_context: None,
++                    old_lines: vec!["old".to_string()],
++                    new_lines: vec!["new".to_string()],
++                    is_end_of_file: false
++                }]
+             },
+             UpdateFile {
+                 path: absolute_update.to_path_buf(),
+@@ -629,17 +656,24 @@ fn test_parse_patch_environment_id_preamble() {
+         parse_patch_text(
+             "*** Begin Patch\n\
+              *** Environment ID: remote\n\
+-             *** Add File: hello.txt\n\
++             *** Update File: hello.txt\n\
++             @@\n\
+              +hello\n\
+              *** End Patch",
+             ParseMode::Strict
+         ),
+         Ok(ApplyPatchArgs {
+-            hunks: vec![AddFile {
++            hunks: vec![UpdateFile {
+                 path: PathBuf::from("hello.txt"),
+-                contents: "hello\n".to_string(),
++                move_path: None,
++                chunks: vec![UpdateFileChunk {
++                    change_context: None,
++                    old_lines: Vec::new(),
++                    new_lines: vec!["hello".to_string()],
++                    is_end_of_file: false,
++                }],
+             }],
+-            patch: "*** Begin Patch\n*** Environment ID: remote\n*** Add File: hello.txt\n+hello\n*** End Patch".to_string(),
++            patch: "*** Begin Patch\n*** Environment ID: remote\n*** Update File: hello.txt\n@@\n+hello\n*** End Patch".to_string(),
+             workdir: None,
+             environment_id: Some("remote".to_string()),
+         })
+@@ -649,7 +683,8 @@ fn test_parse_patch_environment_id_preamble() {
+         parse_patch_text(
+             "*** Begin Patch\n\
+              *** Environment ID:   \n\
+-             *** Add File: hello.txt\n\
++             *** Update File: hello.txt\n\
++             @@\n\
+              +hello\n\
+              *** End Patch",
+             ParseMode::Strict
+diff --git a/codex-rs/apply-patch/src/streaming_parser.rs b/codex-rs/apply-patch/src/streaming_parser.rs
+index 7b447fce3c..f18dbc814e 100644
+--- a/codex-rs/apply-patch/src/streaming_parser.rs
++++ b/codex-rs/apply-patch/src/streaming_parser.rs
+@@ -12,6 +12,7 @@ use crate::parser::MOVE_TO_MARKER;
+ use crate::parser::ParseError;
+ use crate::parser::UPDATE_FILE_MARKER;
+ use crate::parser::UpdateFileChunk;
++use crate::parser::reject_unsupported_operation;
+ 
+ use Hunk::*;
+ use ParseError::*;
+@@ -174,6 +175,7 @@ impl StreamingPatchParser {
+ 
+     fn process_line(&mut self, line: &str) -> Result<(), ParseError> {
+         let trimmed = line.trim();
++        reject_unsupported_operation(trimmed, self.line_number)?;
+         match self.state.mode {
+             StreamingParserMode::NotStarted => {
+                 if trimmed == BEGIN_PATCH_MARKER {
+@@ -190,7 +192,7 @@ impl StreamingPatchParser {
+                 }
+                 Err(InvalidHunkError {
+                     message: format!(
+-                        "'{trimmed}' is not a valid hunk header. Valid hunk headers: '*** Add File: {{path}}', '*** Delete File: {{path}}', '*** Update File: {{path}}'"
++                        "'{trimmed}' is not a valid hunk header. Valid hunk header: '*** Update File: {{path}}'"
+                     ),
+                     line_number: self.line_number,
+                 })
+@@ -208,7 +210,7 @@ impl StreamingPatchParser {
+                 }
+                 Err(InvalidHunkError {
+                     message: format!(
+-                        "'{trimmed}' is not a valid hunk header. Valid hunk headers: '*** Add File: {{path}}', '*** Delete File: {{path}}', '*** Update File: {{path}}'"
++                        "'{trimmed}' is not valid in apply_patch; only contextual Update File hunks are supported"
+                     ),
+                     line_number: self.line_number,
+                 })
+@@ -219,7 +221,7 @@ impl StreamingPatchParser {
+                 }
+                 Err(InvalidHunkError {
+                     message: format!(
+-                        "'{trimmed}' is not a valid hunk header. Valid hunk headers: '*** Add File: {{path}}', '*** Delete File: {{path}}', '*** Update File: {{path}}'"
++                        "'{trimmed}' is not valid in apply_patch; only contextual Update File hunks are supported"
+                     ),
+                     line_number: self.line_number,
+                 })
+@@ -416,66 +418,69 @@ mod tests {
+     use super::*;
+ 
+     #[test]
+-    fn test_streaming_patch_parser_streams_complete_lines_before_end_patch() {
++    fn test_streaming_patch_parser_streams_updates_and_rejects_unsafe_operations() {
+         let mut parser = StreamingPatchParser::default();
+         assert_eq!(
+-            parser.push_delta("*** Begin Patch\n*** Add File: src/hello.txt\n+hello\n+wor"),
+-            Ok(vec![AddFile {
++            parser.push_delta("*** Begin Patch\n*** Update File: src/hello.txt\n@@\n-old\n+wor"),
++            Ok(vec![UpdateFile {
+                 path: PathBuf::from("src/hello.txt"),
+-                contents: "hello\n".to_string(),
++                move_path: None,
++                chunks: vec![UpdateFileChunk {
++                    change_context: None,
++                    old_lines: vec!["old".to_string()],
++                    new_lines: Vec::new(),
++                    is_end_of_file: false,
++                }],
+             }])
+         );
+         assert_eq!(
+             parser.push_delta("ld\n"),
+-            Ok(vec![AddFile {
+-                path: PathBuf::from("src/hello.txt"),
+-                contents: "hello\nworld\n".to_string(),
+-            }])
+-        );
+-
+-        let mut parser = StreamingPatchParser::default();
+-        assert_eq!(
+-            parser.push_delta(
+-                "*** Begin Patch\n*** Update File: src/old.rs\n*** Move to: src/new.rs\n@@\n-old\n+new\n",
+-            ),
+             Ok(vec![UpdateFile {
+-                path: PathBuf::from("src/old.rs"),
+-                move_path: Some(PathBuf::from("src/new.rs")),
++                path: PathBuf::from("src/hello.txt"),
++                move_path: None,
+                 chunks: vec![UpdateFileChunk {
+                     change_context: None,
+                     old_lines: vec!["old".to_string()],
+-                    new_lines: vec!["new".to_string()],
++                    new_lines: vec!["world".to_string()],
+                     is_end_of_file: false,
+                 }],
+             }])
+         );
+ 
++        for (marker, operation) in [
++            ("*** Add File: unsafe.txt", "Add File"),
++            ("*** Delete File: unsafe.txt", "Delete File"),
++            ("*** Move to: unsafe.txt", "Move to"),
++        ] {
++            let mut parser = StreamingPatchParser::default();
++            let patch = format!("*** Begin Patch\n{marker}\n");
++            assert_eq!(
++                parser.push_delta(&patch),
++                Err(InvalidHunkError {
++                    message: format!(
++                        "{operation} is unsupported; apply_patch accepts only contextual Update File hunks"
++                    ),
++                    line_number: 2,
++                })
++            );
++        }
++    }
++
++    #[test]
++    fn test_streaming_patch_parser_rejects_marker_split_across_deltas() {
+         let mut parser = StreamingPatchParser::default();
+         assert_eq!(
+-            parser.push_delta("*** Begin Patch\n*** Delete File: gone.txt"),
++            parser.push_delta("*** Begin Patch\n*** Add Fi"),
+             Ok(Vec::new())
+         );
+         assert_eq!(
+-            parser.push_delta("\n"),
+-            Ok(vec![DeleteFile {
+-                path: PathBuf::from("gone.txt"),
+-            }])
+-        );
+-
+-        let mut parser = StreamingPatchParser::default();
+-        assert_eq!(
+-            parser.push_delta(
+-                "*** Begin Patch\n*** Add File: src/one.txt\n+one\n*** Delete File: src/two.txt\n",
+-            ),
+-            Ok(vec![
+-                AddFile {
+-                    path: PathBuf::from("src/one.txt"),
+-                    contents: "one\n".to_string(),
+-                },
+-                DeleteFile {
+-                    path: PathBuf::from("src/two.txt"),
+-                },
+-            ])
++            parser.push_delta("le: unsafe.txt\n"),
++            Err(InvalidHunkError {
++                message:
++                    "Add File is unsupported; apply_patch accepts only contextual Update File hunks"
++                        .to_string(),
++                line_number: 2,
++            })
+         );
+     }
+ 
+@@ -484,7 +489,8 @@ mod tests {
+         let patch = "\
+ *** Begin Patch
+ *** Environment ID: remote
+-*** Add File: src/hello.txt
++*** Update File: src/hello.txt
++@@
+ +hello
+ *** End Patch
+ ";
+@@ -492,9 +498,15 @@ mod tests {
+         let mut parser = StreamingPatchParser::default();
+         assert_eq!(
+             parser.push_delta(patch),
+-            Ok(vec![AddFile {
++            Ok(vec![UpdateFile {
+                 path: PathBuf::from("src/hello.txt"),
+-                contents: "hello\n".to_string(),
++                move_path: None,
++                chunks: vec![UpdateFileChunk {
++                    change_context: None,
++                    old_lines: Vec::new(),
++                    new_lines: vec!["hello".to_string()],
++                    is_end_of_file: false,
++                }],
+             }])
+         );
+         assert_eq!(parser.environment_id(), Some("remote"));
+@@ -522,13 +534,6 @@ mod tests {
+     fn test_streaming_patch_parser_large_patch_split_by_character() {
+         let patch = "\
+ *** Begin Patch
+-*** Add File: docs/release-notes.md
+-+# Release notes
+-+
+-+## CLI
+-+- Surface apply_patch progress while arguments stream.
+-+- Keep final patch application gated on the completed tool call.
+-+- Include file summaries in the progress event payload.
+ *** Update File: src/config.rs
+ @@ impl Config
+ -    pub apply_patch_progress: bool,
+@@ -537,28 +542,17 @@ mod tests {
+ @@ fn default_progress_interval()
+ -    Duration::from_millis(500)
+ +    Duration::from_millis(250)
+-*** Delete File: src/legacy_patch_progress.rs
+ *** Update File: crates/cli/src/main.rs
+-*** Move to: crates/cli/src/bin/codex.rs
+ @@ fn run()
+ -    let args = Args::parse();
+ -    dispatch(args)
+ +    let cli = Cli::parse();
+ +    dispatch(cli)
+-*** Add File: tests/fixtures/apply_patch_progress.json
+-+{
+-+  \"type\": \"apply_patch_progress\",
+-+  \"hunks\": [
+-+    { \"operation\": \"add\", \"path\": \"docs/release-notes.md\" },
+-+    { \"operation\": \"update\", \"path\": \"src/config.rs\" }
+-+  ]
+-+}
+ *** Update File: README.md
+ @@ Development workflow
+  Build the Rust workspace before opening a pull request.
+ +When touching streamed tool calls, include parser coverage for partial input.
+ +Prefer tests that exercise the exact event payload shape.
+-*** Delete File: docs/old-apply-patch-progress.md
+ *** End Patch";
+ 
+         let mut parser = StreamingPatchParser::default();
+@@ -581,31 +575,17 @@ mod tests {
+             }
+         }
+ 
+-        assert_eq!(saw_hunk_counts, vec![1, 2, 3, 4, 5, 6, 7]);
+-        assert_eq!(hunks.len(), 7);
++        assert_eq!(saw_hunk_counts, vec![1, 2, 3]);
++        assert_eq!(hunks.len(), 3);
+         assert_eq!(
+             hunks
+                 .iter()
+                 .map(|hunk| match hunk {
+-                    AddFile { .. } => "add",
+-                    DeleteFile { .. } => "delete",
+-                    UpdateFile {
+-                        move_path: Some(_), ..
+-                    } => "move-update",
+-                    UpdateFile {
+-                        move_path: None, ..
+-                    } => "update",
++                    UpdateFile { .. } => "update",
++                    AddFile { .. } | DeleteFile { .. } => "unsupported",
+                 })
+                 .collect::<Vec<_>>(),
+-            vec![
+-                "add",
+-                "update",
+-                "delete",
+-                "move-update",
+-                "add",
+-                "update",
+-                "delete"
+-            ]
++            vec!["update", "update", "update"]
+         );
+     }
+ 
+@@ -743,17 +723,31 @@ mod tests {
+     fn test_streaming_patch_parser_finish_processes_final_line_without_newline() {
+         let mut parser = StreamingPatchParser::default();
+         assert_eq!(
+-            parser.push_delta("*** Begin Patch\n*** Add File: file.txt\n+hello\n*** End Patch"),
+-            Ok(vec![AddFile {
++            parser.push_delta(
++                "*** Begin Patch\n*** Update File: file.txt\n@@\n+hello\n*** End Patch",
++            ),
++            Ok(vec![UpdateFile {
+                 path: PathBuf::from("file.txt"),
+-                contents: "hello\n".to_string(),
++                move_path: None,
++                chunks: vec![UpdateFileChunk {
++                    change_context: None,
++                    old_lines: Vec::new(),
++                    new_lines: vec!["hello".to_string()],
++                    is_end_of_file: false,
++                }],
+             }])
+         );
+         assert_eq!(
+             parser.finish(),
+-            Ok(vec![AddFile {
++            Ok(vec![UpdateFile {
+                 path: PathBuf::from("file.txt"),
+-                contents: "hello\n".to_string(),
++                move_path: None,
++                chunks: vec![UpdateFileChunk {
++                    change_context: None,
++                    old_lines: Vec::new(),
++                    new_lines: vec!["hello".to_string()],
++                    is_end_of_file: false,
++                }],
+             }])
+         );
+ 
+@@ -792,10 +786,16 @@ mod tests {
+     fn test_streaming_patch_parser_finish_requires_end_patch() {
+         let mut parser = StreamingPatchParser::default();
+         assert_eq!(
+-            parser.push_delta("*** Begin Patch\n*** Add File: file.txt\n+hello\n"),
+-            Ok(vec![AddFile {
++            parser.push_delta("*** Begin Patch\n*** Update File: file.txt\n@@\n+hello\n"),
++            Ok(vec![UpdateFile {
+                 path: PathBuf::from("file.txt"),
+-                contents: "hello\n".to_string(),
++                move_path: None,
++                chunks: vec![UpdateFileChunk {
++                    change_context: None,
++                    old_lines: Vec::new(),
++                    new_lines: vec!["hello".to_string()],
++                    is_end_of_file: false,
++                }],
+             }])
+         );
+         assert_eq!(
+@@ -811,7 +811,7 @@ mod tests {
+         let mut parser = StreamingPatchParser::default();
+         assert_eq!(
+             parser.push_delta(
+-                "*** Begin Patch\n*** Add File: file.txt\n+hello\n*** End Patch\nextra\n",
++                "*** Begin Patch\n*** Update File: file.txt\n@@\n+hello\n*** End Patch\nextra\n",
+             ),
+             Err(InvalidPatchError(
+                 "The last line of the patch must be '*** End Patch'".to_string(),
+@@ -821,11 +821,17 @@ mod tests {
+         let mut parser = StreamingPatchParser::default();
+         assert_eq!(
+             parser.push_delta(
+-                "*** Begin Patch\n*** Add File: file.txt\n+hello\n*** End Patch\n \t\n",
++                "*** Begin Patch\n*** Update File: file.txt\n@@\n+hello\n*** End Patch\n \t\n",
+             ),
+-            Ok(vec![AddFile {
++            Ok(vec![UpdateFile {
+                 path: PathBuf::from("file.txt"),
+-                contents: "hello\n".to_string(),
++                move_path: None,
++                chunks: vec![UpdateFileChunk {
++                    change_context: None,
++                    old_lines: Vec::new(),
++                    new_lines: vec!["hello".to_string()],
++                    is_end_of_file: false,
++                }],
+             }])
+         );
+     }
+@@ -845,29 +851,31 @@ mod tests {
+         assert_eq!(
+             parser.push_delta("bad\n"),
+             Err(InvalidHunkError {
+-                message: "'bad' is not a valid hunk header. Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Update File: {path}'"
+-                    .to_string(),
++                message:
++                    "'bad' is not a valid hunk header. Valid hunk header: '*** Update File: {path}'"
++                        .to_string(),
+                 line_number: 2,
+             })
+         );
+ 
+         let mut parser = StreamingPatchParser::default();
+         assert_eq!(
+-            parser.push_delta("*** Begin Patch\n*** Add File: file.txt\nbad\n"),
++            parser.push_delta("*** Begin Patch\n*** Add File: file.txt\n"),
+             Err(InvalidHunkError {
+-                message: "'bad' is not a valid hunk header. Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Update File: {path}'"
+-                    .to_string(),
+-                line_number: 3,
++                message:
++                    "Add File is unsupported; apply_patch accepts only contextual Update File hunks"
++                        .to_string(),
++                line_number: 2,
+             })
+         );
+ 
+         let mut parser = StreamingPatchParser::default();
+         assert_eq!(
+-            parser.push_delta("*** Begin Patch\n*** Delete File: file.txt\nbad\n"),
++            parser.push_delta("*** Begin Patch\n*** Delete File: file.txt\n"),
+             Err(InvalidHunkError {
+-                message: "'bad' is not a valid hunk header. Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Update File: {path}'"
++                message: "Delete File is unsupported; apply_patch accepts only contextual Update File hunks"
+                     .to_string(),
+-                line_number: 3,
++                line_number: 2,
+             })
+         );
+ 
+@@ -886,8 +894,9 @@ mod tests {
+                 "*** Begin Patch\n*** Update File: old.txt\n*** Move to: new.txt\n*** Delete File: other.txt\n",
+             ),
+             Err(InvalidHunkError {
+-                message: "Update file hunk for path 'old.txt' is empty".to_string(),
+-                line_number: 2,
++                message: "Move to is unsupported; apply_patch accepts only contextual Update File hunks"
++                    .to_string(),
++                line_number: 3,
+             })
+         );
+ 
+diff --git a/codex-rs/apply-patch/tests/suite/cli.rs b/codex-rs/apply-patch/tests/suite/cli.rs
+index c982c7aa86..a90442734c 100644
+--- a/codex-rs/apply-patch/tests/suite/cli.rs
++++ b/codex-rs/apply-patch/tests/suite/cli.rs
+@@ -14,10 +14,12 @@ fn test_apply_patch_cli_add_and_update() -> anyhow::Result<()> {
+     let file = "cli_test.txt";
+     let absolute_path = tmp.path().join(file);
+ 
+-    // 1) Add a file
++    // 1) Populate a confirmed empty file.
++    fs::write(&absolute_path, "")?;
+     let add_patch = format!(
+         r#"*** Begin Patch
+-*** Add File: {file}
++*** Update File: {file}
++@@
+ +hello
+ *** End Patch"#
+     );
+@@ -26,7 +28,7 @@ fn test_apply_patch_cli_add_and_update() -> anyhow::Result<()> {
+         .current_dir(tmp.path())
+         .assert()
+         .success()
+-        .stdout(format!("Success. Updated the following files:\nA {file}\n"));
++        .stdout(format!("Success. Updated the following files:\nM {file}\n"));
+     assert_eq!(fs::read_to_string(&absolute_path)?, "hello\n");
+ 
+     // 2) Update the file
+@@ -55,10 +57,12 @@ fn test_apply_patch_cli_stdin_add_and_update() -> anyhow::Result<()> {
+     let file = "cli_test_stdin.txt";
+     let absolute_path = tmp.path().join(file);
+ 
+-    // 1) Add a file via stdin
++    // 1) Populate a confirmed empty file via stdin.
++    fs::write(&absolute_path, "")?;
+     let add_patch = format!(
+         r#"*** Begin Patch
+-*** Add File: {file}
++*** Update File: {file}
++@@
+ +hello
+ *** End Patch"#
+     );
+@@ -67,7 +71,7 @@ fn test_apply_patch_cli_stdin_add_and_update() -> anyhow::Result<()> {
+         .write_stdin(add_patch)
+         .assert()
+         .success()
+-        .stdout(format!("Success. Updated the following files:\nA {file}\n"));
++        .stdout(format!("Success. Updated the following files:\nM {file}\n"));
+     assert_eq!(fs::read_to_string(&absolute_path)?, "hello\n");
+ 
+     // 2) Update the file via stdin
+diff --git a/codex-rs/apply-patch/tests/suite/scenarios.rs b/codex-rs/apply-patch/tests/suite/scenarios.rs
+index 3beb7d652d..26ed2b853e 100644
+--- a/codex-rs/apply-patch/tests/suite/scenarios.rs
++++ b/codex-rs/apply-patch/tests/suite/scenarios.rs
+@@ -42,13 +42,22 @@ fn run_apply_patch_scenario(dir: &Path) -> anyhow::Result<()> {
+     // Run apply_patch in the temporary directory. We intentionally do not assert
+     // on the exit status here; the scenarios are specified purely in terms of
+     // final filesystem state, which we compare below.
+-    Command::new(codex_utils_cargo_bin::cargo_bin("apply_patch")?)
++    let output = Command::new(codex_utils_cargo_bin::cargo_bin("apply_patch")?)
+         .arg(patch)
+         .current_dir(tmp.path())
+         .output()?;
+ 
+     // Assert that the final state matches the expected state exactly
+-    let expected_dir = dir.join("expected");
++    let patch = fs::read_to_string(dir.join("patch.txt"))?;
++    let unsupported_operation = ["*** Add File:", "*** Delete File:", "*** Move to:"]
++        .into_iter()
++        .any(|marker| patch.lines().any(|line| line.trim().starts_with(marker)));
++    let expected_dir = if unsupported_operation {
++        assert!(!output.status.success());
++        dir.join("input")
++    } else {
++        dir.join("expected")
++    };
+     let expected_snapshot = snapshot_dir(&expected_dir)?;
+     let actual_snapshot = snapshot_dir(tmp.path())?;
+ 
+diff --git a/codex-rs/apply-patch/tests/suite/tool.rs b/codex-rs/apply-patch/tests/suite/tool.rs
+index 8499d0fb90..ed961883b2 100644
+--- a/codex-rs/apply-patch/tests/suite/tool.rs
++++ b/codex-rs/apply-patch/tests/suite/tool.rs
+@@ -22,7 +22,7 @@ fn resolved_under(root: &Path, path: &str) -> anyhow::Result<PathBuf> {
+ }
+ 
+ #[test]
+-fn test_apply_patch_cli_applies_multiple_operations() -> anyhow::Result<()> {
++fn test_apply_patch_cli_rejects_mixed_unsafe_operations_before_updates() -> anyhow::Result<()> {
+     let tmp = tempdir()?;
+     let add_path = tmp.path().join("nested/new.txt");
+     let modify_path = tmp.path().join("modify.txt");
+@@ -33,13 +33,13 @@ fn test_apply_patch_cli_applies_multiple_operations() -> anyhow::Result<()> {
+ 
+     let patch = "*** Begin Patch\n*** Add File: nested/new.txt\n+created\n*** Delete File: delete.txt\n*** Update File: modify.txt\n@@\n-line2\n+changed\n*** End Patch";
+ 
+-    run_apply_patch_in_dir(tmp.path(), patch)?.success().stdout(
+-        "Success. Updated the following files:\nA nested/new.txt\nM modify.txt\nD delete.txt\n",
+-    );
++    run_apply_patch_in_dir(tmp.path(), patch)?
++        .failure()
++        .stderr("Invalid patch hunk on line 2: Add File is unsupported; apply_patch accepts only contextual Update File hunks\n");
+ 
+-    assert_eq!(fs::read_to_string(add_path)?, "created\n");
+-    assert_eq!(fs::read_to_string(&modify_path)?, "line1\nchanged\n");
+-    assert!(!delete_path.exists());
++    assert!(!add_path.exists());
++    assert_eq!(fs::read_to_string(&modify_path)?, "line1\nline2\n");
++    assert_eq!(fs::read_to_string(&delete_path)?, "obsolete\n");
+ 
+     Ok(())
+ }
+@@ -65,7 +65,7 @@ fn test_apply_patch_cli_applies_multiple_chunks() -> anyhow::Result<()> {
+ }
+ 
+ #[test]
+-fn test_apply_patch_cli_moves_file_to_new_directory() -> anyhow::Result<()> {
++fn test_apply_patch_cli_rejects_move_to_new_directory() -> anyhow::Result<()> {
+     let tmp = tempdir()?;
+     let original_path = tmp.path().join("old/name.txt");
+     let new_path = tmp.path().join("renamed/dir/name.txt");
+@@ -75,11 +75,11 @@ fn test_apply_patch_cli_moves_file_to_new_directory() -> anyhow::Result<()> {
+     let patch = "*** Begin Patch\n*** Update File: old/name.txt\n*** Move to: renamed/dir/name.txt\n@@\n-old content\n+new content\n*** End Patch";
+ 
+     run_apply_patch_in_dir(tmp.path(), patch)?
+-        .success()
+-        .stdout("Success. Updated the following files:\nM renamed/dir/name.txt\n");
++        .failure()
++        .stderr("Invalid patch hunk on line 3: Move to is unsupported; apply_patch accepts only contextual Update File hunks\n");
+ 
+-    assert!(!original_path.exists());
+-    assert_eq!(fs::read_to_string(&new_path)?, "new content\n");
++    assert_eq!(fs::read_to_string(&original_path)?, "old content\n");
++    assert!(!new_path.exists());
+ 
+     Ok(())
+ }
+@@ -118,18 +118,14 @@ fn test_apply_patch_cli_reports_missing_context() -> anyhow::Result<()> {
+ }
+ 
+ #[test]
+-fn test_apply_patch_cli_rejects_missing_file_delete() -> anyhow::Result<()> {
++fn test_apply_patch_cli_rejects_delete_before_path_lookup() -> anyhow::Result<()> {
+     let tmp = tempdir()?;
+-    let missing_path = resolved_under(tmp.path(), "missing.txt")?;
+ 
+     apply_patch_command(tmp.path())?
+         .arg("*** Begin Patch\n*** Delete File: missing.txt\n*** End Patch")
+         .assert()
+         .failure()
+-        .stderr(format!(
+-            "Failed to delete file {}\n",
+-            missing_path.display()
+-        ));
++        .stderr("Invalid patch hunk on line 2: Delete File is unsupported; apply_patch accepts only contextual Update File hunks\n");
+ 
+     Ok(())
+ }
+@@ -178,17 +174,17 @@ fn test_apply_patch_cli_move_overwrites_existing_destination() -> anyhow::Result
+         tmp.path(),
+         "*** Begin Patch\n*** Update File: old/name.txt\n*** Move to: renamed/dir/name.txt\n@@\n-from\n+new\n*** End Patch",
+     )?
+-    .success()
+-    .stdout("Success. Updated the following files:\nM renamed/dir/name.txt\n");
++    .failure()
++    .stderr("Invalid patch hunk on line 3: Move to is unsupported; apply_patch accepts only contextual Update File hunks\n");
+ 
+-    assert!(!original_path.exists());
+-    assert_eq!(fs::read_to_string(&destination)?, "new\n");
++    assert_eq!(fs::read_to_string(&original_path)?, "from\n");
++    assert_eq!(fs::read_to_string(&destination)?, "existing\n");
+ 
+     Ok(())
+ }
+ 
+ #[test]
+-fn test_apply_patch_cli_add_overwrites_existing_file() -> anyhow::Result<()> {
++fn test_apply_patch_cli_add_cannot_overwrite_existing_file() -> anyhow::Result<()> {
+     let tmp = tempdir()?;
+     let path = tmp.path().join("duplicate.txt");
+     fs::write(&path, "old content\n")?;
+@@ -197,10 +193,10 @@ fn test_apply_patch_cli_add_overwrites_existing_file() -> anyhow::Result<()> {
+         tmp.path(),
+         "*** Begin Patch\n*** Add File: duplicate.txt\n+new content\n*** End Patch",
+     )?
+-    .success()
+-    .stdout("Success. Updated the following files:\nA duplicate.txt\n");
++    .failure()
++    .stderr("Invalid patch hunk on line 2: Add File is unsupported; apply_patch accepts only contextual Update File hunks\n");
+ 
+-    assert_eq!(fs::read_to_string(&path)?, "new content\n");
++    assert_eq!(fs::read_to_string(&path)?, "old content\n");
+ 
+     Ok(())
+ }
+@@ -209,17 +205,14 @@ fn test_apply_patch_cli_add_overwrites_existing_file() -> anyhow::Result<()> {
+ fn test_apply_patch_cli_delete_directory_fails() -> anyhow::Result<()> {
+     let tmp = tempdir()?;
+     let dir = tmp.path().join("dir");
+-    let expected_dir = resolved_under(tmp.path(), "dir")?;
+     fs::create_dir(&dir)?;
+ 
+     apply_patch_command(tmp.path())?
+         .arg("*** Begin Patch\n*** Delete File: dir\n*** End Patch")
+         .assert()
+         .failure()
+-        .stderr(format!(
+-            "Failed to delete file {}\n",
+-            expected_dir.display()
+-        ));
++        .stderr("Invalid patch hunk on line 2: Delete File is unsupported; apply_patch accepts only contextual Update File hunks\n");
++    assert!(dir.is_dir());
+ 
+     Ok(())
+ }
+@@ -232,7 +225,7 @@ fn test_apply_patch_cli_rejects_invalid_hunk_header() -> anyhow::Result<()> {
+         .arg("*** Begin Patch\n*** Frobnicate File: foo\n*** End Patch")
+         .assert()
+         .failure()
+-        .stderr("Invalid patch hunk on line 2: '*** Frobnicate File: foo' is not a valid hunk header. Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Update File: {path}'\n");
++        .stderr("Invalid patch hunk on line 2: '*** Frobnicate File: foo' is not a valid hunk header. Valid hunk header: '*** Update File: {path}'\n");
+ 
+     Ok(())
+ }
+@@ -258,22 +251,18 @@ fn test_apply_patch_cli_updates_file_appends_trailing_newline() -> anyhow::Resul
+ }
+ 
+ #[test]
+-fn test_apply_patch_cli_failure_after_partial_success_leaves_changes() -> anyhow::Result<()> {
++fn test_apply_patch_cli_rejects_unsafe_mixed_patch_without_partial_success() -> anyhow::Result<()> {
+     let tmp = tempdir()?;
+     let new_file = tmp.path().join("created.txt");
+-    let missing_file = resolved_under(tmp.path(), "missing.txt")?;
+ 
+     apply_patch_command(tmp.path())?
+         .arg("*** Begin Patch\n*** Add File: created.txt\n+hello\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch")
+         .assert()
+         .failure()
+         .stdout("")
+-        .stderr(format!(
+-            "Failed to read file to update {}: No such file or directory (os error 2)\n",
+-            missing_file.display()
+-        ));
++        .stderr("Invalid patch hunk on line 2: Add File is unsupported; apply_patch accepts only contextual Update File hunks\n");
+ 
+-    assert_eq!(fs::read_to_string(&new_file)?, "hello\n");
++    assert!(!new_file.exists());
+ 
+     Ok(())
+ }
+diff --git a/codex-rs/core/src/tools/handlers/apply_patch.lark b/codex-rs/core/src/tools/handlers/apply_patch.lark
+index 5aa41b0af7..bbcf5e6a65 100644
+--- a/codex-rs/core/src/tools/handlers/apply_patch.lark
++++ b/codex-rs/core/src/tools/handlers/apply_patch.lark
+@@ -2,15 +2,11 @@ start: begin_patch hunk+ end_patch
+ begin_patch: "*** Begin Patch" LF
+ end_patch: "*** End Patch" LF?
+ 
+-hunk: add_hunk | delete_hunk | update_hunk
+-add_hunk: "*** Add File: " filename LF add_line+
+-delete_hunk: "*** Delete File: " filename LF
+-update_hunk: "*** Update File: " filename LF change_move? change?
++hunk: update_hunk
++update_hunk: "*** Update File: " filename LF change?
+ 
+ filename: /(.+)/
+-add_line: "+" /(.*)/ LF -> line
+ 
+-change_move: "*** Move to: " filename LF
+ change: (change_context | change_line)+ eof_line?
+ change_context: ("@@" | "@@ " /(.+)/) LF
+ change_line: ("+" | "-" | " ") /(.*)/ LF
+diff --git a/codex-rs/core/src/tools/handlers/apply_patch_spec.rs b/codex-rs/core/src/tools/handlers/apply_patch_spec.rs
+index 8227605027..737c80b6df 100644
+--- a/codex-rs/core/src/tools/handlers/apply_patch_spec.rs
++++ b/codex-rs/core/src/tools/handlers/apply_patch_spec.rs
+@@ -17,7 +17,7 @@ pub fn create_apply_patch_freeform_tool(include_environment_id: bool) -> ToolSpe
+     };
+     ToolSpec::Freeform(FreeformTool {
+         name: "apply_patch".to_string(),
+-        description: "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.".to_string(),
++        description: "The `apply_patch` tool edits existing files with contextual `*** Update File` hunks. Create a confirmed-missing file as an empty file before populating it with an Update File hunk. This is a FREEFORM tool, so do not wrap the patch in JSON.".to_string(),
+         format: FreeformToolFormat {
+             r#type: "grammar".to_string(),
+             syntax: "lark".to_string(),
+diff --git a/codex-rs/core/src/tools/handlers/apply_patch_spec_tests.rs b/codex-rs/core/src/tools/handlers/apply_patch_spec_tests.rs
+index d6fe521c2f..096611dc16 100644
+--- a/codex-rs/core/src/tools/handlers/apply_patch_spec_tests.rs
++++ b/codex-rs/core/src/tools/handlers/apply_patch_spec_tests.rs
+@@ -8,7 +8,7 @@ fn create_apply_patch_freeform_tool_matches_expected_spec() {
+         ToolSpec::Freeform(FreeformTool {
+             name: "apply_patch".to_string(),
+             description:
+-                "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON."
++                "The `apply_patch` tool edits existing files with contextual `*** Update File` hunks. Create a confirmed-missing file as an empty file before populating it with an Update File hunk. This is a FREEFORM tool, so do not wrap the patch in JSON."
+                     .to_string(),
+             format: FreeformToolFormat {
+                 r#type: "grammar".to_string(),
+@@ -33,4 +33,7 @@ fn create_apply_patch_freeform_tool_includes_environment_id_when_requested() {
+             .definition
+             .contains("\"*** Environment ID: \" filename LF")
+     );
++    assert!(!tool.format.definition.contains("*** Add File:"));
++    assert!(!tool.format.definition.contains("*** Delete File:"));
++    assert!(!tool.format.definition.contains("*** Move to:"));
+ }
+diff --git a/codex-rs/core/src/tools/handlers/apply_patch_tests.rs b/codex-rs/core/src/tools/handlers/apply_patch_tests.rs
+index 71dc323c60..b079703012 100644
+--- a/codex-rs/core/src/tools/handlers/apply_patch_tests.rs
++++ b/codex-rs/core/src/tools/handlers/apply_patch_tests.rs
+@@ -7,7 +7,6 @@ use core_test_support::PathBufExt;
+ use core_test_support::PathExt;
+ use pretty_assertions::assert_eq;
+ use serde_json::json;
+-use std::collections::HashMap;
+ use std::path::PathBuf;
+ use std::sync::Arc;
+ use tempfile::TempDir;
+@@ -23,7 +22,9 @@ use crate::turn_diff_tracker::TurnDiffTracker;
+ 
+ fn sample_patch() -> &'static str {
+     r#"*** Begin Patch
+-*** Add File: hello.txt
++*** Update File: hello.txt
++@@
++-old
+ +hello
+ *** End Patch"#
+ }
+@@ -93,20 +94,19 @@ fn diff_consumer_streams_apply_patch_changes() {
+     );
+ 
+     let event = consumer
+-        .push_delta("call-1".to_string(), "*** Add File: hello.txt\n+hello")
+-        .expect("progress event");
+-    assert_eq!(
+-        (event.call_id, event.changes),
+-        (
++        .push_delta(
+             "call-1".to_string(),
+-            HashMap::from([(
+-                PathBuf::from("hello.txt"),
+-                FileChange::Add {
+-                    content: String::new(),
+-                },
+-            )]),
++            "*** Update File: hello.txt\n@@\n-old\n+hello",
+         )
+-    );
++        .expect("progress event");
++    assert_eq!(event.call_id, "call-1");
++    assert!(matches!(
++        event.changes.get(&PathBuf::from("hello.txt")),
++        Some(FileChange::Update {
++            move_path: None,
++            ..
++        })
++    ));
+ 
+     assert!(
+         consumer
+@@ -123,18 +123,14 @@ fn diff_consumer_streams_apply_patch_changes() {
+         .finish_update_on_complete()
+         .expect("finish parser")
+         .expect("progress event");
+-    assert_eq!(
+-        (event.call_id, event.changes),
+-        (
+-            "call-1".to_string(),
+-            HashMap::from([(
+-                PathBuf::from("hello.txt"),
+-                FileChange::Add {
+-                    content: "hello\nworld\n".to_string(),
+-                },
+-            )]),
+-        )
+-    );
++    assert_eq!(event.call_id, "call-1");
++    assert!(matches!(
++        event.changes.get(&PathBuf::from("hello.txt")),
++        Some(FileChange::Update {
++            move_path: None,
++            ..
++        })
++    ));
+ }
+ 
+ #[test]
+@@ -150,17 +146,18 @@ fn diff_consumer_streams_apply_patch_changes_with_environment_header() {
+     );
+ 
+     let event = consumer
+-        .push_delta("call-1".to_string(), "*** Add File: hello.txt\n+hello")
++        .push_delta(
++            "call-1".to_string(),
++            "*** Update File: hello.txt\n@@\n-old\n+hello",
++        )
+         .expect("progress event");
+-    assert_eq!(
+-        event.changes,
+-        HashMap::from([(
+-            PathBuf::from("hello.txt"),
+-            FileChange::Add {
+-                content: String::new(),
+-            },
+-        )])
+-    );
++    assert!(matches!(
++        event.changes.get(&PathBuf::from("hello.txt")),
++        Some(FileChange::Update {
++            move_path: None,
++            ..
++        })
++    ));
+ }
+ 
+ #[test]
+@@ -168,32 +165,31 @@ fn diff_consumer_sends_next_update_after_buffer_interval() {
+     let mut consumer = ApplyPatchArgumentDiffConsumer::default();
+     consumer.push_delta("call-1".to_string(), "*** Begin Patch\n");
+     let first = consumer
+-        .push_delta("call-1".to_string(), "*** Add File: hello.txt\n+hello")
++        .push_delta(
++            "call-1".to_string(),
++            "*** Update File: hello.txt\n@@\n-old\n+hello",
++        )
+         .expect("first progress event");
+-    assert_eq!(
+-        first.changes,
+-        HashMap::from([(
+-            PathBuf::from("hello.txt"),
+-            FileChange::Add {
+-                content: String::new(),
+-            },
+-        )])
+-    );
++    assert!(matches!(
++        first.changes.get(&PathBuf::from("hello.txt")),
++        Some(FileChange::Update {
++            move_path: None,
++            ..
++        })
++    ));
+ 
+     consumer.last_sent_at =
+         Some(std::time::Instant::now() - APPLY_PATCH_ARGUMENT_DIFF_BUFFER_INTERVAL);
+     let second = consumer
+         .push_delta("call-1".to_string(), "\n+world")
+         .expect("second progress event");
+-    assert_eq!(
+-        second.changes,
+-        HashMap::from([(
+-            PathBuf::from("hello.txt"),
+-            FileChange::Add {
+-                content: "hello\n".to_string(),
+-            },
+-        )])
+-    );
++    assert!(matches!(
++        second.changes.get(&PathBuf::from("hello.txt")),
++        Some(FileChange::Update {
++            move_path: None,
++            ..
++        })
++    ));
+ }
+ 
+ #[test]
+@@ -213,7 +209,7 @@ fn reconcile_environment_id_requires_selection_when_enabled() {
+ }
+ 
+ #[tokio::test]
+-async fn approval_keys_include_move_destination() {
++async fn move_to_is_rejected_before_approval_key_derivation() {
+     let tmp = TempDir::new().expect("tmp");
+     let cwd_path = tmp.path();
+     let cwd = cwd_path.abs();
+@@ -230,20 +226,19 @@ async fn approval_keys_include_move_destination() {
+     let argv = vec!["apply_patch".to_string(), patch.to_string()];
+     // TODO(anp): Keep apply_patch handler test cwd values as PathUri.
+     let cwd = PathUri::from_abs_path(&cwd);
+-    let action = match codex_apply_patch::maybe_parse_apply_patch_verified(
++    let result = codex_apply_patch::maybe_parse_apply_patch_verified(
+         &argv,
+         &cwd,
+         LOCAL_FS.as_ref(),
+         /*sandbox*/ None,
+     )
+-    .await
+-    {
+-        MaybeApplyPatchVerified::Body(action) => action,
+-        other => panic!("expected patch body, got: {other:?}"),
+-    };
+-
+-    let keys = file_paths_for_action(&action);
+-    assert_eq!(keys.len(), 2);
++    .await;
++    assert!(matches!(
++        result,
++        MaybeApplyPatchVerified::CorrectnessError(codex_apply_patch::ApplyPatchError::ParseError(
++            _
++        ))
++    ));
+ }
+ 
+ #[test]

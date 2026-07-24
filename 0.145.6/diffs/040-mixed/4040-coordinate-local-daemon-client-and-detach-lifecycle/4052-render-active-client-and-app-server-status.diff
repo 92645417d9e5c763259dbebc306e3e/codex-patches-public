@@ -1,0 +1,713 @@
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index 2fd42e1e00..7d338deccd 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -1012,6 +1012,7 @@ impl App {
+             }
+         };
+         chat_widget.remote_connection = remote_connection;
++        chat_widget.set_owned_app_server_stops_when_idle(app_server_target.owns_local_daemon());
+         let thread_and_widget_ms = thread_and_widget_started_at.elapsed().as_millis();
+         chat_widget
+             .maybe_prompt_windows_sandbox_enable(should_prompt_windows_sandbox_nux_at_startup);
+diff --git a/codex-rs/tui/src/app/app_server_events.rs b/codex-rs/tui/src/app/app_server_events.rs
+index 188fbd8dc8..db760092c5 100644
+--- a/codex-rs/tui/src/app/app_server_events.rs
++++ b/codex-rs/tui/src/app/app_server_events.rs
+@@ -65,6 +65,11 @@ impl App {
+         notification: ServerNotification,
+     ) {
+         match &notification {
++            ServerNotification::ActiveClientCountChanged(notification) => {
++                self.chat_widget
++                    .set_app_server_active_client_count(notification.active_client_count);
++                return;
++            }
+             ServerNotification::ServerRequestResolved(notification) => {
+                 if let Some(request) = self
+                     .pending_app_server_requests
+diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
+index f31c63c96b..d953654fe0 100644
+--- a/codex-rs/tui/src/app/session_lifecycle.rs
++++ b/codex-rs/tui/src/app/session_lifecycle.rs
+@@ -397,6 +397,11 @@ impl App {
+             chat_widget.last_terminal_title = previous_terminal_title;
+         }
+         chat_widget.remote_connection = self.chat_widget.remote_connection.clone();
++        if let Some(active_client_count) = self.chat_widget.app_server_active_client_count() {
++            chat_widget.set_app_server_active_client_count(active_client_count);
++        }
++        chat_widget
++            .set_owned_app_server_stops_when_idle(self.app_server_target.owns_local_daemon());
+         for (thread_id, entry) in self.agent_navigation.ordered_threads() {
+             chat_widget.set_collab_agent_metadata(
+                 thread_id,
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+index 43826269ab..799707ff64 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+@@ -489,6 +489,7 @@ pub(crate) struct ChatComposer {
+     personality_command_enabled: bool,
+     windows_degraded_sandbox_active: bool,
+     side_conversation_active: bool,
++    owned_app_server_stops_when_idle: bool,
+     history_search: Option<HistorySearchSession>,
+     submit_keys: Vec<KeyBinding>,
+     queue_keys: Vec<KeyBinding>,
+@@ -563,6 +564,7 @@ impl ChatComposer {
+             personality_command_enabled: self.personality_command_enabled,
+             allow_elevate_sandbox: self.windows_degraded_sandbox_active,
+             side_conversation_active: self.side_conversation_active,
++            owned_app_server_stops_when_idle: self.owned_app_server_stops_when_idle,
+         }
+     }
+ 
+@@ -666,6 +668,7 @@ impl ChatComposer {
+             personality_command_enabled: false,
+             windows_degraded_sandbox_active: false,
+             side_conversation_active: false,
++            owned_app_server_stops_when_idle: false,
+             history_search: None,
+             submit_keys: vec![key_hint::plain(KeyCode::Enter)],
+             queue_keys: vec![key_hint::plain(KeyCode::Tab)],
+@@ -864,6 +867,10 @@ impl ChatComposer {
+         self.side_conversation_active = active;
+     }
+ 
++    pub(crate) fn set_owned_app_server_stops_when_idle(&mut self, enabled: bool) {
++        self.owned_app_server_stops_when_idle = enabled;
++    }
++
+     /// Compatibility shim for tests that still toggle the removed steer mode flag.
+     #[cfg(test)]
+     pub fn set_steer_enabled(&mut self, _enabled: bool) {}
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer/slash_input.rs b/codex-rs/tui/src/bottom_pane/chat_composer/slash_input.rs
+index d8a6201946..d74ec66a08 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer/slash_input.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer/slash_input.rs
+@@ -180,6 +180,9 @@ impl<'a> SlashInput<'a> {
+                 personality_command_enabled: self.command_flags.personality_command_enabled,
+                 windows_degraded_sandbox_active: self.command_flags.allow_elevate_sandbox,
+                 side_conversation_active: self.command_flags.side_conversation_active,
++                owned_app_server_stops_when_idle: self
++                    .command_flags
++                    .owned_app_server_stops_when_idle,
+             },
+             self.service_tier_commands.to_vec(),
+         );
+diff --git a/codex-rs/tui/src/bottom_pane/command_popup.rs b/codex-rs/tui/src/bottom_pane/command_popup.rs
+index f613e5ee3f..5d7a7e9004 100644
+--- a/codex-rs/tui/src/bottom_pane/command_popup.rs
++++ b/codex-rs/tui/src/bottom_pane/command_popup.rs
+@@ -37,6 +37,7 @@ pub(crate) struct CommandPopup {
+     command_filter: String,
+     commands: Vec<CommandItem>,
+     state: ScrollState,
++    owned_app_server_stops_when_idle: bool,
+ }
+ 
+ #[derive(Clone, Copy, Debug, Default)]
+@@ -50,6 +51,7 @@ pub(crate) struct CommandPopupFlags {
+     pub(crate) personality_command_enabled: bool,
+     pub(crate) windows_degraded_sandbox_active: bool,
+     pub(crate) side_conversation_active: bool,
++    pub(crate) owned_app_server_stops_when_idle: bool,
+ }
+ 
+ impl From<CommandPopupFlags> for BuiltinCommandFlags {
+@@ -64,6 +66,7 @@ impl From<CommandPopupFlags> for BuiltinCommandFlags {
+             personality_command_enabled: value.personality_command_enabled,
+             allow_elevate_sandbox: value.windows_degraded_sandbox_active,
+             side_conversation_active: value.side_conversation_active,
++            owned_app_server_stops_when_idle: value.owned_app_server_stops_when_idle,
+         }
+     }
+ }
+@@ -87,6 +90,7 @@ impl CommandPopup {
+             command_filter: String::new(),
+             commands,
+             state: ScrollState::new(),
++            owned_app_server_stops_when_idle: flags.owned_app_server_stops_when_idle,
+         }
+     }
+ 
+@@ -205,7 +209,9 @@ impl CommandPopup {
+             .into_iter()
+             .map(|(item, indices)| {
+                 let name = format!("/{}", item.command());
+-                let description = item.description().to_string();
++                let description = item
++                    .description(self.owned_app_server_stops_when_idle)
++                    .to_string();
+                 GenericDisplayRow {
+                     name,
+                     name_prefix_spans: Vec::new(),
+@@ -253,9 +259,9 @@ impl CommandItem {
+         }
+     }
+ 
+-    fn description(&self) -> &str {
++    fn description(&self, owned_app_server_stops_when_idle: bool) -> &str {
+         match self {
+-            Self::Builtin(cmd) => cmd.description(),
++            Self::Builtin(cmd) => cmd.description_for_app_server(owned_app_server_stops_when_idle),
+             Self::ServiceTier(command) => &command.description,
+         }
+     }
+@@ -415,13 +421,14 @@ mod tests {
+     fn default_command_popup_items_snapshot() {
+         let mut popup = CommandPopup::new(CommandPopupFlags::default(), Vec::new());
+         popup.on_composer_text_change("/".to_string());
++        let owned_app_server_stops_when_idle = popup.owned_app_server_stops_when_idle;
+ 
+         let commands = popup
+             .filtered_items()
+             .into_iter()
+             .map(|item| {
+                 let command = item.command();
+-                let description = item.description();
++                let description = item.description(owned_app_server_stops_when_idle);
+                 format!("/{command} - {description}")
+             })
+             .collect::<Vec<_>>()
+@@ -537,6 +544,7 @@ mod tests {
+                 personality_command_enabled: true,
+                 windows_degraded_sandbox_active: false,
+                 side_conversation_active: false,
++                owned_app_server_stops_when_idle: false,
+             },
+             Vec::new(),
+         );
+@@ -564,6 +572,7 @@ mod tests {
+                 personality_command_enabled: false,
+                 windows_degraded_sandbox_active: false,
+                 side_conversation_active: false,
++                owned_app_server_stops_when_idle: false,
+             },
+             Vec::new(),
+         );
+@@ -596,6 +605,7 @@ mod tests {
+                 personality_command_enabled: true,
+                 windows_degraded_sandbox_active: false,
+                 side_conversation_active: false,
++                owned_app_server_stops_when_idle: false,
+             },
+             Vec::new(),
+         );
+@@ -627,4 +637,26 @@ mod tests {
+             "expected no /debug* command in popup menu, got {cmds:?}"
+         );
+     }
++
++    #[test]
++    fn quit_description_mentions_shutdown_only_for_owned_daemon() {
++        let mut owned_popup = CommandPopup::new(
++            CommandPopupFlags {
++                owned_app_server_stops_when_idle: true,
++                ..CommandPopupFlags::default()
++            },
++            Vec::new(),
++        );
++        owned_popup.on_composer_text_change("/quit".to_string());
++        let owned_rows = owned_popup.rows_from_matches(owned_popup.filtered());
++        assert_eq!(
++            owned_rows[0].description.as_deref(),
++            Some("exit Codex; app-server stops when no active clients remain")
++        );
++
++        let mut remote_popup = CommandPopup::new(CommandPopupFlags::default(), Vec::new());
++        remote_popup.on_composer_text_change("/quit".to_string());
++        let remote_rows = remote_popup.rows_from_matches(remote_popup.filtered());
++        assert_eq!(remote_rows[0].description.as_deref(), Some("exit Codex"));
++    }
+ }
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+index 3e5c0ea7b1..e8360de070 100644
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -80,6 +80,7 @@ pub(crate) use mcp_server_elicitation::McpServerElicitationFormRequest;
+ pub(crate) use mcp_server_elicitation::McpServerElicitationOverlay;
+ pub(crate) use request_user_input::RequestUserInputOverlay;
+ pub(crate) use status_line_style::status_line_from_segments;
++pub(crate) use status_line_style::status_line_from_segments_with_styles;
+ mod bottom_pane_view;
+ mod effort_ignition;
+ 
+@@ -471,6 +472,11 @@ impl BottomPane {
+         self.request_redraw();
+     }
+ 
++    pub(crate) fn set_owned_app_server_stops_when_idle(&mut self, enabled: bool) {
++        self.composer.set_owned_app_server_stops_when_idle(enabled);
++        self.request_redraw();
++    }
++
+     pub(crate) fn set_placeholder_text(&mut self, placeholder: String) {
+         self.composer.set_placeholder_text(placeholder);
+         self.request_redraw();
+diff --git a/codex-rs/tui/src/bottom_pane/slash_commands.rs b/codex-rs/tui/src/bottom_pane/slash_commands.rs
+index 6ca1ba93d1..cfd9997123 100644
+--- a/codex-rs/tui/src/bottom_pane/slash_commands.rs
++++ b/codex-rs/tui/src/bottom_pane/slash_commands.rs
+@@ -64,6 +64,7 @@ pub(crate) struct BuiltinCommandFlags {
+     pub(crate) personality_command_enabled: bool,
+     pub(crate) allow_elevate_sandbox: bool,
+     pub(crate) side_conversation_active: bool,
++    pub(crate) owned_app_server_stops_when_idle: bool,
+ }
+ 
+ /// Return the built-ins that should be visible/usable for the current input.
+@@ -173,6 +174,7 @@ mod tests {
+             personality_command_enabled: true,
+             allow_elevate_sandbox: true,
+             side_conversation_active: false,
++            owned_app_server_stops_when_idle: false,
+         }
+     }
+ 
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_setup.rs b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+index dce31d47e5..8e97bcb870 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_setup.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_setup.rs
+@@ -112,6 +112,9 @@ pub(crate) enum StatusLineItem {
+     /// Codex application version.
+     CodexVersion,
+ 
++    /// Active app-server client count.
++    ActiveClients,
++
+     /// Total context window size in tokens.
+     ContextWindowSize,
+ 
+@@ -176,6 +179,7 @@ impl StatusLineItem {
+                 "Remaining usage on the secondary usage limit (omitted when unavailable)"
+             }
+             StatusLineItem::CodexVersion => "Codex application version",
++            StatusLineItem::ActiveClients => "Active app-server client count",
+             StatusLineItem::ContextWindowSize => {
+                 "Total context window size in tokens (omitted when unknown)"
+             }
+@@ -215,6 +219,7 @@ impl StatusLineItem {
+             StatusLineItem::FiveHourLimit => StatusSurfacePreviewItem::FiveHourLimit,
+             StatusLineItem::WeeklyLimit => StatusSurfacePreviewItem::WeeklyLimit,
+             StatusLineItem::CodexVersion => StatusSurfacePreviewItem::CodexVersion,
++            StatusLineItem::ActiveClients => StatusSurfacePreviewItem::ActiveClients,
+             StatusLineItem::ContextWindowSize => StatusSurfacePreviewItem::ContextWindowSize,
+             StatusLineItem::UsedTokens => StatusSurfacePreviewItem::UsedTokens,
+             StatusLineItem::TotalInputTokens => StatusSurfacePreviewItem::TotalInputTokens,
+@@ -432,6 +437,15 @@ mod tests {
+             "context-remaining"
+         );
+     }
++
++    #[test]
++    fn active_clients_is_selectable_id() {
++        assert_eq!(StatusLineItem::ActiveClients.to_string(), "active-clients");
++        assert_eq!(
++            "active-clients".parse::<StatusLineItem>(),
++            Ok(StatusLineItem::ActiveClients)
++        );
++    }
+     #[test]
+     fn project_name_is_canonical_and_accepts_legacy_ids() {
+         assert_eq!(StatusLineItem::ProjectRoot.to_string(), "project-name");
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+index 852b229afc..d27e415386 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -45,7 +45,9 @@ impl StatusLineAccent {
+             | StatusLineItem::TotalInputTokens
+             | StatusLineItem::TotalOutputTokens => Self::Usage,
+             StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit => Self::Limit,
+-            StatusLineItem::CodexVersion | StatusLineItem::SessionId => Self::Metadata,
++            StatusLineItem::CodexVersion
++            | StatusLineItem::ActiveClients
++            | StatusLineItem::SessionId => Self::Metadata,
+             StatusLineItem::FastMode | StatusLineItem::RawOutput => Self::Mode,
+             StatusLineItem::Permissions => Self::Mode,
+             StatusLineItem::ApprovalMode => Self::Mode,
+@@ -85,11 +87,27 @@ pub(crate) fn status_line_from_segments<I>(
+ where
+     I: IntoIterator<Item = (StatusLineItem, String)>,
+ {
+-    status_line_from_segments_with_resolver(segments, use_theme_colors, |accent| {
+-        foreground_style_for_scopes(accent.scopes())
+-    })
++    status_line_from_segments_with_styles(segments, use_theme_colors, |_| None)
+ }
+ 
++pub(crate) fn status_line_from_segments_with_styles<I, F>(
++    segments: I,
++    use_theme_colors: bool,
++    style_for_item: F,
++) -> Option<Line<'static>>
++where
++    I: IntoIterator<Item = (StatusLineItem, String)>,
++    F: Fn(StatusLineItem) -> Option<Style>,
++{
++    status_line_from_segments_with_item_styles(
++        segments,
++        use_theme_colors,
++        |accent| foreground_style_for_scopes(accent.scopes()),
++        style_for_item,
++    )
++}
++
++#[cfg(test)]
+ fn status_line_from_segments_with_resolver<I, F>(
+     segments: I,
+     use_theme_colors: bool,
+@@ -98,6 +116,25 @@ fn status_line_from_segments_with_resolver<I, F>(
+ where
+     I: IntoIterator<Item = (StatusLineItem, String)>,
+     F: Fn(StatusLineAccent) -> Option<Style>,
++{
++    status_line_from_segments_with_item_styles(
++        segments,
++        use_theme_colors,
++        theme_style_for_accent,
++        |_| None,
++    )
++}
++
++fn status_line_from_segments_with_item_styles<I, F, G>(
++    segments: I,
++    use_theme_colors: bool,
++    theme_style_for_accent: F,
++    style_for_item: G,
++) -> Option<Line<'static>>
++where
++    I: IntoIterator<Item = (StatusLineItem, String)>,
++    F: Fn(StatusLineAccent) -> Option<Style>,
++    G: Fn(StatusLineItem) -> Option<Style>,
+ {
+     let mut spans = Vec::new();
+     for (item, text) in segments {
+@@ -106,9 +143,11 @@ where
+         }
+         let style = if use_theme_colors {
+             let accent = StatusLineAccent::for_item(item);
+-            soften_status_line_style(
+-                theme_style_for_accent(accent).unwrap_or_else(|| accent.fallback_style()),
+-            )
++            style_for_item(item).unwrap_or_else(|| {
++                soften_status_line_style(
++                    theme_style_for_accent(accent).unwrap_or_else(|| accent.fallback_style()),
++                )
++            })
+         } else {
+             Style::default().dim()
+         };
+@@ -233,6 +272,22 @@ mod tests {
+         assert!(!line.spans[2].style.add_modifier.contains(Modifier::DIM));
+     }
+ 
++    #[test]
++    fn status_line_segments_allow_a_narrow_item_style_override() {
++        let line = status_line_from_segments_with_styles(
++            [
++                (StatusLineItem::CodexVersion, "0.145.0".to_string()),
++                (StatusLineItem::ActiveClients, "2".to_string()),
++            ],
++            /*use_theme_colors*/ true,
++            |item| (item == StatusLineItem::CodexVersion).then(|| Style::default().red()),
++        )
++        .expect("status line");
++
++        assert_eq!(line.spans[0].style.fg, Some(Color::Red));
++        assert_ne!(line.spans[2].style.fg, Some(Color::Red));
++    }
++
+     #[test]
+     #[allow(clippy::disallowed_methods)]
+     fn status_line_segments_soften_rgb_theme_styles_without_dimming_text() {
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+index b8b7a6fbd4..f3e846c779 100644
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -23,6 +23,7 @@ pub(crate) enum StatusSurfacePreviewItem {
+     FiveHourLimit,
+     WeeklyLimit,
+     CodexVersion,
++    ActiveClients,
+     ContextWindowSize,
+     UsedTokens,
+     TotalInputTokens,
+@@ -56,6 +57,7 @@ impl StatusSurfacePreviewItem {
+             StatusSurfacePreviewItem::FiveHourLimit => "primary 0%",
+             StatusSurfacePreviewItem::WeeklyLimit => "secondary 0%",
+             StatusSurfacePreviewItem::CodexVersion => "0.0.0",
++            StatusSurfacePreviewItem::ActiveClients => "1",
+             StatusSurfacePreviewItem::ContextWindowSize => "0 window",
+             StatusSurfacePreviewItem::UsedTokens => "0 used",
+             StatusSurfacePreviewItem::TotalInputTokens => "0 in",
+@@ -89,6 +91,7 @@ impl StatusSurfacePreviewItem {
+             Self::FiveHourLimit,
+             Self::WeeklyLimit,
+             Self::CodexVersion,
++            Self::ActiveClients,
+             Self::ContextWindowSize,
+             Self::UsedTokens,
+             Self::TotalInputTokens,
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index c98508b177..b94d908a82 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -477,7 +477,11 @@ use unicode_segmentation::UnicodeSegmentation;
+ const USER_SHELL_COMMAND_HELP_TITLE: &str = "Prefix a command with ! to run it locally";
+ const USER_SHELL_COMMAND_HELP_HINT: &str = "Example: !ls";
+ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+-const DEFAULT_STATUS_LINE_ITEMS: [&str; 2] = ["model-with-reasoning", "current-dir"];
++const DEFAULT_STATUS_LINE_ITEMS: [&str; 3] = [
++    "model-with-reasoning",
++    "active-clients",
++    "current-dir",
++];
+ 
+ /// Common initialization parameters shared by all `ChatWidget` constructors.
+ pub(crate) struct ChatWidgetInit {
+@@ -552,6 +556,8 @@ pub(crate) struct ChatWidget {
+     status_account_display: Option<StatusAccountDisplay>,
+     runtime_model_provider_base_url: Option<String>,
+     pub(crate) remote_connection: Option<RemoteConnectionStatus>,
++    app_server_active_client_count: Option<usize>,
++    owned_app_server_stops_when_idle: bool,
+     token_info: Option<TokenUsageInfo>,
+     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
+     refreshing_status_outputs: Vec<(u64, StatusHistoryHandle)>,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index eb979ceff1..60b907a8fd 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -122,6 +122,8 @@ impl ChatWidget {
+             status_account_display,
+             runtime_model_provider_base_url,
+             remote_connection: None,
++            app_server_active_client_count: None,
++            owned_app_server_stops_when_idle: false,
+             token_info: None,
+             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
+             refreshing_status_outputs: Vec::new(),
+diff --git a/codex-rs/tui/src/chatwidget/settings.rs b/codex-rs/tui/src/chatwidget/settings.rs
+index 58fe920905..1e4a9000a6 100644
+--- a/codex-rs/tui/src/chatwidget/settings.rs
++++ b/codex-rs/tui/src/chatwidget/settings.rs
+@@ -5,6 +5,21 @@ use crate::app_event::AppEvent;
+ use crate::chatwidget::rate_limits::RATE_LIMIT_SWITCH_PROMPT_VIEW_ID;
+ 
+ impl ChatWidget {
++    pub(crate) fn set_app_server_active_client_count(&mut self, count: usize) {
++        self.app_server_active_client_count = Some(count);
++        self.refresh_status_line();
++    }
++
++    pub(crate) fn app_server_active_client_count(&self) -> Option<usize> {
++        self.app_server_active_client_count
++    }
++
++    pub(crate) fn set_owned_app_server_stops_when_idle(&mut self, enabled: bool) {
++        self.owned_app_server_stops_when_idle = enabled;
++        self.bottom_pane
++            .set_owned_app_server_stops_when_idle(enabled);
++    }
++
+     /// Set the approval policy in the widget's config copy.
+     pub(crate) fn set_approval_policy(&mut self, policy: AskForApproval) {
+         if let Err(err) = self
+diff --git a/codex-rs/tui/src/chatwidget/slash_dispatch.rs b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+index e28cfd7043..0f1d8c698d 100644
+--- a/codex-rs/tui/src/chatwidget/slash_dispatch.rs
++++ b/codex-rs/tui/src/chatwidget/slash_dispatch.rs
+@@ -1039,6 +1039,7 @@ impl ChatWidget {
+             personality_command_enabled: self.config.features.enabled(Feature::Personality),
+             allow_elevate_sandbox,
+             side_conversation_active: self.active_side_conversation,
++            owned_app_server_stops_when_idle: self.owned_app_server_stops_when_idle,
+         }
+     }
+ 
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 2fce88958c..d8720921de 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -4,7 +4,7 @@
+ //! behavior easier to review without paging through the rest of `chatwidget.rs`.
+ 
+ use super::*;
+-use crate::bottom_pane::status_line_from_segments;
++use crate::bottom_pane::status_line_from_segments_with_styles;
+ use crate::branch_summary;
+ use crate::chatwidget::limit_label_for_window;
+ use crate::chatwidget::rate_limits::get_limits_duration;
+@@ -191,9 +191,25 @@ impl ChatWidget {
+             }
+         }
+ 
+-        self.set_status_line(status_line_from_segments(
++        let app_server_version_matches = self
++            .remote_connection
++            .as_ref()
++            .map(|connection| connection.version_matches(CODEX_CLI_VERSION));
++        self.set_status_line(status_line_from_segments_with_styles(
+             segments,
+             self.config.tui_status_line_use_colors,
++            |item| {
++                (item == StatusLineItem::CodexVersion)
++                    .then_some(app_server_version_matches)
++                    .flatten()
++                    .map(|matches| {
++                        if matches {
++                            Style::default().green()
++                        } else {
++                            Style::default().red()
++                        }
++                    })
++            },
+         ));
+         let hyperlink_url = selections
+             .status_line_items
+@@ -717,6 +733,9 @@ impl ChatWidget {
+                 self.status_line_limit_display(Some(window), &label)
+             }
+             StatusLineItem::CodexVersion => Some(CODEX_CLI_VERSION.to_string()),
++            StatusLineItem::ActiveClients => self
++                .app_server_active_client_count
++                .map(|count| count.to_string()),
+             StatusLineItem::ContextWindowSize => self
+                 .status_line_context_window_size()
+                 .map(|cws| format!("{} window", format_tokens_compact(cws))),
+@@ -782,6 +801,7 @@ impl ChatWidget {
+             StatusSurfacePreviewItem::FiveHourLimit => StatusLineItem::FiveHourLimit,
+             StatusSurfacePreviewItem::WeeklyLimit => StatusLineItem::WeeklyLimit,
+             StatusSurfacePreviewItem::CodexVersion => StatusLineItem::CodexVersion,
++            StatusSurfacePreviewItem::ActiveClients => StatusLineItem::ActiveClients,
+             StatusSurfacePreviewItem::ContextWindowSize => StatusLineItem::ContextWindowSize,
+             StatusSurfacePreviewItem::UsedTokens => StatusLineItem::UsedTokens,
+             StatusSurfacePreviewItem::TotalInputTokens => StatusLineItem::TotalInputTokens,
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index 6bdda815d9..fc4da3a2f0 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -2735,6 +2735,19 @@ async fn status_line_context_remaining_renders_labeled_percent() {
+     );
+ }
+ 
++#[tokio::test]
++async fn status_line_active_clients_appears_after_lifecycle_notification_value() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.config.tui_status_line = Some(vec!["active-clients".to_string()]);
++
++    chat.refresh_status_line();
++    assert_eq!(status_line_text(&chat), None);
++
++    chat.set_app_server_active_client_count(3);
++    assert_eq!(status_line_text(&chat), Some("3".to_string()));
++    assert!(drain_insert_history(&mut rx).is_empty());
++}
++
+ #[tokio::test]
+ async fn status_line_legacy_context_usage_renders_context_used_percent() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/slash_command.rs b/codex-rs/tui/src/slash_command.rs
+index abd1386932..4243351dd9 100644
+--- a/codex-rs/tui/src/slash_command.rs
++++ b/codex-rs/tui/src/slash_command.rs
+@@ -81,6 +81,13 @@ pub enum SlashCommand {
+ impl SlashCommand {
+     /// User-visible description shown in the popup.
+     pub fn description(self) -> &'static str {
++        self.description_for_app_server(/*owned_app_server_stops_when_idle*/ false)
++    }
++
++    pub(crate) fn description_for_app_server(
++        self,
++        owned_app_server_stops_when_idle: bool,
++    ) -> &'static str {
+         match self {
+             SlashCommand::Feedback => "send logs to maintainers",
+             SlashCommand::New => "start a new chat during a conversation",
+@@ -94,6 +101,9 @@ impl SlashCommand {
+             SlashCommand::Clear => "clear the terminal and start a new chat",
+             SlashCommand::Fork => "fork the current chat",
+             SlashCommand::App => "continue this session in the Desktop app",
++            SlashCommand::Quit | SlashCommand::Exit if owned_app_server_stops_when_idle => {
++                "exit Codex; app-server stops when no active clients remain"
++            }
+             SlashCommand::Quit | SlashCommand::Exit => "exit Codex",
+             SlashCommand::Copy => "copy last response as markdown",
+             SlashCommand::Raw => "toggle raw scrollback mode for copy-friendly terminal selection",
+diff --git a/codex-rs/tui/src/status/card.rs b/codex-rs/tui/src/status/card.rs
+index b6ce9dbd0f..cc047254b0 100644
+--- a/codex-rs/tui/src/status/card.rs
++++ b/codex-rs/tui/src/status/card.rs
+@@ -713,11 +713,18 @@ fn status_approval_label(
+ impl HistoryCell for StatusHistoryCell {
+     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+         let mut lines: Vec<Line<'static>> = Vec::new();
++        let app_server_version_style = match self.remote_connection.as_ref() {
++            None => Style::default().add_modifier(Modifier::DIM),
++            Some(connection) if connection.version_matches(CODEX_CLI_VERSION) => {
++                Style::default().green()
++            }
++            Some(_) => Style::default().red(),
++        };
+         lines.push(Line::from(vec![
+             Span::from(format!("{}>_ ", FieldFormatter::INDENT)).dim(),
+             Span::from("OpenAI Codex").bold(),
+             Span::from(" ").dim(),
+-            Span::from(format!("(v{CODEX_CLI_VERSION})")).dim(),
++            Span::styled(format!("(v{CODEX_CLI_VERSION})"), app_server_version_style),
+         ]));
+ 
+         let available_inner_width = usize::from(width.saturating_sub(4));
+@@ -807,7 +814,7 @@ impl HistoryCell for StatusHistoryCell {
+                 [Line::from(vec![
+                     Span::from(remote_connection.address.clone()),
+                     Span::from(" (").dim(),
+-                    Span::from(remote_connection.version.clone()).dim(),
++                    Span::styled(remote_connection.version.clone(), app_server_version_style),
+                     Span::from(")").dim(),
+                 ])],
+                 RtOptions::new(value_width.max(1)),
+diff --git a/codex-rs/tui/src/status/remote_connection.rs b/codex-rs/tui/src/status/remote_connection.rs
+index 610af5815b..c74589b4bc 100644
+--- a/codex-rs/tui/src/status/remote_connection.rs
++++ b/codex-rs/tui/src/status/remote_connection.rs
+@@ -8,6 +8,14 @@ pub(crate) struct RemoteConnectionStatus {
+     pub(crate) version: String,
+ }
+ 
++impl RemoteConnectionStatus {
++    pub(crate) fn version_matches(&self, local_version: &str) -> bool {
++        self.version
++            .strip_prefix('v')
++            .is_some_and(|version| version == local_version)
++    }
++}
++
+ pub(crate) fn remote_connection_status_value(
+     app_server_target: &AppServerTarget,
+     server_version: Option<&str>,
+@@ -83,4 +91,22 @@ mod tests {
+         );
+         Ok(())
+     }
++
++    #[test]
++    fn remote_connection_version_match_is_exact() {
++        let status = RemoteConnectionStatus {
++            address: "unix:///tmp/codex.sock".to_string(),
++            version: "v0.145.0".to_string(),
++        };
++
++        assert!(status.version_matches("0.145.0"));
++        assert!(!status.version_matches("0.145.1"));
++        assert!(
++            !RemoteConnectionStatus {
++                version: "unknown".to_string(),
++                ..status
++            }
++            .version_matches("0.145.0")
++        );
++    }
+ }

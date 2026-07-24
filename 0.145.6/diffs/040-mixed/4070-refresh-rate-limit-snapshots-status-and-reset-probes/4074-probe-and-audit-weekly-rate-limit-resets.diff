@@ -1,0 +1,1179 @@
+diff --git a/codex-rs/app-server/src/rate_limits.rs b/codex-rs/app-server/src/rate_limits.rs
+index 80b2bc0504..f1d1e9aa75 100644
+--- a/codex-rs/app-server/src/rate_limits.rs
++++ b/codex-rs/app-server/src/rate_limits.rs
+@@ -1,3 +1,6 @@
++use std::collections::HashMap;
++use std::path::Path;
++use std::path::PathBuf;
+ use std::sync::Arc;
+ use std::time::Duration;
+ use std::time::SystemTime;
+@@ -6,7 +9,9 @@ use std::time::UNIX_EPOCH;
+ use codex_app_server_protocol::AccountRateLimitsUpdatedNotification;
+ use codex_app_server_protocol::GetAccountRateLimitsResponse;
+ use codex_app_server_protocol::JSONRPCErrorError;
++use codex_app_server_protocol::RateLimitWindow;
+ use codex_app_server_protocol::ServerNotification;
++use serde::Serialize;
+ use tokio::sync::Mutex;
+ use tokio::sync::Notify;
+ use tokio_util::sync::CancellationToken;
+@@ -19,6 +24,10 @@ use crate::thread_status::ThreadWatchManager;
+ 
+ const ACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
+ const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
++const WEEKLY_WINDOW_MINUTES: i64 = 7 * 24 * 60;
++const WEEKLY_RESET_CHANGE_TOLERANCE_SECS: u64 = 30;
++const WEEKLY_RESET_PROBE_PROMPT: &str = "reply OK if everything is fine";
++const WEEKLY_RESET_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+ 
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ pub(crate) struct RateLimitIdentity {
+@@ -36,6 +45,111 @@ pub(crate) struct FetchedRateLimits {
+     pub(crate) identity: RateLimitIdentity,
+     pub(crate) response: GetAccountRateLimitsResponse,
+     pub(crate) pace_by_limit_id: std::collections::HashMap<String, RateLimitWindowPace>,
++    pub(crate) captured_at: SystemTime,
++}
++
++#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
++#[serde(rename_all = "lowercase")]
++enum WeeklyWindowSlot {
++    Primary,
++    Secondary,
++}
++
++#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
++struct WeeklyWindowKey {
++    limit_id: String,
++    slot: WeeklyWindowSlot,
++}
++
++#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
++struct WeeklyResetChange {
++    limit_id: String,
++    slot: WeeklyWindowSlot,
++    previous_resets_at: i64,
++    resets_at: i64,
++}
++
++#[derive(Clone, Debug)]
++struct WeeklyResetBatch {
++    identity: RateLimitIdentity,
++    observed_at: SystemTime,
++    changes: Vec<WeeklyResetChange>,
++}
++
++#[derive(Default)]
++struct WeeklyResetDetector {
++    identity: Option<RateLimitIdentity>,
++    resets_at: HashMap<WeeklyWindowKey, i64>,
++}
++
++impl WeeklyResetDetector {
++    fn clear(&mut self) {
++        self.identity = None;
++        self.resets_at.clear();
++    }
++
++    fn observe(
++        &mut self,
++        identity: &RateLimitIdentity,
++        response: &GetAccountRateLimitsResponse,
++        observed_at: SystemTime,
++    ) -> Option<WeeklyResetBatch> {
++        if self.identity.as_ref() != Some(identity) {
++            self.clear();
++            self.identity = Some(identity.clone());
++        }
++        let mut observations = response
++            .rate_limits_by_limit_id
++            .as_ref()?
++            .iter()
++            .flat_map(|(limit_id, snapshot)| {
++                [
++                    (WeeklyWindowSlot::Primary, snapshot.primary.as_ref()),
++                    (WeeklyWindowSlot::Secondary, snapshot.secondary.as_ref()),
++                ]
++                .into_iter()
++                .filter_map(|(slot, window)| {
++                    weekly_reset_at(window).map(|resets_at| {
++                        (
++                            WeeklyWindowKey {
++                                limit_id: limit_id.clone(),
++                                slot,
++                            },
++                            resets_at,
++                        )
++                    })
++                })
++            })
++            .collect::<Vec<_>>();
++        observations.sort_by(|left, right| left.0.cmp(&right.0));
++
++        let mut changes = Vec::new();
++        for (key, resets_at) in observations {
++            let previous = self.resets_at.insert(key.clone(), resets_at);
++            if let Some(previous_resets_at) = previous
++                && previous_resets_at.abs_diff(resets_at) > WEEKLY_RESET_CHANGE_TOLERANCE_SECS
++            {
++                changes.push(WeeklyResetChange {
++                    limit_id: key.limit_id,
++                    slot: key.slot,
++                    previous_resets_at,
++                    resets_at,
++                });
++            }
++        }
++        (!changes.is_empty()).then(|| WeeklyResetBatch {
++            identity: identity.clone(),
++            observed_at,
++            changes,
++        })
++    }
++}
++
++fn weekly_reset_at(window: Option<&RateLimitWindow>) -> Option<i64> {
++    let window = window?;
++    (window.window_duration_mins == Some(WEEKLY_WINDOW_MINUTES))
++        .then_some(window.resets_at)
++        .flatten()
+ }
+ 
+ #[derive(Clone)]
+@@ -52,6 +166,7 @@ struct RefreshState {
+     cached: Option<CachedSnapshot>,
+     refreshing: bool,
+     generation: u64,
++    weekly_resets: WeeklyResetDetector,
+ }
+ 
+ impl RefreshState {
+@@ -77,6 +192,11 @@ impl RefreshState {
+         self.cached = None;
+         self.request_refresh()
+     }
++
++    fn invalidate_for_auth_change(&mut self) -> u64 {
++        self.weekly_resets.clear();
++        self.invalidate()
++    }
+ }
+ 
+ struct Inner {
+@@ -84,6 +204,10 @@ struct Inner {
+     outgoing: Arc<OutgoingMessageSender>,
+     state: Mutex<RefreshState>,
+     changed: Notify,
++    probe_lock: Mutex<()>,
++    probe_log_path: PathBuf,
++    tasks: TaskTracker,
++    cancel: CancellationToken,
+ }
+ 
+ #[derive(Clone)]
+@@ -98,15 +222,22 @@ impl RateLimitManager {
+         processor: AccountRequestProcessor,
+         outgoing: Arc<OutgoingMessageSender>,
+     ) -> Self {
++        let cancel = CancellationToken::new();
++        let tasks = TaskTracker::new();
++        let probe_log_path = processor.rate_limit_reset_probe_log_path();
+         let manager = Self {
+             inner: Arc::new(Inner {
+                 processor,
+                 outgoing,
+                 state: Mutex::new(RefreshState::default()),
+                 changed: Notify::new(),
++                probe_lock: Mutex::new(()),
++                probe_log_path,
++                tasks: tasks.clone(),
++                cancel: cancel.clone(),
+             }),
+-            cancel: CancellationToken::new(),
+-            tasks: TaskTracker::new(),
++            cancel,
++            tasks,
+         };
+         manager.spawn_refresh(/*required_generation*/ None);
+         manager
+@@ -154,7 +285,7 @@ impl RateLimitManager {
+                         if changed.is_err() {
+                             break;
+                         }
+-                        manager.invalidate_and_refresh().await;
++                        manager.invalidate_for_auth_change_and_refresh().await;
+                         schedule.reset_for_auth_change(SystemTime::now());
+                     }
+                     _ = wait_until(deadline) => {
+@@ -189,6 +320,13 @@ impl RateLimitManager {
+         });
+     }
+ 
++    async fn invalidate_for_auth_change_and_refresh(&self) {
++        let mut state = self.inner.state.lock().await;
++        let generation = state.invalidate_for_auth_change();
++        drop(state);
++        self.spawn_refresh(Some(generation));
++    }
++
+     pub(crate) fn cancel(&self) {
+         self.cancel.cancel();
+     }
+@@ -344,6 +482,7 @@ async fn refresh(
+ 
+         let result = inner.processor.fetch_account_rate_limits().await;
+         let mut notification = None;
++        let mut weekly_reset_batch = None;
+         let generation_is_current;
+         let mut accepted = false;
+         {
+@@ -359,6 +498,11 @@ async fn refresh(
+                     generation: fetch_generation,
+                     pace_by_limit_id: fetched.pace_by_limit_id.clone(),
+                 });
++                weekly_reset_batch = state.weekly_resets.observe(
++                    &fetched.identity,
++                    &fetched.response,
++                    fetched.captured_at,
++                );
+                 notification = Some(AccountRateLimitsUpdatedNotification {
+                     rate_limits: fetched.response.rate_limits.clone(),
+                 });
+@@ -376,6 +520,18 @@ async fn refresh(
+                 .await;
+         }
+ 
++        if let Some(batch) = weekly_reset_batch {
++            let inner = Arc::clone(inner);
++            let cancel = inner.cancel.clone();
++            let tasks = inner.tasks.clone();
++            tasks.spawn(async move {
++                tokio::select! {
++                    _ = cancel.cancelled() => {}
++                    _ = probe_and_audit_weekly_reset(&inner, batch) => {}
++                }
++            });
++        }
++
+         if !generation_is_current {
+             continue;
+         }
+@@ -389,20 +545,170 @@ async fn refresh(
+     }
+ }
+ 
++#[derive(Serialize)]
++struct WeeklyResetAuditRecord<'a> {
++    event: &'static str,
++    timestamp: String,
++    changes: &'a [WeeklyResetChange],
++}
++
++#[derive(Serialize)]
++struct ModelProbeAuditRecord<'a> {
++    event: &'static str,
++    model: &'a str,
++    timestamp: String,
++    request: &'static str,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    response: Option<&'a str>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    error: Option<&'a str>,
++}
++
++async fn probe_and_audit_weekly_reset(inner: &Arc<Inner>, batch: WeeklyResetBatch) {
++    let _guard = inner.probe_lock.lock().await;
++    let reset = WeeklyResetAuditRecord {
++        event: "weekly_rate_limit_reset_changed",
++        timestamp: chrono::DateTime::<chrono::Utc>::from(batch.observed_at).to_rfc3339(),
++        changes: &batch.changes,
++    };
++    if let Err(err) =
++        append_audit_records(&inner.probe_log_path, std::slice::from_ref(&reset)).await
++    {
++        tracing::warn!(error = %err, "failed to write weekly rate-limit reset audit");
++    }
++
++    let outcomes = match inner
++        .processor
++        .probe_enabled_models(
++            &batch.identity,
++            WEEKLY_RESET_PROBE_TIMEOUT,
++            WEEKLY_RESET_PROBE_PROMPT,
++        )
++        .await
++    {
++        Ok(outcomes) => outcomes,
++        Err(err) => {
++            tracing::warn!(error = %err, "failed to prepare weekly rate-limit model probes");
++            return;
++        }
++    };
++    let timestamp = chrono::Utc::now().to_rfc3339();
++    let records = outcomes
++        .iter()
++        .map(|outcome| {
++            let (response, error) = match &outcome.result {
++                Ok(response) => (Some(response.as_str()), None),
++                Err(error) => (None, Some(error.as_str())),
++            };
++            ModelProbeAuditRecord {
++                event: "weekly_rate_limit_model_probe",
++                model: &outcome.model,
++                timestamp: timestamp.clone(),
++                request: WEEKLY_RESET_PROBE_PROMPT,
++                response,
++                error,
++            }
++        })
++        .collect::<Vec<_>>();
++    if let Err(err) = append_audit_records(&inner.probe_log_path, &records).await {
++        tracing::warn!(error = %err, "failed to write weekly rate-limit probe audit");
++    }
++}
++
++async fn append_audit_records<T: Serialize>(path: &Path, records: &[T]) -> std::io::Result<()> {
++    use tokio::io::AsyncWriteExt as _;
++
++    let Some(parent) = path.parent() else {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::InvalidInput,
++            "rate-limit probe log path has no parent",
++        ));
++    };
++    tokio::fs::create_dir_all(parent).await?;
++    let mut output = Vec::new();
++    for record in records {
++        serde_json::to_writer(&mut output, record)?;
++        output.push(b'\n');
++    }
++    let mut file = tokio::fs::OpenOptions::new()
++        .create(true)
++        .append(true)
++        .open(path)
++        .await?;
++    file.write_all(&output).await?;
++    file.flush().await
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::DueRefresh;
++    use super::ModelProbeAuditRecord;
+     use super::RateLimitSchedule;
+     use super::RefreshState;
++    use super::WeeklyResetAuditRecord;
++    use super::WeeklyResetDetector;
++    use super::WeeklyWindowSlot;
+     use super::aligned_idle_deadline;
++    use super::append_audit_records;
+     use super::strict_next_boundary;
++    use codex_app_server_protocol::GetAccountRateLimitsResponse;
++    use codex_app_server_protocol::RateLimitSnapshot;
++    use codex_app_server_protocol::RateLimitWindow;
+     use std::time::Duration;
+     use std::time::UNIX_EPOCH;
++    use tempfile::tempdir;
+ 
+     fn at_seconds(seconds: u64) -> std::time::SystemTime {
+         UNIX_EPOCH + Duration::from_secs(seconds)
+     }
+ 
++    fn identity(revision: u64) -> super::RateLimitIdentity {
++        super::RateLimitIdentity {
++            auth_revision: revision,
++            account_id: Some(format!("account-{revision}")),
++        }
++    }
++
++    fn window(duration: Option<i64>, resets_at: Option<i64>) -> RateLimitWindow {
++        RateLimitWindow {
++            used_percent: 10,
++            window_duration_mins: duration,
++            resets_at,
++        }
++    }
++
++    fn snapshot(
++        limit_id: &str,
++        primary: Option<RateLimitWindow>,
++        secondary: Option<RateLimitWindow>,
++    ) -> RateLimitSnapshot {
++        RateLimitSnapshot {
++            limit_id: Some(limit_id.to_string()),
++            limit_name: None,
++            primary,
++            secondary,
++            credits: None,
++            individual_limit: None,
++            spend_control_reached: None,
++            plan_type: None,
++            rate_limit_reached_type: None,
++        }
++    }
++
++    fn response(snapshots: Vec<RateLimitSnapshot>) -> GetAccountRateLimitsResponse {
++        let rate_limits = snapshots[0].clone();
++        GetAccountRateLimitsResponse {
++            rate_limits,
++            rate_limits_by_limit_id: Some(
++                snapshots
++                    .into_iter()
++                    .map(|snapshot| (snapshot.limit_id.clone().expect("limit id"), snapshot))
++                    .collect(),
++            ),
++            rate_limit_reset_credits: None,
++        }
++    }
++
+     #[test]
+     fn invalidation_rejects_in_flight_generation_and_requires_another_fetch() {
+         let mut state = RefreshState::default();
+@@ -478,4 +784,163 @@ mod tests {
+         assert_eq!(schedule.active_at, None);
+         assert_eq!(schedule.idle_at, at_seconds(3_900));
+     }
++
++    #[test]
++    fn weekly_detector_baselines_both_slots_and_uses_a_moving_tolerance() {
++        let mut detector = WeeklyResetDetector::default();
++        let first = response(vec![snapshot(
++            "codex",
++            Some(window(Some(10_080), Some(1_000))),
++            Some(window(Some(10_080), Some(2_000))),
++        )]);
++        assert!(
++            detector
++                .observe(&identity(1), &first, at_seconds(1))
++                .is_none()
++        );
++
++        let tolerated = response(vec![snapshot(
++            "codex",
++            Some(window(Some(10_080), Some(1_030))),
++            Some(window(Some(10_080), Some(1_970))),
++        )]);
++        assert!(
++            detector
++                .observe(&identity(1), &tolerated, at_seconds(2))
++                .is_none()
++        );
++
++        let changed = response(vec![snapshot(
++            "codex",
++            Some(window(Some(10_080), Some(1_061))),
++            Some(window(Some(10_080), Some(1_939))),
++        )]);
++        let batch = detector
++            .observe(&identity(1), &changed, at_seconds(3))
++            .expect("both moving baselines changed by 31 seconds");
++        assert_eq!(batch.changes.len(), 2);
++        assert_eq!(batch.changes[0].slot, WeeklyWindowSlot::Primary);
++        assert_eq!(batch.changes[0].previous_resets_at, 1_030);
++        assert_eq!(batch.changes[1].slot, WeeklyWindowSlot::Secondary);
++        assert_eq!(batch.changes[1].previous_resets_at, 1_970);
++    }
++
++    #[test]
++    fn weekly_detector_ignores_incomplete_and_nonweekly_windows_without_losing_baselines() {
++        let mut detector = WeeklyResetDetector::default();
++        let baseline = response(vec![snapshot(
++            "codex",
++            Some(window(Some(10_080), Some(1_000))),
++            None,
++        )]);
++        assert!(
++            detector
++                .observe(&identity(1), &baseline, at_seconds(1))
++                .is_none()
++        );
++        let incomplete = response(vec![snapshot(
++            "codex",
++            Some(window(None, Some(1_050))),
++            Some(window(Some(10_079), Some(2_000))),
++        )]);
++        assert!(
++            detector
++                .observe(&identity(1), &incomplete, at_seconds(2))
++                .is_none()
++        );
++        let restored = response(vec![snapshot(
++            "codex",
++            Some(window(Some(10_080), Some(1_100))),
++            None,
++        )]);
++        let batch = detector
++            .observe(&identity(1), &restored, at_seconds(3))
++            .expect("the prior complete baseline must survive missing metadata");
++        assert_eq!(batch.changes[0].previous_resets_at, 1_000);
++    }
++
++    #[test]
++    fn weekly_detector_coalesces_limits_and_rebaselines_on_auth_change() {
++        let mut detector = WeeklyResetDetector::default();
++        let baseline = response(vec![
++            snapshot("codex", Some(window(Some(10_080), Some(1_000))), None),
++            snapshot("spark", None, Some(window(Some(10_080), Some(2_000)))),
++        ]);
++        assert!(
++            detector
++                .observe(&identity(1), &baseline, at_seconds(1))
++                .is_none()
++        );
++        let changed = response(vec![
++            snapshot("codex", Some(window(Some(10_080), Some(1_100))), None),
++            snapshot("spark", None, Some(window(Some(10_080), Some(2_100)))),
++        ]);
++        let batch = detector
++            .observe(&identity(1), &changed, at_seconds(2))
++            .expect("one response should produce one coalesced batch");
++        assert_eq!(
++            batch
++                .changes
++                .iter()
++                .map(|change| change.limit_id.as_str())
++                .collect::<Vec<_>>(),
++            vec!["codex", "spark"]
++        );
++        assert!(
++            detector
++                .observe(&identity(2), &changed, at_seconds(3))
++                .is_none(),
++            "a new account's first complete observation is only a baseline"
++        );
++    }
++
++    #[tokio::test]
++    async fn weekly_reset_audit_precedes_deterministic_model_results() {
++        let directory = tempdir().expect("temporary audit directory");
++        let path = directory.path().join("rate_limit_reset_probes.jsonl");
++        let changes = [super::WeeklyResetChange {
++            limit_id: "codex".to_string(),
++            slot: WeeklyWindowSlot::Secondary,
++            previous_resets_at: 1_000,
++            resets_at: 2_000,
++        }];
++        let reset = WeeklyResetAuditRecord {
++            event: "weekly_rate_limit_reset_changed",
++            timestamp: "2026-07-22T00:00:00Z".to_string(),
++            changes: &changes,
++        };
++        append_audit_records(&path, std::slice::from_ref(&reset))
++            .await
++            .expect("append reset");
++        let results = [
++            ModelProbeAuditRecord {
++                event: "weekly_rate_limit_model_probe",
++                model: "a",
++                timestamp: "2026-07-22T00:00:01Z".to_string(),
++                request: "reply OK if everything is fine",
++                response: Some("OK"),
++                error: None,
++            },
++            ModelProbeAuditRecord {
++                event: "weekly_rate_limit_model_probe",
++                model: "b",
++                timestamp: "2026-07-22T00:00:01Z".to_string(),
++                request: "reply OK if everything is fine",
++                response: None,
++                error: Some("failed"),
++            },
++        ];
++        append_audit_records(&path, &results)
++            .await
++            .expect("append model results");
++
++        let records = std::fs::read_to_string(path)
++            .expect("read audit")
++            .lines()
++            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSONL"))
++            .collect::<Vec<_>>();
++        assert_eq!(records[0]["event"], "weekly_rate_limit_reset_changed");
++        assert_eq!(records[1]["model"], "a");
++        assert_eq!(records[2]["model"], "b");
++    }
+ }
+diff --git a/codex-rs/app-server/src/request_processors/account_processor.rs b/codex-rs/app-server/src/request_processors/account_processor.rs
+index 8ee09fda17..f8472857ef 100644
+--- a/codex-rs/app-server/src/request_processors/account_processor.rs
++++ b/codex-rs/app-server/src/request_processors/account_processor.rs
+@@ -8,9 +8,16 @@ use crate::rate_limits::RateLimitIdentity;
+ use crate::rate_limits::RateLimitWindowPace;
+ use chrono::DateTime;
+ use codex_model_provider::is_supported_amazon_bedrock_region;
++use codex_models_manager::manager::RefreshStrategy;
+ 
+ mod rate_limit_resets;
+ 
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub(crate) struct ModelProbeOutcome {
++    pub(crate) model: String,
++    pub(crate) result: Result<String, String>,
++}
++
+ // Duration before a browser ChatGPT login attempt is abandoned.
+ const LOGIN_CHATGPT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+ const ACCOUNT_TOKEN_USAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 10);
+@@ -1049,6 +1056,7 @@ impl AccountRequestProcessor {
+                 identity,
+                 response,
+                 pace_by_limit_id,
++                captured_at,
+             });
+         }
+     }
+@@ -1140,6 +1148,85 @@ impl AccountRequestProcessor {
+         self.auth_manager.auth_change_receiver()
+     }
+ 
++    pub(crate) fn rate_limit_reset_probe_log_path(&self) -> PathBuf {
++        self.config.log_dir.join("rate_limit_reset_probes.jsonl")
++    }
++
++    pub(crate) async fn probe_enabled_models(
++        &self,
++        expected_identity: &RateLimitIdentity,
++        timeout: Duration,
++        prompt: &'static str,
++    ) -> Result<Vec<ModelProbeOutcome>, String> {
++        let mut auth_changes = self.auth_manager.auth_change_receiver();
++        if &self.cached_rate_limit_identity() != expected_identity {
++            return Err("rate-limit probe account changed before model selection".to_string());
++        }
++        let auth = self
++            .auth_manager
++            .auth()
++            .await
++            .ok_or_else(|| "rate-limit probe requires ChatGPT authentication".to_string())?;
++        if !auth.uses_codex_backend() {
++            return Err("rate-limit probe requires ChatGPT authentication".to_string());
++        }
++        if auth.get_account_id() != expected_identity.account_id
++            || &self.cached_rate_limit_identity() != expected_identity
++        {
++            return Err("rate-limit probe account changed while resolving auth".to_string());
++        }
++        let mut client = BackendClient::from_auth(
++            self.config.chatgpt_base_url.clone(),
++            &auth,
++            self.config.http_client_factory(),
++        );
++        if let Some(account_id) = expected_identity.account_id.as_deref() {
++            client = client.with_chatgpt_account_id(account_id);
++        }
++        let mut models = self
++            .thread_manager
++            .get_models_manager()
++            .list_probe_models(RefreshStrategy::Offline, self.config.http_client_factory())
++            .await;
++        if &self.cached_rate_limit_identity() != expected_identity {
++            return Err("rate-limit probe account changed while selecting models".to_string());
++        }
++        models.sort_by(|left, right| left.model.cmp(&right.model));
++        if models.is_empty() {
++            return Err("rate-limit probe found no enabled models".to_string());
++        }
++
++        let probes = futures::future::join_all(models.into_iter().map(|model| {
++            let client = client.clone();
++            async move {
++                let result = match tokio::time::timeout(
++                    timeout,
++                    client.send_responses_probe(&model.model, prompt),
++                )
++                .await
++                {
++                    Ok(Ok(response)) => Ok(response),
++                    Ok(Err(err)) => Err(err.to_string()),
++                    Err(_) => Err(format!(
++                        "probe timed out after {} seconds",
++                        timeout.as_secs()
++                    )),
++                };
++                ModelProbeOutcome {
++                    model: model.model,
++                    result,
++                }
++            }
++        }));
++        let outcomes = await_probes_while_auth_is_stable(&mut auth_changes, probes)
++            .await
++            .map_err(str::to_string)?;
++        if &self.cached_rate_limit_identity() != expected_identity {
++            return Err("rate-limit probe account changed while probes were running".to_string());
++        }
++        Ok(outcomes)
++    }
++
+     async fn get_account_token_usage_response(
+         &self,
+     ) -> Result<GetAccountTokenUsageResponse, JSONRPCErrorError> {
+@@ -1304,6 +1391,26 @@ impl AccountRequestProcessor {
+     }
+ }
+ 
++async fn await_probes_while_auth_is_stable<F, T>(
++    auth_changes: &mut tokio::sync::watch::Receiver<u64>,
++    probes: F,
++) -> Result<T, &'static str>
++where
++    F: std::future::Future<Output = T>,
++{
++    tokio::select! {
++        biased;
++        changed = auth_changes.changed() => {
++            Err(if changed.is_ok() {
++                "rate-limit probe account changed while probes were running"
++            } else {
++                "rate-limit probe auth watcher closed while probes were running"
++            })
++        }
++        outcomes = probes => Ok(outcomes),
++    }
++}
++
+ fn workspace_message_from_backend(
+     message: BackendWorkspaceMessage,
+ ) -> Result<WorkspaceMessage, JSONRPCErrorError> {
+@@ -1387,6 +1494,32 @@ mod tests {
+     use codex_backend_client::TokenUsageProfileStats;
+     use pretty_assertions::assert_eq;
+ 
++    #[tokio::test]
++    async fn model_probe_batch_stops_when_auth_revision_changes() {
++        let (auth_tx, mut auth_rx) = tokio::sync::watch::channel(1_u64);
++        auth_tx.send(2).expect("publish auth change");
++
++        let result = await_probes_while_auth_is_stable(
++            &mut auth_rx,
++            std::future::pending::<Vec<ModelProbeOutcome>>(),
++        )
++        .await;
++
++        assert_eq!(
++            result,
++            Err("rate-limit probe account changed while probes were running")
++        );
++    }
++
++    #[tokio::test]
++    async fn model_probe_batch_returns_without_an_auth_change() {
++        let (_auth_tx, mut auth_rx) = tokio::sync::watch::channel(1_u64);
++
++        let result = await_probes_while_auth_is_stable(&mut auth_rx, async { vec!["OK"] }).await;
++
++        assert_eq!(result, Ok(vec!["OK"]));
++    }
++
+     #[test]
+     fn rate_limit_window_pace_is_signed_against_elapsed_window_time() {
+         let mut window = RateLimitWindow {
+diff --git a/codex-rs/backend-client/src/client.rs b/codex-rs/backend-client/src/client.rs
+index 97e3bdaee9..d2ed872117 100644
+--- a/codex-rs/backend-client/src/client.rs
++++ b/codex-rs/backend-client/src/client.rs
+@@ -24,6 +24,7 @@ use codex_protocol::protocol::RateLimitWindow;
+ use codex_protocol::protocol::SpendControlLimitSnapshot;
+ use http::Method;
+ use http::StatusCode;
++use http::header::ACCEPT;
+ use http::header::CACHE_CONTROL;
+ use http::header::CONTENT_TYPE;
+ use http::header::HeaderMap;
+@@ -36,6 +37,9 @@ use std::fmt;
+ 
+ mod rate_limit_resets;
+ 
++use crate::responses_probe::Decoder as ResponsesProbeDecoder;
++use crate::responses_probe::body as responses_probe_body;
++
+ #[derive(Debug)]
+ pub enum RequestError {
+     UnexpectedStatus {
+@@ -352,6 +356,71 @@ impl Client {
+         Ok(())
+     }
+ 
++    /// Send one small Responses request without creating a Codex thread.
++    ///
++    /// This is used by process-owned health probes. It deliberately waits for
++    /// `response.completed` so a partial stream is never reported as success.
++    pub async fn send_responses_probe(
++        &self,
++        model: &str,
++        prompt: &str,
++    ) -> std::result::Result<String, RequestError> {
++        let url = self.responses_probe_url();
++        let request = self
++            .http
++            .post(&url)
++            .headers(self.headers())
++            .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
++            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
++            .json(&responses_probe_body(model, prompt));
++        let mut response = request
++            .send()
++            .await
++            .map_err(anyhow::Error::from)
++            .map_err(RequestError::Other)?;
++        let status = response.status();
++        let content_type = response
++            .headers()
++            .get(CONTENT_TYPE)
++            .and_then(|value| value.to_str().ok())
++            .unwrap_or("")
++            .to_string();
++        if !status.is_success() {
++            return Err(RequestError::UnexpectedStatus {
++                method: "POST".to_string(),
++                url,
++                status,
++                content_type,
++                body: String::new(),
++            });
++        }
++
++        let mut decoder = ResponsesProbeDecoder::default();
++        while let Some(chunk) = response
++            .chunk()
++            .await
++            .map_err(anyhow::Error::from)
++            .map_err(RequestError::Other)?
++        {
++            if let Some(result) = decoder.push(&chunk) {
++                return result.map_err(|reason| {
++                    RequestError::Other(anyhow::anyhow!(
++                        "responses probe returned a terminal failure: {reason}"
++                    ))
++                });
++            }
++        }
++        match decoder.finish() {
++            Some(Ok(output)) => Ok(output),
++            Some(Err(reason)) => Err(RequestError::Other(anyhow::anyhow!(
++                "responses probe returned a terminal failure: {reason}"
++            ))),
++            None => Err(RequestError::Other(anyhow::anyhow!(
++                "responses probe ended without response.completed"
++            ))),
++        }
++    }
++
+     pub async fn list_tasks(
+         &self,
+         limit: Option<i32>,
+@@ -627,6 +696,13 @@ impl Client {
+         }
+     }
+ 
++    fn responses_probe_url(&self) -> String {
++        match self.path_style {
++            PathStyle::CodexApi => format!("{}/api/codex/responses", self.base_url),
++            PathStyle::ChatGptApi => format!("{}/codex/responses", self.base_url),
++        }
++    }
++
+     fn workspace_messages_url(&self) -> String {
+         match self.path_style {
+             PathStyle::CodexApi => format!("{}/api/codex/workspace-messages", self.base_url),
+@@ -1105,6 +1181,29 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn responses_probe_uses_native_paths_and_minimal_body() {
++        let codex_client = test_client("https://example.test", PathStyle::CodexApi);
++        let chatgpt_client = test_client("https://chatgpt.com/backend-api", PathStyle::ChatGptApi);
++
++        assert_eq!(
++            codex_client.responses_probe_url(),
++            "https://example.test/api/codex/responses"
++        );
++        assert_eq!(
++            chatgpt_client.responses_probe_url(),
++            "https://chatgpt.com/backend-api/codex/responses"
++        );
++        let body = responses_probe_body("gpt-test", "reply OK if everything is fine");
++        assert_eq!(body["model"], "gpt-test");
++        assert_eq!(body["stream"], true);
++        assert_eq!(body["store"], false);
++        assert_eq!(
++            body.pointer("/input/0/content/0/text"),
++            Some(&serde_json::json!("reply OK if everything is fine"))
++        );
++    }
++
+     #[test]
+     fn user_settings_missing_attribution_policy_defaults_to_disabled() {
+         assert_eq!(
+diff --git a/codex-rs/backend-client/src/lib.rs b/codex-rs/backend-client/src/lib.rs
+index 91aa10488d..a6a01decbe 100644
+--- a/codex-rs/backend-client/src/lib.rs
++++ b/codex-rs/backend-client/src/lib.rs
+@@ -1,4 +1,5 @@
+ mod client;
++mod responses_probe;
+ pub(crate) mod types;
+ 
+ pub use client::AddCreditsNudgeCreditType;
+diff --git a/codex-rs/backend-client/src/responses_probe.rs b/codex-rs/backend-client/src/responses_probe.rs
+new file mode 100644
+index 0000000000..4c4e7d6e9e
+--- /dev/null
++++ b/codex-rs/backend-client/src/responses_probe.rs
+@@ -0,0 +1,188 @@
++const RESPONSES_PROBE_INSTRUCTIONS: &str =
++    "You are Codex. Respond directly to this health-check prompt.";
++
++pub(super) fn body(model: &str, prompt: &str) -> serde_json::Value {
++    serde_json::json!({
++        "model": model,
++        "instructions": RESPONSES_PROBE_INSTRUCTIONS,
++        "input": [{
++            "type": "message",
++            "role": "user",
++            "content": [{"type": "input_text", "text": prompt}],
++        }],
++        "stream": true,
++        "store": false,
++        "tools": [],
++        "tool_choice": "auto",
++        "parallel_tool_calls": false,
++        "reasoning": null,
++        "include": [],
++    })
++}
++
++#[derive(Default)]
++pub(super) struct Decoder {
++    pending: Vec<u8>,
++    output_deltas: String,
++    completed_output_parts: String,
++}
++
++impl Decoder {
++    pub(super) fn push(&mut self, chunk: &[u8]) -> Option<std::result::Result<String, String>> {
++        self.pending.extend_from_slice(chunk);
++        while let Some((frame_end, delimiter_len)) = next_sse_frame(&self.pending) {
++            let frame = self.pending.drain(..frame_end).collect::<Vec<_>>();
++            self.pending.drain(..delimiter_len);
++            if let Some(result) = self.consume_frame(&frame) {
++                return Some(result);
++            }
++        }
++        None
++    }
++
++    pub(super) fn finish(&mut self) -> Option<std::result::Result<String, String>> {
++        if self.pending.is_empty() {
++            return None;
++        }
++        let frame = std::mem::take(&mut self.pending);
++        self.consume_frame(&frame)
++    }
++
++    fn consume_frame(&mut self, frame: &[u8]) -> Option<std::result::Result<String, String>> {
++        let frame = String::from_utf8_lossy(frame).replace('\r', "");
++        let data = frame
++            .lines()
++            .filter_map(|line| line.strip_prefix("data:").map(str::trim_start))
++            .collect::<Vec<_>>()
++            .join("\n");
++        if data.is_empty() || data == "[DONE]" {
++            return None;
++        }
++        let event = serde_json::from_str::<serde_json::Value>(&data).ok()?;
++        match event.get("type").and_then(serde_json::Value::as_str)? {
++            "response.output_text.delta" => {
++                if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str) {
++                    self.output_deltas.push_str(delta);
++                }
++                None
++            }
++            "response.output_text.done" => {
++                if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
++                    self.completed_output_parts.push_str(text);
++                }
++                None
++            }
++            "response.completed" => Some(Ok(completed_output(&event)
++                .or_else(|| {
++                    (!self.completed_output_parts.is_empty())
++                        .then(|| self.completed_output_parts.clone())
++                })
++                .unwrap_or_else(|| self.output_deltas.clone()))),
++            kind @ ("response.failed" | "response.incomplete") => {
++                Some(Err(failure_reason(&event, kind)))
++            }
++            _ => None,
++        }
++    }
++}
++
++fn next_sse_frame(bytes: &[u8]) -> Option<(usize, usize)> {
++    let line_feed = bytes
++        .windows(2)
++        .position(|window| window == b"\n\n")
++        .map(|index| (index, 2));
++    let carriage_return = bytes
++        .windows(4)
++        .position(|window| window == b"\r\n\r\n")
++        .map(|index| (index, 4));
++    match (line_feed, carriage_return) {
++        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
++        (Some(frame), None) | (None, Some(frame)) => Some(frame),
++        (None, None) => None,
++    }
++}
++
++fn completed_output(event: &serde_json::Value) -> Option<String> {
++    let output = event
++        .get("response")?
++        .get("output")?
++        .as_array()?
++        .iter()
++        .filter_map(|item| item.get("content").and_then(serde_json::Value::as_array))
++        .flatten()
++        .filter(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("output_text"))
++        .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
++        .collect::<String>();
++    (!output.is_empty()).then_some(output)
++}
++
++fn failure_reason(event: &serde_json::Value, kind: &str) -> String {
++    let reason = match kind {
++        "response.failed" => event
++            .pointer("/response/error/message")
++            .or_else(|| event.pointer("/error/message")),
++        "response.incomplete" => event.pointer("/response/incomplete_details/reason"),
++        _ => None,
++    }
++    .and_then(serde_json::Value::as_str);
++    reason.map_or_else(|| kind.to_string(), |reason| format!("{kind}: {reason}"))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use pretty_assertions::assert_eq;
++
++    #[test]
++    fn waits_for_completed_across_chunks() {
++        let mut decoder = Decoder::default();
++
++        assert_eq!(
++            decoder.push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"O\"}\n\n"),
++            None
++        );
++        assert_eq!(
++            decoder
++                .push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"K\"}\r\n\r\n"),
++            None
++        );
++        assert_eq!(decoder.push(b"data: {\"type\":\"response.comp"), None);
++        assert_eq!(
++            decoder.push(b"leted\",\"response\":{}}\n\n"),
++            Some(Ok("OK".to_string()))
++        );
++    }
++
++    #[test]
++    fn reports_terminal_failure_and_rejects_partial_eof() {
++        let mut failed = Decoder::default();
++        assert_eq!(
++            failed.push(
++                b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"denied\"}}}\n\n"
++            ),
++            Some(Err("response.failed: denied".to_string()))
++        );
++
++        let mut partial = Decoder::default();
++        assert_eq!(
++            partial.push(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n"),
++            None
++        );
++        assert_eq!(partial.finish(), None);
++    }
++
++    #[test]
++    fn uses_the_earliest_mixed_line_ending() {
++        let mut decoder = Decoder::default();
++        assert_eq!(
++            decoder.push(
++                concat!(
++                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\r\n\r\n",
++                    "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
++                )
++                .as_bytes()
++            ),
++            Some(Ok("OK".to_string()))
++        );
++    }
++}
+diff --git a/codex-rs/models-manager/src/manager.rs b/codex-rs/models-manager/src/manager.rs
+index 6289a08632..519c41283d 100644
+--- a/codex-rs/models-manager/src/manager.rs
++++ b/codex-rs/models-manager/src/manager.rs
+@@ -111,6 +111,26 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
+         )
+     }
+ 
++    /// List models that can receive process-owned health probes.
++    ///
++    /// Picker-hidden models remain eligible, while catalog entries with no
++    /// product visibility are not active model surfaces.
++    fn list_probe_models(
++        &self,
++        refresh_strategy: RefreshStrategy,
++        http_client_factory: HttpClientFactory,
++    ) -> ModelsManagerFuture<'_, Vec<ModelPreset>> {
++        Box::pin(async move {
++            let mut catalog = self
++                .raw_model_catalog(refresh_strategy, http_client_factory)
++                .await;
++            catalog
++                .models
++                .retain(|model| model.visibility != ModelVisibility::None);
++            self.build_available_models(catalog.models)
++        })
++    }
++
+     /// Return the active raw model catalog, refreshing according to the specified strategy.
+     fn raw_model_catalog(
+         &self,
+diff --git a/codex-rs/models-manager/src/manager_tests.rs b/codex-rs/models-manager/src/manager_tests.rs
+index a7414e05ee..cee45c53c0 100644
+--- a/codex-rs/models-manager/src/manager_tests.rs
++++ b/codex-rs/models-manager/src/manager_tests.rs
+@@ -3008,6 +3008,29 @@ fn build_available_models_picks_default_after_hiding_hidden_models() {
+     assert_eq!(available, vec![expected_hidden, expected_visible]);
+ }
+ 
++#[tokio::test]
++async fn probe_models_include_hidden_and_omit_models_without_visibility() {
++    let listed = remote_model_with_visibility("listed", "Listed", /*priority*/ 0, "list");
++    let hidden = remote_model_with_visibility("hidden", "Hidden", /*priority*/ 1, "hide");
++    let unavailable =
++        remote_model_with_visibility("unavailable", "Unavailable", /*priority*/ 2, "none");
++    let manager = static_manager_for_tests(ModelsResponse {
++        models: vec![listed, hidden, unavailable],
++    });
++
++    let models = manager
++        .list_probe_models(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY)
++        .await;
++
++    assert_eq!(
++        models
++            .into_iter()
++            .map(|model| model.model)
++            .collect::<Vec<_>>(),
++        vec!["listed", "hidden"]
++    );
++}
++
+ #[tokio::test]
+ async fn static_manager_reads_latest_auth_mode() {
+     let auth_manager =

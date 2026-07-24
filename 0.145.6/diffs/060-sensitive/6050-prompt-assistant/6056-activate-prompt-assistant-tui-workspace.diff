@@ -1,0 +1,1201 @@
+diff --git a/codex-rs/tui/src/app/app_server_event_targets.rs b/codex-rs/tui/src/app/app_server_event_targets.rs
+index 95ede3203a..a68ee5cd3e 100644
+--- a/codex-rs/tui/src/app/app_server_event_targets.rs
++++ b/codex-rs/tui/src/app/app_server_event_targets.rs
+@@ -162,6 +162,12 @@ pub(super) fn server_notification_thread_target(
+         ServerNotification::ThreadRealtimeClosed(notification) => {
+             Some(notification.thread_id.as_str())
+         }
++        ServerNotification::PromptAssistantWorkspaceUpdated(notification) => {
++            Some(notification.workspace.thread_id.as_str())
++        }
++        ServerNotification::PromptAssistantProgress(notification) => {
++            Some(notification.thread_id.as_str())
++        }
+         ServerNotification::Warning(notification) => notification.thread_id.as_deref(),
+         ServerNotification::GuardianWarning(notification) => Some(notification.thread_id.as_str()),
+         ServerNotification::McpServerStatusUpdated(notification) => {
+@@ -212,6 +218,8 @@ mod tests {
+     use codex_app_server_protocol::GuardianWarningNotification;
+     use codex_app_server_protocol::McpServerStartupState;
+     use codex_app_server_protocol::McpServerStatusUpdatedNotification;
++    use codex_app_server_protocol::PromptAssistantOperationKind;
++    use codex_app_server_protocol::PromptAssistantProgressNotification;
+     use codex_app_server_protocol::ResponsesStreamConnectionStatusNotification;
+     use codex_app_server_protocol::ServerNotification;
+     use codex_app_server_protocol::ThreadSettings;
+@@ -351,4 +359,21 @@ mod tests {
+ 
+         assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
+     }
++
++    #[test]
++    fn prompt_assistant_progress_routes_to_its_parent_thread() {
++        let thread_id = ThreadId::new();
++        let notification =
++            ServerNotification::PromptAssistantProgress(PromptAssistantProgressNotification {
++                thread_id: thread_id.to_string(),
++                workspace_id: "workspace".to_string(),
++                generation: 2,
++                operation: PromptAssistantOperationKind::Compose,
++                received_bytes: 42,
++            });
++
++        let target = server_notification_thread_target(&notification);
++
++        assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
++    }
+ }
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index fbeccb65d6..17b49f2d93 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -21,6 +21,59 @@ impl App {
+         event: AppEvent,
+     ) -> Result<AppRunControl> {
+         match event {
++            AppEvent::PromptAssistantOpen { thread_id } => {
++                let result = app_server
++                    .prompt_assistant_open(thread_id)
++                    .await
++                    .map_err(|err| err.to_string());
++                self.chat_widget.prompt_assistant_opened(result);
++            }
++            AppEvent::PromptAssistantCompose(params) => {
++                let result = app_server
++                    .prompt_assistant_compose(params)
++                    .await
++                    .map(|response| response.workspace)
++                    .map_err(|err| err.to_string());
++                self.chat_widget
++                    .prompt_assistant_request_acknowledged(result);
++            }
++            AppEvent::PromptAssistantRevise(params) => {
++                let result = app_server
++                    .prompt_assistant_revise(params)
++                    .await
++                    .map(|response| response.workspace)
++                    .map_err(|err| err.to_string());
++                self.chat_widget
++                    .prompt_assistant_request_acknowledged(result);
++            }
++            AppEvent::PromptAssistantApply(params) => {
++                let result = app_server
++                    .prompt_assistant_apply(params)
++                    .await
++                    .map_err(|err| err.to_string());
++                self.chat_widget.prompt_assistant_applied(result);
++            }
++            AppEvent::PromptAssistantInterrupt(params) => {
++                let result = app_server
++                    .prompt_assistant_interrupt(params)
++                    .await
++                    .map(|response| response.workspace)
++                    .map_err(|err| err.to_string());
++                self.chat_widget
++                    .prompt_assistant_request_acknowledged(result);
++            }
++            AppEvent::PromptAssistantCancel(params) => {
++                let result = app_server
++                    .prompt_assistant_cancel(params)
++                    .await
++                    .map(|_| ())
++                    .map_err(|err| err.to_string());
++                self.chat_widget.prompt_assistant_cancelled(result);
++            }
++            AppEvent::PromptAssistantResultAction(action) => {
++                self.chat_widget
++                    .handle_prompt_assistant_result_action(action);
++            }
+             AppEvent::NewSession { name } => {
+                 self.start_fresh_session_with_summary_hint(
+                     tui, app_server, /*session_start_source*/ None,
+diff --git a/codex-rs/tui/src/app/input.rs b/codex-rs/tui/src/app/input.rs
+index 0a0e66dfab..22379c0af5 100644
+--- a/codex-rs/tui/src/app/input.rs
++++ b/codex-rs/tui/src/app/input.rs
+@@ -133,6 +133,11 @@ impl App {
+         app_server: &mut AppServerSession,
+         key_event: KeyEvent,
+     ) {
++        if self.chat_widget.prompt_assistant_active() {
++            self.chat_widget.handle_key_event(key_event);
++            return;
++        }
++
+         // Some terminals, especially on macOS, encode Option+Left/Right as Option+b/f unless
+         // enhanced keyboard reporting is available. We only treat those word-motion fallbacks as
+         // agent-switch shortcuts when the composer is empty so we never steal the expected
+@@ -195,6 +200,13 @@ impl App {
+             return;
+         }
+ 
++        if app_keymap_shortcuts_available
++            && self.keymap.composer.prompt_assistant.is_pressed(key_event)
++        {
++            self.chat_widget.open_prompt_assistant();
++            return;
++        }
++
+         if app_keymap_shortcuts_available && self.keymap.app.toggle_vim_mode.is_pressed(key_event) {
+             self.chat_widget.toggle_vim_mode_and_notify();
+             return;
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+index e25dbe482c..47d620ad68 100644
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -29,6 +29,11 @@ use codex_app_server_protocol::PluginMarketplaceEntry;
+ use codex_app_server_protocol::PluginReadParams;
+ use codex_app_server_protocol::PluginReadResponse;
+ use codex_app_server_protocol::PluginUninstallResponse;
++use codex_app_server_protocol::PromptAssistantApplyParams;
++use codex_app_server_protocol::PromptAssistantCancelParams;
++use codex_app_server_protocol::PromptAssistantComposeParams;
++use codex_app_server_protocol::PromptAssistantInterruptParams;
++use codex_app_server_protocol::PromptAssistantReviseParams;
+ use codex_app_server_protocol::SkillsListResponse;
+ use codex_app_server_protocol::ThreadGoalStatus;
+ use codex_connectors::AppInfo;
+@@ -42,6 +47,7 @@ use codex_utils_approval_presets::ApprovalPreset;
+ use crate::app_command::AppCommand;
+ use crate::app_server_session::AppServerStartedThread;
+ use crate::bottom_pane::ApprovalRequest;
++use crate::bottom_pane::PromptAssistantResultAction;
+ use crate::bottom_pane::StatusLineItem;
+ use crate::bottom_pane::TerminalTitleItem;
+ use crate::chatwidget::UserMessage;
+@@ -173,6 +179,23 @@ pub(crate) enum KeymapEditIntent {
+ #[allow(clippy::large_enum_variant)]
+ #[derive(Debug)]
+ pub(crate) enum AppEvent {
++    /// Open a connection-local Prompt Assistant workspace for the active thread.
++    PromptAssistantOpen {
++        thread_id: ThreadId,
++    },
++    /// Start the first Prompt Assistant composition request.
++    PromptAssistantCompose(PromptAssistantComposeParams),
++    /// Revise the current Prompt Assistant candidate.
++    PromptAssistantRevise(PromptAssistantReviseParams),
++    /// Apply the current full candidate back to the main composer.
++    PromptAssistantApply(PromptAssistantApplyParams),
++    /// Interrupt only the active Prompt Assistant model request.
++    PromptAssistantInterrupt(PromptAssistantInterruptParams),
++    /// Discard the connection-local Prompt Assistant workspace.
++    PromptAssistantCancel(PromptAssistantCancelParams),
++    /// Handle an action selected from the Prompt Assistant result view.
++    PromptAssistantResultAction(PromptAssistantResultAction),
++
+     /// Open the agent picker for switching active threads.
+     OpenAgentPicker,
+     /// Switch the active thread to the selected agent.
+diff --git a/codex-rs/tui/src/app_server_session.rs b/codex-rs/tui/src/app_server_session.rs
+index 5b248541da..3b6a47c500 100644
+--- a/codex-rs/tui/src/app_server_session.rs
++++ b/codex-rs/tui/src/app_server_session.rs
+@@ -44,6 +44,18 @@ use codex_app_server_protocol::Model as ApiModel;
+ use codex_app_server_protocol::ModelListParams;
+ use codex_app_server_protocol::ModelListResponse;
+ use codex_app_server_protocol::NewThreadModelDefaults;
++use codex_app_server_protocol::PromptAssistantApplyParams;
++use codex_app_server_protocol::PromptAssistantApplyResponse;
++use codex_app_server_protocol::PromptAssistantCancelParams;
++use codex_app_server_protocol::PromptAssistantCancelResponse;
++use codex_app_server_protocol::PromptAssistantComposeParams;
++use codex_app_server_protocol::PromptAssistantComposeResponse;
++use codex_app_server_protocol::PromptAssistantInterruptParams;
++use codex_app_server_protocol::PromptAssistantInterruptResponse;
++use codex_app_server_protocol::PromptAssistantOpenParams;
++use codex_app_server_protocol::PromptAssistantOpenResponse;
++use codex_app_server_protocol::PromptAssistantReviseParams;
++use codex_app_server_protocol::PromptAssistantReviseResponse;
+ use codex_app_server_protocol::RateLimitSnapshot;
+ use codex_app_server_protocol::RequestId;
+ use codex_app_server_protocol::ReviewDelivery;
+@@ -282,6 +294,77 @@ pub(crate) enum TurnPermissionsOverride {
+ }
+ 
+ impl AppServerSession {
++    pub(crate) async fn prompt_assistant_open(
++        &mut self,
++        thread_id: ThreadId,
++    ) -> Result<PromptAssistantOpenResponse> {
++        let request_id = self.next_request_id();
++        self.client
++            .request_typed(ClientRequest::PromptAssistantOpen {
++                request_id,
++                params: PromptAssistantOpenParams {
++                    thread_id: thread_id.to_string(),
++                },
++            })
++            .await
++            .wrap_err("promptAssistant/open failed in TUI")
++    }
++
++    pub(crate) async fn prompt_assistant_compose(
++        &mut self,
++        params: PromptAssistantComposeParams,
++    ) -> Result<PromptAssistantComposeResponse> {
++        let request_id = self.next_request_id();
++        self.client
++            .request_typed(ClientRequest::PromptAssistantCompose { request_id, params })
++            .await
++            .wrap_err("promptAssistant/compose failed in TUI")
++    }
++
++    pub(crate) async fn prompt_assistant_revise(
++        &mut self,
++        params: PromptAssistantReviseParams,
++    ) -> Result<PromptAssistantReviseResponse> {
++        let request_id = self.next_request_id();
++        self.client
++            .request_typed(ClientRequest::PromptAssistantRevise { request_id, params })
++            .await
++            .wrap_err("promptAssistant/revise failed in TUI")
++    }
++
++    pub(crate) async fn prompt_assistant_apply(
++        &mut self,
++        params: PromptAssistantApplyParams,
++    ) -> Result<PromptAssistantApplyResponse> {
++        let request_id = self.next_request_id();
++        self.client
++            .request_typed(ClientRequest::PromptAssistantApply { request_id, params })
++            .await
++            .wrap_err("promptAssistant/apply failed in TUI")
++    }
++
++    pub(crate) async fn prompt_assistant_interrupt(
++        &mut self,
++        params: PromptAssistantInterruptParams,
++    ) -> Result<PromptAssistantInterruptResponse> {
++        let request_id = self.next_request_id();
++        self.client
++            .request_typed(ClientRequest::PromptAssistantInterrupt { request_id, params })
++            .await
++            .wrap_err("promptAssistant/interrupt failed in TUI")
++    }
++
++    pub(crate) async fn prompt_assistant_cancel(
++        &mut self,
++        params: PromptAssistantCancelParams,
++    ) -> Result<PromptAssistantCancelResponse> {
++        let request_id = self.next_request_id();
++        self.client
++            .request_typed(ClientRequest::PromptAssistantCancel { request_id, params })
++            .await
++            .wrap_err("promptAssistant/cancel failed in TUI")
++    }
++
+     pub(crate) fn new(client: AppServerClient, thread_params_mode: ThreadParamsMode) -> Self {
+         Self {
+             client,
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+index b2d91eb442..e0c4da6b62 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+@@ -427,6 +427,8 @@ pub(crate) struct ChatComposerConfig {
+     pub(crate) slash_commands_enabled: bool,
+     /// Whether pasting a file path can attach local images.
+     pub(crate) image_paste_enabled: bool,
++    /// Whether Up/Down may replace the draft from persistent input history.
++    pub(crate) history_recall_enabled: bool,
+ }
+ 
+ impl Default for ChatComposerConfig {
+@@ -435,6 +437,7 @@ impl Default for ChatComposerConfig {
+             popups_enabled: true,
+             slash_commands_enabled: true,
+             image_paste_enabled: true,
++            history_recall_enabled: true,
+         }
+     }
+ }
+@@ -449,6 +452,7 @@ impl ChatComposerConfig {
+             popups_enabled: false,
+             slash_commands_enabled: false,
+             image_paste_enabled: false,
++            history_recall_enabled: false,
+         }
+     }
+ }
+@@ -523,6 +527,7 @@ struct ComposerDraft {
+ #[derive(Clone, Debug, PartialEq)]
+ pub(crate) struct ComposerDraftSnapshot {
+     pub(crate) text: String,
++    pub(crate) cursor: usize,
+     pub(crate) text_elements: Vec<TextElement>,
+     pub(crate) local_images: Vec<LocalImageAttachment>,
+     pub(crate) remote_image_urls: Vec<String>,
+@@ -774,6 +779,11 @@ impl ChatComposer {
+         self.config.image_paste_enabled = enabled;
+     }
+ 
++    pub(crate) fn set_config(&mut self, config: ChatComposerConfig) {
++        self.config = config;
++        self.sync_popups();
++    }
++
+     pub fn set_connector_mentions(&mut self, connectors_snapshot: Option<ConnectorsSnapshot>) {
+         self.connectors_snapshot = connectors_snapshot;
+         self.sync_popups();
+@@ -848,6 +858,10 @@ impl ChatComposer {
+         self.footer.reasoning_up_key = primary_binding(&keymap.chat.increase_reasoning_effort);
+     }
+ 
++    pub(crate) fn is_submit_key(&self, key_event: KeyEvent) -> bool {
++        self.submit_keys.is_pressed(key_event)
++    }
++
+     pub fn set_collaboration_mode_indicator(
+         &mut self,
+         indicator: Option<CollaborationModeIndicator>,
+@@ -1570,6 +1584,13 @@ impl ChatComposer {
+         self.sync_popups();
+     }
+ 
++    pub(crate) fn set_cursor(&mut self, cursor: usize) {
++        self.draft
++            .textarea
++            .set_cursor(cursor.min(self.draft.textarea.text().len()));
++        self.sync_popups();
++    }
++
+     fn move_cursor_to_history_entry_end(&mut self) {
+         let cursor = if self.draft.textarea.is_vim_normal_mode() {
+             self.draft.textarea.vim_normal_end_cursor()
+@@ -1671,6 +1692,7 @@ impl ChatComposer {
+     pub(crate) fn draft_snapshot(&self) -> ComposerDraftSnapshot {
+         ComposerDraftSnapshot {
+             text: self.current_text(),
++            cursor: self.current_cursor(),
+             text_elements: self.text_elements(),
+             local_images: self.local_images(),
+             remote_image_urls: self.remote_image_urls(),
+@@ -3410,9 +3432,11 @@ impl ChatComposer {
+             )
+         };
+         if history_up_pressed || history_down_pressed {
+-            if self
+-                .history
+-                .should_handle_navigation(&self.current_text(), self.history_navigation_cursor())
++            if self.config.history_recall_enabled
++                && self.history.should_handle_navigation(
++                    &self.current_text(),
++                    self.history_navigation_cursor(),
++                )
+             {
+                 let replace_entry = if history_up_pressed {
+                     self.history.navigate_up(&self.app_event_tx)
+@@ -3789,9 +3813,10 @@ impl ChatComposer {
+         } else {
+             self.current_editable_at_token_range_with_options(/*allow_empty*/ false)
+         };
+-        let browsing_history = self
+-            .history
+-            .should_handle_navigation(&self.current_text(), self.history_navigation_cursor());
++        let browsing_history = self.config.history_recall_enabled
++            && self
++                .history
++                .should_handle_navigation(&self.current_text(), self.history_navigation_cursor());
+         // When browsing input history (shell-style Up/Down recall), skip all popup
+         // synchronization so nothing steals focus from continued history navigation.
+         if browsing_history {
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+index 8ec98eb0e6..78aeaea427 100644
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -150,6 +150,10 @@ mod paste_burst;
+ mod pending_input_preview;
+ mod pending_thread_approvals;
+ pub(crate) mod popup_consts;
++mod prompt_assistant_result_view;
++pub(crate) use prompt_assistant_result_view::PROMPT_ASSISTANT_RESULT_VIEW_ID;
++pub(crate) use prompt_assistant_result_view::PromptAssistantResultAction;
++pub(crate) use prompt_assistant_result_view::PromptAssistantResultView;
+ mod scroll_state;
+ mod selection_popup_common;
+ mod selection_tabs;
+@@ -191,6 +195,7 @@ pub(crate) enum CancellationEvent {
+ use crate::bottom_pane::prompt_args::parse_slash_name;
+ pub(crate) use chat_composer::ChatComposer;
+ pub(crate) use chat_composer::ChatComposerConfig;
++pub(crate) use chat_composer::ComposerDraftSnapshot;
+ pub(crate) use chat_composer::InputResult;
+ pub(crate) use chat_composer::QueuedInputAction;
+ pub(crate) use chat_composer_history::HistoryEntry;
+@@ -837,6 +842,33 @@ impl BottomPane {
+         self.request_redraw();
+     }
+ 
++    pub(crate) fn set_composer_config(&mut self, config: ChatComposerConfig) {
++        self.composer.set_config(config);
++        self.request_redraw();
++    }
++
++    pub(crate) fn restore_composer_draft(
++        &mut self,
++        snapshot: chat_composer::ComposerDraftSnapshot,
++    ) {
++        let cursor = snapshot.cursor;
++        let local_image_paths = snapshot
++            .local_images
++            .into_iter()
++            .map(|image| image.path)
++            .collect();
++        self.set_composer_text_with_mention_bindings(
++            snapshot.text,
++            snapshot.text_elements,
++            local_image_paths,
++            snapshot.mention_bindings,
++        );
++        self.set_remote_image_urls(snapshot.remote_image_urls);
++        self.set_composer_pending_pastes(snapshot.pending_pastes);
++        self.composer.set_cursor(cursor);
++        self.request_redraw();
++    }
++
+     pub(crate) fn show_shutdown_in_progress(&mut self) {
+         self.view_stack.clear();
+         self.composer.show_shutdown_in_progress();
+@@ -894,6 +926,10 @@ impl BottomPane {
+         self.composer.input_enabled()
+     }
+ 
++    pub(crate) fn composer_submit_key_pressed(&self, key_event: KeyEvent) -> bool {
++        self.composer.is_submit_key(key_event)
++    }
++
+     pub(crate) fn composer_pending_pastes(&self) -> Vec<(String, String)> {
+         self.composer.pending_pastes()
+     }
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 630afdefe2..f1b9ab1f25 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -386,6 +386,7 @@ mod notifications;
+ use self::notifications::Notification;
+ mod permission_popups;
+ mod permissions_menu;
++mod prompt_assistant;
+ mod protocol;
+ mod protocol_requests;
+ mod rate_limits;
+@@ -556,6 +557,7 @@ struct RequestPerformanceState {
+ /// active work, arming the double-press quit shortcut, and requesting shutdown-first exit.
+ pub(crate) struct ChatWidget {
+     app_event_tx: AppEventSender,
++    prompt_assistant: Option<prompt_assistant::PromptAssistantUiState>,
+     codex_op_target: CodexOpTarget,
+     bottom_pane: BottomPane,
+     transcript: TranscriptState,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 96c5c494f2..a043dd756d 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -93,6 +93,7 @@ impl ChatWidget {
+         );
+         let mut widget = Self {
+             app_event_tx: app_event_tx.clone(),
++            prompt_assistant: None,
+             frame_requester: frame_requester.clone(),
+             codex_op_target,
+             bottom_pane: BottomPane::new(BottomPaneParams {
+diff --git a/codex-rs/tui/src/chatwidget/interaction.rs b/codex-rs/tui/src/chatwidget/interaction.rs
+index d8581e7af3..0dd8e84c62 100644
+--- a/codex-rs/tui/src/chatwidget/interaction.rs
++++ b/codex-rs/tui/src/chatwidget/interaction.rs
+@@ -4,6 +4,9 @@ use super::*;
+ 
+ impl ChatWidget {
+     pub(crate) fn handle_key_event(&mut self, key_event: KeyEvent) {
++        if self.handle_prompt_assistant_key_event(key_event) {
++            return;
++        }
+         if self.bottom_pane.has_active_view()
+             && !matches!(
+                 key_event,
+diff --git a/codex-rs/tui/src/chatwidget/prompt_assistant.rs b/codex-rs/tui/src/chatwidget/prompt_assistant.rs
+new file mode 100644
+index 0000000000..1e7fd162ef
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/prompt_assistant.rs
+@@ -0,0 +1,662 @@
++use codex_app_server_protocol::PromptAssistantApplyParams;
++use codex_app_server_protocol::PromptAssistantApplyResponse;
++use codex_app_server_protocol::PromptAssistantCancelParams;
++use codex_app_server_protocol::PromptAssistantComposeParams;
++use codex_app_server_protocol::PromptAssistantInterruptParams;
++use codex_app_server_protocol::PromptAssistantModelOption;
++use codex_app_server_protocol::PromptAssistantOpenResponse;
++use codex_app_server_protocol::PromptAssistantOutcome;
++use codex_app_server_protocol::PromptAssistantPhase;
++use codex_app_server_protocol::PromptAssistantProgressNotification;
++use codex_app_server_protocol::PromptAssistantReviseParams;
++use codex_app_server_protocol::PromptAssistantWorkspace;
++use crossterm::event::KeyCode;
++use crossterm::event::KeyEvent;
++use crossterm::event::KeyEventKind;
++use crossterm::event::KeyModifiers;
++use ratatui::style::Stylize;
++use ratatui::text::Line;
++use ratatui::text::Span;
++use std::time::Instant;
++
++use super::ChatWidget;
++use crate::app_event::AppEvent;
++use crate::bottom_pane::ChatComposerConfig;
++use crate::bottom_pane::ComposerDraftSnapshot;
++use crate::bottom_pane::PROMPT_ASSISTANT_RESULT_VIEW_ID;
++use crate::bottom_pane::PromptAssistantResultAction;
++use crate::bottom_pane::PromptAssistantResultView;
++use crate::key_hint::KeyBindingListExt;
++use crate::model_color::model_style;
++use crate::model_color::reasoning_effort_style;
++use crate::status_indicator_widget::StatusDetailsCapitalization;
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum PromptAssistantEditingKind {
++    Compose,
++    Revise,
++}
++
++pub(super) struct PromptAssistantUiState {
++    source_draft: ComposerDraftSnapshot,
++    initial_input: String,
++    revision_draft: String,
++    workspace: Option<PromptAssistantWorkspace>,
++    models: Vec<PromptAssistantModelOption>,
++    editing_kind: PromptAssistantEditingKind,
++    working: bool,
++    received_bytes: u64,
++    progress_initialized: bool,
++}
++
++impl ChatWidget {
++    pub(crate) fn prompt_assistant_active(&self) -> bool {
++        self.prompt_assistant.is_some()
++    }
++
++    pub(crate) fn open_prompt_assistant(&mut self) {
++        if self.prompt_assistant.is_some() {
++            return;
++        }
++        if self.bottom_pane.is_task_running() {
++            self.add_error_message(
++                "Prompt Assistant is unavailable while the main thread is working.".to_string(),
++            );
++            return;
++        }
++        let Some(thread_id) = self.thread_id else {
++            self.add_error_message(
++                "Prompt Assistant is unavailable until startup completes.".to_string(),
++            );
++            return;
++        };
++
++        let source_draft = self.bottom_pane.composer_draft_snapshot();
++        if !source_draft.local_images.is_empty() || !source_draft.remote_image_urls.is_empty() {
++            self.add_error_message(
++                "Prompt Assistant cannot open while the composer contains images.".to_string(),
++            );
++            return;
++        }
++        let initial_input = self.bottom_pane.composer_text_with_pending();
++        self.prompt_assistant = Some(PromptAssistantUiState {
++            source_draft,
++            initial_input,
++            revision_draft: String::new(),
++            workspace: None,
++            models: Vec::new(),
++            editing_kind: PromptAssistantEditingKind::Compose,
++            working: false,
++            received_bytes: 0,
++            progress_initialized: false,
++        });
++        self.bottom_pane
++            .set_composer_input_enabled(false, Some("Opening Prompt Assistant…".to_string()));
++        self.app_event_tx
++            .send(AppEvent::PromptAssistantOpen { thread_id });
++        self.request_redraw();
++    }
++
++    pub(crate) fn prompt_assistant_opened(
++        &mut self,
++        result: Result<PromptAssistantOpenResponse, String>,
++    ) {
++        let Ok(response) = result else {
++            let message = result.expect_err("checked above");
++            self.close_prompt_assistant_restoring_source();
++            self.add_error_message(message);
++            return;
++        };
++        let Some(state) = self.prompt_assistant.as_mut() else {
++            return;
++        };
++        state.workspace = Some(response.workspace);
++        state.models = response.models;
++        self.bottom_pane
++            .set_composer_config(ChatComposerConfig::plain_text());
++        self.bottom_pane
++            .set_composer_text(state.initial_input.clone(), Vec::new(), Vec::new());
++        self.bottom_pane.set_remote_image_urls(Vec::new());
++        self.bottom_pane.set_composer_pending_pastes(Vec::new());
++        self.bottom_pane
++            .set_composer_input_enabled(true, Some("Describe the prompt to compose".to_string()));
++        self.update_prompt_assistant_status_line();
++        self.request_redraw();
++    }
++
++    pub(crate) fn handle_prompt_assistant_key_event(&mut self, key_event: KeyEvent) -> bool {
++        if self.prompt_assistant.is_none() {
++            return false;
++        }
++        if self.bottom_pane.has_active_view() {
++            return false;
++        }
++
++        if key_event.kind != KeyEventKind::Press {
++            return true;
++        }
++
++        if matches!(key_event.code, KeyCode::Esc) {
++            let working = self
++                .prompt_assistant
++                .as_ref()
++                .is_some_and(|state| state.working);
++            if working {
++                self.request_prompt_assistant_interrupt();
++            } else if self.prompt_assistant.as_ref().is_some_and(|state| {
++                state.editing_kind == PromptAssistantEditingKind::Revise
++                    && state
++                        .workspace
++                        .as_ref()
++                        .and_then(|workspace| workspace.candidate.as_ref())
++                        .is_some()
++            }) {
++                if let Some(state) = self.prompt_assistant.as_mut() {
++                    state.revision_draft = self.bottom_pane.composer_text_with_pending();
++                }
++                self.show_prompt_assistant_result();
++            } else {
++                self.request_prompt_assistant_cancel();
++            }
++            return true;
++        }
++
++        if matches!(
++            key_event,
++            KeyEvent {
++                code: KeyCode::Char('c'),
++                modifiers,
++                ..
++            } if modifiers.contains(KeyModifiers::ALT)
++        ) {
++            self.copy_prompt_assistant_candidate();
++            return true;
++        }
++
++        if matches!(
++            key_event,
++            KeyEvent {
++                code: KeyCode::Char('g'),
++                modifiers,
++                ..
++            } if modifiers.contains(KeyModifiers::CONTROL)
++        ) {
++            return true;
++        }
++
++        if matches!(
++            key_event,
++            KeyEvent {
++                code: KeyCode::Char('v'),
++                modifiers,
++                ..
++            } if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
++        ) {
++            self.add_error_message(
++                "Prompt Assistant accepts text paste only; image paste is disabled.".to_string(),
++            );
++            return true;
++        }
++
++        if self.prompt_assistant_step_model(key_event)
++            || self.prompt_assistant_step_reasoning(key_event)
++        {
++            return true;
++        }
++
++        if self.bottom_pane.composer_submit_key_pressed(key_event) {
++            self.submit_prompt_assistant_edit();
++            return true;
++        }
++
++        key_event
++            .modifiers
++            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
++    }
++
++    fn submit_prompt_assistant_edit(&mut self) {
++        let input = self.bottom_pane.composer_text_with_pending();
++        if input.trim().is_empty() {
++            self.add_warning_message("Prompt Assistant input must not be empty.".to_string());
++            return;
++        }
++        let Some(state) = self.prompt_assistant.as_mut() else {
++            return;
++        };
++        let Some(workspace) = state.workspace.as_ref() else {
++            return;
++        };
++        if state.working {
++            return;
++        }
++
++        let event = match state.editing_kind {
++            PromptAssistantEditingKind::Compose => {
++                AppEvent::PromptAssistantCompose(PromptAssistantComposeParams {
++                    thread_id: workspace.thread_id.clone(),
++                    workspace_id: workspace.workspace_id.clone(),
++                    expected_generation: workspace.generation,
++                    input,
++                    model: workspace.selected_model.clone(),
++                    reasoning_effort: workspace.selected_reasoning_effort.clone(),
++                })
++            }
++            PromptAssistantEditingKind::Revise => {
++                let Some(candidate_hash) = workspace.candidate_hash.clone() else {
++                    self.add_error_message(
++                        "Prompt Assistant cannot revise a candidate without an audit hash."
++                            .to_string(),
++                    );
++                    return;
++                };
++                AppEvent::PromptAssistantRevise(PromptAssistantReviseParams {
++                    thread_id: workspace.thread_id.clone(),
++                    workspace_id: workspace.workspace_id.clone(),
++                    expected_generation: workspace.generation,
++                    expected_candidate_generation: workspace.candidate_generation,
++                    expected_candidate_hash: candidate_hash,
++                    input,
++                    model: workspace.selected_model.clone(),
++                    reasoning_effort: workspace.selected_reasoning_effort.clone(),
++                })
++            }
++        };
++        state.working = true;
++        state.received_bytes = 0;
++        state.progress_initialized = false;
++        self.bottom_pane.clear_response_output_bytes();
++        self.bottom_pane
++            .set_composer_input_enabled(false, Some("Prompt Assistant is working…".to_string()));
++        self.bottom_pane.ensure_status_indicator();
++        self.bottom_pane.set_status_timer_started_at(Instant::now());
++        self.bottom_pane.update_status(
++            match state.editing_kind {
++                PromptAssistantEditingKind::Compose => "Composing prompt".to_string(),
++                PromptAssistantEditingKind::Revise => "Revising prompt".to_string(),
++            },
++            None,
++            StatusDetailsCapitalization::Preserve,
++            1,
++        );
++        self.app_event_tx.send(event);
++    }
++
++    pub(crate) fn prompt_assistant_request_acknowledged(
++        &mut self,
++        result: Result<PromptAssistantWorkspace, String>,
++    ) {
++        match result {
++            Ok(workspace) => {
++                if let Some(state) = self.prompt_assistant.as_mut() {
++                    state.workspace = Some(workspace);
++                }
++            }
++            Err(message) => {
++                if let Some(state) = self.prompt_assistant.as_mut() {
++                    state.working = false;
++                }
++                self.bottom_pane.hide_status_indicator();
++                self.bottom_pane
++                    .set_composer_input_enabled(true, Some("Try again".to_string()));
++                self.add_error_message(message);
++            }
++        }
++    }
++
++    pub(crate) fn on_prompt_assistant_progress(
++        &mut self,
++        notification: PromptAssistantProgressNotification,
++    ) {
++        let Some(state) = self.prompt_assistant.as_mut() else {
++            return;
++        };
++        let Some(workspace) = state.workspace.as_ref() else {
++            return;
++        };
++        if workspace.workspace_id != notification.workspace_id
++            || notification.generation < workspace.generation
++        {
++            return;
++        }
++        if notification.received_bytes < state.received_bytes {
++            return;
++        }
++        let delta = notification.received_bytes - state.received_bytes;
++        if !state.progress_initialized {
++            self.bottom_pane
++                .update_response_output_bytes(&notification.workspace_id, 0, true);
++            state.progress_initialized = true;
++        }
++        state.received_bytes = notification.received_bytes;
++        self.bottom_pane
++            .update_response_output_bytes(&notification.workspace_id, delta, false);
++    }
++
++    pub(crate) fn on_prompt_assistant_workspace_updated(
++        &mut self,
++        workspace: PromptAssistantWorkspace,
++    ) {
++        let Some(state) = self.prompt_assistant.as_mut() else {
++            return;
++        };
++        if state
++            .workspace
++            .as_ref()
++            .is_some_and(|current| current.workspace_id != workspace.workspace_id)
++        {
++            return;
++        }
++        state.workspace = Some(workspace.clone());
++        state.working = matches!(
++            workspace.phase,
++            PromptAssistantPhase::Preparing | PromptAssistantPhase::Revising
++        );
++        if workspace.outcome == Some(PromptAssistantOutcome::Ready) {
++            state.revision_draft.clear();
++        }
++        if state.working {
++            return;
++        }
++
++        self.update_prompt_assistant_status_line();
++        self.bottom_pane.clear_response_output_bytes();
++        self.bottom_pane.hide_status_indicator();
++        match workspace.outcome {
++            Some(PromptAssistantOutcome::Ready) => self.show_prompt_assistant_result(),
++            Some(outcome @ (PromptAssistantOutcome::Blocked | PromptAssistantOutcome::Failed)) => {
++                let message = workspace.message.unwrap_or_else(|| {
++                    "Prompt Assistant could not produce a candidate.".to_string()
++                });
++                self.bottom_pane
++                    .set_composer_input_enabled(true, Some("Revise the request".to_string()));
++                match outcome {
++                    PromptAssistantOutcome::Blocked => self.add_warning_message(message),
++                    PromptAssistantOutcome::Failed => self.add_error_message(message),
++                    _ => unreachable!("matched blocked or failed"),
++                }
++            }
++            Some(PromptAssistantOutcome::Interrupted) => {
++                self.bottom_pane
++                    .set_composer_input_enabled(true, Some("Continue editing".to_string()));
++            }
++            Some(PromptAssistantOutcome::Cancelled) => {
++                self.close_prompt_assistant_restoring_source();
++            }
++            None => {}
++        }
++    }
++
++    fn show_prompt_assistant_result(&mut self) {
++        let Some(workspace) = self
++            .prompt_assistant
++            .as_ref()
++            .and_then(|state| state.workspace.clone())
++        else {
++            return;
++        };
++        let Some(candidate) = workspace.candidate.clone() else {
++            return;
++        };
++        let tx = self.app_event_tx.clone();
++        self.bottom_pane
++            .set_composer_input_enabled(false, Some("Review the candidate".to_string()));
++        self.bottom_pane
++            .show_view(Box::new(PromptAssistantResultView::new(
++                candidate,
++                workspace.selected_model,
++                workspace.selected_reasoning_effort,
++                move |action| tx.send(AppEvent::PromptAssistantResultAction(action)),
++            )));
++    }
++
++    pub(crate) fn handle_prompt_assistant_result_action(
++        &mut self,
++        action: PromptAssistantResultAction,
++    ) {
++        match action {
++            PromptAssistantResultAction::Apply => self.request_prompt_assistant_apply(),
++            PromptAssistantResultAction::Revise => {
++                let revision_draft = self
++                    .prompt_assistant
++                    .as_ref()
++                    .map(|state| state.revision_draft.clone())
++                    .unwrap_or_default();
++                if let Some(state) = self.prompt_assistant.as_mut() {
++                    state.editing_kind = PromptAssistantEditingKind::Revise;
++                }
++                self.bottom_pane
++                    .set_composer_text(revision_draft, Vec::new(), Vec::new());
++                self.bottom_pane.set_composer_input_enabled(
++                    true,
++                    Some("Describe how to revise the candidate".to_string()),
++                );
++                self.update_prompt_assistant_status_line();
++            }
++            PromptAssistantResultAction::Copy => self.copy_prompt_assistant_candidate(),
++            PromptAssistantResultAction::Discard => self.request_prompt_assistant_cancel(),
++        }
++    }
++
++    fn request_prompt_assistant_apply(&mut self) {
++        let Some(workspace) = self
++            .prompt_assistant
++            .as_ref()
++            .and_then(|state| state.workspace.as_ref())
++        else {
++            return;
++        };
++        let Some(candidate_hash) = workspace.candidate_hash.clone() else {
++            return;
++        };
++        self.app_event_tx
++            .send(AppEvent::PromptAssistantApply(PromptAssistantApplyParams {
++                thread_id: workspace.thread_id.clone(),
++                workspace_id: workspace.workspace_id.clone(),
++                expected_generation: workspace.generation,
++                expected_candidate_generation: workspace.candidate_generation,
++                expected_candidate_hash: candidate_hash,
++            }));
++    }
++
++    pub(crate) fn prompt_assistant_applied(
++        &mut self,
++        result: Result<PromptAssistantApplyResponse, String>,
++    ) {
++        match result {
++            Ok(response) => {
++                self.prompt_assistant = None;
++                self.bottom_pane
++                    .dismiss_active_view_if_id(PROMPT_ASSISTANT_RESULT_VIEW_ID);
++                self.bottom_pane
++                    .set_composer_config(ChatComposerConfig::default());
++                self.bottom_pane
++                    .set_composer_text(response.candidate, Vec::new(), Vec::new());
++                self.bottom_pane.set_composer_input_enabled(true, None);
++                self.refresh_status_line();
++            }
++            Err(message) => self.add_error_message(message),
++        }
++    }
++
++    fn request_prompt_assistant_interrupt(&mut self) {
++        let Some(workspace) = self
++            .prompt_assistant
++            .as_ref()
++            .and_then(|state| state.workspace.as_ref())
++        else {
++            return;
++        };
++        self.app_event_tx.send(AppEvent::PromptAssistantInterrupt(
++            PromptAssistantInterruptParams {
++                thread_id: workspace.thread_id.clone(),
++                workspace_id: workspace.workspace_id.clone(),
++                expected_generation: workspace.generation,
++                active_operation_generation: workspace.generation,
++            },
++        ));
++    }
++
++    fn request_prompt_assistant_cancel(&mut self) {
++        let Some(workspace) = self
++            .prompt_assistant
++            .as_ref()
++            .and_then(|state| state.workspace.as_ref())
++        else {
++            self.close_prompt_assistant_restoring_source();
++            return;
++        };
++        self.app_event_tx.send(AppEvent::PromptAssistantCancel(
++            PromptAssistantCancelParams {
++                thread_id: workspace.thread_id.clone(),
++                workspace_id: workspace.workspace_id.clone(),
++            },
++        ));
++    }
++
++    pub(crate) fn prompt_assistant_cancelled(&mut self, result: Result<(), String>) {
++        self.close_prompt_assistant_restoring_source();
++        if let Err(message) = result {
++            self.add_error_message(message);
++        }
++    }
++
++    fn close_prompt_assistant_restoring_source(&mut self) {
++        let Some(state) = self.prompt_assistant.take() else {
++            return;
++        };
++        self.bottom_pane
++            .dismiss_active_view_if_id(PROMPT_ASSISTANT_RESULT_VIEW_ID);
++        self.bottom_pane.hide_status_indicator();
++        self.bottom_pane.clear_response_output_bytes();
++        self.bottom_pane
++            .set_composer_config(ChatComposerConfig::default());
++        self.bottom_pane.restore_composer_draft(state.source_draft);
++        self.bottom_pane.set_composer_input_enabled(true, None);
++        self.refresh_status_line();
++        self.request_redraw();
++    }
++
++    fn copy_prompt_assistant_candidate(&mut self) {
++        let candidate = self
++            .prompt_assistant
++            .as_ref()
++            .and_then(|state| state.workspace.as_ref())
++            .and_then(|workspace| workspace.candidate.as_deref());
++        let Some(candidate) = candidate else {
++            return;
++        };
++        match crate::clipboard_copy::copy_to_clipboard(candidate) {
++            Ok(lease) => {
++                self.clipboard_lease = lease;
++                self.add_info_message(
++                    "Copied Prompt Assistant candidate to clipboard.".to_string(),
++                    None,
++                );
++            }
++            Err(message) => self.add_error_message(format!("Copy failed: {message}")),
++        }
++    }
++
++    fn prompt_assistant_step_model(&mut self, key_event: KeyEvent) -> bool {
++        let delta = if self.chat_keymap.previous_model.is_pressed(key_event) {
++            -1
++        } else if self.chat_keymap.next_model.is_pressed(key_event) {
++            1
++        } else {
++            return false;
++        };
++        let Some(state) = self.prompt_assistant.as_mut() else {
++            return false;
++        };
++        if state.working || state.models.is_empty() {
++            return true;
++        }
++        let Some(workspace) = state.workspace.as_mut() else {
++            return true;
++        };
++        let current = state
++            .models
++            .iter()
++            .position(|model| model.model == workspace.selected_model)
++            .unwrap_or(0);
++        let next = (current as isize + delta).rem_euclid(state.models.len() as isize) as usize;
++        let model = &state.models[next];
++        workspace.selected_model = model.model.clone();
++        workspace.selected_reasoning_effort = model.default_reasoning_effort.clone();
++        self.update_prompt_assistant_status_line();
++        self.request_redraw();
++        true
++    }
++
++    fn prompt_assistant_step_reasoning(&mut self, key_event: KeyEvent) -> bool {
++        let delta = if self
++            .chat_keymap
++            .decrease_reasoning_effort
++            .is_pressed(key_event)
++        {
++            -1
++        } else if self
++            .chat_keymap
++            .increase_reasoning_effort
++            .is_pressed(key_event)
++        {
++            1
++        } else {
++            return false;
++        };
++        let Some(state) = self.prompt_assistant.as_mut() else {
++            return false;
++        };
++        if state.working {
++            return true;
++        }
++        let Some(workspace) = state.workspace.as_mut() else {
++            return true;
++        };
++        let Some(model) = state
++            .models
++            .iter()
++            .find(|model| model.model == workspace.selected_model)
++        else {
++            return true;
++        };
++        if model.supported_reasoning_efforts.is_empty() {
++            return true;
++        }
++        let current = model
++            .supported_reasoning_efforts
++            .iter()
++            .position(|effort| effort == &workspace.selected_reasoning_effort)
++            .unwrap_or(0);
++        let next = (current as isize + delta)
++            .clamp(0, model.supported_reasoning_efforts.len() as isize - 1)
++            as usize;
++        workspace.selected_reasoning_effort = model.supported_reasoning_efforts[next].clone();
++        self.update_prompt_assistant_status_line();
++        self.request_redraw();
++        true
++    }
++
++    fn update_prompt_assistant_status_line(&mut self) {
++        let Some(workspace) = self
++            .prompt_assistant
++            .as_ref()
++            .and_then(|state| state.workspace.as_ref())
++        else {
++            return;
++        };
++        self.bottom_pane.set_status_line(Some(Line::from(vec![
++            Span::from("Prompt Assistant").bold(),
++            Span::from(" ▪ ").dim(),
++            Span::styled(
++                workspace.selected_model.clone(),
++                model_style(&workspace.selected_model),
++            ),
++            Span::from(" ▪ ").dim(),
++            Span::styled(
++                workspace.selected_reasoning_effort.to_string(),
++                reasoning_effort_style(&workspace.selected_reasoning_effort),
++            ),
++        ])));
++    }
++}
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index 5f9bd37671..63f3ac523b 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -29,6 +29,12 @@ impl ChatWidget {
+             self.restore_retry_status_header_if_present();
+         }
+         match notification {
++            ServerNotification::PromptAssistantWorkspaceUpdated(notification) => {
++                self.on_prompt_assistant_workspace_updated(notification.workspace);
++            }
++            ServerNotification::PromptAssistantProgress(notification) => {
++                self.on_prompt_assistant_progress(notification);
++            }
+             ServerNotification::ThreadTokenUsageUpdated(notification) => {
+                 self.set_token_info(Some(token_usage_info_from_app_server(
+                     notification.token_usage,

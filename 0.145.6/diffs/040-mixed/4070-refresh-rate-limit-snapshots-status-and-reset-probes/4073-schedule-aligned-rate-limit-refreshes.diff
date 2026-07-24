@@ -1,0 +1,386 @@
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index 93ecb2b779..1c202a3b7d 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -434,6 +434,7 @@ impl MessageProcessor {
+         );
+         let rate_limit_manager =
+             RateLimitManager::start(account_processor.clone(), outgoing.clone());
++        rate_limit_manager.start_aligned_polling(thread_watch_manager.clone());
+         let apps_processor = AppsRequestProcessor::new(
+             auth_manager.clone(),
+             Arc::clone(&thread_manager),
+diff --git a/codex-rs/app-server/src/rate_limits.rs b/codex-rs/app-server/src/rate_limits.rs
+index 9513ef41b9..80b2bc0504 100644
+--- a/codex-rs/app-server/src/rate_limits.rs
++++ b/codex-rs/app-server/src/rate_limits.rs
+@@ -1,4 +1,7 @@
+ use std::sync::Arc;
++use std::time::Duration;
++use std::time::SystemTime;
++use std::time::UNIX_EPOCH;
+ 
+ use codex_app_server_protocol::AccountRateLimitsUpdatedNotification;
+ use codex_app_server_protocol::GetAccountRateLimitsResponse;
+@@ -11,6 +14,11 @@ use tokio_util::task::TaskTracker;
+ 
+ use crate::outgoing_message::OutgoingMessageSender;
+ use crate::request_processors::AccountRequestProcessor;
++use crate::thread_status::ModelRequestActivity;
++use crate::thread_status::ThreadWatchManager;
++
++const ACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
++const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
+ 
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ pub(crate) struct RateLimitIdentity {
+@@ -34,6 +42,7 @@ pub(crate) struct FetchedRateLimits {
+ struct CachedSnapshot {
+     identity: RateLimitIdentity,
+     response: GetAccountRateLimitsResponse,
++    generation: u64,
+     #[allow(dead_code)]
+     pace_by_limit_id: std::collections::HashMap<String, RateLimitWindowPace>,
+ }
+@@ -59,9 +68,14 @@ impl RefreshState {
+         generation == self.generation
+     }
+ 
+-    fn invalidate(&mut self) {
+-        self.cached = None;
++    fn request_refresh(&mut self) -> u64 {
+         self.generation = self.generation.wrapping_add(1);
++        self.generation
++    }
++
++    fn invalidate(&mut self) -> u64 {
++        self.cached = None;
++        self.request_refresh()
+     }
+ }
+ 
+@@ -94,28 +108,83 @@ impl RateLimitManager {
+             cancel: CancellationToken::new(),
+             tasks: TaskTracker::new(),
+         };
+-        manager.spawn_refresh();
++        manager.spawn_refresh(/*required_generation*/ None);
+         manager
+     }
+ 
+     pub(crate) async fn read(&self) -> Result<GetAccountRateLimitsResponse, JSONRPCErrorError> {
+-        refresh(&self.inner).await
++        refresh(&self.inner, /*required_generation*/ None).await
+     }
+ 
+     pub(crate) async fn invalidate_and_refresh(&self) {
+         let mut state = self.inner.state.lock().await;
+-        state.invalidate();
++        let generation = state.invalidate();
+         drop(state);
+-        self.spawn_refresh();
++        self.spawn_refresh(Some(generation));
+     }
+ 
+-    fn spawn_refresh(&self) {
++    pub(crate) async fn refresh_now(&self) -> Result<(), JSONRPCErrorError> {
++        let generation = self.inner.state.lock().await.request_refresh();
++        refresh(&self.inner, Some(generation)).await.map(|_| ())
++    }
++
++    pub(crate) fn start_aligned_polling(&self, thread_watch_manager: ThreadWatchManager) {
++        let manager = self.clone();
++        let cancel = self.cancel.clone();
++        self.tasks.spawn(async move {
++            let Some(mut activity_rx) = thread_watch_manager
++                .take_model_request_activity_receiver()
++                .await
++            else {
++                return;
++            };
++            let mut auth_changes = manager.inner.processor.subscribe_rate_limit_auth_changes();
++            let mut schedule = RateLimitSchedule::new(SystemTime::now());
++            loop {
++                let deadline = schedule.next_deadline();
++                tokio::select! {
++                    _ = cancel.cancelled() => break,
++                    activity = activity_rx.recv() => {
++                        let Some(activity) = activity else { break };
++                        if activity_matches_current_auth(&manager, &activity) {
++                            schedule.observe_activity(activity.observed_at);
++                        }
++                    }
++                    changed = auth_changes.changed() => {
++                        if changed.is_err() {
++                            break;
++                        }
++                        manager.invalidate_and_refresh().await;
++                        schedule.reset_for_auth_change(SystemTime::now());
++                    }
++                    _ = wait_until(deadline) => {
++                        let now = SystemTime::now();
++                        let due = schedule.take_due(now);
++                        if !due.any() {
++                            continue;
++                        }
++                        let result = tokio::select! {
++                            _ = cancel.cancelled() => break,
++                            result = manager.refresh_now() => result,
++                        };
++                        if result.is_ok() {
++                            schedule.complete_refresh(SystemTime::now());
++                        } else {
++                            schedule.retry_after_failure(SystemTime::now(), due);
++                        }
++                    }
++                }
++            }
++        });
++    }
++
++    fn spawn_refresh(&self, required_generation: Option<u64>) {
+         let inner = Arc::clone(&self.inner);
+         let cancel = self.cancel.clone();
+         self.tasks.spawn(async move {
+             tokio::select! {
+                 _ = cancel.cancelled() => {}
+-                _ = refresh(&inner) => {}
++                _ = refresh(&inner, required_generation) => {}
+             }
+         });
+     }
+@@ -131,7 +200,123 @@ impl RateLimitManager {
+     }
+ }
+ 
+-async fn refresh(inner: &Arc<Inner>) -> Result<GetAccountRateLimitsResponse, JSONRPCErrorError> {
++fn activity_matches_current_auth(
++    manager: &RateLimitManager,
++    activity: &ModelRequestActivity,
++) -> bool {
++    let identity = manager.inner.processor.cached_rate_limit_identity();
++    activity.auth_revision == Some(identity.auth_revision)
++        && activity.account_id == identity.account_id
++}
++
++#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++struct DueRefresh {
++    active: bool,
++    idle: bool,
++}
++
++impl DueRefresh {
++    fn any(self) -> bool {
++        self.active || self.idle
++    }
++}
++
++#[derive(Debug)]
++struct RateLimitSchedule {
++    active_at: Option<SystemTime>,
++    idle_at: SystemTime,
++}
++
++impl RateLimitSchedule {
++    fn new(now: SystemTime) -> Self {
++        Self {
++            active_at: None,
++            idle_at: aligned_idle_deadline(now),
++        }
++    }
++
++    fn observe_activity(&mut self, observed_at: SystemTime) {
++        let active_at = strict_next_boundary(observed_at);
++        self.active_at = Some(
++            self.active_at
++                .map_or(active_at, |current| current.min(active_at)),
++        );
++        self.idle_at = aligned_idle_deadline(observed_at);
++    }
++
++    fn next_deadline(&self) -> SystemTime {
++        self.active_at
++            .map_or(self.idle_at, |active_at| active_at.min(self.idle_at))
++    }
++
++    fn take_due(&mut self, now: SystemTime) -> DueRefresh {
++        let active = self.active_at.is_some_and(|deadline| deadline <= now);
++        let idle = self.idle_at <= now;
++        if active {
++            self.active_at = None;
++        }
++        DueRefresh { active, idle }
++    }
++
++    fn complete_refresh(&mut self, now: SystemTime) {
++        self.reset_idle(now);
++    }
++
++    fn reset_idle(&mut self, now: SystemTime) {
++        self.idle_at = aligned_idle_deadline(now);
++    }
++
++    fn reset_for_auth_change(&mut self, now: SystemTime) {
++        self.active_at = None;
++        self.reset_idle(now);
++    }
++
++    fn retry_after_failure(&mut self, now: SystemTime, due: DueRefresh) {
++        if due.active {
++            self.active_at = Some(strict_next_boundary(now));
++        }
++        if due.idle {
++            self.reset_idle(now);
++        }
++    }
++}
++
++fn strict_next_boundary(now: SystemTime) -> SystemTime {
++    boundary_from_epoch_millis(now, /*offset*/ Duration::ZERO, /*strict*/ true)
++}
++
++fn aligned_idle_deadline(now: SystemTime) -> SystemTime {
++    boundary_from_epoch_millis(now, IDLE_POLL_INTERVAL, /*strict*/ false)
++}
++
++fn boundary_from_epoch_millis(now: SystemTime, offset: Duration, strict: bool) -> SystemTime {
++    let quantum = ACTIVE_POLL_INTERVAL.as_millis();
++    let millis = now
++        .duration_since(UNIX_EPOCH)
++        .unwrap_or_default()
++        .as_millis()
++        .saturating_add(offset.as_millis());
++    let boundary = if strict {
++        millis / quantum * quantum + quantum
++    } else {
++        millis.div_ceil(quantum) * quantum
++    };
++    UNIX_EPOCH + Duration::from_millis(u64::try_from(boundary).unwrap_or(u64::MAX))
++}
++
++async fn wait_until(deadline: SystemTime) {
++    tokio::time::sleep(
++        deadline
++            .duration_since(SystemTime::now())
++            .unwrap_or_default(),
++    )
++    .await;
++}
++
++async fn refresh(
++    inner: &Arc<Inner>,
++    required_generation: Option<u64>,
++) -> Result<GetAccountRateLimitsResponse, JSONRPCErrorError> {
+     loop {
+         let current_identity = inner.processor.cached_rate_limit_identity();
+         let notified = inner.changed.notified();
+@@ -139,6 +324,7 @@ async fn refresh(inner: &Arc<Inner>) -> Result<GetAccountRateLimitsResponse, JSO
+             let mut state = inner.state.lock().await;
+             if let Some(cached) = &state.cached
+                 && cached.identity == current_identity
++                && required_generation.is_none_or(|required| cached.generation >= required)
+             {
+                 return Ok(cached.response.clone());
+             }
+@@ -170,6 +356,7 @@ async fn refresh(inner: &Arc<Inner>) -> Result<GetAccountRateLimitsResponse, JSO
+                 state.cached = Some(CachedSnapshot {
+                     identity: fetched.identity.clone(),
+                     response: fetched.response.clone(),
++                    generation: fetch_generation,
+                     pace_by_limit_id: fetched.pace_by_limit_id.clone(),
+                 });
+                 notification = Some(AccountRateLimitsUpdatedNotification {
+@@ -204,7 +391,17 @@ async fn refresh(inner: &Arc<Inner>) -> Result<GetAccountRateLimitsResponse, JSO
+ 
+ #[cfg(test)]
+ mod tests {
++    use super::DueRefresh;
++    use super::RateLimitSchedule;
+     use super::RefreshState;
++    use super::aligned_idle_deadline;
++    use super::strict_next_boundary;
++    use std::time::Duration;
++    use std::time::UNIX_EPOCH;
++
++    fn at_seconds(seconds: u64) -> std::time::SystemTime {
++        UNIX_EPOCH + Duration::from_secs(seconds)
++    }
+ 
+     #[test]
+     fn invalidation_rejects_in_flight_generation_and_requires_another_fetch() {
+@@ -225,4 +422,60 @@ mod tests {
+         assert_eq!(state.begin_refresh(), None);
+         assert!(state.finish_refresh(generation));
+     }
++
++    #[test]
++    fn active_deadlines_use_the_strict_next_five_minute_boundary() {
++        assert_eq!(strict_next_boundary(at_seconds(60)), at_seconds(300));
++        assert_eq!(strict_next_boundary(at_seconds(300)), at_seconds(600));
++        assert_eq!(
++            strict_next_boundary(UNIX_EPOCH + Duration::from_millis(299_999)),
++            at_seconds(300)
++        );
++    }
++
++    #[test]
++    fn idle_deadlines_ceil_one_hour_to_a_five_minute_boundary() {
++        assert_eq!(aligned_idle_deadline(at_seconds(0)), at_seconds(3_600));
++        assert_eq!(aligned_idle_deadline(at_seconds(60)), at_seconds(3_900));
++    }
++
++    #[test]
++    fn repeated_activity_keeps_earliest_active_and_moves_idle_deadline() {
++        let mut schedule = RateLimitSchedule::new(at_seconds(0));
++
++        schedule.observe_activity(at_seconds(60));
++        schedule.observe_activity(at_seconds(301));
++
++        assert_eq!(schedule.active_at, Some(at_seconds(300)));
++        assert_eq!(schedule.idle_at, at_seconds(4_200));
++        assert_eq!(schedule.next_deadline(), at_seconds(300));
++    }
++
++    #[test]
++    fn due_refresh_is_consumed_and_failure_retries_at_the_next_boundary() {
++        let mut schedule = RateLimitSchedule::new(at_seconds(0));
++        schedule.observe_activity(at_seconds(60));
++
++        let due = schedule.take_due(at_seconds(300));
++        assert_eq!(
++            due,
++            DueRefresh {
++                active: true,
++                idle: false,
++            }
++        );
++        schedule.retry_after_failure(at_seconds(300), due);
++        assert_eq!(schedule.active_at, Some(at_seconds(600)));
++    }
++
++    #[test]
++    fn auth_change_discards_the_previous_identity_active_deadline() {
++        let mut schedule = RateLimitSchedule::new(at_seconds(0));
++        schedule.observe_activity(at_seconds(60));
++
++        schedule.reset_for_auth_change(at_seconds(120));
++
++        assert_eq!(schedule.active_at, None);
++        assert_eq!(schedule.idle_at, at_seconds(3_900));
++    }
+ }
+diff --git a/codex-rs/app-server/src/request_processors/account_processor.rs b/codex-rs/app-server/src/request_processors/account_processor.rs
+index 37ec1d4482..8ee09fda17 100644
+--- a/codex-rs/app-server/src/request_processors/account_processor.rs
++++ b/codex-rs/app-server/src/request_processors/account_processor.rs
+@@ -1136,6 +1136,10 @@ impl AccountRequestProcessor {
+         }
+     }
+ 
++    pub(crate) fn subscribe_rate_limit_auth_changes(&self) -> tokio::sync::watch::Receiver<u64> {
++        self.auth_manager.auth_change_receiver()
++    }
++
+     async fn get_account_token_usage_response(
+         &self,
+     ) -> Result<GetAccountTokenUsageResponse, JSONRPCErrorError> {

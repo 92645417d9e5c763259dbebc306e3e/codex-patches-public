@@ -1,0 +1,579 @@
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+index 59f3f0b025..633fd1a470 100644
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -115,6 +115,7 @@ mod message_processor_admission_tests;
+ mod models;
+ mod models_refresh_worker;
+ mod outgoing_message;
++mod rate_limits;
+ mod request_processors;
+ mod request_serialization;
+ mod server_request_error;
+diff --git a/codex-rs/app-server/src/message_processor.rs b/codex-rs/app-server/src/message_processor.rs
+index a77e200b66..93ecb2b779 100644
+--- a/codex-rs/app-server/src/message_processor.rs
++++ b/codex-rs/app-server/src/message_processor.rs
+@@ -20,6 +20,7 @@ use crate::outgoing_message::ConnectionId;
+ use crate::outgoing_message::ConnectionRequestId;
+ use crate::outgoing_message::OutgoingMessageSender;
+ use crate::outgoing_message::RequestContext;
++use crate::rate_limits::RateLimitManager;
+ use crate::request_processors::AccountRequestProcessor;
+ use crate::request_processors::AppsRequestProcessor;
+ use crate::request_processors::CatalogRequestProcessor;
+@@ -54,6 +55,7 @@ use codex_app_server_protocol::ClientNotification;
+ use codex_app_server_protocol::ClientRequest;
+ use codex_app_server_protocol::ClientResponsePayload;
+ use codex_app_server_protocol::ConfigWarningNotification;
++use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditOutcome;
+ use codex_app_server_protocol::ExperimentalApi;
+ use codex_app_server_protocol::JSONRPCError;
+ use codex_app_server_protocol::JSONRPCErrorError;
+@@ -179,6 +181,7 @@ pub(crate) struct MessageProcessor {
+     models_refresh_worker: ModelsRefreshWorker,
+     skills_watcher: Arc<SkillsWatcher>,
+     account_processor: AccountRequestProcessor,
++    rate_limit_manager: RateLimitManager,
+     apps_processor: AppsRequestProcessor,
+     catalog_processor: CatalogRequestProcessor,
+     command_exec_processor: CommandExecRequestProcessor,
+@@ -429,6 +432,8 @@ impl MessageProcessor {
+             Arc::clone(&config),
+             config_manager.clone(),
+         );
++        let rate_limit_manager =
++            RateLimitManager::start(account_processor.clone(), outgoing.clone());
+         let apps_processor = AppsRequestProcessor::new(
+             auth_manager.clone(),
+             Arc::clone(&thread_manager),
+@@ -580,6 +585,7 @@ impl MessageProcessor {
+             models_refresh_worker,
+             skills_watcher,
+             account_processor,
++            rate_limit_manager,
+             apps_processor,
+             catalog_processor,
+             command_exec_processor,
+@@ -611,6 +617,7 @@ impl MessageProcessor {
+         self.apps_processor.shutdown();
+         self.models_refresh_worker.cancel();
+         self.skills_watcher.shutdown();
++        self.rate_limit_manager.cancel();
+     }
+ 
+     pub(crate) async fn process_request(
+@@ -874,6 +881,7 @@ impl MessageProcessor {
+     pub(crate) async fn drain_background_tasks(&self) {
+         self.models_refresh_worker.shutdown().await;
+         self.thread_processor.drain_background_tasks().await;
++        self.rate_limit_manager.drain().await;
+     }
+ 
+     pub(crate) async fn cancel_active_login(&self) {
+@@ -1591,13 +1599,30 @@ impl MessageProcessor {
+             ClientRequest::GetAuthStatus { params, .. } => {
+                 self.account_processor.get_auth_status(params).await
+             }
+-            ClientRequest::GetAccountRateLimits { .. } => {
+-                self.account_processor.get_account_rate_limits().await
+-            }
++            ClientRequest::GetAccountRateLimits { .. } => self
++                .rate_limit_manager
++                .read()
++                .await
++                .map(|response| Some(response.into())),
+             ClientRequest::ConsumeAccountRateLimitResetCredit { params, .. } => {
+-                self.account_processor
++                let result = self
++                    .account_processor
+                     .consume_account_rate_limit_reset_credit(params)
+-                    .await
++                    .await;
++                let refresh = matches!(
++                    &result,
++                    Ok(Some(ClientResponsePayload::ConsumeAccountRateLimitResetCredit(
++                        response
++                    ))) if matches!(
++                        response.outcome,
++                        ConsumeAccountRateLimitResetCreditOutcome::Reset
++                            | ConsumeAccountRateLimitResetCreditOutcome::AlreadyRedeemed
++                    )
++                );
++                if refresh {
++                    self.rate_limit_manager.invalidate_and_refresh().await;
++                }
++                result
+             }
+             ClientRequest::GetAccountTokenUsage { .. } => {
+                 self.account_processor.get_account_token_usage().await
+diff --git a/codex-rs/app-server/src/rate_limits.rs b/codex-rs/app-server/src/rate_limits.rs
+new file mode 100644
+index 0000000000..9513ef41b9
+--- /dev/null
++++ b/codex-rs/app-server/src/rate_limits.rs
+@@ -0,0 +1,228 @@
++use std::sync::Arc;
++
++use codex_app_server_protocol::AccountRateLimitsUpdatedNotification;
++use codex_app_server_protocol::GetAccountRateLimitsResponse;
++use codex_app_server_protocol::JSONRPCErrorError;
++use codex_app_server_protocol::ServerNotification;
++use tokio::sync::Mutex;
++use tokio::sync::Notify;
++use tokio_util::sync::CancellationToken;
++use tokio_util::task::TaskTracker;
++
++use crate::outgoing_message::OutgoingMessageSender;
++use crate::request_processors::AccountRequestProcessor;
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub(crate) struct RateLimitIdentity {
++    pub(crate) auth_revision: u64,
++    pub(crate) account_id: Option<String>,
++}
++
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub(crate) struct RateLimitWindowPace {
++    pub(crate) primary: Option<i32>,
++    pub(crate) secondary: Option<i32>,
++}
++
++pub(crate) struct FetchedRateLimits {
++    pub(crate) identity: RateLimitIdentity,
++    pub(crate) response: GetAccountRateLimitsResponse,
++    pub(crate) pace_by_limit_id: std::collections::HashMap<String, RateLimitWindowPace>,
++}
++
++#[derive(Clone)]
++struct CachedSnapshot {
++    identity: RateLimitIdentity,
++    response: GetAccountRateLimitsResponse,
++    #[allow(dead_code)]
++    pace_by_limit_id: std::collections::HashMap<String, RateLimitWindowPace>,
++}
++
++#[derive(Default)]
++struct RefreshState {
++    cached: Option<CachedSnapshot>,
++    refreshing: bool,
++    generation: u64,
++}
++
++impl RefreshState {
++    fn begin_refresh(&mut self) -> Option<u64> {
++        if self.refreshing {
++            return None;
++        }
++        self.refreshing = true;
++        Some(self.generation)
++    }
++
++    fn finish_refresh(&mut self, generation: u64) -> bool {
++        self.refreshing = false;
++        generation == self.generation
++    }
++
++    fn invalidate(&mut self) {
++        self.cached = None;
++        self.generation = self.generation.wrapping_add(1);
++    }
++}
++
++struct Inner {
++    processor: AccountRequestProcessor,
++    outgoing: Arc<OutgoingMessageSender>,
++    state: Mutex<RefreshState>,
++    changed: Notify,
++}
++
++#[derive(Clone)]
++pub(crate) struct RateLimitManager {
++    inner: Arc<Inner>,
++    cancel: CancellationToken,
++    tasks: TaskTracker,
++}
++
++impl RateLimitManager {
++    pub(crate) fn start(
++        processor: AccountRequestProcessor,
++        outgoing: Arc<OutgoingMessageSender>,
++    ) -> Self {
++        let manager = Self {
++            inner: Arc::new(Inner {
++                processor,
++                outgoing,
++                state: Mutex::new(RefreshState::default()),
++                changed: Notify::new(),
++            }),
++            cancel: CancellationToken::new(),
++            tasks: TaskTracker::new(),
++        };
++        manager.spawn_refresh();
++        manager
++    }
++
++    pub(crate) async fn read(&self) -> Result<GetAccountRateLimitsResponse, JSONRPCErrorError> {
++        refresh(&self.inner).await
++    }
++
++    pub(crate) async fn invalidate_and_refresh(&self) {
++        let mut state = self.inner.state.lock().await;
++        state.invalidate();
++        drop(state);
++        self.spawn_refresh();
++    }
++
++    fn spawn_refresh(&self) {
++        let inner = Arc::clone(&self.inner);
++        let cancel = self.cancel.clone();
++        self.tasks.spawn(async move {
++            tokio::select! {
++                _ = cancel.cancelled() => {}
++                _ = refresh(&inner) => {}
++            }
++        });
++    }
++
++    pub(crate) fn cancel(&self) {
++        self.cancel.cancel();
++    }
++
++    pub(crate) async fn drain(&self) {
++        self.cancel();
++        self.tasks.close();
++        self.tasks.wait().await;
++    }
++}
++
++async fn refresh(inner: &Arc<Inner>) -> Result<GetAccountRateLimitsResponse, JSONRPCErrorError> {
++    loop {
++        let current_identity = inner.processor.cached_rate_limit_identity();
++        let notified = inner.changed.notified();
++        let fetch_generation = {
++            let mut state = inner.state.lock().await;
++            if let Some(cached) = &state.cached
++                && cached.identity == current_identity
++            {
++                return Ok(cached.response.clone());
++            }
++            if state
++                .cached
++                .as_ref()
++                .is_some_and(|cached| cached.identity != current_identity)
++            {
++                state.cached = None;
++            }
++            state.begin_refresh()
++        };
++        let Some(fetch_generation) = fetch_generation else {
++            notified.await;
++            continue;
++        };
++
++        let result = inner.processor.fetch_account_rate_limits().await;
++        let mut notification = None;
++        let generation_is_current;
++        let mut accepted = false;
++        {
++            let mut state = inner.state.lock().await;
++            generation_is_current = state.finish_refresh(fetch_generation);
++            if generation_is_current
++                && let Ok(fetched) = &result
++                && fetched.identity == inner.processor.cached_rate_limit_identity()
++            {
++                state.cached = Some(CachedSnapshot {
++                    identity: fetched.identity.clone(),
++                    response: fetched.response.clone(),
++                    pace_by_limit_id: fetched.pace_by_limit_id.clone(),
++                });
++                notification = Some(AccountRateLimitsUpdatedNotification {
++                    rate_limits: fetched.response.rate_limits.clone(),
++                });
++                accepted = true;
++            }
++        }
++        inner.changed.notify_waiters();
++
++        if let Some(notification) = notification {
++            inner
++                .outgoing
++                .send_server_notification(ServerNotification::AccountRateLimitsUpdated(
++                    notification,
++                ))
++                .await;
++        }
++
++        if !generation_is_current {
++            continue;
++        }
++        match result {
++            Ok(fetched) if accepted => return Ok(fetched.response),
++            Ok(_) => {
++                continue;
++            }
++            Err(err) => return Err(err),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::RefreshState;
++
++    #[test]
++    fn invalidation_rejects_in_flight_generation_and_requires_another_fetch() {
++        let mut state = RefreshState::default();
++        let stale_generation = state.begin_refresh().expect("initial fetch");
++
++        state.invalidate();
++
++        assert!(!state.finish_refresh(stale_generation));
++        assert_eq!(state.begin_refresh(), Some(stale_generation + 1));
++    }
++
++    #[test]
++    fn concurrent_refreshes_share_one_generation() {
++        let mut state = RefreshState::default();
++        let generation = state.begin_refresh().expect("initial fetch");
++
++        assert_eq!(state.begin_refresh(), None);
++        assert!(state.finish_refresh(generation));
++    }
++}
+diff --git a/codex-rs/app-server/src/request_processors.rs b/codex-rs/app-server/src/request_processors.rs
+index 60a31ab95c..ed4b9a47fb 100644
+--- a/codex-rs/app-server/src/request_processors.rs
++++ b/codex-rs/app-server/src/request_processors.rs
+@@ -168,6 +168,8 @@ use codex_app_server_protocol::RateLimitResetCredit;
+ use codex_app_server_protocol::RateLimitResetCreditStatus;
+ use codex_app_server_protocol::RateLimitResetCreditsSummary;
+ use codex_app_server_protocol::RateLimitResetType;
++use codex_app_server_protocol::RateLimitSnapshot;
++use codex_app_server_protocol::RateLimitWindow;
+ use codex_app_server_protocol::RequestId;
+ use codex_app_server_protocol::ReviewDelivery as ApiReviewDelivery;
+ use codex_app_server_protocol::ReviewStartParams;
+diff --git a/codex-rs/app-server/src/request_processors/account_processor.rs b/codex-rs/app-server/src/request_processors/account_processor.rs
+index 44f519522b..37ec1d4482 100644
+--- a/codex-rs/app-server/src/request_processors/account_processor.rs
++++ b/codex-rs/app-server/src/request_processors/account_processor.rs
+@@ -3,6 +3,9 @@ use super::bedrock_auth::set_user_model_provider_to_bedrock;
+ use super::*;
+ use crate::auth_mode::auth_mode_to_api;
+ use crate::external_auth::ExternalAuthBridge;
++use crate::rate_limits::FetchedRateLimits;
++use crate::rate_limits::RateLimitIdentity;
++use crate::rate_limits::RateLimitWindowPace;
+ use chrono::DateTime;
+ use codex_model_provider::is_supported_amazon_bedrock_region;
+ 
+@@ -139,9 +142,9 @@ impl AccountRequestProcessor {
+     pub(crate) async fn get_account_rate_limits(
+         &self,
+     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+-        self.get_account_rate_limits_response()
++        self.fetch_account_rate_limits()
+             .await
+-            .map(|response| Some(response.into()))
++            .map(|fetched| Some(fetched.response.into()))
+     }
+ 
+     pub(crate) async fn get_account_token_usage(
+@@ -1022,6 +1025,34 @@ impl AccountRequestProcessor {
+         })
+     }
+ 
++    pub(crate) async fn fetch_account_rate_limits(
++        &self,
++    ) -> Result<FetchedRateLimits, JSONRPCErrorError> {
++        loop {
++            let auth_revision = *self.auth_manager.auth_change_receiver().borrow();
++            let captured_at = std::time::SystemTime::now();
++            let response = self.get_account_rate_limits_response().await?;
++            if auth_revision != *self.auth_manager.auth_change_receiver().borrow() {
++                continue;
++            }
++            let identity = self.cached_rate_limit_identity();
++            if identity.auth_revision != auth_revision {
++                continue;
++            }
++            let pace_by_limit_id = response
++                .rate_limits_by_limit_id
++                .as_ref()
++                .map(|snapshots| rate_limit_paces_by_limit_id(snapshots, captured_at))
++                .unwrap_or_default();
++
++            return Ok(FetchedRateLimits {
++                identity,
++                response,
++                pace_by_limit_id,
++            });
++        }
++    }
++
+     async fn get_account_rate_limits_response(
+         &self,
+     ) -> Result<GetAccountRateLimitsResponse, JSONRPCErrorError> {
+@@ -1095,6 +1126,16 @@ impl AccountRequestProcessor {
+         })
+     }
+ 
++    pub(crate) fn cached_rate_limit_identity(&self) -> RateLimitIdentity {
++        RateLimitIdentity {
++            auth_revision: *self.auth_manager.auth_change_receiver().borrow(),
++            account_id: self
++                .auth_manager
++                .auth_cached()
++                .and_then(|auth| auth.get_account_id()),
++        }
++    }
++
+     async fn get_account_token_usage_response(
+         &self,
+     ) -> Result<GetAccountTokenUsageResponse, JSONRPCErrorError> {
+@@ -1301,6 +1342,40 @@ fn workspace_messages_feature_disabled(err: &BackendRequestError) -> bool {
+     err.status().is_some_and(|status| status.as_u16() == 404)
+ }
+ 
++fn rate_limit_paces_by_limit_id(
++    snapshots: &HashMap<String, RateLimitSnapshot>,
++    captured_at: std::time::SystemTime,
++) -> HashMap<String, RateLimitWindowPace> {
++    let captured_at = captured_at
++        .duration_since(std::time::UNIX_EPOCH)
++        .ok()
++        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok());
++    snapshots
++        .iter()
++        .filter_map(|(limit_id, snapshot)| {
++            let captured_at = captured_at?;
++            let pace = RateLimitWindowPace {
++                primary: rate_limit_window_pace(snapshot.primary.as_ref(), captured_at),
++                secondary: rate_limit_window_pace(snapshot.secondary.as_ref(), captured_at),
++            };
++            (pace.primary.is_some() || pace.secondary.is_some()).then(|| (limit_id.clone(), pace))
++        })
++        .collect()
++}
++
++fn rate_limit_window_pace(window: Option<&RateLimitWindow>, captured_at: i64) -> Option<i32> {
++    let window = window?;
++    let duration_secs = window.window_duration_mins?.checked_mul(60)?;
++    if duration_secs <= 0 {
++        return None;
++    }
++    let started_at = window.resets_at?.checked_sub(duration_secs)?;
++    let elapsed_secs = captured_at.checked_sub(started_at)?;
++    let elapsed_percent = (elapsed_secs as f64 / duration_secs as f64 * 100.0).clamp(0.0, 100.0);
++    let used_percent = window.used_percent.clamp(0, 100) as f64;
++    Some((elapsed_percent - used_percent).round() as i32)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -1308,6 +1383,83 @@ mod tests {
+     use codex_backend_client::TokenUsageProfileStats;
+     use pretty_assertions::assert_eq;
+ 
++    #[test]
++    fn rate_limit_window_pace_is_signed_against_elapsed_window_time() {
++        let mut window = RateLimitWindow {
++            used_percent: 40,
++            window_duration_mins: Some(60),
++            resets_at: Some(3_600),
++        };
++
++        assert_eq!(rate_limit_window_pace(Some(&window), 1_800), Some(10));
++        window.used_percent = 70;
++        assert_eq!(rate_limit_window_pace(Some(&window), 1_800), Some(-20));
++    }
++
++    #[test]
++    fn rate_limit_window_pace_requires_complete_window_metadata() {
++        let mut window = RateLimitWindow {
++            used_percent: 40,
++            window_duration_mins: None,
++            resets_at: Some(3_600),
++        };
++
++        assert_eq!(rate_limit_window_pace(Some(&window), 1_800), None);
++        window.window_duration_mins = Some(0);
++        assert_eq!(rate_limit_window_pace(Some(&window), 1_800), None);
++        assert_eq!(rate_limit_window_pace(None, 1_800), None);
++    }
++
++    #[test]
++    fn rate_limit_pace_keeps_limit_and_window_slots_separate() {
++        let window = |used_percent| RateLimitWindow {
++            used_percent,
++            window_duration_mins: Some(60),
++            resets_at: Some(3_600),
++        };
++        let snapshot = |limit_id: &str, primary, secondary| RateLimitSnapshot {
++            limit_id: Some(limit_id.to_string()),
++            limit_name: None,
++            primary,
++            secondary,
++            credits: None,
++            individual_limit: None,
++            spend_control_reached: None,
++            plan_type: None,
++            rate_limit_reached_type: None,
++        };
++        let snapshots = HashMap::from([
++            (
++                "codex".to_string(),
++                snapshot("codex", Some(window(40)), Some(window(70))),
++            ),
++            (
++                "other".to_string(),
++                snapshot("other", Some(window(50)), None),
++            ),
++        ]);
++
++        let pace = rate_limit_paces_by_limit_id(
++            &snapshots,
++            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800),
++        );
++
++        assert_eq!(
++            pace.get("codex"),
++            Some(&RateLimitWindowPace {
++                primary: Some(10),
++                secondary: Some(-20),
++            })
++        );
++        assert_eq!(
++            pace.get("other"),
++            Some(&RateLimitWindowPace {
++                primary: Some(0),
++                secondary: None,
++            })
++        );
++    }
++
+     #[test]
+     fn account_token_usage_response_maps_profile_stats_and_daily_buckets() {
+         let response = AccountRequestProcessor::account_token_usage_response(TokenUsageProfile {
+diff --git a/codex-rs/app-server/tests/suite/v2/rate_limits.rs b/codex-rs/app-server/tests/suite/v2/rate_limits.rs
+index 3194f2cf40..bc2b9e28cf 100644
+--- a/codex-rs/app-server/tests/suite/v2/rate_limits.rs
++++ b/codex-rs/app-server/tests/suite/v2/rate_limits.rs
+@@ -333,6 +333,15 @@ async fn get_account_rate_limits_returns_snapshot() -> Result<()> {
+     };
+     assert_eq!(received, expected);
+ 
++    let cached_request_id = mcp.send_get_account_rate_limits_request().await?;
++    let cached_response: JSONRPCResponse = timeout(
++        DEFAULT_READ_TIMEOUT,
++        mcp.read_stream_until_response_message(RequestId::Integer(cached_request_id)),
++    )
++    .await??;
++    let cached: GetAccountRateLimitsResponse = to_response(cached_response)?;
++    assert_eq!(cached, expected);
++
+     Ok(())
+ }
+ 

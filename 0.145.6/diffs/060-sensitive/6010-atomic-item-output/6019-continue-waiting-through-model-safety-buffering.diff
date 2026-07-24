@@ -1,0 +1,2029 @@
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index 123c799f00..ac5acf66d4 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -217,7 +217,6 @@ mod platform_actions;
+ mod plugin_mentions;
+ mod replay_filter;
+ mod resize_reflow;
+-mod safety_buffering;
+ mod session_lifecycle;
+ mod side;
+ mod startup_prompts;
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index 0f56c3cb92..fbeccb65d6 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -430,26 +430,6 @@ impl App {
+                     tracing::error!(error = ?err, "failed to start turn through app server");
+                 }
+             }
+-            AppEvent::RetrySafetyBufferedTurn {
+-                thread_id,
+-                turn_id,
+-                model,
+-                turn,
+-                prompt,
+-            } => {
+-                self.retry_safety_buffered_turn(
+-                    tui,
+-                    app_server,
+-                    super::safety_buffering::SafetyBufferedRetry {
+-                        thread_id,
+-                        turn_id,
+-                        model,
+-                        turn,
+-                        prompt,
+-                    },
+-                )
+-                .await;
+-            }
+             AppEvent::RetryCurrentStream { thread_id, turn_id } => {
+                 if let Err(err) = app_server.turn_retry_now(thread_id, turn_id).await {
+                     self.chat_widget
+diff --git a/codex-rs/tui/src/app/safety_buffering.rs b/codex-rs/tui/src/app/safety_buffering.rs
+deleted file mode 100644
+index 58d2fc22fb..0000000000
+--- a/codex-rs/tui/src/app/safety_buffering.rs
++++ /dev/null
+@@ -1,222 +0,0 @@
+-//! Safety-buffered turn retries that preserve the source thread.
+-
+-use super::session_lifecycle::ThreadAttachPresentation;
+-use super::*;
+-use crate::app_server_session::ForkGoalContinuation;
+-use crate::chatwidget::ThreadInputState;
+-use crate::chatwidget::ThreadInputStateRestoreMode;
+-use crate::chatwidget::UserMessage;
+-use codex_app_server_protocol::UserInput;
+-
+-pub(super) struct SafetyBufferedRetry {
+-    pub(super) thread_id: ThreadId,
+-    pub(super) turn_id: String,
+-    pub(super) model: String,
+-    pub(super) turn: AppCommand,
+-    pub(super) prompt: UserMessage,
+-}
+-
+-impl App {
+-    pub(super) async fn retry_safety_buffered_turn(
+-        &mut self,
+-        tui: &mut tui::Tui,
+-        app_server: &mut AppServerSession,
+-        retry: SafetyBufferedRetry,
+-    ) {
+-        let SafetyBufferedRetry {
+-            thread_id,
+-            turn_id,
+-            model,
+-            mut turn,
+-            prompt,
+-        } = retry;
+-        if self.active_thread_id != Some(thread_id)
+-            || self.chat_widget.thread_id() != Some(thread_id)
+-            || self.primary_thread_id != Some(thread_id)
+-        {
+-            return;
+-        }
+-        if !self.chat_widget.can_retry_safety_buffered_turn(&turn_id) {
+-            self.app_event_tx.send(AppEvent::UpdateModel(model));
+-            self.app_event_tx.send(AppEvent::UpdateReasoningEffort(Some(
+-                ReasoningEffortConfig::Low,
+-            )));
+-            return;
+-        }
+-
+-        let retry_config = self.chat_widget.config_ref().clone();
+-        let input_state = self.chat_widget.capture_thread_input_state();
+-
+-        let AppCommand::UserTurn {
+-            items,
+-            model: turn_model,
+-            effort,
+-            collaboration_mode,
+-            ..
+-        } = &mut turn
+-        else {
+-            self.chat_widget.add_error_message(
+-                "Failed to retry with a faster model: original turn is unavailable.".to_string(),
+-            );
+-            return;
+-        };
+-        *turn_model = model.clone();
+-        *effort = Some(ReasoningEffortConfig::Low);
+-        *collaboration_mode = collaboration_mode.as_ref().map(|mode| {
+-            mode.with_updates(
+-                Some(model.clone()),
+-                Some(Some(ReasoningEffortConfig::Low)),
+-                /*developer_instructions*/ None,
+-            )
+-        });
+-
+-        if let Err(err) = app_server.turn_interrupt(thread_id, turn_id.clone()).await {
+-            self.chat_widget
+-                .add_error_message(format!("Failed to retry with a faster model: {err}"));
+-            return;
+-        }
+-
+-        let thread = match app_server
+-            .thread_read(thread_id, /*include_turns*/ true)
+-            .await
+-        {
+-            Ok(thread) => thread,
+-            Err(err) => {
+-                self.fail_safety_buffered_branch(input_state, prompt, err);
+-                return;
+-            }
+-        };
+-        if let Err(err) = safety_retry_fork_point(&thread.turns, &turn_id) {
+-            self.fail_safety_buffered_branch(input_state, prompt, err);
+-            return;
+-        }
+-        items.extend(
+-            thread
+-                .turns
+-                .iter()
+-                .find(|turn| turn.id == turn_id)
+-                .into_iter()
+-                .flat_map(|turn| &turn.items)
+-                .filter_map(|item| match item {
+-                    ThreadItem::UserMessage { content, .. } => Some(content),
+-                    _ => None,
+-                })
+-                .skip(/*n*/ 1)
+-                .flat_map(|content| {
+-                    std::iter::once(UserInput::Text {
+-                        text: "\n".to_string(),
+-                        text_elements: Vec::new(),
+-                    })
+-                    .chain(content.iter().cloned())
+-                }),
+-        );
+-        let retry_display = ChatWidget::user_message_display_from_inputs(items);
+-
+-        self.config = retry_config.clone();
+-        let started = app_server
+-            .fork_thread_at(
+-                retry_config,
+-                thread_id,
+-                /*last_turn_id*/ None,
+-                /*before_turn_id*/ Some(turn_id),
+-                ForkGoalContinuation::DeferUntilNextTurn,
+-            )
+-            .await;
+-        let started = match started {
+-            Ok(started) => started,
+-            Err(err) => {
+-                self.fail_safety_buffered_branch(input_state, prompt, err);
+-                return;
+-            }
+-        };
+-        let retry_thread_id = started.session.thread_id;
+-
+-        self.shutdown_current_thread(app_server).await;
+-        if let Err(err) = self
+-            .replace_chat_widget_with_app_server_thread(
+-                tui,
+-                started,
+-                ThreadAttachPresentation::SessionLineage,
+-                /*initial_user_message*/ None,
+-            )
+-            .await
+-        {
+-            self.fail_safety_buffered_branch(input_state, prompt, err);
+-            return;
+-        }
+-
+-        let failure_input_state = input_state.clone();
+-        self.chat_widget.restore_thread_input_state(
+-            input_state,
+-            ThreadInputStateRestoreMode {
+-                preserve_in_flight_turn: false,
+-            },
+-        );
+-        self.chat_widget.prepare_safety_buffered_retry_submission(
+-            prompt.clone(),
+-            model,
+-            Some(ReasoningEffortConfig::Low),
+-        );
+-        if let Err(err) = self
+-            .submit_thread_op(app_server, retry_thread_id, turn)
+-            .await
+-        {
+-            self.fail_safety_buffered_branch(failure_input_state, prompt, err);
+-            return;
+-        }
+-        self.chat_widget
+-            .commit_safety_buffered_retry_submission(retry_display);
+-    }
+-
+-    fn fail_safety_buffered_branch(
+-        &mut self,
+-        input_state: Option<ThreadInputState>,
+-        prompt: UserMessage,
+-        err: impl std::fmt::Display,
+-    ) {
+-        self.chat_widget.restore_thread_input_state(
+-            input_state,
+-            ThreadInputStateRestoreMode {
+-                preserve_in_flight_turn: false,
+-            },
+-        );
+-        self.chat_widget.cancel_safety_buffered_retry_submission();
+-        self.chat_widget.restore_user_message_to_composer(prompt);
+-        self.chat_widget
+-            .add_error_message(format!("Failed to retry with a faster model: {err}"));
+-    }
+-}
+-
+-fn safety_retry_fork_point(turns: &[Turn], turn_id: &str) -> Result<()> {
+-    let Some(turn_index) = turns.iter().position(|turn| turn.id == turn_id) else {
+-        return Err(color_eyre::eyre::eyre!(
+-            "interrupted turn {turn_id} is missing from the source thread"
+-        ));
+-    };
+-    if turn_index + 1 != turns.len() {
+-        return Err(color_eyre::eyre::eyre!(
+-            "interrupted turn {turn_id} is no longer the latest turn"
+-        ));
+-    }
+-    if turns[turn_index].status == TurnStatus::InProgress {
+-        return Err(color_eyre::eyre::eyre!(
+-            "interrupted turn {turn_id} is still in progress"
+-        ));
+-    }
+-
+-    let Some(previous_turn) = turns[..turn_index].last() else {
+-        return Ok(());
+-    };
+-    if previous_turn.status == TurnStatus::InProgress {
+-        return Err(color_eyre::eyre::eyre!(
+-            "previous turn {} is still in progress",
+-            previous_turn.id
+-        ));
+-    }
+-
+-    Ok(())
+-}
+-
+-#[cfg(test)]
+-#[path = "safety_buffering_tests.rs"]
+-mod tests;
+diff --git a/codex-rs/tui/src/app/safety_buffering_tests.rs b/codex-rs/tui/src/app/safety_buffering_tests.rs
+deleted file mode 100644
+index 4d1c2b7196..0000000000
+--- a/codex-rs/tui/src/app/safety_buffering_tests.rs
++++ /dev/null
+@@ -1,33 +0,0 @@
+-use super::*;
+-use codex_app_server_protocol::TurnItemsView;
+-
+-fn turn(id: &str, status: TurnStatus) -> Turn {
+-    Turn {
+-        id: id.to_string(),
+-        items: Vec::new(),
+-        items_view: TurnItemsView::Full,
+-        status,
+-        error: None,
+-        started_at: None,
+-        completed_at: None,
+-        duration_ms: None,
+-    }
+-}
+-
+-#[test]
+-fn retry_rejects_a_stale_or_in_progress_turn() {
+-    let stale = vec![
+-        turn("turn-1", TurnStatus::Interrupted),
+-        turn("turn-2", TurnStatus::InProgress),
+-    ];
+-    let in_progress = vec![turn("turn-1", TurnStatus::InProgress)];
+-    let previous_in_progress = vec![
+-        turn("turn-1", TurnStatus::InProgress),
+-        turn("turn-2", TurnStatus::Interrupted),
+-    ];
+-
+-    assert!(safety_retry_fork_point(&stale, "turn-1").is_err());
+-    assert!(safety_retry_fork_point(&in_progress, "turn-1").is_err());
+-    assert!(safety_retry_fork_point(&in_progress, "missing").is_err());
+-    assert!(safety_retry_fork_point(&previous_in_progress, "turn-2").is_err());
+-}
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index c521808ef7..b8e6201c7a 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -5,7 +5,6 @@ mod advanced_reasoning_tests;
+ mod model_catalog;
+ mod plugin_catalog;
+ mod rate_limits;
+-mod safety_buffering;
+ #[path = "tests/session_lifecycle_requests.rs"]
+ mod session_lifecycle_requests;
+ mod session_summary;
+diff --git a/codex-rs/tui/src/app/tests/safety_buffering.rs b/codex-rs/tui/src/app/tests/safety_buffering.rs
+deleted file mode 100644
+index dd87907f23..0000000000
+--- a/codex-rs/tui/src/app/tests/safety_buffering.rs
++++ /dev/null
+@@ -1,876 +0,0 @@
+-use super::*;
+-use crate::app::safety_buffering::SafetyBufferedRetry;
+-use crate::app::session_lifecycle::ThreadAttachPresentation;
+-use crate::chatwidget::UserMessage;
+-use codex_app_server_client::AppServerEvent;
+-use codex_app_server_protocol::ModelSafetyBufferingUpdatedNotification;
+-use codex_utils_absolute_path::test_support::PathExt;
+-use core_test_support::responses;
+-use core_test_support::responses::ev_assistant_message;
+-use core_test_support::responses::ev_completed;
+-use core_test_support::responses::ev_completed_with_tokens;
+-use core_test_support::responses::ev_response_created;
+-use core_test_support::streaming_sse::StreamingSseChunk;
+-use core_test_support::streaming_sse::StreamingSseServer;
+-use core_test_support::streaming_sse::start_streaming_sse_server;
+-use pretty_assertions::assert_eq;
+-use serde_json::Value;
+-use tokio::sync::oneshot;
+-
+-const CURRENT_MODEL: &str = "gpt-5.2";
+-const FASTER_MODEL: &str = "gpt-5.4";
+-const MODEL_PROVIDER_ID: &str = "safety-retry-test";
+-const PREVIOUS_PROMPT: &str = "Establish context";
+-const RETRY_PROMPT: &str = "Handle the safety-buffered request";
+-const COMMITTED_STEER: &str = "Keep the accepted steer";
+-const UNSENT_DRAFT: &str = "Keep this unsent draft";
+-const RETRY_GOAL: &str = "Preserve this goal across the retry";
+-
+-#[derive(Clone, Copy, PartialEq, Eq)]
+-enum SafetyRetryScenario {
+-    Once,
+-    RetryTwice,
+-    InterruptedPrevious,
+-}
+-
+-fn response_chunks(response_id: &str) -> Vec<StreamingSseChunk> {
+-    [
+-        ev_response_created(response_id),
+-        ev_assistant_message(&format!("message-{response_id}"), "done"),
+-        ev_completed(response_id),
+-    ]
+-    .into_iter()
+-    .map(|event| StreamingSseChunk {
+-        gate: None,
+-        body: responses::sse(vec![event]),
+-    })
+-    .collect()
+-}
+-
+-fn gated_response_chunks(
+-    response_id: &str,
+-    completed: Value,
+-) -> (Vec<StreamingSseChunk>, oneshot::Sender<()>) {
+-    let (release_tx, release_rx) = oneshot::channel();
+-    (
+-        vec![
+-            StreamingSseChunk {
+-                gate: None,
+-                body: responses::sse(vec![ev_response_created(response_id)]),
+-            },
+-            StreamingSseChunk {
+-                gate: Some(release_rx),
+-                body: responses::sse(vec![completed]),
+-            },
+-        ],
+-        release_tx,
+-    )
+-}
+-
+-fn next_user_turn_event(
+-    app_event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+-) -> AppCommand {
+-    while let Ok(event) = app_event_rx.try_recv() {
+-        if let AppEvent::CodexOp(turn @ AppCommand::UserTurn { .. }) = event {
+-            return turn;
+-        }
+-    }
+-    panic!("expected UserTurn app event");
+-}
+-
+-fn submit_prompt(app: &mut App, prompt: &str) {
+-    app.chat_widget.apply_external_edit(prompt.to_string());
+-    app.chat_widget
+-        .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+-}
+-
+-fn drain_active_thread_events(app: &mut App) {
+-    while let Some(event) = app
+-        .active_thread_rx
+-        .as_mut()
+-        .and_then(|receiver| receiver.try_recv().ok())
+-    {
+-        app.handle_thread_event_now(event);
+-    }
+-}
+-
+-async fn next_turn_started(
+-    app: &mut App,
+-    app_server: &mut AppServerSession,
+-    thread_id: ThreadId,
+-) -> String {
+-    loop {
+-        let event = tokio::time::timeout(
+-            std::time::Duration::from_secs(/*secs*/ 5),
+-            app_server.next_event(),
+-        )
+-        .await
+-        .expect("app-server should emit a turn/start event")
+-        .expect("app-server event stream should remain open");
+-        let started_turn_id = match &event {
+-            AppServerEvent::ServerNotification(ServerNotification::TurnStarted(notification))
+-                if notification.thread_id == thread_id.to_string() =>
+-            {
+-                Some(notification.turn.id.clone())
+-            }
+-            _ => None,
+-        };
+-        app.handle_app_server_event(app_server, event).await;
+-        drain_active_thread_events(app);
+-        if let Some(turn_id) = started_turn_id {
+-            return turn_id;
+-        }
+-    }
+-}
+-
+-async fn wait_for_turn_completed(
+-    app: &mut App,
+-    app_server: &mut AppServerSession,
+-    thread_id: ThreadId,
+-) {
+-    loop {
+-        let event = tokio::time::timeout(
+-            std::time::Duration::from_secs(/*secs*/ 5),
+-            app_server.next_event(),
+-        )
+-        .await
+-        .expect("app-server should emit a turn/completed event")
+-        .expect("app-server event stream should remain open");
+-        let completed = matches!(
+-            &event,
+-            AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(notification))
+-                if notification.thread_id == thread_id.to_string()
+-        );
+-        app.handle_app_server_event(app_server, event).await;
+-        drain_active_thread_events(app);
+-        if completed {
+-            return;
+-        }
+-    }
+-}
+-
+-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn active_turn_interrupt_is_nonblocking_and_coalesces_repeated_requests() -> Result<()> {
+-    let (chunks, release_response) =
+-        gated_response_chunks("interrupt-response", ev_completed("interrupt-response"));
+-    let (server, _completions) = start_streaming_sse_server(vec![chunks]).await;
+-    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+-    let codex_home = tempdir()?;
+-    std::fs::write(
+-        codex_home.path().join("config.toml"),
+-        format!(
+-            r#"
+-model = "{CURRENT_MODEL}"
+-model_provider = "{MODEL_PROVIDER_ID}"
+-
+-[model_providers.{MODEL_PROVIDER_ID}]
+-name = "Interrupt test"
+-base_url = "{}/v1"
+-wire_api = "responses"
+-request_max_retries = 0
+-stream_max_retries = 0
+-"#,
+-            server.uri()
+-        ),
+-    )?;
+-    app.config.codex_home = codex_home.path().to_path_buf().abs();
+-    app.config.sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
+-    app.config.model = Some(CURRENT_MODEL.to_string());
+-    app.config.model_provider_id = MODEL_PROVIDER_ID.to_string();
+-    app.config.model_provider = ModelProviderInfo {
+-        name: "Interrupt test".to_string(),
+-        base_url: Some(format!("{}/v1", server.uri())),
+-        request_max_retries: Some(0),
+-        stream_max_retries: Some(0),
+-        ..ModelProviderInfo::default()
+-    };
+-
+-    let mut tui = crate::tui::test_support::make_test_tui()?;
+-    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+-    let started = app_server.start_thread(&app.config).await?;
+-    let thread_id = started.session.thread_id;
+-    app.replace_chat_widget_with_app_server_thread(
+-        &mut tui,
+-        started,
+-        ThreadAttachPresentation::SessionLineage,
+-        /*initial_user_message*/ None,
+-    )
+-    .await?;
+-    while app_event_rx.try_recv().is_ok() {}
+-
+-    submit_prompt(&mut app, "Keep this turn running until interrupted");
+-    let turn = next_user_turn_event(&mut app_event_rx);
+-    app.submit_thread_op(&mut app_server, thread_id, turn)
+-        .await?;
+-    let turn_id = next_turn_started(&mut app, &mut app_server, thread_id).await;
+-    drive_until_request_count(
+-        &mut app,
+-        &mut app_server,
+-        &server,
+-        /*expected_request_count*/ 1,
+-    )
+-    .await;
+-
+-    let interrupt = AppCommand::interrupt();
+-    assert!(
+-        app.try_submit_active_thread_op_via_app_server(&mut app_server, thread_id, &interrupt)
+-            .await?
+-    );
+-    let AppServerRequestId::Integer(next_request_id) = app_server.next_request_id() else {
+-        unreachable!("embedded app-server request IDs are integers");
+-    };
+-    assert!(
+-        app.try_submit_active_thread_op_via_app_server(&mut app_server, thread_id, &interrupt)
+-            .await?
+-    );
+-    assert_eq!(
+-        app_server.next_request_id(),
+-        AppServerRequestId::Integer(next_request_id + 1)
+-    );
+-    {
+-        let store = app.thread_event_channels[&thread_id].store.lock().await;
+-        assert_eq!(store.active_turn_id.as_deref(), Some(turn_id.as_str()));
+-        assert_eq!(
+-            store.pending_interrupt_turn_id.as_deref(),
+-            Some(turn_id.as_str())
+-        );
+-    }
+-
+-    while app_event_rx.try_recv().is_ok() {}
+-    app.handle_thread_event_now(ThreadBufferedEvent::Notification(
+-        ServerNotification::Warning(WarningNotification {
+-            thread_id: Some(thread_id.to_string()),
+-            message: "event handled while interrupt is pending".to_string(),
+-        }),
+-    ));
+-    assert!(matches!(
+-        app_event_rx.try_recv(),
+-        Ok(AppEvent::InsertHistoryCell(_))
+-    ));
+-
+-    wait_for_turn_completed(&mut app, &mut app_server, thread_id).await;
+-    assert_eq!(
+-        app.thread_event_channels[&thread_id]
+-            .store
+-            .lock()
+-            .await
+-            .pending_interrupt_turn_id,
+-        None
+-    );
+-
+-    let _ = release_response.send(());
+-    app_server.shutdown().await?;
+-    server.shutdown().await;
+-    Ok(())
+-}
+-
+-async fn drive_until_request_count(
+-    app: &mut App,
+-    app_server: &mut AppServerSession,
+-    server: &StreamingSseServer,
+-    expected_request_count: usize,
+-) {
+-    let timeout = tokio::time::sleep(std::time::Duration::from_secs(/*secs*/ 5));
+-    tokio::pin!(timeout);
+-    loop {
+-        tokio::select! {
+-            () = server.wait_for_request_count(expected_request_count) => return,
+-            event = app_server.next_event() => {
+-                let event = event.expect("app-server event stream should remain open");
+-                app.handle_app_server_event(app_server, event).await;
+-                drain_active_thread_events(app);
+-            }
+-            () = &mut timeout => {
+-                panic!("expected {expected_request_count} Responses API requests");
+-            }
+-        }
+-    }
+-}
+-
+-fn user_input_texts(body: &Value) -> Vec<String> {
+-    body.get("input")
+-        .and_then(Value::as_array)
+-        .into_iter()
+-        .flatten()
+-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+-        .filter(|item| item.get("role").and_then(Value::as_str) == Some("user"))
+-        .filter_map(|item| item.get("content").and_then(Value::as_array))
+-        .flatten()
+-        .filter(|span| span.get("type").and_then(Value::as_str) == Some("input_text"))
+-        .filter_map(|span| span.get("text").and_then(Value::as_str).map(str::to_owned))
+-        .collect()
+-}
+-
+-fn user_message_count(thread: &Thread, prompt: &str) -> usize {
+-    thread
+-        .turns
+-        .iter()
+-        .flat_map(|turn| &turn.items)
+-        .filter_map(|item| match item {
+-            ThreadItem::UserMessage { content, .. } => Some(content),
+-            _ => None,
+-        })
+-        .flatten()
+-        .filter(|item| matches!(item, AppServerUserInput::Text { text, .. } if text == prompt))
+-        .count()
+-}
+-
+-async fn run_safety_retry(
+-    previous_prompt: Option<&str>,
+-    failing_draft: Option<&str>,
+-    committed_steer: Option<&str>,
+-    scenario: SafetyRetryScenario,
+-) -> Result<()> {
+-    let (active_chunks, release_active_response) = gated_response_chunks(
+-        "active-response",
+-        ev_completed_with_tokens("active-response", /*total_tokens*/ 100),
+-    );
+-    let mut release_active_response = Some(release_active_response);
+-    let (steered_chunks, release_steered_response) =
+-        gated_response_chunks("steered-response", ev_completed("steered-response"));
+-    let (previous_chunks, release_previous_response) =
+-        gated_response_chunks("previous-response", ev_completed("previous-response"));
+-    let (retry_chunks, release_retry_response) =
+-        gated_response_chunks("retry-response", ev_completed("retry-response"));
+-    let mut response_sequences = Vec::new();
+-    if previous_prompt.is_some() {
+-        if scenario == SafetyRetryScenario::InterruptedPrevious {
+-            response_sequences.push(previous_chunks);
+-        } else {
+-            response_sequences.push(response_chunks("previous-response"));
+-        }
+-    }
+-    response_sequences.push(active_chunks);
+-    if committed_steer.is_some() {
+-        response_sequences.push(steered_chunks);
+-    }
+-    if scenario == SafetyRetryScenario::RetryTwice {
+-        response_sequences.push(retry_chunks);
+-        response_sequences.push(response_chunks("second-retry-response"));
+-    } else {
+-        response_sequences.push(response_chunks("retry-response"));
+-    }
+-    response_sequences.push(vec![StreamingSseChunk {
+-        gate: None,
+-        body: responses::sse(vec![
+-            ev_response_created("goal-continuation-response"),
+-            ev_assistant_message("goal-continuation-message", "done"),
+-            ev_completed_with_tokens("goal-continuation-response", /*total_tokens*/ 1_000),
+-        ]),
+-    }]);
+-    let expected_request_count = response_sequences.len();
+-    let (server, _completions) = start_streaming_sse_server(response_sequences).await;
+-
+-    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+-    let codex_home = tempdir()?;
+-    std::fs::write(
+-        codex_home.path().join("config.toml"),
+-        format!(
+-            r#"
+-model = "{CURRENT_MODEL}"
+-model_provider = "{MODEL_PROVIDER_ID}"
+-
+-[model_providers.{MODEL_PROVIDER_ID}]
+-name = "Safety retry test"
+-base_url = "{}/v1"
+-wire_api = "responses"
+-request_max_retries = 0
+-stream_max_retries = 0
+-
+-[features]
+-goals = true
+-"#,
+-            server.uri()
+-        ),
+-    )?;
+-    app.config.codex_home = codex_home.path().to_path_buf().abs();
+-    app.config.sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
+-    app.config.model = Some(CURRENT_MODEL.to_string());
+-    app.config.model_provider_id = MODEL_PROVIDER_ID.to_string();
+-    app.config.model_provider = ModelProviderInfo {
+-        name: "Safety retry test".to_string(),
+-        base_url: Some(format!("{}/v1", server.uri())),
+-        request_max_retries: Some(0),
+-        stream_max_retries: Some(0),
+-        ..ModelProviderInfo::default()
+-    };
+-    app.config
+-        .features
+-        .enable(Feature::Goals)
+-        .expect("test config should allow goals");
+-
+-    let mut tui = crate::tui::test_support::make_test_tui()?;
+-    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+-    let started = app_server.start_thread(&app.config).await?;
+-    let source_thread_id = started.session.thread_id;
+-    app.replace_chat_widget_with_app_server_thread(
+-        &mut tui,
+-        started,
+-        ThreadAttachPresentation::SessionLineage,
+-        /*initial_user_message*/ None,
+-    )
+-    .await?;
+-    while app_event_rx.try_recv().is_ok() {}
+-
+-    if let Some(previous_prompt) = previous_prompt {
+-        submit_prompt(&mut app, previous_prompt);
+-        let previous_turn = next_user_turn_event(&mut app_event_rx);
+-        app.submit_thread_op(&mut app_server, source_thread_id, previous_turn)
+-            .await?;
+-        if scenario == SafetyRetryScenario::InterruptedPrevious {
+-            let previous_turn_id =
+-                next_turn_started(&mut app, &mut app_server, source_thread_id).await;
+-            drive_until_request_count(
+-                &mut app,
+-                &mut app_server,
+-                &server,
+-                /*expected_request_count*/ 1,
+-            )
+-            .await;
+-            app_server
+-                .turn_interrupt(source_thread_id, previous_turn_id)
+-                .await?;
+-        } else {
+-            wait_for_turn_completed(&mut app, &mut app_server, source_thread_id).await;
+-        }
+-    }
+-
+-    let state_db = codex_state::StateRuntime::init(
+-        app.config.sqlite.clone(),
+-        app.config.model_provider_id.clone(),
+-    )
+-    .await
+-    .expect("state db should initialize");
+-    state_db
+-        .thread_goals()
+-        .replace_thread_goal(
+-            source_thread_id,
+-            RETRY_GOAL,
+-            codex_state::ThreadGoalStatus::Active,
+-            /*token_budget*/ Some(1_000),
+-        )
+-        .await
+-        .expect("source goal should be stored");
+-    let source_goal_id = state_db
+-        .thread_goals()
+-        .get_thread_goal(source_thread_id)
+-        .await
+-        .expect("source goal should be readable")
+-        .expect("source goal")
+-        .goal_id;
+-    state_db
+-        .thread_goals()
+-        .account_thread_goal_usage(
+-            source_thread_id,
+-            /*time_delta_seconds*/ 12,
+-            /*token_delta*/ 50,
+-            codex_state::GoalAccountingMode::ActiveOrStopped,
+-            Some(source_goal_id.as_str()),
+-        )
+-        .await
+-        .expect("source goal usage should be recorded");
+-
+-    submit_prompt(&mut app, RETRY_PROMPT);
+-    let active_turn = next_user_turn_event(&mut app_event_rx);
+-    app.submit_thread_op(&mut app_server, source_thread_id, active_turn.clone())
+-        .await?;
+-    let active_turn_id = next_turn_started(&mut app, &mut app_server, source_thread_id).await;
+-    drive_until_request_count(
+-        &mut app,
+-        &mut app_server,
+-        &server,
+-        usize::from(previous_prompt.is_some()) + 1,
+-    )
+-    .await;
+-
+-    if let Some(committed_steer) = committed_steer {
+-        submit_prompt(&mut app, committed_steer);
+-        let steer = next_user_turn_event(&mut app_event_rx);
+-        app.submit_thread_op(&mut app_server, source_thread_id, steer)
+-            .await?;
+-        let _ = release_active_response
+-            .take()
+-            .expect("active response should still be gated")
+-            .send(());
+-        drive_until_request_count(
+-            &mut app,
+-            &mut app_server,
+-            &server,
+-            usize::from(previous_prompt.is_some()) + 2,
+-        )
+-        .await;
+-        let source = app_server
+-            .thread_read(source_thread_id, /*include_turns*/ true)
+-            .await?;
+-        assert_eq!(user_message_count(&source, committed_steer), 1);
+-    }
+-
+-    app.handle_app_server_event(
+-        &app_server,
+-        AppServerEvent::ServerNotification(ServerNotification::ModelSafetyBufferingUpdated(
+-            ModelSafetyBufferingUpdatedNotification {
+-                thread_id: source_thread_id.to_string(),
+-                turn_id: active_turn_id.clone(),
+-                model: CURRENT_MODEL.to_string(),
+-                use_cases: Vec::new(),
+-                reasons: Vec::new(),
+-                show_buffering_ui: true,
+-                faster_model: Some(FASTER_MODEL.to_string()),
+-            },
+-        )),
+-    )
+-    .await;
+-    drain_active_thread_events(&mut app);
+-    assert!(
+-        app.chat_widget
+-            .can_retry_safety_buffered_turn(&active_turn_id)
+-    );
+-    if let Some(draft) = failing_draft {
+-        app.chat_widget.apply_external_edit(draft.to_string());
+-        let source = app_server
+-            .thread_read(source_thread_id, /*include_turns*/ true)
+-            .await?;
+-        std::fs::remove_file(
+-            source
+-                .path
+-                .expect("source thread should have a rollout path"),
+-        )?;
+-    }
+-
+-    let primary_thread_id = ThreadId::new();
+-    app.primary_thread_id = Some(primary_thread_id);
+-    Box::pin(app.retry_safety_buffered_turn(
+-        &mut tui,
+-        &mut app_server,
+-        SafetyBufferedRetry {
+-            thread_id: source_thread_id,
+-            turn_id: active_turn_id.clone(),
+-            model: FASTER_MODEL.to_string(),
+-            turn: active_turn.clone(),
+-            prompt: UserMessage::from(RETRY_PROMPT),
+-        },
+-    ))
+-    .await;
+-
+-    assert_eq!(app.primary_thread_id, Some(primary_thread_id));
+-    assert_eq!(app.active_thread_id, Some(source_thread_id));
+-    assert_eq!(app.chat_widget.thread_id(), Some(source_thread_id));
+-    app.primary_thread_id = Some(source_thread_id);
+-    while app_event_rx.try_recv().is_ok() {}
+-
+-    Box::pin(app.retry_safety_buffered_turn(
+-        &mut tui,
+-        &mut app_server,
+-        SafetyBufferedRetry {
+-            thread_id: source_thread_id,
+-            turn_id: active_turn_id,
+-            model: FASTER_MODEL.to_string(),
+-            turn: active_turn,
+-            prompt: UserMessage::from(RETRY_PROMPT),
+-        },
+-    ))
+-    .await;
+-
+-    let first_retry_thread_id = app.chat_widget.thread_id().expect("first retry thread id");
+-    if scenario == SafetyRetryScenario::RetryTwice {
+-        let first_retry_turn_id =
+-            next_turn_started(&mut app, &mut app_server, first_retry_thread_id).await;
+-        drive_until_request_count(
+-            &mut app,
+-            &mut app_server,
+-            &server,
+-            /*expected_request_count*/ 2,
+-        )
+-        .await;
+-        app.handle_app_server_event(
+-            &app_server,
+-            AppServerEvent::ServerNotification(ServerNotification::ModelSafetyBufferingUpdated(
+-                ModelSafetyBufferingUpdatedNotification {
+-                    thread_id: first_retry_thread_id.to_string(),
+-                    turn_id: first_retry_turn_id.clone(),
+-                    model: FASTER_MODEL.to_string(),
+-                    use_cases: Vec::new(),
+-                    reasons: Vec::new(),
+-                    show_buffering_ui: true,
+-                    faster_model: Some(FASTER_MODEL.to_string()),
+-                },
+-            )),
+-        )
+-        .await;
+-        drain_active_thread_events(&mut app);
+-        assert!(
+-            app.chat_widget
+-                .can_retry_safety_buffered_turn(&first_retry_turn_id)
+-        );
+-        app.chat_widget
+-            .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+-        let second_retry = loop {
+-            match app_event_rx.try_recv() {
+-                Ok(AppEvent::RetrySafetyBufferedTurn {
+-                    thread_id,
+-                    turn_id,
+-                    model,
+-                    turn,
+-                    prompt,
+-                }) => {
+-                    break SafetyBufferedRetry {
+-                        thread_id,
+-                        turn_id,
+-                        model,
+-                        turn,
+-                        prompt,
+-                    };
+-                }
+-                Ok(_) => continue,
+-                Err(err) => panic!("expected second safety-buffering retry event: {err}"),
+-            }
+-        };
+-        let AppCommand::UserTurn { items, .. } = &second_retry.turn else {
+-            panic!("second safety-buffering retry should retain the user turn");
+-        };
+-        assert!(items.iter().any(
+-            |item| matches!(item, AppServerUserInput::Text { text, .. } if text == RETRY_PROMPT)
+-        ));
+-        Box::pin(app.retry_safety_buffered_turn(&mut tui, &mut app_server, second_retry)).await;
+-    }
+-
+-    if let Some(draft) = failing_draft {
+-        assert_eq!(
+-            app.chat_widget.composer_text_with_pending(),
+-            format!("{RETRY_PROMPT}\n{draft}")
+-        );
+-        assert_eq!(app.chat_widget.thread_id(), Some(source_thread_id));
+-        if let Some(release_active_response) = release_active_response.take() {
+-            let _ = release_active_response.send(());
+-        }
+-        let _ = release_steered_response.send(());
+-        app_server.shutdown().await?;
+-        server.shutdown().await;
+-        return Ok(());
+-    }
+-
+-    drive_until_request_count(&mut app, &mut app_server, &server, expected_request_count).await;
+-    let mut replayed_history = String::new();
+-    while let Ok(event) = app_event_rx.try_recv() {
+-        if let AppEvent::InsertHistoryCell(cell) = event {
+-            replayed_history.push_str(&lines_to_single_string(
+-                &cell.transcript_lines(/*width*/ 80),
+-            ));
+-        }
+-    }
+-    assert_eq!(
+-        replayed_history.contains("Conversation interrupted"),
+-        scenario == SafetyRetryScenario::InterruptedPrevious
+-    );
+-    let forked_history = replayed_history
+-        .rsplit_once("Thread forked from")
+-        .expect("safety retry should render fork lineage")
+-        .1;
+-    assert_eq!(
+-        forked_history.matches(RETRY_PROMPT).count(),
+-        1,
+-        "the fork should render the retried prompt once: {forked_history}"
+-    );
+-    if committed_steer.is_some() {
+-        let rendered_retry = forked_history
+-            .lines()
+-            .skip_while(|line| !line.contains(RETRY_PROMPT))
+-            .collect::<Vec<_>>()
+-            .join("\n");
+-        insta::assert_snapshot!("safety_retry_committed_steer_history", rendered_retry);
+-    }
+-
+-    let retry_thread_id = app.chat_widget.thread_id().expect("retry thread id");
+-    let source = app_server
+-        .thread_read(source_thread_id, /*include_turns*/ true)
+-        .await?;
+-    let retry = app_server
+-        .thread_read(retry_thread_id, /*include_turns*/ true)
+-        .await?;
+-    assert_ne!(retry_thread_id, source_thread_id);
+-    assert_eq!(
+-        source.turns.last().map(|turn| &turn.status),
+-        Some(&TurnStatus::Interrupted)
+-    );
+-    assert_eq!(
+-        retry.forked_from_id.as_deref(),
+-        Some(
+-            if scenario == SafetyRetryScenario::RetryTwice {
+-                first_retry_thread_id
+-            } else {
+-                source_thread_id
+-            }
+-            .to_string()
+-        )
+-        .as_deref()
+-    );
+-    let expected_retry_prompt = match committed_steer {
+-        Some(committed_steer) => format!("{RETRY_PROMPT}\n{committed_steer}"),
+-        None => RETRY_PROMPT.to_string(),
+-    };
+-    assert_eq!(user_message_count(&source, RETRY_PROMPT), 1);
+-    assert_eq!(user_message_count(&retry, &expected_retry_prompt), 1);
+-    if let Some(committed_steer) = committed_steer {
+-        assert_eq!(user_message_count(&source, committed_steer), 1);
+-    }
+-    if let Some(previous_prompt) = previous_prompt {
+-        assert_eq!(user_message_count(&source, previous_prompt), 1);
+-        assert_eq!(user_message_count(&retry, previous_prompt), 1);
+-    }
+-
+-    let source_goal = app_server
+-        .thread_goal_get(source_thread_id)
+-        .await?
+-        .goal
+-        .expect("source goal");
+-    let retry_goal = app_server
+-        .thread_goal_get(retry_thread_id)
+-        .await?
+-        .goal
+-        .expect("retry goal");
+-    let expected_source_tokens = if committed_steer.is_some() { 150 } else { 50 };
+-    assert_eq!(source_goal.objective, RETRY_GOAL);
+-    assert_eq!(source_goal.tokens_used, expected_source_tokens);
+-    assert_eq!(source_goal.time_used_seconds, 12);
+-    assert_eq!(retry_goal.objective, RETRY_GOAL);
+-    assert!(retry_goal.tokens_used >= expected_source_tokens);
+-    assert!(retry_goal.time_used_seconds >= 12);
+-
+-    let request_bodies = server
+-        .requests()
+-        .await
+-        .iter()
+-        .map(|request| serde_json::from_slice::<Value>(request))
+-        .collect::<serde_json::Result<Vec<_>>>()?;
+-    let retry_request_index =
+-        usize::from(previous_prompt.is_some()) + usize::from(committed_steer.is_some()) + 1;
+-    let retry_request = request_bodies
+-        .get(retry_request_index)
+-        .expect("retry should issue a Responses API request");
+-    assert_eq!(retry_request["model"].as_str(), Some(FASTER_MODEL));
+-    assert_eq!(retry_request["reasoning"]["effort"].as_str(), Some("low"));
+-    let relevant_prompts = user_input_texts(retry_request)
+-        .into_iter()
+-        .filter(|text| {
+-            text == PREVIOUS_PROMPT
+-                || text == RETRY_PROMPT
+-                || committed_steer.is_some_and(|steer| text == steer)
+-        })
+-        .collect::<Vec<_>>();
+-    let mut expected_prompts = match previous_prompt {
+-        Some(previous_prompt) => vec![previous_prompt.to_string(), RETRY_PROMPT.to_string()],
+-        None => vec![RETRY_PROMPT.to_string()],
+-    };
+-    expected_prompts.extend(committed_steer.map(str::to_string));
+-    assert_eq!(relevant_prompts, expected_prompts);
+-    if previous_prompt.is_none() {
+-        assert!(
+-            !user_input_texts(retry_request)
+-                .iter()
+-                .any(|text| text.contains("<turn_aborted>")),
+-            "first-turn safety retry should not inherit an interruption marker"
+-        );
+-    }
+-    let goal_continuation_request_index = if scenario == SafetyRetryScenario::RetryTwice {
+-        let second_retry_request = request_bodies
+-            .get(retry_request_index + 1)
+-            .expect("second retry should issue a Responses API request");
+-        assert!(
+-            user_input_texts(second_retry_request)
+-                .iter()
+-                .any(|text| text == RETRY_PROMPT),
+-            "second safety retry should submit the original prompt"
+-        );
+-        assert!(
+-            !user_input_texts(second_retry_request)
+-                .iter()
+-                .any(|text| text.contains("<turn_aborted>")),
+-            "second safety retry should not inherit an interruption marker"
+-        );
+-        retry_request_index + 2
+-    } else {
+-        retry_request_index + 1
+-    };
+-    assert!(
+-        user_input_texts(&request_bodies[goal_continuation_request_index])
+-            .iter()
+-            .any(|text| text.contains(RETRY_GOAL)),
+-        "inherited goal continuation should resume after the explicit retry"
+-    );
+-
+-    if let Some(release_active_response) = release_active_response.take() {
+-        let _ = release_active_response.send(());
+-    }
+-    let _ = release_steered_response.send(());
+-    let _ = release_previous_response.send(());
+-    let _ = release_retry_response.send(());
+-    app_server.shutdown().await?;
+-    server.shutdown().await;
+-    Ok(())
+-}
+-
+-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn safety_retry_forks_after_the_previous_turn_and_uses_faster_settings() -> Result<()> {
+-    run_safety_retry(
+-        Some(PREVIOUS_PROMPT),
+-        /*failing_draft*/ None,
+-        /*committed_steer*/ None,
+-        SafetyRetryScenario::Once,
+-    )
+-    .await
+-}
+-
+-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn safety_retry_preserves_a_committed_steer_from_the_interrupted_turn() -> Result<()> {
+-    run_safety_retry(
+-        Some(PREVIOUS_PROMPT),
+-        /*failing_draft*/ None,
+-        Some(COMMITTED_STEER),
+-        SafetyRetryScenario::Once,
+-    )
+-    .await
+-}
+-
+-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn safety_retry_forks_first_turn_and_continues_without_duplicating_prompt() -> Result<()> {
+-    run_safety_retry(
+-        /*previous_prompt*/ None,
+-        /*failing_draft*/ None,
+-        /*committed_steer*/ None,
+-        SafetyRetryScenario::Once,
+-    )
+-    .await
+-}
+-
+-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn safety_retry_can_retry_a_first_turn_a_second_time() -> Result<()> {
+-    run_safety_retry(
+-        /*previous_prompt*/ None,
+-        /*failing_draft*/ None,
+-        /*committed_steer*/ None,
+-        SafetyRetryScenario::RetryTwice,
+-    )
+-    .await
+-}
+-
+-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn safety_retry_replays_older_interruption_notices() -> Result<()> {
+-    run_safety_retry(
+-        Some(PREVIOUS_PROMPT),
+-        /*failing_draft*/ None,
+-        /*committed_steer*/ None,
+-        SafetyRetryScenario::InterruptedPrevious,
+-    )
+-    .await
+-}
+-
+-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+-async fn safety_retry_branch_failure_preserves_unsent_draft() -> Result<()> {
+-    run_safety_retry(
+-        Some(PREVIOUS_PROMPT),
+-        Some(UNSENT_DRAFT),
+-        /*committed_steer*/ None,
+-        SafetyRetryScenario::Once,
+-    )
+-    .await
+-}
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+index 70b3bf7687..40ef71b0fb 100644
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -834,7 +834,7 @@ impl App {
+                             .as_ref()
+                             .map(|profile| &profile.permission_profile),
+                     );
+-                    let response = app_server
++                    app_server
+                         .turn_start(
+                             thread_id,
+                             items.to_vec(),
+@@ -853,12 +853,6 @@ impl App {
+                             *run_user_prompt_submit_hook,
+                         )
+                         .await?;
+-                    if self.active_thread_id == Some(thread_id)
+-                        && self.chat_widget.thread_id() == Some(thread_id)
+-                    {
+-                        self.chat_widget
+-                            .record_safety_buffering_turn(response.turn.id, op);
+-                    }
+                 }
+                 Ok(true)
+             }
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+index a451505dd3..e25dbe482c 100644
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -190,15 +190,6 @@ pub(crate) enum AppEvent {
+         op: AppCommand,
+     },
+ 
+-    /// Interrupt, fork, and retry a safety-buffered turn with the server-selected model.
+-    RetrySafetyBufferedTurn {
+-        thread_id: ThreadId,
+-        turn_id: String,
+-        model: String,
+-        turn: AppCommand,
+-        prompt: UserMessage,
+-    },
+-
+     /// Deliver a synthetic history lookup response to a specific thread channel.
+     ThreadHistoryEntryResponse {
+         thread_id: ThreadId,
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index a09f10d955..0e2d0ec04f 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -687,7 +687,6 @@ pub(crate) struct ChatWidget {
+     // order.
+     suppress_initial_user_message_submit: bool,
+     input_queue: InputQueueState,
+-    safety_buffering_prompt: Option<UserMessage>,
+     /// Main chat-surface bindings resolved from `tui.keymap.chat`.
+     chat_keymap: ChatKeymap,
+     /// Keybinding to show for popping the most-recently queued message back
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 87f2cb2759..478966ae6a 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -209,7 +209,6 @@ impl ChatWidget {
+             forked_from: None,
+             interrupted_turn_notice_mode: InterruptedTurnNoticeMode::Default,
+             input_queue: InputQueueState::default(),
+-            safety_buffering_prompt: None,
+             chat_keymap,
+             queued_message_edit_hint_binding,
+             show_welcome_banner: is_first_run,
+diff --git a/codex-rs/tui/src/chatwidget/input_restore.rs b/codex-rs/tui/src/chatwidget/input_restore.rs
+index 6114656489..cfa80f20a9 100644
+--- a/codex-rs/tui/src/chatwidget/input_restore.rs
++++ b/codex-rs/tui/src/chatwidget/input_restore.rs
+@@ -334,7 +334,6 @@ impl ChatWidget {
+         };
+         Some(ThreadInputState {
+             composer: composer.has_content().then_some(composer),
+-            safety_buffering_prompt: self.safety_buffering_prompt.clone(),
+             pending_steers: self
+                 .input_queue
+                 .pending_steers
+@@ -384,7 +383,6 @@ impl ChatWidget {
+         if let Some(input_state) = input_state {
+             self.current_collaboration_mode = input_state.current_collaboration_mode;
+             self.active_collaboration_mask = input_state.active_collaboration_mask;
+-            self.safety_buffering_prompt = input_state.safety_buffering_prompt;
+             self.turn_lifecycle.restore_running(
+                 preserve_in_flight_turn && input_state.agent_turn_running,
+                 preserve_in_flight_turn
+@@ -429,12 +427,12 @@ impl ChatWidget {
+                     .collect();
+             } else {
+                 self.input_queue.pending_steers.clear();
+-                let mut safety_retry_follow_ups = pending_steers
++                let mut pending_follow_ups = pending_steers
+                     .into_iter()
+                     .map(QueuedUserMessage::from)
+                     .collect::<VecDeque<_>>();
+-                safety_retry_follow_ups.append(&mut queued_user_messages);
+-                queued_user_messages = safety_retry_follow_ups;
++                pending_follow_ups.append(&mut queued_user_messages);
++                queued_user_messages = pending_follow_ups;
+                 pending_steer_history_records.append(&mut queued_user_message_history_records);
+                 queued_user_message_history_records = pending_steer_history_records;
+             }
+@@ -455,7 +453,6 @@ impl ChatWidget {
+         } else {
+             self.turn_lifecycle
+                 .restore_running(/*running*/ false, /*started_at*/ None);
+-            self.safety_buffering_prompt = None;
+             self.input_queue.clear();
+             self.restore_composer_state(Default::default());
+         }
+diff --git a/codex-rs/tui/src/chatwidget/input_submission.rs b/codex-rs/tui/src/chatwidget/input_submission.rs
+index 974d3f1831..c4d9bb98ed 100644
+--- a/codex-rs/tui/src/chatwidget/input_submission.rs
++++ b/codex-rs/tui/src/chatwidget/input_submission.rs
+@@ -454,7 +454,6 @@ impl ChatWidget {
+         }
+ 
+         if render_in_history {
+-            self.safety_buffering_prompt = Some(submitted_message.clone());
+             if !render_before_submit {
+                 self.on_user_message_display(
+                     user_message_display_for_history(submitted_message, &history_record),
+diff --git a/codex-rs/tui/src/chatwidget/safety_buffering.rs b/codex-rs/tui/src/chatwidget/safety_buffering.rs
+index 4ea59a2062..939abb8d11 100644
+--- a/codex-rs/tui/src/chatwidget/safety_buffering.rs
++++ b/codex-rs/tui/src/chatwidget/safety_buffering.rs
+@@ -1,50 +1,41 @@
+-//! Safety-buffering status and retry UI for active turns.
++//! Safety-buffering status for active turns.
+ 
+-use super::input_queue::SubmittedTurnContext;
+ use super::*;
+ use codex_app_server_protocol::ModelSafetyBufferingUpdatedNotification;
+ 
+-const SAFETY_BUFFERING_PROMPT_VIEW_ID: &str = "safety-buffering-prompt";
+-const SAFETY_BUFFERING_LEARN_MORE_URL: &str = "https://help.openai.com/en/articles/20001326";
+-
+ const SAFETY_BUFFERING_HEADER: &str =
+     "Our systems are thinking a bit more about this request before responding.";
+-const SAFETY_BUFFERING_MESSAGE_WITH_RETRY: &str = "Hang tight or retry with a faster model for a quicker response, though it may be less capable of handling complex requests.";
+-const SAFETY_BUFFERING_FOOTER: &str = "No action is required. Codex will keep waiting, and this menu will close when the response is ready.";
+ 
+ #[derive(Debug)]
+ struct ActiveSafetyBuffering {
+     turn_id: String,
+-    last_prompt_had_retry: bool,
+     agent_message_started: bool,
+ }
+ 
+ #[derive(Debug, Default)]
+ pub(super) struct SafetyBufferingState {
+-    submitted_turn: Option<(String, AppCommand)>,
+     active: Option<ActiveSafetyBuffering>,
+ }
+ 
+ impl ChatWidget {
+-    pub(crate) fn record_safety_buffering_turn(&mut self, turn_id: String, turn: &AppCommand) {
+-        self.safety_buffering.submitted_turn = Some((turn_id, turn.clone()));
+-    }
+-
+     pub(super) fn reset_safety_buffering_for_turn_start(&mut self) {
+-        self.bottom_pane
+-            .dismiss_view_by_id(SAFETY_BUFFERING_PROMPT_VIEW_ID);
+         self.safety_buffering.active = None;
+     }
+ 
+     pub(crate) fn clear_safety_buffering(&mut self) {
+-        self.bottom_pane
+-            .dismiss_view_by_id(SAFETY_BUFFERING_PROMPT_VIEW_ID);
+         self.safety_buffering = SafetyBufferingState::default();
+     }
+ 
+     pub(super) fn mark_safety_buffering_agent_message_started(&mut self) {
++        let mut restore_status = false;
+         if let Some(active) = self.safety_buffering.active.as_mut() {
+-            active.agent_message_started = true;
++            if !active.agent_message_started {
++                active.agent_message_started = true;
++                restore_status = true;
++            }
++        }
++        if restore_status {
++            self.restore_reasoning_status_header();
+         }
+     }
+ 
+@@ -55,43 +46,6 @@ impl ChatWidget {
+             .is_some_and(|active| !active.agent_message_started)
+     }
+ 
+-    pub(crate) fn can_retry_safety_buffered_turn(&self, turn_id: &str) -> bool {
+-        self.turn_lifecycle.agent_turn_running
+-            && self
+-                .safety_buffering
+-                .active
+-                .as_ref()
+-                .is_some_and(|active| active.turn_id == turn_id && !active.agent_message_started)
+-    }
+-
+-    pub(crate) fn prepare_safety_buffered_retry_submission(
+-        &mut self,
+-        prompt: UserMessage,
+-        model: String,
+-        reasoning_effort: Option<ReasoningEffortConfig>,
+-    ) {
+-        self.last_rendered_user_message_display = None;
+-        self.finalize_turn();
+-        self.safety_buffering_prompt = Some(prompt);
+-        self.input_queue.user_turn_pending_start = true;
+-        self.input_queue.submitted_turn_context = Some(SubmittedTurnContext {
+-            model,
+-            reasoning_effort,
+-        });
+-        self.refresh_model_dependent_surfaces();
+-    }
+-
+-    pub(crate) fn commit_safety_buffered_retry_submission(&mut self, display: UserMessageDisplay) {
+-        self.on_user_message_display(display, None);
+-    }
+-
+-    pub(crate) fn cancel_safety_buffered_retry_submission(&mut self) {
+-        self.input_queue.user_turn_pending_start = false;
+-        self.input_queue.submitted_turn_context = None;
+-        self.refresh_model_dependent_surfaces();
+-        self.clear_safety_buffering();
+-    }
+-
+     pub(super) fn on_model_safety_buffering_updated(
+         &mut self,
+         notification: ModelSafetyBufferingUpdatedNotification,
+@@ -100,10 +54,9 @@ impl ChatWidget {
+         let ModelSafetyBufferingUpdatedNotification {
+             turn_id,
+             show_buffering_ui,
+-            faster_model,
+             ..
+         } = notification;
+-        if matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages))
++        if replay_kind.is_some()
+             || !self.turn_lifecycle.agent_turn_running
+             || self.turn_lifecycle.last_turn_id.as_deref() != Some(turn_id.as_str())
+         {
+@@ -116,117 +69,33 @@ impl ChatWidget {
+                 .as_ref()
+                 .is_some_and(|active| active.turn_id == turn_id)
+             {
+-                self.bottom_pane
+-                    .dismiss_view_by_id(SAFETY_BUFFERING_PROMPT_VIEW_ID);
+                 self.safety_buffering.active = None;
+                 self.restore_reasoning_status_header();
+             }
+             return;
+         }
+ 
+-        let retry_turn = if self.side_conversation_active() {
+-            None
+-        } else {
+-            self.safety_buffering
+-                .submitted_turn
+-                .as_ref()
+-                .filter(|(submitted_turn_id, _)| {
+-                    replay_kind.is_none() && submitted_turn_id == &turn_id
+-                })
+-                .map(|(_, turn)| turn.clone())
+-        };
+-        let thread_id = self.thread_id;
+-        let retry_prompt = self.safety_buffering_prompt.clone();
+-        let can_offer_retry = faster_model.is_some()
+-            && retry_turn.is_some()
+-            && retry_prompt.is_some()
+-            && thread_id.is_some();
+         let previous_active = self
+             .safety_buffering
+             .active
+             .as_ref()
+             .filter(|active| active.turn_id == turn_id);
+-        let should_show_prompt =
+-            previous_active.is_none_or(|active| active.last_prompt_had_retry != can_offer_retry);
+         let agent_message_started =
+             previous_active.is_some_and(|active| active.agent_message_started);
+         self.safety_buffering.active = Some(ActiveSafetyBuffering {
+             turn_id: turn_id.clone(),
+-            last_prompt_had_retry: can_offer_retry,
+             agent_message_started,
+         });
++        if agent_message_started {
++            return;
++        }
+ 
+-        let status_details = if can_offer_retry {
+-            format!("{SAFETY_BUFFERING_HEADER} {SAFETY_BUFFERING_MESSAGE_WITH_RETRY}")
+-        } else {
+-            SAFETY_BUFFERING_HEADER.to_string()
+-        };
+         self.bottom_pane.ensure_status_indicator();
+         self.set_status(
+             "Working".to_string(),
+-            Some(status_details),
++            Some(SAFETY_BUFFERING_HEADER.to_string()),
+             StatusDetailsCapitalization::Preserve,
+             /*details_max_lines*/ 6,
+         );
+-
+-        if !should_show_prompt {
+-            return;
+-        }
+-        self.bottom_pane
+-            .dismiss_view_by_id(SAFETY_BUFFERING_PROMPT_VIEW_ID);
+-
+-        let mut header = vec![Box::new(
+-            Paragraph::new(Line::from(SAFETY_BUFFERING_HEADER).bold()).wrap(Wrap { trim: false }),
+-        ) as Box<dyn Renderable>];
+-        if can_offer_retry {
+-            header.push(Box::new(
+-                Paragraph::new(Line::from(SAFETY_BUFFERING_MESSAGE_WITH_RETRY).dim())
+-                    .wrap(Wrap { trim: false }),
+-            ));
+-        }
+-        let header = ColumnRenderable::with(header);
+-        let mut items = Vec::new();
+-        if let (Some(faster_model), Some(turn), Some(prompt), Some(thread_id)) =
+-            (faster_model, retry_turn, retry_prompt, thread_id)
+-        {
+-            items.push(SelectionItem {
+-                name: "Retry with a faster model".to_string(),
+-                actions: vec![Box::new(move |tx| {
+-                    tx.send(AppEvent::RetrySafetyBufferedTurn {
+-                        thread_id,
+-                        turn_id: turn_id.clone(),
+-                        model: faster_model.clone(),
+-                        turn: turn.clone(),
+-                        prompt: prompt.clone(),
+-                    });
+-                })],
+-                dismiss_on_select: true,
+-                ..Default::default()
+-            });
+-        }
+-        items.extend([
+-            SelectionItem {
+-                name: "Dismiss and keep waiting".to_string(),
+-                dismiss_on_select: true,
+-                ..Default::default()
+-            },
+-            SelectionItem {
+-                name: "Learn more".to_string(),
+-                actions: vec![Box::new(|tx| {
+-                    tx.send(AppEvent::OpenUrlInBrowser {
+-                        url: SAFETY_BUFFERING_LEARN_MORE_URL.to_string(),
+-                    });
+-                })],
+-                ..Default::default()
+-            },
+-        ]);
+-        self.bottom_pane.show_selection_view(SelectionViewParams {
+-            view_id: Some(SAFETY_BUFFERING_PROMPT_VIEW_ID),
+-            header: Box::new(header),
+-            footer_note: Some(Line::from(SAFETY_BUFFERING_FOOTER).dim()),
+-            footer_hint: Some(Line::default()),
+-            items,
+-            ..Default::default()
+-        });
+     }
+ }
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__safety_buffering_retry_prompt.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__safety_buffering_retry_prompt.snap
+deleted file mode 100644
+index 767c9c393b..0000000000
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__safety_buffering_retry_prompt.snap
++++ /dev/null
+@@ -1,14 +0,0 @@
+----
+-source: tui/src/chatwidget/tests/app_server.rs
+-expression: popup
+----
+-  Our systems are thinking a bit more about this request before responding.
+-  Hang tight or retry with a faster model for a quicker response, though it
+-  may be less capable of handling complex requests.
+-
+-› 1. Retry with a faster model
+-  2. Dismiss and keep waiting
+-  3. Learn more
+-
+-  No action is required. Codex will keep waiting, and this menu will close when
+-  the response is ready.
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__safety_buffering_side_conversation_without_retry.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__safety_buffering_side_conversation_without_retry.snap
+deleted file mode 100644
+index 56efb00764..0000000000
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__safety_buffering_side_conversation_without_retry.snap
++++ /dev/null
+@@ -1,11 +0,0 @@
+----
+-source: tui/src/chatwidget/tests/app_server.rs
+-expression: popup
+----
+-  Our systems are thinking a bit more about this request before responding.
+-
+-› 1. Dismiss and keep waiting
+-  2. Learn more
+-
+-  No action is required. Codex will keep waiting, and this menu will close when
+-  the response is ready.
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__safety_buffering_status_without_retry.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__safety_buffering_status_without_retry.snap
+deleted file mode 100644
+index 56efb00764..0000000000
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__safety_buffering_status_without_retry.snap
++++ /dev/null
+@@ -1,11 +0,0 @@
+----
+-source: tui/src/chatwidget/tests/app_server.rs
+-expression: popup
+----
+-  Our systems are thinking a bit more about this request before responding.
+-
+-› 1. Dismiss and keep waiting
+-  2. Learn more
+-
+-  No action is required. Codex will keep waiting, and this menu will close when
+-  the response is ready.
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__safety_buffering_waiting_status.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__safety_buffering_waiting_status.snap
+new file mode 100644
+index 0000000000..991d10585c
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__safety_buffering_waiting_status.snap
+@@ -0,0 +1,11 @@
++---
++source: tui/src/chatwidget/tests/app_server.rs
++expression: popup
++---
++⠋ Working (0s ▪ esc to interrupt)
++  └ Our systems are thinking a bit more about this request before responding.
++
++────────────────────────────────────────────────────────────────────────────────
++ Ask Codex to do anything
++────────────────────────────────────────────────────────────────────────────────
++  gpt-5.6-sol default ▪ /tmp/project
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index 90c1011516..923ca070a5 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -67,14 +67,12 @@ fn configured_thread_session(thread_id: ThreadId) -> crate::session_state::Threa
+ fn start_safety_buffering_test_turn(
+     chat: &mut ChatWidget,
+     op_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Op>,
+-) -> (ThreadId, &'static str, Op) {
++) -> (ThreadId, &'static str) {
+     let thread_id = ThreadId::new();
+     let turn_id = "turn-safety-buffering";
+     chat.thread_id = Some(thread_id);
+     chat.submit_user_message(UserMessage::from("Explain the request"));
+-    let turn = next_submit_op(op_rx);
+-    assert_matches!(&turn, Op::UserTurn { .. });
+-    chat.record_safety_buffering_turn(turn_id.to_string(), &turn);
++    assert_matches!(next_submit_op(op_rx), Op::UserTurn { .. });
+     chat.handle_server_notification(
+         ServerNotification::TurnStarted(TurnStartedNotification {
+             thread_id: thread_id.to_string(),
+@@ -84,14 +82,14 @@ fn start_safety_buffering_test_turn(
+                 items: Vec::new(),
+                 status: AppServerTurnStatus::InProgress,
+                 error: None,
+-                started_at: Some(0),
++                started_at: None,
+                 completed_at: None,
+                 duration_ms: None,
+             },
+         }),
+         /*replay_kind*/ None,
+     );
+-    (thread_id, turn_id, turn)
++    (thread_id, turn_id)
+ }
+ 
+ fn safety_buffering_notification(
+@@ -111,9 +109,12 @@ fn safety_buffering_notification(
+ }
+ 
+ #[tokio::test]
+-async fn safety_buffering_offers_one_retry_with_app_wording() {
++async fn safety_buffering_waits_without_prompt_or_retry_until_turn_completes() {
+     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+-    let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
++    let (thread_id, turn_id) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
++    while rx.try_recv().is_ok() {}
++    let active_view_before = chat.bottom_pane.active_view_id();
++    assert_eq!(active_view_before, None);
+ 
+     let notification = safety_buffering_notification(thread_id, turn_id, Some("faster-model"));
+     chat.handle_server_notification(
+@@ -121,140 +122,70 @@ async fn safety_buffering_offers_one_retry_with_app_wording() {
+         /*replay_kind*/ None,
+     );
+     chat.handle_server_notification(
+-        ServerNotification::ModelSafetyBufferingUpdated(notification),
++        ServerNotification::ModelSafetyBufferingUpdated(notification.clone()),
+         /*replay_kind*/ None,
+     );
+ 
+-    let popup = render_bottom_popup(&chat, /*width*/ 80);
+-    assert_chatwidget_snapshot!("safety_buffering_retry_prompt", popup);
++    assert_eq!(chat.bottom_pane.active_view_id(), active_view_before);
++    assert!(chat.safety_buffering_is_waiting());
++    let status = chat
++        .bottom_pane
++        .status_widget()
++        .expect("status indicator should be visible");
++    assert_eq!(
++        (status.header(), status.details()),
++        ("Working", Some(SAFETY_BUFFERING_HEADER_TEXT))
++    );
++    let popup = normalize_snapshot_paths(render_bottom_popup(&chat, /*width*/ 80));
++    assert_chatwidget_snapshot!("safety_buffering_waiting_status", popup);
+ 
+-    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+-    chat.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+-    let opened_url = loop {
+-        match rx.try_recv() {
+-            Ok(AppEvent::OpenUrlInBrowser { url }) => break url,
+-            Ok(_) => continue,
+-            Err(err) => panic!("expected learn-more URL event: {err}"),
+-        }
+-    };
+-    assert_eq!(opened_url, "https://help.openai.com/en/articles/20001326");
+-    assert!(render_bottom_popup(&chat, /*width*/ 80).contains(SAFETY_BUFFERING_HEADER_TEXT));
++    while let Ok(event) = rx.try_recv() {
++        assert!(
++            !matches!(&event, AppEvent::CodexOp(_)),
++            "automatic safety-buffering wait must not submit a replacement turn: {event:?}"
++        );
++    }
+ 
+-    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+-    chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+-    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+-    let (event_thread_id, event_turn_id, model, turn, prompt) = loop {
+-        match rx.try_recv() {
+-            Ok(AppEvent::RetrySafetyBufferedTurn {
+-                thread_id,
+-                turn_id,
+-                model,
+-                turn,
+-                prompt,
+-            }) => break (thread_id, turn_id, model, turn, prompt),
+-            Ok(_) => continue,
+-            Err(err) => panic!("expected safety-buffering retry event: {err}"),
+-        }
+-    };
+-    assert_eq!(event_thread_id, thread_id);
+-    assert_eq!(event_turn_id, turn_id);
+-    assert_eq!(model, "faster-model");
+-    assert_matches!(turn, Op::UserTurn { .. });
+-    assert_eq!(prompt, UserMessage::from("Explain the request"));
+-    assert!(
+-        !render_bottom_popup(&chat, /*width*/ 80)
+-            .contains("Press enter to confirm or esc to go back")
++    chat.on_agent_message_delta("Visible response".to_string());
++    assert!(!chat.safety_buffering_is_waiting());
++    assert_ne!(
++        chat.bottom_pane
++            .status_widget()
++            .and_then(|status| status.details()),
++        Some(SAFETY_BUFFERING_HEADER_TEXT)
+     );
+-}
+-
+-#[tokio::test]
+-async fn safety_buffering_does_not_offer_retry_in_side_conversation() {
+-    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+-    chat.set_side_conversation_active(/*active*/ true);
+-    let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
+-
+     chat.handle_server_notification(
+-        ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
+-            thread_id,
+-            turn_id,
+-            Some("faster-model"),
+-        )),
++        ServerNotification::ModelSafetyBufferingUpdated(notification),
+         /*replay_kind*/ None,
+     );
+-
+-    let popup = render_bottom_popup(&chat, /*width*/ 80);
+-    assert_chatwidget_snapshot!("safety_buffering_side_conversation_without_retry", popup);
+-}
+-
+-#[tokio::test]
+-async fn safety_buffering_remains_visible_until_turn_completes() {
+-    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+-    let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
+-    chat.handle_server_notification(
+-        ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
+-            thread_id,
+-            turn_id,
+-            Some("faster-model"),
+-        )),
+-        /*replay_kind*/ None,
++    assert!(!chat.safety_buffering_is_waiting());
++    assert_ne!(
++        chat.bottom_pane
++            .status_widget()
++            .and_then(|status| status.details()),
++        Some(SAFETY_BUFFERING_HEADER_TEXT),
++        "duplicate buffering updates must not re-arm the status after output begins"
+     );
+-    assert!(chat.can_retry_safety_buffered_turn(turn_id));
+-
+-    chat.on_agent_message_delta("Visible response".to_string());
+-
+-    assert!(!chat.can_retry_safety_buffered_turn(turn_id));
+-    assert!(render_bottom_popup(&chat, /*width*/ 80).contains(SAFETY_BUFFERING_HEADER_TEXT));
+ 
+     handle_turn_completed(&mut chat, turn_id, /*duration_ms*/ None);
+ 
+-    assert!(!render_bottom_popup(&chat, /*width*/ 80).contains(SAFETY_BUFFERING_HEADER_TEXT));
+-}
+-
+-#[tokio::test]
+-async fn safety_buffering_without_retry_shows_short_app_message() {
+-    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+-    let (thread_id, turn_id, turn) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
+-
+-    chat.handle_server_notification(
+-        ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
+-            thread_id, turn_id, /*faster_model*/ None,
+-        )),
+-        /*replay_kind*/ None,
+-    );
+-
+-    let render_popup = |chat: &ChatWidget| {
+-        normalize_snapshot_paths(render_bottom_popup(chat, /*width*/ 80))
+-    };
+-    let popup = render_popup(&chat);
+-    assert_chatwidget_snapshot!("safety_buffering_status_without_retry", popup,);
+-
+-    let notification = safety_buffering_notification(thread_id, turn_id, Some("faster-model"));
+-    chat.record_safety_buffering_turn("other-turn".to_string(), &turn);
+-    chat.handle_server_notification(
+-        ServerNotification::ModelSafetyBufferingUpdated(notification.clone()),
+-        /*replay_kind*/ None,
+-    );
+-    assert_eq!(render_popup(&chat), popup);
+-
+-    chat.record_safety_buffering_turn(turn_id.to_string(), &turn);
+-    chat.handle_server_notification(
+-        ServerNotification::ModelSafetyBufferingUpdated(notification),
+-        Some(ReplayKind::ThreadSnapshot),
+-    );
+-    assert_eq!(render_popup(&chat), popup);
+-
+-    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+-    assert!(
+-        !render_bottom_popup(&chat, /*width*/ 80)
+-            .contains("Press enter to confirm or esc to go back")
++    assert!(!chat.safety_buffering_is_waiting());
++    assert_eq!(chat.bottom_pane.active_view_id(), active_view_before);
++    assert_eq!(
++        chat.bottom_pane
++            .status_widget()
++            .and_then(|status| status.details()),
++        None,
++        "completion must clear the safety-buffering detail whether the idle status is retained or removed"
+     );
++    assert!(!render_bottom_popup(&chat, /*width*/ 80).contains(SAFETY_BUFFERING_HEADER_TEXT));
+ }
+ 
+ #[tokio::test]
+ async fn safety_buffering_ignores_hidden_stale_and_historical_updates() {
+     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+-    let (thread_id, turn_id, _) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
++    let (thread_id, turn_id) = start_safety_buffering_test_turn(&mut chat, &mut op_rx);
+ 
+     let mut hidden = safety_buffering_notification(thread_id, turn_id, Some("faster-model"));
+     hidden.show_buffering_ui = false;
+@@ -278,6 +209,14 @@ async fn safety_buffering_ignores_hidden_stale_and_historical_updates() {
+         )),
+         Some(ReplayKind::ResumeInitialMessages),
+     );
++    chat.handle_server_notification(
++        ServerNotification::ModelSafetyBufferingUpdated(safety_buffering_notification(
++            thread_id,
++            turn_id,
++            Some("faster-model"),
++        )),
++        Some(ReplayKind::ThreadSnapshot),
++    );
+     assert!(!render_bottom_popup(&chat, /*width*/ 80).contains(SAFETY_BUFFERING_HEADER_TEXT));
+ 
+     let mut hidden = safety_buffering_notification(thread_id, turn_id, Some("faster-model"));
+@@ -285,12 +224,14 @@ async fn safety_buffering_ignores_hidden_stale_and_historical_updates() {
+         ServerNotification::ModelSafetyBufferingUpdated(hidden.clone()),
+         /*replay_kind*/ None,
+     );
++    assert!(chat.safety_buffering_is_waiting());
+     assert!(render_bottom_popup(&chat, /*width*/ 80).contains(SAFETY_BUFFERING_HEADER_TEXT));
+     hidden.show_buffering_ui = false;
+     chat.handle_server_notification(
+         ServerNotification::ModelSafetyBufferingUpdated(hidden),
+         /*replay_kind*/ None,
+     );
++    assert!(!chat.safety_buffering_is_waiting());
+ 
+     assert_eq!(
+         chat.bottom_pane
+diff --git a/codex-rs/tui/src/chatwidget/tests/composer_submission.rs b/codex-rs/tui/src/chatwidget/tests/composer_submission.rs
+index c81a3efcfa..a7308fe286 100644
+--- a/codex-rs/tui/src/chatwidget/tests/composer_submission.rs
++++ b/codex-rs/tui/src/chatwidget/tests/composer_submission.rs
+@@ -1371,7 +1371,6 @@ async fn restore_thread_input_state_applies_running_state_policy() {
+             text: "composer draft".to_string(),
+             ..Default::default()
+         }),
+-        safety_buffering_prompt: Some(UserMessage::from("buffered prompt")),
+         pending_steers: VecDeque::from([UserMessage::from("submitted to the interrupted turn")]),
+         pending_steer_history_records: VecDeque::from([pending_history.clone()]),
+         pending_steer_compare_keys: VecDeque::new(),
+@@ -1419,15 +1418,7 @@ async fn restore_thread_input_state_applies_running_state_policy() {
+         captured_input_state.submitted_turn_context,
+         input_state.submitted_turn_context
+     );
+-    assert_eq!(
+-        captured_input_state.safety_buffering_prompt,
+-        Some(UserMessage::from("buffered prompt"))
+-    );
+     assert_eq!(chat.input_queue.pending_steers.len(), 1);
+-    assert_eq!(
+-        chat.safety_buffering_prompt,
+-        Some(UserMessage::from("buffered prompt"))
+-    );
+ 
+     chat.restore_thread_input_state(
+         Some(input_state),
+@@ -1444,10 +1435,6 @@ async fn restore_thread_input_state_applies_running_state_policy() {
+     assert!(!chat.input_queue.submit_pending_steers_after_interrupt);
+     assert!(chat.input_queue.pending_steers.is_empty());
+     assert_eq!(chat.bottom_pane.composer_text(), "composer draft");
+-    assert_eq!(
+-        chat.safety_buffering_prompt,
+-        Some(UserMessage::from("buffered prompt"))
+-    );
+     assert_eq!(
+         chat.queued_user_message_texts(),
+         vec!["submitted to the interrupted turn", "already queued"]
+@@ -1470,7 +1457,6 @@ async fn restore_thread_input_state_applies_running_state_policy() {
+     assert!(!chat.turn_lifecycle.agent_turn_running);
+     assert!(!chat.turn_lifecycle.sleep_inhibitor.is_turn_running());
+     assert!(!chat.bottom_pane.is_task_running());
+-    assert_eq!(chat.safety_buffering_prompt, None);
+ }
+ 
+ #[tokio::test]
+diff --git a/codex-rs/tui/src/chatwidget/tests/review_mode.rs b/codex-rs/tui/src/chatwidget/tests/review_mode.rs
+index 18d830af02..1ee733b7ca 100644
+--- a/codex-rs/tui/src/chatwidget/tests/review_mode.rs
++++ b/codex-rs/tui/src/chatwidget/tests/review_mode.rs
+@@ -376,7 +376,6 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
+     chat.restore_thread_input_state(
+         Some(ThreadInputState {
+             composer: None,
+-            safety_buffering_prompt: None,
+             pending_steers,
+             pending_steer_history_records: VecDeque::new(),
+             pending_steer_compare_keys,
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index 7d99d02698..96507e6428 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -3463,30 +3463,6 @@ async fn status_line_uses_submitted_model_context_until_turn_completion() {
+     assert!(chat.input_queue.submitted_turn_context.is_none());
+ }
+ 
+-#[tokio::test]
+-async fn safety_buffered_retry_publishes_and_clears_submitted_model_context() {
+-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
+-
+-    chat.prepare_safety_buffered_retry_submission(
+-        UserMessage::from("retry prompt"),
+-        "gpt-5.4".to_string(),
+-        Some(ReasoningEffortConfig::Low),
+-    );
+-
+-    assert!(chat.input_queue.user_turn_pending_start);
+-    assert_eq!(
+-        chat.input_queue.submitted_turn_context,
+-        Some(crate::chatwidget::input_queue::SubmittedTurnContext {
+-            model: "gpt-5.4".to_string(),
+-            reasoning_effort: Some(ReasoningEffortConfig::Low),
+-        })
+-    );
+-
+-    chat.cancel_safety_buffered_retry_submission();
+-    assert!(!chat.input_queue.user_turn_pending_start);
+-    assert!(chat.input_queue.submitted_turn_context.is_none());
+-}
+-
+ #[tokio::test]
+ async fn status_line_model_with_reasoning_plan_mode_footer_snapshot() {
+     use ratatui::Terminal;
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+index 6f0b568ca7..1d75105f26 100644
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -384,7 +384,6 @@ impl ChatWidget {
+         self.plan_stream_controller = None;
+         self.request_pending_usage_output_insertion_after_stream_shutdown();
+         self.status_state.pending_status_indicator_restore = false;
+-        self.safety_buffering_prompt = None;
+         self.request_status_line_branch_refresh();
+         self.request_status_line_git_summary_refresh();
+         self.maybe_show_pending_rate_limit_prompt();
+diff --git a/codex-rs/tui/src/chatwidget/user_messages.rs b/codex-rs/tui/src/chatwidget/user_messages.rs
+index 17f43e2f39..cda0c6be47 100644
+--- a/codex-rs/tui/src/chatwidget/user_messages.rs
++++ b/codex-rs/tui/src/chatwidget/user_messages.rs
+@@ -130,7 +130,6 @@ impl ThreadComposerState {
+ #[derive(Debug, Clone, PartialEq)]
+ pub(crate) struct ThreadInputState {
+     pub(super) composer: Option<ThreadComposerState>,
+-    pub(super) safety_buffering_prompt: Option<UserMessage>,
+     pub(super) pending_steers: VecDeque<UserMessage>,
+     pub(super) pending_steer_history_records: VecDeque<UserMessageHistoryRecord>,
+     pub(super) pending_steer_compare_keys: VecDeque<PendingSteerCompareKey>,

@@ -1,0 +1,269 @@
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 40de12dab6..630afdefe2 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -619,6 +619,7 @@ pub(crate) struct ChatWidget {
+     collab_agent_metadata: HashMap<ThreadId, AgentMetadata>,
+     pending_sub_agent_activity: VecDeque<ThreadItem>,
+     pending_collab_spawn_requests: HashMap<String, multi_agents::SpawnRequestSummary>,
++    v2_activity_observed: bool,
+     suppressed_exec_calls: HashSet<String>,
+     skills_all: Vec<SkillMetadata>,
+     skills_initial_state: Option<HashMap<AbsolutePathBuf, bool>>,
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 932d6bb3a6..96c5c494f2 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -160,6 +160,7 @@ impl ChatWidget {
+             collab_agent_metadata: HashMap::new(),
+             pending_sub_agent_activity: VecDeque::new(),
+             pending_collab_spawn_requests: HashMap::new(),
++            v2_activity_observed: false,
+             suppressed_exec_calls: HashSet::new(),
+             last_unified_wait: None,
+             unified_exec_wait_streak: None,
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index 1073e6a19d..5f9bd37671 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -455,17 +455,20 @@ impl ChatWidget {
+                 model,
+                 reasoning_effort,
+                 agents_states,
+-            } => self.on_collab_agent_tool_call(ThreadItem::CollabAgentToolCall {
+-                id,
+-                tool,
+-                status,
+-                sender_thread_id,
+-                receiver_thread_ids,
+-                prompt,
+-                model,
+-                reasoning_effort,
+-                agents_states,
+-            }),
++            } => self.on_collab_agent_tool_call(
++                ThreadItem::CollabAgentToolCall {
++                    id,
++                    tool,
++                    status,
++                    sender_thread_id,
++                    receiver_thread_ids,
++                    prompt,
++                    model,
++                    reasoning_effort,
++                    agents_states,
++                },
++                from_replay,
++            ),
+             item @ ThreadItem::SubAgentActivity { .. } => self.on_sub_agent_activity(item),
+             ThreadItem::EnteredReviewMode { review, .. } if !from_replay => {
+                 self.enter_review_mode_with_hint(review, /*from_replay*/ false);
+diff --git a/codex-rs/tui/src/chatwidget/replay.rs b/codex-rs/tui/src/chatwidget/replay.rs
+index 98a1074d18..8bb02b0bb4 100644
+--- a/codex-rs/tui/src/chatwidget/replay.rs
++++ b/codex-rs/tui/src/chatwidget/replay.rs
+@@ -210,17 +210,20 @@ impl ChatWidget {
+                 model,
+                 reasoning_effort,
+                 agents_states,
+-            } => self.on_collab_agent_tool_call(ThreadItem::CollabAgentToolCall {
+-                id,
+-                tool,
+-                status,
+-                sender_thread_id,
+-                receiver_thread_ids,
+-                prompt,
+-                model,
+-                reasoning_effort,
+-                agents_states,
+-            }),
++            } => self.on_collab_agent_tool_call(
++                ThreadItem::CollabAgentToolCall {
++                    id,
++                    tool,
++                    status,
++                    sender_thread_id,
++                    receiver_thread_ids,
++                    prompt,
++                    model,
++                    reasoning_effort,
++                    agents_states,
++                },
++                from_replay,
++            ),
+             item @ ThreadItem::SubAgentActivity { .. } => self.on_sub_agent_activity(item),
+             ThreadItem::DynamicToolCall { .. } => {}
+             ThreadItem::Sleep(_) => {}
+diff --git a/codex-rs/tui/src/chatwidget/tests/app_server.rs b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+index 6ca735e221..7fb7a58535 100644
+--- a/codex-rs/tui/src/chatwidget/tests/app_server.rs
++++ b/codex-rs/tui/src/chatwidget/tests/app_server.rs
+@@ -1302,6 +1302,115 @@ async fn live_app_server_collab_wait_items_render_history() {
+     assert_chatwidget_snapshot!("app_server_collab_wait_items_render_history", combined);
+ }
+ 
++#[tokio::test]
++async fn v2_collab_wait_uses_working_status_without_history() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    let sender_thread_id = ThreadId::new();
++    let receiver_thread_id = ThreadId::new();
++    let other_receiver_thread_id = ThreadId::new();
++    chat.set_collab_agent_metadata(
++        receiver_thread_id,
++        Some("Robie".to_string()),
++        Some("explorer".to_string()),
++    );
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            completed_at_ms: 0,
++            item: AppServerThreadItem::SubAgentActivity {
++                id: "activity-1".to_string(),
++                kind: codex_app_server_protocol::SubAgentActivityKind::Started,
++                agent_thread_id: receiver_thread_id.to_string(),
++                agent_path: "/root/robie".to_string(),
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++    let activity = drain_insert_history(&mut rx)
++        .into_iter()
++        .map(|lines| lines_to_single_string(&lines))
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert!(activity.contains("Started Robie [explorer]"), "{activity}");
++    chat.handle_server_notification(
++        ServerNotification::TurnStarted(TurnStartedNotification {
++            thread_id: "thread-1".to_string(),
++            turn: AppServerTurn {
++                id: "turn-1".to_string(),
++                items_view: codex_app_server_protocol::TurnItemsView::Full,
++                items: Vec::new(),
++                status: AppServerTurnStatus::InProgress,
++                error: None,
++                started_at: Some(0),
++                completed_at: None,
++                duration_ms: None,
++            },
++        }),
++        /*replay_kind*/ None,
++    );
++    drain_insert_history(&mut rx);
++
++    let wait_item = |status| AppServerThreadItem::CollabAgentToolCall {
++        id: "wait-1".to_string(),
++        tool: AppServerCollabAgentTool::Wait,
++        status,
++        sender_thread_id: sender_thread_id.to_string(),
++        receiver_thread_ids: vec![
++            receiver_thread_id.to_string(),
++            other_receiver_thread_id.to_string(),
++        ],
++        prompt: None,
++        model: None,
++        reasoning_effort: None,
++        agents_states: HashMap::new(),
++    };
++    chat.handle_server_notification(
++        ServerNotification::ItemStarted(ItemStartedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            started_at_ms: 0,
++            item: wait_item(AppServerCollabAgentToolCallStatus::InProgress),
++        }),
++        /*replay_kind*/ None,
++    );
++
++    assert_eq!(
++        chat.current_status_header_for_test(),
++        "Waiting for 2 agents"
++    );
++    assert_eq!(chat.run_state_status_text(), "Working");
++    assert!(drain_insert_history(&mut rx).is_empty());
++
++    chat.handle_server_notification(
++        ServerNotification::ItemCompleted(ItemCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            completed_at_ms: 0,
++            item: wait_item(AppServerCollabAgentToolCallStatus::Completed),
++        }),
++        /*replay_kind*/ None,
++    );
++
++    assert_eq!(chat.current_status_header_for_test(), "Working");
++    assert_eq!(chat.run_state_status_text(), "Working");
++    assert!(drain_insert_history(&mut rx).is_empty());
++
++    chat.set_status_header("Thinking".to_string());
++    chat.handle_server_notification(
++        ServerNotification::ItemStarted(ItemStartedNotification {
++            thread_id: "thread-1".to_string(),
++            turn_id: "turn-1".to_string(),
++            started_at_ms: 0,
++            item: wait_item(AppServerCollabAgentToolCallStatus::InProgress),
++        }),
++        Some(ReplayKind::ThreadSnapshot),
++    );
++
++    assert_eq!(chat.current_status_header_for_test(), "Thinking");
++    assert!(drain_insert_history(&mut rx).is_empty());
++}
++
+ #[tokio::test]
+ async fn v2_activity_waits_for_agent_identity_before_rendering() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+index 0edbea38b1..08f5d68bfe 100644
+--- a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
++++ b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
+@@ -118,13 +118,38 @@ impl ChatWidget {
+         self.request_redraw();
+     }
+ 
+-    pub(super) fn on_collab_agent_tool_call(&mut self, item: ThreadItem) {
++    pub(super) fn on_collab_agent_tool_call(&mut self, item: ThreadItem, from_replay: bool) {
+         let ThreadItem::CollabAgentToolCall {
+-            id, tool, status, ..
++            id,
++            tool,
++            status,
++            receiver_thread_ids,
++            ..
+         } = &item
+         else {
+             return;
+         };
++        if self.v2_activity_observed && matches!(tool, CollabAgentTool::Wait) {
++            if !from_replay && self.bottom_pane.is_task_running() {
++                self.set_model_output_run_state(ModelOutputRunState::Working);
++                let header = if matches!(status, CollabAgentToolCallStatus::InProgress) {
++                    match receiver_thread_ids.len() {
++                        1 => "Waiting for 1 agent".to_string(),
++                        count if count > 1 => format!("Waiting for {count} agents"),
++                        _ => "Waiting for agents".to_string(),
++                    }
++                } else {
++                    self.status_state
++                        .model_output_run_state
++                        .active_label()
++                        .to_string()
++                };
++                if self.set_status_header(header) {
++                    self.request_redraw();
++                }
++            }
++            return;
++        }
+         if matches!(tool, CollabAgentTool::SpawnAgent)
+             && let Some(spawn_request) = multi_agents::spawn_request_summary(&item)
+         {
+@@ -150,6 +175,7 @@ impl ChatWidget {
+     }
+ 
+     pub(super) fn on_sub_agent_activity(&mut self, item: ThreadItem) {
++        self.v2_activity_observed = true;
+         self.pending_sub_agent_activity.push_back(item);
+         self.flush_pending_sub_agent_activity();
+     }

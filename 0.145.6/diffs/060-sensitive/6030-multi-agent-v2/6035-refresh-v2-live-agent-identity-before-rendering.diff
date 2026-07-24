@@ -1,0 +1,150 @@
+diff --git a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+index 6882c3e956..1c41ecf12e 100644
+--- a/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
++++ b/codex-rs/tui/src/app/tests/session_lifecycle_requests.rs
+@@ -359,6 +359,102 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
+         .expect("session lifecycle request test thread")
+ }
+ 
++#[tokio::test]
++async fn live_subagent_activity_refreshes_identity_before_transcript_commit() -> Result<()> {
++    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
++    let codex_home = tempdir()?;
++    app.config.codex_home = codex_home.path().to_path_buf().abs();
++    app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
++    let root_thread_id = ThreadId::from_string(
++        &create_fake_rollout(
++            codex_home.path(),
++            "2026-01-01T00-00-00",
++            "2026-01-01T00:00:00Z",
++            "Saved user message",
++            Some(app.config.model_provider_id.as_str()),
++            /*git_info*/ None,
++        )
++        .expect("create root rollout"),
++    )?;
++    let child_thread_id = ThreadId::from_string(
++        &create_fake_parented_rollout_with_source(
++            codex_home.path(),
++            "2026-01-01T00-00-01",
++            "2026-01-01T00:00:01Z",
++            "Saved child message",
++            Some(app.config.model_provider_id.as_str()),
++            /*git_info*/ None,
++            RolloutSessionSource::SubAgent(SubAgentSource::ThreadSpawn {
++                parent_thread_id: root_thread_id,
++                depth: 1,
++                agent_path: Some(AgentPath::try_from("/root/probe").expect("valid agent path")),
++                agent_nickname: Some("McClintock".to_string()),
++                agent_role: Some("default".to_string()),
++            }),
++            root_thread_id.into(),
++            root_thread_id,
++        )
++        .expect("create child rollout"),
++    )?;
++    let (mut app_server, requests, _notifications, proxy) =
++        start_recording_app_server(&app.config).await?;
++    let root = app_server
++        .resume_thread(
++            app.config.clone(),
++            root_thread_id,
++            app.resume_model_settings(),
++        )
++        .await?;
++    app.enqueue_primary_thread_session(root.session, root.turns)
++        .await?;
++    app_server
++        .resume_thread(
++            app.config.clone(),
++            child_thread_id,
++            app.resume_model_settings(),
++        )
++        .await?;
++    while app_event_rx.try_recv().is_ok() {}
++    take_backfill_counts(&requests);
++
++    let event = ThreadBufferedEvent::Notification(ServerNotification::ItemCompleted(
++        codex_app_server_protocol::ItemCompletedNotification {
++            thread_id: root_thread_id.to_string(),
++            turn_id: "turn-1".to_string(),
++            completed_at_ms: 1,
++            item: codex_app_server_protocol::ThreadItem::SubAgentActivity {
++                id: "activity-1".to_string(),
++                kind: codex_app_server_protocol::SubAgentActivityKind::Started,
++                agent_thread_id: child_thread_id.to_string(),
++                agent_path: "/root/probe".to_string(),
++            },
++        },
++    ));
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    app.handle_active_thread_event(&mut tui, &mut app_server, event)
++        .await?;
++
++    let history = std::iter::from_fn(|| app_event_rx.try_recv().ok())
++        .filter_map(|event| match event {
++            AppEvent::InsertHistoryCell(cell) => {
++                Some(lines_to_single_string(&cell.display_lines(/*width*/ 120)))
++            }
++            _ => None,
++        })
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert!(
++        history.contains("Started McClintock [default]"),
++        "{history}"
++    );
++    assert!(!history.contains(&child_thread_id.to_string()), "{history}");
++    assert_eq!(take_backfill_counts(&requests), (0, 1));
++
++    app_server.shutdown().await?;
++    proxy.await??;
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn local_daemon_detach_requests_idle_shutdown_before_disconnect() -> Result<()> {
+     let mut app = make_test_app().await;
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+index 40ef71b0fb..896070b7ef 100644
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -1666,6 +1666,23 @@ impl App {
+         app_server: &mut AppServerSession,
+         event: ThreadBufferedEvent,
+     ) -> Result<()> {
++        // A freshly spawned V2 child can publish its parent-facing activity before the
++        // `thread/started` snapshot visible to this client contains the generated nickname. The
++        // transcript deliberately waits for that identity instead of flashing a UUID or agent
++        // path, so refresh this one exact child before forwarding the activity. This keeps the
++        // live path aligned with bounded replay without scanning loaded threads or changing the
++        // app-server protocol.
++        if let Some(thread_id) = buffered_sub_agent_activity_thread_id(&event)
++            && !self
++                .agent_navigation
++                .get(&thread_id)
++                .and_then(|entry| entry.agent_nickname.as_deref())
++                .is_some_and(|nickname| !nickname.trim().is_empty())
++        {
++            self.refresh_agent_picker_thread_liveness(app_server, thread_id)
++                .await;
++        }
++
+         // Capture this before any potential thread switch: we only want to clear
+         // the exit marker when the currently active thread acknowledges shutdown.
+         let pending_shutdown_exit_completed = matches!(
+@@ -1724,6 +1741,14 @@ impl App {
+     }
+ }
+ 
++fn buffered_sub_agent_activity_thread_id(event: &ThreadBufferedEvent) -> Option<ThreadId> {
++    let ThreadBufferedEvent::Notification(notification) = event else {
++        return None;
++    };
++    sub_agent_activity_item(notification)
++        .and_then(crate::multi_agents::sub_agent_activity_thread_id)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;

@@ -1,0 +1,534 @@
+diff --git a/codex-rs/tui/src/app/safety_buffering.rs b/codex-rs/tui/src/app/safety_buffering.rs
+index d9f223db0e..58d2fc22fb 100644
+--- a/codex-rs/tui/src/app/safety_buffering.rs
++++ b/codex-rs/tui/src/app/safety_buffering.rs
+@@ -64,7 +64,7 @@ impl App {
+         *effort = Some(ReasoningEffortConfig::Low);
+         *collaboration_mode = collaboration_mode.as_ref().map(|mode| {
+             mode.with_updates(
+-                Some(model),
++                Some(model.clone()),
+                 Some(Some(ReasoningEffortConfig::Low)),
+                 /*developer_instructions*/ None,
+             )
+@@ -152,8 +152,11 @@ impl App {
+                 preserve_in_flight_turn: false,
+             },
+         );
+-        self.chat_widget
+-            .prepare_safety_buffered_retry_submission(prompt.clone());
++        self.chat_widget.prepare_safety_buffered_retry_submission(
++            prompt.clone(),
++            model,
++            Some(ReasoningEffortConfig::Low),
++        );
+         if let Err(err) = self
+             .submit_thread_op(app_server, retry_thread_id, turn)
+             .await
+diff --git a/codex-rs/tui/src/chatwidget/input_queue.rs b/codex-rs/tui/src/chatwidget/input_queue.rs
+index 4ee2a8df99..ade061d166 100644
+--- a/codex-rs/tui/src/chatwidget/input_queue.rs
++++ b/codex-rs/tui/src/chatwidget/input_queue.rs
+@@ -5,6 +5,8 @@
+ 
+ use std::collections::VecDeque;
+ 
++use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
++
+ use super::PendingSteer;
+ use super::QueuedUserMessage;
+ use super::UserMessage;
+@@ -29,6 +31,8 @@ pub(super) struct InputQueueState {
+     pub(super) queued_user_message_history_records: VecDeque<UserMessageHistoryRecord>,
+     /// A user turn has been submitted to core, but `TurnStarted` has not arrived yet.
+     pub(super) user_turn_pending_start: bool,
++    /// Model and effort submitted for the active turn, retained until it ends.
++    pub(super) submitted_turn_context: Option<SubmittedTurnContext>,
+     /// User messages that tried to steer a non-regular turn and must be retried first.
+     pub(super) rejected_steers_queue: VecDeque<UserMessage>,
+     /// History records for rejected steers. Slash commands such as `/goal` can
+@@ -44,6 +48,12 @@ pub(super) struct InputQueueState {
+     pub(super) suppress_queue_autosend: bool,
+ }
+ 
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(super) struct SubmittedTurnContext {
++    pub(super) model: String,
++    pub(super) reasoning_effort: Option<ReasoningEffortConfig>,
++}
++
+ impl InputQueueState {
+     pub(super) fn has_queued_follow_up_messages(&self) -> bool {
+         !self.rejected_steers_queue.is_empty() || !self.queued_user_messages.is_empty()
+@@ -53,6 +63,7 @@ impl InputQueueState {
+         self.queued_user_messages.clear();
+         self.queued_user_message_history_records.clear();
+         self.user_turn_pending_start = false;
++        self.submitted_turn_context = None;
+         self.rejected_steers_queue.clear();
+         self.rejected_steer_history_records.clear();
+         self.pending_steers.clear();
+diff --git a/codex-rs/tui/src/chatwidget/input_restore.rs b/codex-rs/tui/src/chatwidget/input_restore.rs
+index 101e3ec6bc..576107dbe8 100644
+--- a/codex-rs/tui/src/chatwidget/input_restore.rs
++++ b/codex-rs/tui/src/chatwidget/input_restore.rs
+@@ -361,6 +361,7 @@ impl ChatWidget {
+                 .queued_user_message_history_records
+                 .clone(),
+             user_turn_pending_start: self.input_queue.user_turn_pending_start,
++            submitted_turn_context: self.input_queue.submitted_turn_context.clone(),
+             submit_pending_steers_after_interrupt: self
+                 .input_queue
+                 .submit_pending_steers_after_interrupt,
+@@ -389,6 +390,9 @@ impl ChatWidget {
+             );
+             self.input_queue.user_turn_pending_start =
+                 preserve_in_flight_turn && input_state.user_turn_pending_start;
++            self.input_queue.submitted_turn_context = preserve_in_flight_turn
++                .then_some(input_state.submitted_turn_context)
++                .flatten();
+             self.input_queue.submit_pending_steers_after_interrupt =
+                 preserve_in_flight_turn && input_state.submit_pending_steers_after_interrupt;
+             self.update_collaboration_mode_indicator();
+diff --git a/codex-rs/tui/src/chatwidget/input_submission.rs b/codex-rs/tui/src/chatwidget/input_submission.rs
+index 0430213220..9b933a79f4 100644
+--- a/codex-rs/tui/src/chatwidget/input_submission.rs
++++ b/codex-rs/tui/src/chatwidget/input_submission.rs
+@@ -1,5 +1,6 @@
+ //! User-message and shell-prompt submission behavior for `ChatWidget`.
+ 
++use super::input_queue::SubmittedTurnContext;
+ use super::*;
+ 
+ impl ChatWidget {
+@@ -368,13 +369,15 @@ impl ChatWidget {
+             .filter(|_| self.current_model_supports_personality());
+         let service_tier = self.service_tier_update_for_core();
+         let active_permission_profile = self.config.permissions.active_permission_profile();
++        let submitted_model = effective_mode.model().to_string();
++        let submitted_effort = effective_mode.reasoning_effort();
+         let op = AppCommand::user_turn(
+             items,
+             self.config.cwd.to_path_buf(),
+             AskForApproval::from(self.config.permissions.approval_policy.value()),
+             active_permission_profile,
+-            effective_mode.model().to_string(),
+-            effective_mode.reasoning_effort(),
++            submitted_model.clone(),
++            submitted_effort.clone(),
+             /*summary*/ None,
+             service_tier,
+             /*final_output_json_schema*/ None,
+@@ -407,6 +410,11 @@ impl ChatWidget {
+         }
+         if render_in_history {
+             self.input_queue.user_turn_pending_start = true;
++            self.input_queue.submitted_turn_context = Some(SubmittedTurnContext {
++                model: submitted_model,
++                reasoning_effort: submitted_effort,
++            });
++            self.refresh_model_dependent_surfaces();
+         }
+ 
+         // Persist the submitted text to cross-session message history. Mentions are encoded into
+diff --git a/codex-rs/tui/src/chatwidget/safety_buffering.rs b/codex-rs/tui/src/chatwidget/safety_buffering.rs
+index 2f079c9c3f..4ea59a2062 100644
+--- a/codex-rs/tui/src/chatwidget/safety_buffering.rs
++++ b/codex-rs/tui/src/chatwidget/safety_buffering.rs
+@@ -1,5 +1,6 @@
+ //! Safety-buffering status and retry UI for active turns.
+ 
++use super::input_queue::SubmittedTurnContext;
+ use super::*;
+ use codex_app_server_protocol::ModelSafetyBufferingUpdatedNotification;
+ 
+@@ -63,11 +64,21 @@ impl ChatWidget {
+                 .is_some_and(|active| active.turn_id == turn_id && !active.agent_message_started)
+     }
+ 
+-    pub(crate) fn prepare_safety_buffered_retry_submission(&mut self, prompt: UserMessage) {
++    pub(crate) fn prepare_safety_buffered_retry_submission(
++        &mut self,
++        prompt: UserMessage,
++        model: String,
++        reasoning_effort: Option<ReasoningEffortConfig>,
++    ) {
+         self.last_rendered_user_message_display = None;
+         self.finalize_turn();
+         self.safety_buffering_prompt = Some(prompt);
+         self.input_queue.user_turn_pending_start = true;
++        self.input_queue.submitted_turn_context = Some(SubmittedTurnContext {
++            model,
++            reasoning_effort,
++        });
++        self.refresh_model_dependent_surfaces();
+     }
+ 
+     pub(crate) fn commit_safety_buffered_retry_submission(&mut self, display: UserMessageDisplay) {
+@@ -76,6 +87,8 @@ impl ChatWidget {
+ 
+     pub(crate) fn cancel_safety_buffered_retry_submission(&mut self) {
+         self.input_queue.user_turn_pending_start = false;
++        self.input_queue.submitted_turn_context = None;
++        self.refresh_model_dependent_surfaces();
+         self.clear_safety_buffering();
+     }
+ 
+diff --git a/codex-rs/tui/src/chatwidget/session_flow.rs b/codex-rs/tui/src/chatwidget/session_flow.rs
+index 071c13f4cf..7a613ca02a 100644
+--- a/codex-rs/tui/src/chatwidget/session_flow.rs
++++ b/codex-rs/tui/src/chatwidget/session_flow.rs
+@@ -28,6 +28,7 @@ impl ChatWidget {
+         self.refresh_plan_mode_nudge();
+         self.turn_lifecycle.reset_thread();
+         self.clear_safety_buffering();
++        self.input_queue.submitted_turn_context = None;
+         self.thread_name = session.thread_name.clone();
+         self.current_goal_status_indicator = None;
+         self.current_goal_status = None;
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index e8f37f28cb..d9d4c2fc59 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -9,6 +9,7 @@ use crate::branch_summary;
+ use crate::chatwidget::limit_label_for_window;
+ use crate::chatwidget::rate_limits::get_limits_duration;
+ use crate::legacy_core::config::Config;
++use crate::model_color::model_style;
+ use crate::permission_mode::PermissionMode;
+ use crate::status::format_tokens_compact;
+ use codex_app_server_protocol::AskForApproval;
+@@ -222,6 +223,10 @@ impl ChatWidget {
+ 
+     fn status_line_display_line_for_item(&mut self, item: StatusLineItem) -> Option<Line<'static>> {
+         match item {
++            StatusLineItem::ModelName => Some(self.model_display_line()),
++            StatusLineItem::ModelWithReasoning => Some(self.model_with_reasoning_display_line()),
++            StatusLineItem::Reasoning => Some(self.reasoning_display_line()),
++            StatusLineItem::FastMode => Some(self.fast_mode_display_line()),
+             StatusLineItem::FiveHourLimit => {
+                 self.status_line_limit_display_line(five_hour_status_window)
+             }
+@@ -945,6 +950,106 @@ impl ChatWidget {
+         format!("{} {label}{service_tier_label}", self.model_display_name())
+     }
+ 
++    fn status_line_model_context(&self) -> (String, Option<ReasoningEffortConfig>) {
++        self.input_queue
++            .submitted_turn_context
++            .as_ref()
++            .map(|context| (context.model.clone(), context.reasoning_effort.clone()))
++            .unwrap_or_else(|| {
++                (
++                    self.model_display_name().to_string(),
++                    self.effective_reasoning_effort(),
++                )
++            })
++    }
++
++    fn model_display_line(&self) -> Line<'static> {
++        let (model, _) = self.status_line_model_context();
++        let style = self
++            .config
++            .tui_status_line_use_colors
++            .then(|| model_style(&model))
++            .unwrap_or_default();
++        Line::from(Span::styled(model, style))
++    }
++
++    fn reasoning_display_line(&self) -> Line<'static> {
++        let (_, effort) = self.status_line_model_context();
++        let label = Self::status_line_reasoning_effort_label(effort.as_ref());
++        let style = self
++            .config
++            .tui_status_line_use_colors
++            .then(|| {
++                effort
++                    .as_ref()
++                    .map(crate::model_color::reasoning_effort_style)
++                    .unwrap_or_else(|| {
++                        crate::model_color::reasoning_effort_style(&ReasoningEffortConfig::None)
++                    })
++            })
++            .unwrap_or_default();
++        Line::from(Span::styled(label, style))
++    }
++
++    pub(super) fn model_with_reasoning_display_line(&self) -> Line<'static> {
++        let (model, effort) = self.status_line_model_context();
++        let model_style = self
++            .config
++            .tui_status_line_use_colors
++            .then(|| model_style(&model))
++            .unwrap_or_default();
++        let effort_style = self
++            .config
++            .tui_status_line_use_colors
++            .then(|| {
++                effort
++                    .as_ref()
++                    .map(crate::model_color::reasoning_effort_style)
++                    .unwrap_or_else(|| {
++                        crate::model_color::reasoning_effort_style(&ReasoningEffortConfig::None)
++                    })
++            })
++            .unwrap_or_default();
++        let mut spans = vec![Span::styled(model, model_style), Span::from(" ")];
++        spans.push(Span::styled(
++            Self::status_line_reasoning_effort_label(effort.as_ref()),
++            effort_style,
++        ));
++        if let Some(service_tier) = self
++            .current_service_tier()
++            .and_then(|service_tier| {
++                self.current_model_service_tier_commands()
++                    .into_iter()
++                    .find(|tier| tier.id == service_tier)
++                    .map(|tier| tier.name)
++            })
++            .filter(|_| self.has_chatgpt_account)
++        {
++            spans.push(Span::from(" "));
++            spans.push(
++                if service_tier == "fast" && self.config.tui_status_line_use_colors {
++                    Span::from(service_tier).red()
++                } else {
++                    Span::from(service_tier)
++                },
++            );
++        }
++        Line::from(spans)
++    }
++
++    pub(super) fn fast_mode_display_line(&self) -> Line<'static> {
++        if self.current_service_tier() == Some(ServiceTier::Fast.request_value()) {
++            let on = if self.config.tui_status_line_use_colors {
++                Span::from("on").red()
++            } else {
++                Span::from("on")
++            };
++            Line::from(vec![Span::from("Fast "), on])
++        } else {
++            Line::from("Fast off")
++        }
++    }
++
+     /// Computes the compact runtime status label used by word-based status items.
+     ///
+     /// Startup takes precedence over normal task states, and idle state renders
+diff --git a/codex-rs/tui/src/chatwidget/tests/composer_submission.rs b/codex-rs/tui/src/chatwidget/tests/composer_submission.rs
+index 98aba0f00d..bcb2c4752b 100644
+--- a/codex-rs/tui/src/chatwidget/tests/composer_submission.rs
++++ b/codex-rs/tui/src/chatwidget/tests/composer_submission.rs
+@@ -1342,6 +1342,10 @@ async fn restore_thread_input_state_applies_running_state_policy() {
+         queued_user_messages: VecDeque::from([UserMessage::from("already queued").into()]),
+         queued_user_message_history_records: VecDeque::from([queued_history.clone()]),
+         user_turn_pending_start: true,
++        submitted_turn_context: Some(crate::chatwidget::input_queue::SubmittedTurnContext {
++            model: "submitted-model".to_string(),
++            reasoning_effort: Some(ReasoningEffortConfig::High),
++        }),
+         submit_pending_steers_after_interrupt: true,
+         current_collaboration_mode: chat.current_collaboration_mode.clone(),
+         active_collaboration_mask: chat.active_collaboration_mask.clone(),
+@@ -1364,6 +1368,10 @@ async fn restore_thread_input_state_applies_running_state_policy() {
+         .capture_thread_input_state()
+         .expect("thread input state");
+     assert!(captured_input_state.submit_pending_steers_after_interrupt);
++    assert_eq!(
++        captured_input_state.submitted_turn_context,
++        input_state.submitted_turn_context
++    );
+     assert_eq!(
+         captured_input_state.safety_buffering_prompt,
+         Some(UserMessage::from("buffered prompt"))
+diff --git a/codex-rs/tui/src/chatwidget/tests/review_mode.rs b/codex-rs/tui/src/chatwidget/tests/review_mode.rs
+index 71c80e31b1..f1a025c729 100644
+--- a/codex-rs/tui/src/chatwidget/tests/review_mode.rs
++++ b/codex-rs/tui/src/chatwidget/tests/review_mode.rs
+@@ -385,6 +385,7 @@ async fn restore_thread_input_state_restores_pending_steers_without_downgrading_
+             queued_user_messages,
+             queued_user_message_history_records: VecDeque::new(),
+             user_turn_pending_start: false,
++            submitted_turn_context: None,
+             submit_pending_steers_after_interrupt: false,
+             current_collaboration_mode: chat.current_collaboration_mode.clone(),
+             active_collaboration_mask: chat.active_collaboration_mask.clone(),
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index e8fd31cc56..13d7bcd82c 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -3142,6 +3142,10 @@ async fn status_line_fast_mode_renders_on_and_off() {
+     chat.set_service_tier(Some(ServiceTier::Fast.request_value().to_string()));
+     chat.refresh_status_line();
+     assert_eq!(status_line_text(&chat), Some("Fast on".to_string()));
++    assert_eq!(
++        chat.fast_mode_display_line().spans[1].style.fg,
++        Some(ratatui::style::Color::Red)
++    );
+ }
+ 
+ #[tokio::test]
+@@ -3266,6 +3270,65 @@ async fn status_line_model_with_reasoning_updates_on_mode_switch_without_manual_
+     assert_eq!(status_line_text(&chat), Some("gpt-5.2 high".to_string()));
+ }
+ 
++#[tokio::test]
++async fn status_line_uses_submitted_model_context_until_turn_completion() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
++    chat.config.tui_status_line = Some(vec!["model-with-reasoning".to_string()]);
++    chat.input_queue.submitted_turn_context =
++        Some(crate::chatwidget::input_queue::SubmittedTurnContext {
++            model: "gpt-5".to_string(),
++            reasoning_effort: Some(ReasoningEffortConfig::High),
++        });
++    chat.set_model("gpt-5.4");
++    chat.set_reasoning_effort(Some(ReasoningEffortConfig::Low));
++    chat.refresh_status_line();
++
++    assert_eq!(status_line_text(&chat), Some("gpt-5 high".to_string()));
++    let line = chat.model_with_reasoning_display_line();
++    assert_eq!(
++        line.spans[0].style,
++        crate::model_color::model_style("gpt-5")
++    );
++    assert_eq!(
++        line.spans[2].style.fg,
++        Some(ratatui::style::Color::Rgb(255, 128, 0))
++    );
++
++    chat.config.tui_status_line_use_colors = false;
++    let monochrome = chat.model_with_reasoning_display_line();
++    assert_eq!(monochrome.spans[0].style, ratatui::style::Style::default());
++    assert_eq!(monochrome.spans[2].style, ratatui::style::Style::default());
++
++    chat.on_task_complete(
++        /*last_agent_message*/ None, /*duration_ms*/ None, false,
++    );
++    assert!(chat.input_queue.submitted_turn_context.is_none());
++}
++
++#[tokio::test]
++async fn safety_buffered_retry_publishes_and_clears_submitted_model_context() {
++    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5")).await;
++
++    chat.prepare_safety_buffered_retry_submission(
++        UserMessage::from("retry prompt"),
++        "gpt-5.4".to_string(),
++        Some(ReasoningEffortConfig::Low),
++    );
++
++    assert!(chat.input_queue.user_turn_pending_start);
++    assert_eq!(
++        chat.input_queue.submitted_turn_context,
++        Some(crate::chatwidget::input_queue::SubmittedTurnContext {
++            model: "gpt-5.4".to_string(),
++            reasoning_effort: Some(ReasoningEffortConfig::Low),
++        })
++    );
++
++    chat.cancel_safety_buffered_retry_submission();
++    assert!(!chat.input_queue.user_turn_pending_start);
++    assert!(chat.input_queue.submitted_turn_context.is_none());
++}
++
+ #[tokio::test]
+ async fn status_line_model_with_reasoning_plan_mode_footer_snapshot() {
+     use ratatui::Terminal;
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+index 6006ac64bf..2beb032cd9 100644
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -107,6 +107,11 @@ impl ChatWidget {
+         from_replay: bool,
+     ) {
+         self.input_queue.submit_pending_steers_after_interrupt = false;
++        self.input_queue.submitted_turn_context = None;
++        // Use `last_agent_message` from the turn-complete notification as the copy
++        // source only when no earlier item-level event (AgentMessageItem, plan
++        // commit, review output) already recorded markdown for this turn. This
++        // prevents the final summary from overwriting a more specific source.
+         let sanitized_last_agent_message = last_agent_message.as_deref().map(|message| {
+             parse_assistant_markdown(message, self.config.cwd.as_path()).visible_markdown
+         });
+@@ -329,6 +334,7 @@ impl ChatWidget {
+         self.clear_active_hook_cell();
+         // Reset running state and clear streaming buffers.
+         self.input_queue.user_turn_pending_start = false;
++        self.input_queue.submitted_turn_context = None;
+         self.clear_guardian_review_status();
+         self.turn_lifecycle.finish();
+         self.update_task_running_state();
+diff --git a/codex-rs/tui/src/chatwidget/user_messages.rs b/codex-rs/tui/src/chatwidget/user_messages.rs
+index 91ee7d641f..623a56910a 100644
+--- a/codex-rs/tui/src/chatwidget/user_messages.rs
++++ b/codex-rs/tui/src/chatwidget/user_messages.rs
+@@ -25,6 +25,7 @@ use codex_utils_plugins::mention_syntax::PLUGIN_TEXT_MENTION_SIGIL;
+ use codex_utils_plugins::mention_syntax::TOOL_MENTION_SIGIL;
+ 
+ use super::ChatWidget;
++use super::input_queue::SubmittedTurnContext;
+ 
+ #[derive(Debug, Clone, PartialEq)]
+ pub(crate) struct UserMessage {
+@@ -138,6 +139,7 @@ pub(crate) struct ThreadInputState {
+     pub(super) queued_user_messages: VecDeque<QueuedUserMessage>,
+     pub(super) queued_user_message_history_records: VecDeque<UserMessageHistoryRecord>,
+     pub(super) user_turn_pending_start: bool,
++    pub(super) submitted_turn_context: Option<SubmittedTurnContext>,
+     pub(super) submit_pending_steers_after_interrupt: bool,
+     pub(super) current_collaboration_mode: CollaborationMode,
+     pub(super) active_collaboration_mask: Option<CollaborationModeMask>,
+diff --git a/codex-rs/tui/src/history_cell/session.rs b/codex-rs/tui/src/history_cell/session.rs
+index 2ad010989c..072f0ca56c 100644
+--- a/codex-rs/tui/src/history_cell/session.rs
++++ b/codex-rs/tui/src/history_cell/session.rs
+@@ -377,8 +377,8 @@ impl HistoryCell for SessionHeaderHistoryCell {
+                 spans.push(Span::from(reasoning.to_owned()));
+             }
+             if self.show_fast_status {
+-                spans.push("   ".into());
+-                spans.push(Span::styled("fast", self.model_style.magenta()));
++                spans.push(" ".into());
++                spans.push("fast".red());
+             }
+             spans.push("   ".dim());
+             spans.push(CHANGE_MODEL_HINT_COMMAND.cyan());
+diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
+index c96b36b2c7..a02e591219 100644
+--- a/codex-rs/tui/src/history_cell/tests.rs
++++ b/codex-rs/tui/src/history_cell/tests.rs
+@@ -23,6 +23,7 @@ use dirs::home_dir;
+ use pretty_assertions::assert_eq;
+ use ratatui::buffer::Buffer;
+ use ratatui::layout::Rect;
++use ratatui::style::Color;
+ use reqwest::StatusCode;
+ use serde_json::json;
+ use std::collections::HashMap;
+@@ -1598,8 +1599,24 @@ fn session_header_includes_reasoning_level_when_present() {
+         .find(|line| line.contains("model:"))
+         .expect("model line");
+ 
+-    assert!(model_line.contains("gpt-4o high   fast"));
++    assert!(model_line.contains("gpt-4o high fast"));
+     assert!(model_line.contains("/model to change"));
++
++    let styled_model_line = cell
++        .display_lines(/*width*/ 80)
++        .into_iter()
++        .find(|line| {
++            line.spans
++                .iter()
++                .any(|span| span.content.contains("model:"))
++        })
++        .expect("styled model line");
++    let fast_span = styled_model_line
++        .spans
++        .iter()
++        .find(|span| span.content.as_ref() == "fast")
++        .expect("fast span");
++    assert_eq!(fast_span.style.fg, Some(Color::Red));
+ }
+ 
+ #[test]

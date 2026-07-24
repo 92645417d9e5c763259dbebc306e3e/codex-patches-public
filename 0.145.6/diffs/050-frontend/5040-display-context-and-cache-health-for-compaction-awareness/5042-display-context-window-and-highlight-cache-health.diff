@@ -1,0 +1,555 @@
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index b337894ee2..a23b2e8442 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -439,7 +439,7 @@ fn session_summary(
+     thread_name: Option<String>,
+     rollout_path: Option<&Path>,
+ ) -> Option<SessionSummary> {
+-    let usage_line = (!token_usage.is_zero()).then(|| token_usage.to_string());
++    let usage_line = (!token_usage.is_zero()).then(|| token_usage_summary_line(&token_usage));
+     let resume_hint = resume_hint_for_resumable_thread(thread_id, thread_name, rollout_path);
+ 
+     if usage_line.is_none() && resume_hint.is_none() {
+@@ -452,6 +452,17 @@ fn session_summary(
+     })
+ }
+ 
++impl App {
++    fn current_session_summary(&self) -> Option<SessionSummary> {
++        session_summary(
++            self.chat_widget.token_usage(),
++            self.chat_widget.thread_id(),
++            self.chat_widget.thread_name(),
++            self.chat_widget.rollout_path().as_deref(),
++        )
++    }
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ struct ResumableThread {
+     thread_id: ThreadId,
+@@ -495,10 +506,28 @@ fn errors_for_cwd(cwd: &Path, response: &SkillsListResponse) -> Vec<SkillErrorIn
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ struct SessionSummary {
+-    usage_line: Option<String>,
++    usage_line: Option<Line<'static>>,
+     resume_hint: Option<String>,
+ }
+ 
++fn token_usage_summary_line(token_usage: &TokenUsage) -> Line<'static> {
++    let Some(cache_hit_rate) = token_usage.cache_hit_rate_percent() else {
++        return token_usage.to_string().into();
++    };
++
++    let text = token_usage.to_string();
++    let marker = format!("{cache_hit_rate:.1}% hit");
++    let Some(start) = text.find(&marker) else {
++        return text.into();
++    };
++    let end = start + marker.len();
++    Line::from(vec![
++        text[..start].to_string().into(),
++        marker.yellow(),
++        text[end..].to_string().into(),
++    ])
++}
++
+ #[derive(Debug, Default)]
+ struct InitialHistoryReplayBuffer {
+     retained_lines: VecDeque<crate::terminal_hyperlinks::HyperlinkLine>,
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index 0fd37178d7..2bde0ef582 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -33,15 +33,17 @@ impl App {
+                     .await?;
+             }
+             AppEvent::ClearUi { name } => {
++                let summary = self.current_session_summary();
+                 self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
+                 self.reset_app_ui_state_after_clear();
+ 
+-                self.start_fresh_session_with_summary_hint(
++                self.start_fresh_session_with_summary(
+                     tui,
+                     app_server,
+                     Some(ThreadStartSource::Clear),
+                     /*initial_user_message*/ None,
+                     name,
++                    summary,
+                 )
+                 .await;
+             }
+@@ -49,10 +51,11 @@ impl App {
+                 self.apply_raw_output_mode(tui, enabled, /*notify*/ false);
+             }
+             AppEvent::ClearUiAndSubmitUserMessage { text } => {
++                let summary = self.current_session_summary();
+                 self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
+                 self.reset_app_ui_state_after_clear();
+ 
+-                self.start_fresh_session_with_summary_hint(
++                self.start_fresh_session_with_summary(
+                     tui,
+                     app_server,
+                     Some(ThreadStartSource::Clear),
+@@ -62,6 +65,7 @@ impl App {
+                         Vec::new(),
+                     ),
+                     /*new_thread_name*/ None,
++                    summary,
+                 )
+                 .await;
+             }
+@@ -196,7 +200,7 @@ impl App {
+                                     if let Some(summary) = summary {
+                                         let mut lines: Vec<Line<'static>> = Vec::new();
+                                         if let Some(usage_line) = summary.usage_line {
+-                                            lines.push(usage_line.into());
++                                            lines.push(usage_line);
+                                         }
+                                         if let Some(command) = summary.resume_hint {
+                                             let spans = vec![
+diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
+index 793e219e02..35e6922045 100644
+--- a/codex-rs/tui/src/app/session_lifecycle.rs
++++ b/codex-rs/tui/src/app/session_lifecycle.rs
+@@ -678,6 +678,27 @@ impl App {
+         session_start_source: Option<ThreadStartSource>,
+         initial_user_message: Option<crate::chatwidget::UserMessage>,
+         new_thread_name: Option<String>,
++    ) {
++        let summary = self.current_session_summary();
++        self.start_fresh_session_with_summary(
++            tui,
++            app_server,
++            session_start_source,
++            initial_user_message,
++            new_thread_name,
++            summary,
++        )
++        .await;
++    }
++
++    pub(super) async fn start_fresh_session_with_summary(
++        &mut self,
++        tui: &mut tui::Tui,
++        app_server: &mut AppServerSession,
++        session_start_source: Option<ThreadStartSource>,
++        initial_user_message: Option<crate::chatwidget::UserMessage>,
++        new_thread_name: Option<String>,
++        summary: Option<SessionSummary>,
+     ) {
+         // Start a fresh in-memory session while preserving resumability via persisted rollout
+         // history. If an initial message is provided, `enqueue_primary_thread_session` suppresses it
+@@ -692,12 +713,6 @@ impl App {
+             &self.cli_kv_overrides,
+             &self.harness_overrides,
+         );
+-        let summary = session_summary(
+-            self.chat_widget.token_usage(),
+-            self.chat_widget.thread_id(),
+-            self.chat_widget.thread_name(),
+-            self.chat_widget.rollout_path().as_deref(),
+-        );
+         self.shutdown_current_thread(app_server).await;
+         let tracked_thread_ids: Vec<ThreadId> =
+             self.thread_event_channels.keys().copied().collect();
+@@ -745,7 +760,7 @@ impl App {
+                     if let Some(summary) = summary {
+                         let mut lines: Vec<Line<'static>> = Vec::new();
+                         if let Some(usage_line) = summary.usage_line {
+-                            lines.push(usage_line.into());
++                            lines.push(usage_line);
+                         }
+                         if let Some(command) = summary.resume_hint {
+                             let spans =
+@@ -1081,7 +1096,7 @@ impl App {
+                         if let Some(summary) = summary {
+                             let mut lines: Vec<Line<'static>> = Vec::new();
+                             if let Some(usage_line) = summary.usage_line {
+-                                lines.push(usage_line.into());
++                                lines.push(usage_line);
+                             }
+                             if let Some(command) = summary.resume_hint {
+                                 let spans =
+diff --git a/codex-rs/tui/src/app/tests/session_summary.rs b/codex-rs/tui/src/app/tests/session_summary.rs
+index 63ff92a097..622a7418e9 100644
+--- a/codex-rs/tui/src/app/tests/session_summary.rs
++++ b/codex-rs/tui/src/app/tests/session_summary.rs
+@@ -53,7 +53,7 @@ async fn session_summary_includes_resume_hint_for_persisted_rollout() {
+     )
+     .expect("summary");
+     assert_eq!(
+-        summary.usage_line,
++        summary.usage_line.as_ref().map(ToString::to_string),
+         Some("Token usage: total=12 input=10 output=2".to_string())
+     );
+     assert_eq!(
+@@ -62,6 +62,40 @@ async fn session_summary_includes_resume_hint_for_persisted_rollout() {
+     );
+ }
+ 
++#[tokio::test]
++async fn session_summary_highlights_cached_input_hit_rate() {
++    let usage = TokenUsage {
++        input_tokens: 1_030_732,
++        cached_input_tokens: 987_264,
++        output_tokens: 18_345,
++        reasoning_output_tokens: 5_262,
++        total_tokens: 1_049_077,
++    };
++    let temp_dir = tempdir().expect("temp dir");
++    let rollout_path = temp_dir.path().join("rollout.jsonl");
++    std::fs::write(&rollout_path, "{}\n").expect("write rollout");
++
++    let summary = session_summary(
++        usage,
++        Some(ThreadId::new()),
++        /*thread_name*/ None,
++        Some(&rollout_path),
++    )
++    .expect("summary");
++    let usage_line = summary.usage_line.expect("usage line");
++
++    assert_eq!(
++        usage_line.to_string(),
++        "Token usage: total=61,813 input=43,468 (+ 987,264 cached, 95.8% hit) output=18,345 (reasoning 5,262)"
++    );
++    let hit_rate = usage_line
++        .spans
++        .iter()
++        .find(|span| span.content.as_ref() == "95.8% hit")
++        .expect("hit-rate span");
++    assert_eq!(hit_rate.style.fg, Some(ratatui::style::Color::Yellow));
++}
++
+ #[tokio::test]
+ async fn session_summary_names_picker_item_when_thread_has_name() {
+     let usage = TokenUsage {
+diff --git a/codex-rs/tui/src/bottom_pane/status_line_style.rs b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+index 9cb1b6f3e1..8dbbcd2a67 100644
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -177,6 +177,12 @@ where
+         } else {
+             style
+         };
++        if item == StatusLineItem::ContextRemaining
++            && let Some(context_spans) = context_remaining_line_spans(&line, style)
++        {
++            spans.extend(context_spans);
++            continue;
++        }
+         spans.extend(line.spans.into_iter().map(|span| {
+             let span_style = style.patch(span.style);
+             Span::styled(span.content, span_style)
+@@ -239,6 +245,67 @@ fn soften_rgb_channel(channel: u8, luma: u16) -> u8 {
+     ((softened * STATUS_LINE_COLOR_BRIGHTNESS_PERCENT + 50) / 100) as u8
+ }
+ 
++fn parse_unsigned_percent(text: &str) -> Option<i64> {
++    if matches!(text.as_bytes().first(), Some(b'+' | b'-')) {
++        return None;
++    }
++    let percent = text.strip_suffix('%')?.parse::<i64>().ok()?;
++    Some(percent.clamp(0, 100))
++}
++
++fn context_remaining_line_spans(
++    line: &Line<'static>,
++    base_style: Style,
++) -> Option<Vec<Span<'static>>> {
++    let mut output = Vec::new();
++    let mut parsed_percent = false;
++
++    for span in &line.spans {
++        if span.style == Style::default()
++            && let Some(mut spans) = context_remaining_text_spans(span.content.as_ref(), base_style)
++        {
++            parsed_percent = true;
++            output.append(&mut spans);
++        } else {
++            output.push(span.clone());
++        }
++    }
++
++    parsed_percent.then_some(output)
++}
++
++fn context_remaining_text_spans(text: &str, base_style: Style) -> Option<Vec<Span<'static>>> {
++    let mut spans = Vec::new();
++    let mut saw_percent = false;
++
++    for part in text.split_whitespace() {
++        if !spans.is_empty() {
++            spans.push(" ".into());
++        }
++        if let Some(percent) = parse_unsigned_percent(part) {
++            saw_percent = true;
++            spans.push(Span::styled(
++                format!("{percent}%"),
++                context_remaining_percent_style(percent),
++            ));
++        } else {
++            spans.push(Span::styled(part.to_string(), base_style));
++        }
++    }
++
++    saw_percent.then_some(spans)
++}
++
++fn context_remaining_percent_style(percent: i64) -> Style {
++    let color = match percent {
++        75..=100 => Color::Green,
++        50..=74 => Color::Yellow,
++        25..=49 => Color::Rgb(255, 128, 0),
++        _ => Color::Red,
++    };
++    Style::default().fg(color).add_modifier(Modifier::BOLD)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -274,6 +341,36 @@ mod tests {
+         assert!(!line.spans[4].style.add_modifier.contains(Modifier::DIM));
+     }
+ 
++    #[test]
++    fn context_remaining_percent_uses_threshold_colors() {
++        let cases = [
++            ("100% of 258K left", Color::Green),
++            ("75% of 258K left", Color::Green),
++            ("74% of 258K left", Color::Yellow),
++            ("50% of 258K left", Color::Yellow),
++            ("49% of 258K left", Color::Rgb(255, 128, 0)),
++            ("25% of 258K left", Color::Rgb(255, 128, 0)),
++            ("24% of 258K left", Color::Red),
++            ("0% of 258K left", Color::Red),
++        ];
++
++        for (label, expected_color) in cases {
++            let line = status_line_from_segments_with_resolver(
++                [(StatusLineItem::ContextRemaining, label.to_string())],
++                /*use_theme_colors*/ true,
++                |_| Some(Style::default().cyan()),
++            )
++            .expect("status line");
++
++            assert_eq!(line_text(&line), label);
++            assert_eq!(line.spans[0].style.fg, Some(expected_color));
++            assert!(line.spans[0].style.add_modifier.contains(Modifier::BOLD));
++            assert_eq!(line.spans[2].style.fg, Some(Color::Cyan));
++            assert_eq!(line.spans[4].style.fg, Some(Color::Cyan));
++            assert_eq!(line.spans[6].style.fg, Some(Color::Cyan));
++        }
++    }
++
+     #[test]
+     fn status_line_segments_dim_separators_and_use_theme_styles_first() {
+         let line = status_line_from_segments_with_resolver(
+diff --git a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+index 7228413134..2a86afb4fb 100644
+--- a/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
++++ b/codex-rs/tui/src/bottom_pane/status_surface_preview.rs
+@@ -53,7 +53,7 @@ impl StatusSurfacePreviewItem {
+             StatusSurfacePreviewItem::BranchChanges => "+12 -3",
+             StatusSurfacePreviewItem::Permissions => "Workspace",
+             StatusSurfacePreviewItem::ApprovalMode => "on-request",
+-            StatusSurfacePreviewItem::ContextRemaining => "Context 0% left",
++            StatusSurfacePreviewItem::ContextRemaining => "0% of 0 left",
+             StatusSurfacePreviewItem::ContextUsed => "Context 0% used",
+             StatusSurfacePreviewItem::FiveHourLimit => "primary 0%",
+             StatusSurfacePreviewItem::WeeklyLimit => "secondary 0%",
+diff --git a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_context_remaining_footer.snap b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_context_remaining_footer.snap
+index 6e42c3cc0e..bc86169ca7 100644
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_context_remaining_footer.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_model_with_reasoning_context_remaining_footer.snap
+@@ -6,4 +6,4 @@ expression: normalized_backend_snapshot(terminal.backend())
+ "                                                                                "
+ "› Ask Codex to do anything                                                      "
+ "                                                                                "
+-"  gpt-5.4 xhigh fast ▪ Context 100% left ▪ /tmp/project                         "
++"  gpt-5.4 xhigh fast ▪ 100% of 258K left ▪ /tmp/project                         "
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 0fbcfa9f31..e3947b6e7a 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -752,9 +752,7 @@ impl ChatWidget {
+                     Some(format!("{} used", format_tokens_compact(total)))
+                 }
+             }
+-            StatusLineItem::ContextRemaining => self
+-                .status_line_context_remaining_percent()
+-                .map(|remaining| format!("Context {remaining}% left")),
++            StatusLineItem::ContextRemaining => self.status_line_context_remaining_display(),
+             StatusLineItem::ContextUsed => self
+                 .status_line_context_used_percent()
+                 .map(|used| format!("Context {used}% used")),
+@@ -861,6 +859,16 @@ impl ChatWidget {
+         };
+         self.status_line_value_for_item(status_line_item)
+     }
++    fn status_line_context_remaining_display(&self) -> Option<String> {
++        let remaining = self.status_line_context_remaining_percent()?;
++        match self.status_line_context_window_size() {
++            Some(context_window) => Some(format!(
++                "{remaining}% of {} left",
++                format_tokens_compact(context_window)
++            )),
++            None => Some(format!("{remaining}% left")),
++        }
++    }
+     /// Resolves one configured terminal-title item into a displayable segment.
+     ///
+     /// Returning `None` means "omit this segment for now" so callers can keep
+diff --git a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+index e03ce9f39f..e81f7d5e99 100644
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -2779,13 +2779,16 @@ async fn status_line_context_used_renders_labeled_percent() {
+ async fn status_line_context_remaining_renders_labeled_percent() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+     chat.thread_id = Some(ThreadId::new());
++    chat.token_info = Some(make_token_info(
++        /*total_tokens*/ 0, /*context_window*/ 258_000,
++    ));
+     chat.config.tui_status_line = Some(vec!["context-remaining".to_string()]);
+ 
+     chat.refresh_status_line();
+ 
+     assert_eq!(
+         status_line_text(&chat),
+-        Some("Context 100% left".to_string())
++        Some("100% of 258K left".to_string())
+     );
+     assert!(
+         drain_insert_history(&mut rx).is_empty(),
+@@ -3449,6 +3452,9 @@ async fn status_line_model_with_reasoning_context_remaining_footer_snapshot() {
+     set_chatgpt_auth(&mut chat);
+     set_fast_mode_test_catalog(&mut chat);
+     assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
++    chat.token_info = Some(make_token_info(
++        /*total_tokens*/ 0, /*context_window*/ 258_000,
++    ));
+     chat.refresh_status_line();
+ 
+     let width = 80;
+diff --git a/codex-rs/tui/src/main.rs b/codex-rs/tui/src/main.rs
+index 7cb30cc07d..179b6b140a 100644
+--- a/codex-rs/tui/src/main.rs
++++ b/codex-rs/tui/src/main.rs
+@@ -22,7 +22,10 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
+ 
+     let mut lines = Vec::new();
+     if !token_usage.is_zero() {
+-        lines.push(token_usage.to_string());
++        lines.push(format_token_usage_for_terminal(
++            token_usage.to_string(),
++            color_enabled,
++        ));
+     }
+ 
+     if let Some(resume_cmd) = resume_hint {
+@@ -46,6 +49,34 @@ fn format_exit_messages(exit_info: AppExitInfo, color_enabled: bool) -> Vec<Stri
+     lines
+ }
+ 
++fn format_token_usage_for_terminal(text: String, color_enabled: bool) -> String {
++    if !color_enabled {
++        return text;
++    }
++    let Some(hit_suffix_start) = text.find("% hit") else {
++        return text;
++    };
++    let mut marker_start = hit_suffix_start;
++    while marker_start > 0 {
++        let byte = text.as_bytes()[marker_start - 1];
++        if byte.is_ascii_digit() || byte == b'.' {
++            marker_start -= 1;
++        } else {
++            break;
++        }
++    }
++    let marker_end = hit_suffix_start + "% hit".len();
++    if marker_start == hit_suffix_start {
++        return text;
++    }
++    format!(
++        "{}\u{1b}[33m{}\u{1b}[39m{}",
++        &text[..marker_start],
++        &text[marker_start..marker_end],
++        &text[marker_end..]
++    )
++}
++
+ #[derive(Parser, Debug)]
+ struct TopCli {
+     #[clap(flatten)]
+@@ -119,4 +150,17 @@ mod tests {
+             ]
+         );
+     }
++
++    #[test]
++    fn format_token_usage_highlights_cache_hit_rate_only_when_color_is_enabled() {
++        let text = "Token usage: total=12 (+ 90 cached, 90.0% hit)".to_string();
++        assert_eq!(
++            format_token_usage_for_terminal(text.clone(), /*color_enabled*/ false),
++            text
++        );
++        assert_eq!(
++            format_token_usage_for_terminal(text, /*color_enabled*/ true),
++            "Token usage: total=12 (+ 90 cached, \u{1b}[33m90.0% hit\u{1b}[39m)"
++        );
++    }
+ }
+diff --git a/codex-rs/tui/src/token_usage.rs b/codex-rs/tui/src/token_usage.rs
+index 49b88603e3..8c6b3c46e6 100644
+--- a/codex-rs/tui/src/token_usage.rs
++++ b/codex-rs/tui/src/token_usage.rs
+@@ -96,6 +96,26 @@ mod tests {
+         };
+ 
+         assert_eq!(usage.cache_hit_rate_percent(), None);
++        assert_eq!(
++            usage.to_string(),
++            "Token usage: total=110 input=100 output=10"
++        );
++    }
++
++    #[test]
++    fn token_usage_display_includes_cache_hit_rate() {
++        let usage = TokenUsage {
++            input_tokens: 1_030_732,
++            cached_input_tokens: 987_264,
++            output_tokens: 18_345,
++            reasoning_output_tokens: 5_262,
++            total_tokens: 1_049_077,
++        };
++
++        assert_eq!(
++            usage.to_string(),
++            "Token usage: total=61,813 input=43,468 (+ 987,264 cached, 95.8% hit) output=18,345 (reasoning 5,262)"
++        );
+     }
+ }
+ 
+@@ -113,10 +133,11 @@ impl fmt::Display for TokenUsage {
+             "Token usage: total={} input={}{} output={}{}",
+             format_with_separators(self.blended_total()),
+             format_with_separators(self.non_cached_input()),
+-            if self.cached_input() > 0 {
++            if let Some(cache_hit_rate) = self.cache_hit_rate_percent() {
+                 format!(
+-                    " (+ {} cached)",
+-                    format_with_separators(self.cached_input())
++                    " (+ {} cached, {:.1}% hit)",
++                    format_with_separators(self.cached_input()),
++                    cache_hit_rate
+                 )
+             } else {
+                 String::new()

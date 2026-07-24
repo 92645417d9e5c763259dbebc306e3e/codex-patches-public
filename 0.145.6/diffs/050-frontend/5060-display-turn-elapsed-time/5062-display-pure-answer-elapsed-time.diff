@@ -1,0 +1,238 @@
+diff --git a/codex-rs/tui/src/chatwidget/tests/exec_flow.rs b/codex-rs/tui/src/chatwidget/tests/exec_flow.rs
+index 0db2658e78..147f0c80e4 100644
+--- a/codex-rs/tui/src/chatwidget/tests/exec_flow.rs
++++ b/codex-rs/tui/src/chatwidget/tests/exec_flow.rs
+@@ -733,6 +733,75 @@ async fn final_worked_for_prefers_local_elapsed_over_protocol_duration() {
+     assert_chatwidget_snapshot!("final_worked_for_uses_cumulative_turn_duration", normalized);
+ }
+ 
++#[tokio::test]
++async fn pure_answer_footer_uses_local_elapsed_without_work_label() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    handle_turn_started(&mut chat, "turn-1");
++    let local_started_at = std::time::Instant::now() - std::time::Duration::from_secs(125);
++    chat.turn_lifecycle.active_turn_started_at = Some(local_started_at);
++    chat.bottom_pane
++        .set_status_timer_started_at(local_started_at);
++
++    complete_assistant_message(
++        &mut chat,
++        "msg-final",
++        "Direct answer.",
++        Some(MessagePhase::FinalAnswer),
++    );
++    handle_turn_completed(&mut chat, "turn-1", Some(597_000));
++
++    let combined = drain_insert_history(&mut rx)
++        .iter()
++        .map(|lines| lines_to_single_string(lines))
++        .collect::<String>();
++    assert!(combined.contains("Answered in 2m 05s"), "{combined}");
++    assert!(!combined.contains("Worked for"), "{combined}");
++    assert!(!combined.contains("Answered in 9m 57s"), "{combined}");
++}
++
++#[tokio::test]
++async fn completed_turn_without_visible_answer_has_no_answer_footer() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    handle_turn_started(&mut chat, "turn-1");
++
++    handle_turn_completed(&mut chat, "turn-1", Some(125_000));
++
++    let combined = drain_insert_history(&mut rx)
++        .iter()
++        .map(|lines| lines_to_single_string(lines))
++        .collect::<String>();
++    assert!(!combined.contains("Answered in"), "{combined}");
++}
++
++#[tokio::test]
++async fn subsecond_pure_answer_has_no_unlabeled_timing_separator() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    handle_turn_started(&mut chat, "turn-1");
++    complete_assistant_message(
++        &mut chat,
++        "msg-final",
++        "Fast answer.",
++        Some(MessagePhase::FinalAnswer),
++    );
++
++    handle_turn_completed(&mut chat, "turn-1", /*duration_ms*/ None);
++
++    let cells = drain_insert_history(&mut rx);
++    assert!(
++        cells
++            .iter()
++            .any(|lines| lines_to_single_string(lines).contains("Fast answer."))
++    );
++    assert!(cells.iter().all(|lines| {
++        let rendered = lines_to_single_string(lines);
++        !rendered.contains("Answered in")
++            && !rendered.lines().any(|line| {
++                let trimmed = line.trim();
++                !trimmed.is_empty() && trimmed.chars().all(|ch| ch == '─')
++            })
++    }));
++}
++
+ #[tokio::test]
+ async fn unified_exec_wait_status_header_updates_on_late_command_display() {
+     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+index afffd98b95..6f0b568ca7 100644
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -135,6 +135,7 @@ impl ChatWidget {
+                 }
+             })
+             .unwrap_or_default();
++        let had_visible_answer = !notification_response.is_empty();
+         self.transcript.saw_copy_source_this_turn = false;
+         // If a stream is currently active, finalize it.
+         self.flush_answer_stream_with_separator();
+@@ -159,19 +160,32 @@ impl ChatWidget {
+                 (!self.turn_runtime_metrics.is_empty()).then_some(self.turn_runtime_metrics);
+             let show_work_separator = self.transcript.had_work_activity
+                 && (self.transcript.needs_final_message_separator || runtime_metrics.is_some());
+-            if show_work_separator || runtime_metrics.is_some() {
+-                let elapsed_seconds = if show_work_separator {
+-                    self.completed_turn_elapsed_seconds(duration_ms)
+-                } else {
+-                    None
+-                };
++            let answered_elapsed_seconds = (had_visible_answer
++                && !self.transcript.had_work_activity)
++                .then(|| self.completed_turn_elapsed_seconds(duration_ms))
++                .flatten();
++            if show_work_separator
++                || answered_elapsed_seconds.is_some()
++                || runtime_metrics.is_some()
++            {
++                let elapsed_seconds = show_work_separator
++                    .then(|| self.completed_turn_elapsed_seconds(duration_ms))
++                    .flatten();
+                 let finished_at = elapsed_seconds
+                     .map(|_| chrono::Local::now().format("%m-%d %H:%M:%S").to_string());
+-                self.add_to_history(history_cell::FinalMessageSeparator::new(
+-                    elapsed_seconds,
+-                    finished_at,
+-                    runtime_metrics,
+-                ));
++                if let Some(answered_elapsed_seconds) = answered_elapsed_seconds {
++                    self.add_to_history(history_cell::FinalMessageSeparator::answered(
++                        answered_elapsed_seconds,
++                        chrono::Local::now().format("%m-%d %H:%M:%S").to_string(),
++                        runtime_metrics,
++                    ));
++                } else {
++                    self.add_to_history(history_cell::FinalMessageSeparator::new(
++                        elapsed_seconds,
++                        finished_at,
++                        runtime_metrics,
++                    ));
++                }
+             }
+             self.turn_runtime_metrics = RuntimeMetricsSummary::default();
+             self.transcript.needs_final_message_separator = false;
+diff --git a/codex-rs/tui/src/history_cell/separators.rs b/codex-rs/tui/src/history_cell/separators.rs
+index 98cbaee59e..45255cbeb6 100644
+--- a/codex-rs/tui/src/history_cell/separators.rs
++++ b/codex-rs/tui/src/history_cell/separators.rs
+@@ -9,10 +9,18 @@ use super::*;
+ /// applying patches, making MCP tool calls), so purely conversational turns do not show an empty
+ /// divider.
+ pub struct FinalMessageSeparator {
++    timing_kind: FinalMessageTimingKind,
+     elapsed_seconds: Option<u64>,
+     finished_at: Option<String>,
+     runtime_metrics: Option<RuntimeMetricsSummary>,
+ }
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum FinalMessageTimingKind {
++    Worked,
++    Answered,
++}
++
+ impl FinalMessageSeparator {
+     /// Creates a separator; completed turns should pass protocol turn duration when available.
+     pub(crate) fn new(
+@@ -21,11 +29,32 @@ impl FinalMessageSeparator {
+         runtime_metrics: Option<RuntimeMetricsSummary>,
+     ) -> Self {
+         Self {
++            timing_kind: FinalMessageTimingKind::Worked,
+             elapsed_seconds,
+             finished_at,
+             runtime_metrics,
+         }
+     }
++
++    pub(crate) fn answered(
++        elapsed_seconds: u64,
++        finished_at: String,
++        runtime_metrics: Option<RuntimeMetricsSummary>,
++    ) -> Self {
++        Self {
++            timing_kind: FinalMessageTimingKind::Answered,
++            elapsed_seconds: Some(elapsed_seconds),
++            finished_at: Some(finished_at),
++            runtime_metrics,
++        }
++    }
++
++    fn timing_prefix(&self) -> &'static str {
++        match self.timing_kind {
++            FinalMessageTimingKind::Worked => "Worked for ",
++            FinalMessageTimingKind::Answered => "Answered in ",
++        }
++    }
+ }
+ 
+ #[derive(Debug)]
+@@ -156,8 +185,9 @@ impl HistoryCell for FinalMessageSeparator {
+             .filter(|seconds| *seconds > 0)
+             .map(crate::status_indicator_widget::fmt_elapsed_compact)
+         {
+-            let mut label = format!("Worked for {elapsed_seconds}");
+-            label_spans.push("Worked for ".dim());
++            let timing_prefix = self.timing_prefix();
++            let mut label = format!("{timing_prefix}{elapsed_seconds}");
++            label_spans.push(timing_prefix.dim());
+             label_spans.push(elapsed_seconds.fg(Color::Cyan).add_modifier(Modifier::BOLD));
+             if let Some(finished_at) = &self.finished_at {
+                 label.push_str(" at ");
+@@ -216,7 +246,7 @@ impl HistoryCell for FinalMessageSeparator {
+             .filter(|seconds| *seconds > 0)
+             .map(crate::status_indicator_widget::fmt_elapsed_compact)
+         {
+-            let mut label = format!("Worked for {elapsed_seconds}");
++            let mut label = format!("{}{elapsed_seconds}", self.timing_prefix());
+             if let Some(finished_at) = &self.finished_at {
+                 label.push_str(" at ");
+                 label.push_str(finished_at);
+diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
+index 7175325aa3..4998f2e5dc 100644
+--- a/codex-rs/tui/src/history_cell/tests.rs
++++ b/codex-rs/tui/src/history_cell/tests.rs
+@@ -625,6 +625,20 @@ fn prompt_submitted_at_separator_labels_submission_time() {
+     );
+ }
+ 
++#[test]
++fn answered_separator_uses_answer_timing_label() {
++    let cell = FinalMessageSeparator::answered(
++        /*elapsed_seconds*/ 12,
++        "07-22 12:34:56".to_string(),
++        /*runtime_metrics*/ None,
++    );
++    let rendered = render_lines(&cell.display_lines(/*width*/ 100));
++
++    assert_eq!(rendered.len(), 1);
++    assert!(rendered[0].contains("Answered in 12s at 07-22 12:34:56"));
++    assert!(!rendered[0].contains("Worked for"));
++}
++
+ #[test]
+ fn resume_history_loaded_separator_renders_pluralized_counts() {
+     let plural =

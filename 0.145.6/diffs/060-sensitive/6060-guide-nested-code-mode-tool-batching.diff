@@ -1,0 +1,139 @@
+diff --git a/codex-rs/code-mode-protocol/src/description.rs b/codex-rs/code-mode-protocol/src/description.rs
+index f2c787aaaf..2452c635e9 100644
+--- a/codex-rs/code-mode-protocol/src/description.rs
++++ b/codex-rs/code-mode-protocol/src/description.rs
+@@ -20,6 +20,18 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
+ - `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms.
+ - `max_output_tokens` sets the token budget for direct `exec` results. Defaults to 10000 tokens.
+ - When the JS code is fully evaluated, the isolate's lifetime ends and unawaited promises are silently discarded.
++- Batch independent nested tool calls within one bounded `exec` stage. Use `await Promise.allSettled([...])` when partial results remain useful and inspect every settled result; use `await Promise.all([...])` only when any failure should abort the batch.
++- Keep dependencies, waits and resumes, approval-sensitive calls, conflicting mutations, and adaptive investigations whose next call depends on an earlier result sequential.
++- Example for independent inspections:
++```js
++const results = await Promise.allSettled([
++  tools.exec_command({ cmd: "git status --short" }),
++  tools.exec_command({ cmd: "rg -n \"TODO|FIXME\" src" }),
++]);
++for (const result of results) {
++  text(result.status === "fulfilled" ? result.value : `failed: ${result.reason}`);
++}
++```
+ 
+ - Global helpers:
+ - `exit()`: Immediately ends the current script successfully (like an early return from the top level).
+@@ -896,6 +908,27 @@ bar"
+         assert!(description.contains("`clearTimeout(timeoutId?: number)`"));
+     }
+ 
++    #[test]
++    fn exec_description_guides_safe_nested_tool_batching() {
++        for code_mode_only in [false, true] {
++            let description = build_exec_tool_description(
++                &[],
++                &[],
++                &BTreeMap::new(),
++                crate::DEFAULT_EXEC_YIELD_TIME_MS,
++                code_mode_only,
++            );
++            assert!(description.contains("Batch independent nested tool calls"));
++            assert!(description.contains("Promise.allSettled"));
++            assert!(description.contains("inspect every settled result"));
++            assert!(description.contains("Promise.all"));
++            assert!(description.contains("waits and resumes"));
++            assert!(description.contains("approval-sensitive calls"));
++            assert!(description.contains("conflicting mutations"));
++            assert!(description.contains("adaptive investigations"));
++        }
++    }
++
+     #[test]
+     fn code_mode_only_description_groups_namespace_instructions_once() {
+         let namespace_descriptions = BTreeMap::from([(
+diff --git a/codex-rs/core/src/tools/code_mode/execute_spec.rs b/codex-rs/core/src/tools/code_mode/execute_spec.rs
+index 9987396556..261c4604ab 100644
+--- a/codex-rs/core/src/tools/code_mode/execute_spec.rs
++++ b/codex-rs/core/src/tools/code_mode/execute_spec.rs
+@@ -89,4 +89,22 @@ SOURCE: /[\s\S]+/
+             })
+         );
+     }
++
++    #[test]
++    fn create_code_mode_tool_exposes_nested_batching_guidance_in_both_modes() {
++        for code_mode_only in [false, true] {
++            let ToolSpec::Freeform(tool) = create_code_mode_tool(
++                &[],
++                &[],
++                &BTreeMap::new(),
++                codex_code_mode::DEFAULT_EXEC_YIELD_TIME_MS,
++                code_mode_only,
++            ) else {
++                panic!("code mode tool must remain freeform");
++            };
++            assert!(tool.description.contains("Promise.allSettled"));
++            assert!(tool.description.contains("Promise.all"));
++            assert!(tool.description.contains("inspect every settled result"));
++        }
++    }
+ }
+diff --git a/codex-rs/core/tests/suite/responses_lite.rs b/codex-rs/core/tests/suite/responses_lite.rs
+index 40de16c31e..ddb8cdec28 100644
+--- a/codex-rs/core/tests/suite/responses_lite.rs
++++ b/codex-rs/core/tests/suite/responses_lite.rs
+@@ -13,6 +13,7 @@ use codex_login::auth::BedrockApiKeyAuth;
+ use codex_protocol::config_types::WebSearchMode;
+ use codex_protocol::models::ImageDetail;
+ use codex_protocol::openai_models::InputModality;
++use codex_protocol::openai_models::ToolMode;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::Op;
+ use codex_protocol::user_input::UserInput;
+@@ -80,6 +81,48 @@ fn additional_tools(body: &Value) -> Result<&[Value]> {
+         .context("additional_tools tools should be an array")
+ }
+ 
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn responses_lite_carries_code_mode_nested_batching_guidance() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = responses::start_mock_server().await;
++    let response_mock = responses::mount_sse_once(
++        &server,
++        responses::sse(vec![
++            responses::ev_response_created("resp-1"),
++            responses::ev_completed("resp-1"),
++        ]),
++    )
++    .await;
++    let mut builder = test_codex()
++        .with_model_info_override("gpt-5.4", |model_info| {
++            model_info.use_responses_lite = true;
++            model_info.supports_parallel_tool_calls = true;
++            model_info.tool_mode = Some(ToolMode::CodeModeOnly);
++        })
++        .with_config(|config| {
++            assert!(config.features.enable(Feature::CodeMode).is_ok());
++            assert!(config.features.enable(Feature::CodeModeOnly).is_ok());
++        });
++    let test = builder.build(&server).await?;
++
++    test.submit_turn("inspect independent inputs").await?;
++
++    let body = response_mock.single_request().body_json();
++    assert_eq!(body.get("parallel_tool_calls"), Some(&Value::Bool(false)));
++    let exec_description = additional_tools(&body)?
++        .iter()
++        .find(|tool| tool.get("name").and_then(Value::as_str) == Some("exec"))
++        .and_then(|tool| tool.get("description"))
++        .and_then(Value::as_str)
++        .context("Responses Lite additional_tools should include the exec description")?;
++    assert!(exec_description.contains("Promise.allSettled"));
++    assert!(exec_description.contains("inspect every settled result"));
++    assert!(exec_description.contains("Promise.all"));
++
++    Ok(())
++}
++
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn responses_lite_uses_input_items_for_instructions_and_tools() -> Result<()> {
+     skip_if_no_network!(Ok(()));

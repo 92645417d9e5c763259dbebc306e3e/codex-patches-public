@@ -1,0 +1,97 @@
+diff --git a/codex-rs/core-plugins/src/manager.rs b/codex-rs/core-plugins/src/manager.rs
+index 8893aa2a45..949e49c8a8 100644
+--- a/codex-rs/core-plugins/src/manager.rs
++++ b/codex-rs/core-plugins/src/manager.rs
+@@ -1124,6 +1124,10 @@ impl PluginsManager {
+         options: PluginListBackgroundTaskOptions,
+         on_effective_plugins_changed: Option<EffectivePluginsChangedCallback>,
+     ) {
++        if !config.plugins_enabled {
++            return;
++        }
++
+         self.maybe_start_non_curated_plugin_cache_refresh(config, roots);
+         self.maybe_start_remote_catalog_cache_refresh(
+             config,
+diff --git a/codex-rs/core-plugins/src/manager_tests.rs b/codex-rs/core-plugins/src/manager_tests.rs
+index 2928e72cae..e5a4951bf5 100644
+--- a/codex-rs/core-plugins/src/manager_tests.rs
++++ b/codex-rs/core-plugins/src/manager_tests.rs
+@@ -3422,6 +3422,77 @@ enabled = true
+     assert_eq!(marketplaces, Vec::new());
+ }
+ 
++async fn plugin_list_background_tasks_materialize_non_curated_cache(plugins_enabled: bool) -> bool {
++    let tmp = tempfile::tempdir().unwrap();
++    let repo_root = tmp.path().join("repo");
++    fs::create_dir_all(repo_root.join(".git")).unwrap();
++    fs::create_dir_all(repo_root.join(".agents/plugins")).unwrap();
++    write_plugin_with_version(&repo_root, "sample-plugin", "sample-plugin", Some("1.2.3"));
++    write_file(
++        &repo_root.join(".agents/plugins/marketplace.json"),
++        r#"{
++  "name": "debug",
++  "plugins": [
++    {
++      "name": "sample-plugin",
++      "source": {
++        "source": "local",
++        "path": "./sample-plugin"
++      }
++    }
++  ]
++}"#,
++    );
++    let config_toml = format!(
++        r#"[features]
++plugins = {plugins_enabled}
++
++[plugins."sample-plugin@debug"]
++enabled = true
++"#
++    );
++    write_file(&tmp.path().join(CONFIG_TOML_FILE), &config_toml);
++
++    let config = load_config(tmp.path(), &repo_root).await;
++    let manager = std::sync::Arc::new(PluginsManager::new(tmp.path().to_path_buf()));
++    manager.maybe_start_plugin_list_background_tasks_for_config(
++        &config,
++        /*auth*/ None,
++        &[repo_root.abs()],
++        PluginListBackgroundTaskOptions::default(),
++        /*on_effective_plugins_changed*/ None,
++    );
++    tokio::time::timeout(Duration::from_secs(1), async {
++        loop {
++            let in_flight = manager
++                .non_curated_cache_refresh_state
++                .read()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .in_flight;
++            if !in_flight {
++                break;
++            }
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .expect("non-curated cache refresh should finish");
++
++    tmp.path()
++        .join("plugins/cache/debug/sample-plugin/1.2.3")
++        .exists()
++}
++
++#[tokio::test]
++async fn disabled_plugin_list_background_tasks_do_not_materialize_non_curated_cache() {
++    assert!(!plugin_list_background_tasks_materialize_non_curated_cache(false).await);
++}
++
++#[tokio::test]
++async fn enabled_plugin_list_background_tasks_materialize_non_curated_cache() {
++    assert!(plugin_list_background_tasks_materialize_non_curated_cache(true).await);
++}
++
+ #[tokio::test]
+ async fn list_marketplaces_excludes_plugins_with_explicit_empty_products() {
+     let tmp = tempfile::tempdir().unwrap();
