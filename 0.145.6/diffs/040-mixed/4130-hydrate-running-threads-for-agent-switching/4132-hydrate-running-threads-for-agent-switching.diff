@@ -1,0 +1,615 @@
+diff --git a/codex-rs/tui/src/app/agent_navigation.rs b/codex-rs/tui/src/app/agent_navigation.rs
+index cbd90480d6..00d4b966f7 100644
+--- a/codex-rs/tui/src/app/agent_navigation.rs
++++ b/codex-rs/tui/src/app/agent_navigation.rs
+@@ -273,9 +273,22 @@ impl AgentNavigationState {
+     pub(crate) fn adjacent_thread_id(
+         &self,
+         current_displayed_thread_id: Option<ThreadId>,
++        primary_thread_id: Option<ThreadId>,
+         direction: AgentNavigationDirection,
+     ) -> Option<ThreadId> {
+-        let ordered_threads = self.ordered_threads();
++        let ordered_threads = self
++            .ordered_threads()
++            .into_iter()
++            .filter(|(thread_id, entry)| {
++                Some(*thread_id) == primary_thread_id
++                    || (entry.is_running
++                        && !entry.is_closed
++                        && entry
++                            .agent_path
++                            .as_deref()
++                            .is_some_and(|path| !path.trim().is_empty()))
++            })
++            .collect::<Vec<_>>();
+         if ordered_threads.len() < 2 {
+             return None;
+         }
+@@ -435,22 +448,72 @@ mod tests {
+ 
+     #[test]
+     fn adjacent_thread_id_wraps_in_spawn_order() {
+-        let (state, main_thread_id, first_agent_id, second_agent_id) = populated_state();
++        let (mut state, main_thread_id, first_agent_id, second_agent_id) = populated_state();
++        state.set_agent_path(first_agent_id, Some("/root/first".to_string()));
++        state.set_agent_path(second_agent_id, Some("/root/second".to_string()));
++        state.mark_running(first_agent_id);
++        state.mark_running(second_agent_id);
+ 
+         assert_eq!(
+-            state.adjacent_thread_id(Some(second_agent_id), AgentNavigationDirection::Next),
++            state.adjacent_thread_id(
++                Some(second_agent_id),
++                Some(main_thread_id),
++                AgentNavigationDirection::Next,
++            ),
+             Some(main_thread_id)
+         );
+         assert_eq!(
+-            state.adjacent_thread_id(Some(second_agent_id), AgentNavigationDirection::Previous),
++            state.adjacent_thread_id(
++                Some(second_agent_id),
++                Some(main_thread_id),
++                AgentNavigationDirection::Previous,
++            ),
+             Some(first_agent_id)
+         );
+         assert_eq!(
+-            state.adjacent_thread_id(Some(main_thread_id), AgentNavigationDirection::Previous),
++            state.adjacent_thread_id(
++                Some(main_thread_id),
++                Some(main_thread_id),
++                AgentNavigationDirection::Previous,
++            ),
+             Some(second_agent_id)
+         );
+     }
+ 
++    #[test]
++    fn adjacent_thread_id_skips_closed_stopped_and_unrelated_threads() {
++        let (mut state, main_thread_id, first_agent_id, second_agent_id) = populated_state();
++        let unrelated_thread_id = ThreadId::new();
++        state.set_agent_path(first_agent_id, Some("/root/first".to_string()));
++        state.mark_running(first_agent_id);
++        state.set_agent_path(second_agent_id, Some("/root/second".to_string()));
++        state.mark_closed(second_agent_id);
++        state.upsert(
++            unrelated_thread_id,
++            Some("unrelated".to_string()),
++            None,
++            /*is_closed*/ false,
++        );
++        state.mark_running(unrelated_thread_id);
++
++        assert_eq!(
++            state.adjacent_thread_id(
++                Some(main_thread_id),
++                Some(main_thread_id),
++                AgentNavigationDirection::Next,
++            ),
++            Some(first_agent_id)
++        );
++        assert_eq!(
++            state.adjacent_thread_id(
++                Some(first_agent_id),
++                Some(main_thread_id),
++                AgentNavigationDirection::Next,
++            ),
++            Some(main_thread_id)
++        );
++    }
++
+     #[test]
+     fn picker_subtitle_mentions_shortcuts() {
+         let previous: Span<'static> = previous_agent_shortcut().into();
+diff --git a/codex-rs/tui/src/app/background_requests.rs b/codex-rs/tui/src/app/background_requests.rs
+index 21a136ece1..f6f2c0a8b5 100644
+--- a/codex-rs/tui/src/app/background_requests.rs
++++ b/codex-rs/tui/src/app/background_requests.rs
+@@ -624,17 +624,7 @@ impl App {
+ 
+         let should_send = {
+             let mut guard = store.lock().await;
+-            guard
+-                .buffer
+-                .push_back(ThreadBufferedEvent::FeedbackSubmission(event.clone()));
+-            if guard.buffer.len() > guard.capacity
+-                && let Some(removed) = guard.buffer.pop_front()
+-                && let ThreadBufferedEvent::Request(request) = &removed
+-            {
+-                guard
+-                    .pending_interactive_replay
+-                    .note_evicted_server_request(request);
+-            }
++            guard.push_buffered_event(ThreadBufferedEvent::FeedbackSubmission(event.clone()));
+             guard.active
+         };
+ 
+diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
+index ca43f7fdff..793e219e02 100644
+--- a/codex-rs/tui/src/app/session_lifecycle.rs
++++ b/codex-rs/tui/src/app/session_lifecycle.rs
+@@ -4,6 +4,7 @@
+ //! resuming/forking saved sessions, replacing ChatWidget instances, and maintaining the agent picker
+ //! cache used for multi-agent navigation.
+ 
++use super::thread_routing::resume_history_load_summary;
+ use super::*;
+ use crate::app_server_session::source_agent_path;
+ use crate::app_server_session::thread_blocks_direct_input;
+@@ -24,6 +25,14 @@ pub(super) struct LoadedSubagentBackfill {
+     pub(super) refreshed_thread_ids: HashSet<ThreadId>,
+ }
+ 
++#[derive(Debug)]
++pub(super) struct ThreadSelectionHydration {
++    pub(super) live_attached: bool,
++    pub(super) history_window_metadata:
++        codex_app_server_protocol::ThreadResumeHistoryWindowMetadata,
++    pub(super) resume_elapsed: Option<std::time::Duration>,
++}
++
+ impl App {
+     pub(super) async fn open_agent_picker(&mut self, app_server: &mut AppServerSession) {
+         let backfill = self.backfill_loaded_subagent_threads(app_server).await;
+@@ -321,12 +330,8 @@ impl App {
+         &mut self,
+         app_server: &mut AppServerSession,
+         thread_id: ThreadId,
+-    ) -> Result<bool> {
+-        if self.thread_event_channels.contains_key(&thread_id) {
+-            return Ok(true);
+-        }
+-
+-        let (session, turns, live_attached) = match app_server
++    ) -> Result<ThreadSelectionHydration> {
++        let (session, turns, hydration) = match app_server
+             .resume_thread(self.config.clone(), thread_id, self.resume_model_settings())
+             .await
+         {
+@@ -334,7 +339,12 @@ impl App {
+                 if started.blocks_direct_input {
+                     self.agent_navigation.mark_parent_owned(thread_id);
+                 }
+-                (started.session, started.turns, true)
++                let hydration = ThreadSelectionHydration {
++                    live_attached: true,
++                    history_window_metadata: started.history_window_metadata,
++                    resume_elapsed: started.resume_elapsed,
++                };
++                (started.session, started.turns, hydration)
+             }
+             Err(resume_err) => {
+                 tracing::warn!(
+@@ -373,25 +383,37 @@ impl App {
+                 // `thread/read` can seed replay state, but it does not attach the app-server
+                 // listener that `thread/resume` establishes, so treat this path as replay-only.
+                 session.model.clear();
+-                (session, turns, false)
++                (
++                    session,
++                    turns,
++                    ThreadSelectionHydration {
++                        live_attached: false,
++                        history_window_metadata: Default::default(),
++                        resume_elapsed: None,
++                    },
++                )
+             }
+         };
+         let channel = self.ensure_thread_channel(thread_id);
+-        if !live_attached {
++        if !hydration.live_attached {
+             channel.mark_replay_only();
+         }
+         let mut store = channel.store.lock().await;
+         store.set_session(session, turns);
+-        Ok(live_attached)
++        store.rebase_buffer_after_session_refresh();
++        Ok(hydration)
+     }
+ 
+     /// Replaces the chat widget and re-seeds the new widget's collab metadata from the navigation
+     /// cache.
+     ///
+-    /// Thread switches reconstruct the `ChatWidget`, which loses the `collab_agent_metadata` map.
+-    /// This helper copies every known nickname/role from `AgentNavigationState` into the
+-    /// replacement widget so that replayed collab items render agent names immediately.
+-    pub(super) fn replace_chat_widget(&mut self, mut chat_widget: ChatWidget) {
++    /// Cold thread attachment reconstructs the `ChatWidget`; hot switching restores its cached
++    /// presentation through the same state-transfer boundary.
++    pub(super) fn replace_chat_widget(&mut self, chat_widget: ChatWidget) {
++        drop(self.swap_chat_widget(chat_widget));
++    }
++
++    fn swap_chat_widget(&mut self, mut chat_widget: ChatWidget) -> ChatWidget {
+         // Transfer the last-written terminal title to the replacement widget
+         // so it knows what OSC title is currently displayed. Without this, the
+         // new widget would redundantly clear and rewrite the same title, causing
+@@ -423,8 +445,9 @@ impl App {
+                 entry.agent_role.clone(),
+             );
+         }
+-        self.chat_widget = chat_widget;
++        let previous = std::mem::replace(&mut self.chat_widget, chat_widget);
+         self.sync_active_agent_label();
++        previous
+     }
+ 
+     pub(super) async fn select_agent_thread(
+@@ -454,34 +477,45 @@ impl App {
+             .get(&thread_id)
+             .is_some_and(|entry| entry.is_closed);
+         let mut attached_replay_only = false;
+-        if self.should_attach_live_thread_for_selection(thread_id) {
++        if !self.should_attach_live_thread_for_selection(thread_id)
++            && !self.thread_event_channels.contains_key(&thread_id)
++            && is_replay_only
++        {
++            self.chat_widget
++                .add_error_message(format!("Agent thread {thread_id} is no longer available."));
++            return Ok(());
++        }
++        let previous_thread_id = self.active_thread_id;
++        self.drain_active_thread_events(tui).await?;
++        self.freeze_active_thread_for_switch().await;
++        self.active_thread_id = None;
++
++        let hydration = if self.should_attach_live_thread_for_selection(thread_id) {
+             match self
+                 .attach_live_thread_for_selection(app_server, thread_id)
+                 .await
+             {
+-                Ok(live_attached) => {
+-                    attached_replay_only = !live_attached;
++                Ok(hydration) => {
++                    attached_replay_only = !hydration.live_attached;
+                     if attached_replay_only {
+                         is_replay_only = true;
+                     }
++                    Some(hydration)
+                 }
+                 Err(err) => {
+                     self.chat_widget.add_error_message(format!(
+                         "Failed to attach to agent thread {thread_id}: {err}"
+                     ));
++                    if let Some(previous_thread_id) = previous_thread_id {
++                        self.activate_thread_channel(previous_thread_id).await;
++                    }
+                     return Ok(());
+                 }
+             }
+-        } else if !self.thread_event_channels.contains_key(&thread_id) && is_replay_only {
+-            self.chat_widget
+-                .add_error_message(format!("Agent thread {thread_id} is no longer available."));
+-            return Ok(());
+-        }
+-        let previous_thread_id = self.active_thread_id;
+-        self.store_active_thread_receiver().await;
+-        self.active_thread_id = None;
+-        let Some((receiver, mut snapshot)) = self.activate_thread_for_replay(thread_id).await
+-        else {
++        } else {
++            None
++        };
++        let Some((receiver, snapshot)) = self.activate_thread_for_replay(thread_id).await else {
+             self.chat_widget
+                 .add_error_message(format!("Agent thread {thread_id} is already active."));
+             if let Some(previous_thread_id) = previous_thread_id {
+@@ -490,13 +524,6 @@ impl App {
+             return Ok(());
+         };
+ 
+-        self.refresh_snapshot_session_if_needed(
+-            app_server,
+-            thread_id,
+-            is_replay_only,
+-            &mut snapshot,
+-        )
+-        .await;
+         let blocks_direct_input = self.agent_navigation.is_parent_owned(thread_id);
+ 
+         self.active_thread_id = Some(thread_id);
+@@ -512,8 +539,23 @@ impl App {
+             self.chat_widget.set_parent_owned_thread();
+         }
+ 
++        let resume_history_summary = hydration.as_ref().and_then(|hydration| {
++            resume_history_load_summary(&snapshot.turns, hydration.history_window_metadata)
++        });
+         self.reset_for_thread_switch(tui)?;
+         self.replay_thread_snapshot(snapshot, !is_replay_only);
++        if let (Some(summary), Some(hydration)) = (resume_history_summary, hydration.as_ref()) {
++            self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
++                history_cell::ResumeHistoryLoadedSeparator::new(
++                    summary.messages,
++                    summary.turns,
++                    summary.app_server_turns,
++                    summary.loaded_context_windows,
++                    summary.omitted_context_windows,
++                    hydration.resume_elapsed,
++                ),
++            )));
++        }
+         if is_replay_only {
+             let message = if attached_replay_only {
+                 format!(
+@@ -531,7 +573,7 @@ impl App {
+     }
+ 
+     pub(super) fn should_attach_live_thread_for_selection(&self, thread_id: ThreadId) -> bool {
+-        !self.thread_event_channels.contains_key(&thread_id)
++        !self.side_threads.contains_key(&thread_id)
+             && self
+                 .agent_navigation
+                 .get(&thread_id)
+@@ -872,10 +914,11 @@ impl App {
+         direction: AgentNavigationDirection,
+     ) -> Option<ThreadId> {
+         let current_thread = self.current_displayed_thread_id();
+-        if let Some(thread_id) = self
+-            .agent_navigation
+-            .adjacent_thread_id(current_thread, direction)
+-        {
++        if let Some(thread_id) = self.agent_navigation.adjacent_thread_id(
++            current_thread,
++            self.primary_thread_id,
++            direction,
++        ) {
+             return Some(thread_id);
+         }
+ 
+@@ -891,8 +934,11 @@ impl App {
+         {
+             self.last_subagent_backfill_attempt = Some(primary_thread_id);
+         }
+-        self.agent_navigation
+-            .adjacent_thread_id(self.current_displayed_thread_id(), direction)
++        self.agent_navigation.adjacent_thread_id(
++            self.current_displayed_thread_id(),
++            self.primary_thread_id,
++            direction,
++        )
+     }
+ 
+     pub(super) fn fresh_session_config(&self) -> Config {
+diff --git a/codex-rs/tui/src/app/thread_events.rs b/codex-rs/tui/src/app/thread_events.rs
+index 27472880f3..9e54e997b7 100644
+--- a/codex-rs/tui/src/app/thread_events.rs
++++ b/codex-rs/tui/src/app/thread_events.rs
+@@ -158,27 +158,24 @@ impl ThreadEventStore {
+             return;
+         }
+ 
+-        self.buffer
+-            .push_back(ThreadBufferedEvent::Notification(notification.into_owned()));
+-        if self.buffer.len() > self.capacity
+-            && let Some(removed) = self.buffer.pop_front()
+-            && let ThreadBufferedEvent::Request(request) = &removed
+-        {
+-            self.pending_interactive_replay
+-                .note_evicted_server_request(request);
+-        }
++        self.push_buffered_event(ThreadBufferedEvent::Notification(notification.into_owned()));
+     }
+ 
+     pub(super) fn push_request(&mut self, request: ServerRequest) {
+         self.pending_interactive_replay
+             .note_server_request(&request);
+-        self.buffer.push_back(ThreadBufferedEvent::Request(request));
+-        if self.buffer.len() > self.capacity
+-            && let Some(removed) = self.buffer.pop_front()
+-            && let ThreadBufferedEvent::Request(request) = &removed
+-        {
+-            self.pending_interactive_replay
+-                .note_evicted_server_request(request);
++        self.push_buffered_event(ThreadBufferedEvent::Request(request));
++    }
++
++    pub(super) fn push_buffered_event(&mut self, event: ThreadBufferedEvent) {
++        self.buffer.push_back(event);
++        if self.buffer.len() > self.capacity {
++            if let Some(removed) = self.buffer.pop_front()
++                && let ThreadBufferedEvent::Request(request) = &removed
++            {
++                self.pending_interactive_replay
++                    .note_evicted_server_request(request);
++            }
+         }
+     }
+ 
+@@ -244,15 +241,15 @@ impl ThreadEventStore {
+             events: self
+                 .buffer
+                 .iter()
+-                .filter(|event| match event {
++                .filter_map(|event| match event {
+                     ThreadBufferedEvent::Request(request) => self
+                         .pending_interactive_replay
+-                        .should_replay_snapshot_request(request),
++                        .should_replay_snapshot_request(request)
++                        .then(|| event.clone()),
+                     ThreadBufferedEvent::Notification(_)
+                     | ThreadBufferedEvent::HistoryEntryResponse(_)
+-                    | ThreadBufferedEvent::FeedbackSubmission(_) => true,
++                    | ThreadBufferedEvent::FeedbackSubmission(_) => Some(event.clone()),
+                 })
+-                .cloned()
+                 .collect(),
+             input_state: self.input_state.clone(),
+         }
+diff --git a/codex-rs/tui/src/app/thread_routing.rs b/codex-rs/tui/src/app/thread_routing.rs
+index a4c409efab..70b3bf7687 100644
+--- a/codex-rs/tui/src/app/thread_routing.rs
++++ b/codex-rs/tui/src/app/thread_routing.rs
+@@ -13,15 +13,15 @@ use codex_app_server_protocol::TurnInterruptResponse;
+ use codex_app_server_protocol::WarningNotification;
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+-struct ResumeHistoryLoadSummary {
+-    messages: u64,
+-    turns: u64,
+-    app_server_turns: u64,
+-    loaded_context_windows: u64,
+-    omitted_context_windows: u64,
++pub(super) struct ResumeHistoryLoadSummary {
++    pub(super) messages: u64,
++    pub(super) turns: u64,
++    pub(super) app_server_turns: u64,
++    pub(super) loaded_context_windows: u64,
++    pub(super) omitted_context_windows: u64,
+ }
+ 
+-fn resume_history_load_summary(
++pub(super) fn resume_history_load_summary(
+     turns: &[Turn],
+     history_window_metadata: codex_app_server_protocol::ThreadResumeHistoryWindowMetadata,
+ ) -> Option<ResumeHistoryLoadSummary> {
+@@ -114,6 +114,7 @@ impl App {
+         self.refresh_pending_thread_approvals().await;
+     }
+ 
++    #[cfg(test)]
+     pub(super) async fn store_active_thread_receiver(&mut self) {
+         let Some(active_id) = self.active_thread_id else {
+             return;
+@@ -130,6 +131,38 @@ impl App {
+         }
+     }
+ 
++    pub(super) async fn freeze_active_thread_for_switch(&mut self) {
++        let Some(active_id) = self.active_thread_id else {
++            return;
++        };
++        let Some(mut receiver) = self.active_thread_rx.take() else {
++            return;
++        };
++        let Some(channel) = self.thread_event_channels.get_mut(&active_id) else {
++            return;
++        };
++        let drained = {
++            let mut store = channel.store.lock().await;
++            store.active = false;
++            let mut drained = Vec::new();
++            loop {
++                match receiver.try_recv() {
++                    Ok(event) => drained.push(event),
++                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
++                }
++            }
++            channel.receiver = Some(receiver);
++            drained
++        };
++        for event in drained {
++            self.handle_thread_event_now(event);
++        }
++        let input_state = self.chat_widget.capture_thread_input_state();
++        if let Some(channel) = self.thread_event_channels.get(&active_id) {
++            channel.store.lock().await.input_state = input_state;
++        }
++    }
++
+     pub(super) async fn activate_thread_for_replay(
+         &mut self,
+         thread_id: ThreadId,
+@@ -138,8 +171,7 @@ impl App {
+         let receiver = channel.receiver.take()?;
+         let mut store = channel.store.lock().await;
+         store.active = true;
+-        let snapshot = store.snapshot();
+-        Some((receiver, snapshot))
++        Some((receiver, store.snapshot()))
+     }
+ 
+     pub(super) async fn clear_active_thread(&mut self) {
+@@ -1241,17 +1273,7 @@ impl App {
+             // retaining another deep copy for thread replay only accumulates already-delivered
+             // history data. Inactive responses still need the buffer because they are not sent.
+             if !should_send || !matches!(&event, HistoryLookupResponse::Batch { .. }) {
+-                guard
+-                    .buffer
+-                    .push_back(ThreadBufferedEvent::HistoryEntryResponse(event.clone()));
+-                if guard.buffer.len() > guard.capacity
+-                    && let Some(removed) = guard.buffer.pop_front()
+-                    && let ThreadBufferedEvent::Request(request) = &removed
+-                {
+-                    guard
+-                        .pending_interactive_replay
+-                        .note_evicted_server_request(request);
+-                }
++                guard.push_buffered_event(ThreadBufferedEvent::HistoryEntryResponse(event.clone()));
+             }
+             should_send
+         };
+@@ -1429,70 +1451,6 @@ impl App {
+         Ok(())
+     }
+ 
+-    pub(super) async fn refresh_snapshot_session_if_needed(
+-        &mut self,
+-        app_server: &mut AppServerSession,
+-        thread_id: ThreadId,
+-        is_replay_only: bool,
+-        snapshot: &mut ThreadEventSnapshot,
+-    ) {
+-        if !self.should_refresh_snapshot_session(thread_id, is_replay_only, snapshot) {
+-            return;
+-        }
+-
+-        match app_server
+-            .resume_thread(self.config.clone(), thread_id, self.resume_model_settings())
+-            .await
+-        {
+-            Ok(started) => {
+-                self.apply_refreshed_snapshot_thread(thread_id, started, snapshot)
+-                    .await
+-            }
+-            Err(err) => {
+-                tracing::warn!(
+-                    thread_id = %thread_id,
+-                    error = %err,
+-                    "failed to refresh inferred thread session before replay"
+-                );
+-            }
+-        }
+-    }
+-
+-    pub(super) fn should_refresh_snapshot_session(
+-        &self,
+-        thread_id: ThreadId,
+-        is_replay_only: bool,
+-        snapshot: &ThreadEventSnapshot,
+-    ) -> bool {
+-        !is_replay_only
+-            && !self.side_threads.contains_key(&thread_id)
+-            && snapshot.session.as_ref().is_none_or(|session| {
+-                session.model.trim().is_empty() || session.rollout_path.is_none()
+-            })
+-    }
+-
+-    pub(super) async fn apply_refreshed_snapshot_thread(
+-        &mut self,
+-        thread_id: ThreadId,
+-        started: AppServerStartedThread,
+-        snapshot: &mut ThreadEventSnapshot,
+-    ) {
+-        if started.blocks_direct_input {
+-            self.agent_navigation.mark_parent_owned(thread_id);
+-        }
+-        let AppServerStartedThread { session, turns, .. } = started;
+-        if let Some(channel) = self.thread_event_channels.get(&thread_id) {
+-            let mut store = channel.store.lock().await;
+-            store.set_session(session.clone(), turns.clone());
+-            store.rebase_buffer_after_session_refresh();
+-        }
+-        snapshot.session = Some(session);
+-        snapshot.turns = turns;
+-        snapshot
+-            .events
+-            .retain(ThreadEventStore::event_survives_session_refresh);
+-    }
+-
+     /// Opens the `/agent` picker after refreshing cached labels for known threads.
+     ///
+     /// The picker state is derived from long-lived thread channels plus best-effort metadata
