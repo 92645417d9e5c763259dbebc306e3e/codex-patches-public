@@ -1,0 +1,860 @@
+diff --git a/codex-rs/tui/src/app/agent_status_feed_tests.rs b/codex-rs/tui/src/app/agent_status_feed_tests.rs
+index a197caeb04..fd136ec082 100644
+--- a/codex-rs/tui/src/app/agent_status_feed_tests.rs
++++ b/codex-rs/tui/src/app/agent_status_feed_tests.rs
+@@ -73,6 +73,7 @@ fn agent_status_uses_reasoning_summaries_only() {
+                 id: "reasoning-with-summary".to_string(),
+                 summary: vec!["safe summary".to_string()],
+                 content: vec!["hidden raw reasoning".to_string()],
++                reasoning_output_tokens: None,
+             },
+             thread_id: "thread-child".to_string(),
+             turn_id: "turn-1".to_string(),
+@@ -85,6 +86,7 @@ fn agent_status_uses_reasoning_summaries_only() {
+                 id: "reasoning-without-summary".to_string(),
+                 summary: Vec::new(),
+                 content: vec!["raw-only reasoning".to_string()],
++                reasoning_output_tokens: None,
+             },
+             thread_id: "thread-child".to_string(),
+             turn_id: "turn-1".to_string(),
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index 4993bdd198..83d23b0723 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -647,6 +647,8 @@ pub(crate) struct ChatWidget {
+     reasoning_header: Option<String>,
+     // Preserves reasoning-summary part boundaries for transcript-only recording.
+     reasoning_summary_parts: Vec<String>,
++    // Buffers every reasoning item in one model response until its exact usage arrives at the tail.
++    pending_atomic_reasoning_items: Vec<(String, Vec<String>)>,
+     status_state: StatusState,
+     review: ReviewState,
+     // Active hook runs render in a dedicated live cell so they can run alongside tools.
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index 478966ae6a..189bae304d 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -187,6 +187,7 @@ impl ChatWidget {
+             reasoning_buffer: String::new(),
+             reasoning_header: None,
+             reasoning_summary_parts: Vec::new(),
++            pending_atomic_reasoning_items: Vec::new(),
+             status_state: StatusState::default(),
+             review: ReviewState::default(),
+             active_hook_cell: None,
+diff --git a/codex-rs/tui/src/chatwidget/replay.rs b/codex-rs/tui/src/chatwidget/replay.rs
+index d97ba1c8fa..32769b5c67 100644
+--- a/codex-rs/tui/src/chatwidget/replay.rs
++++ b/codex-rs/tui/src/chatwidget/replay.rs
+@@ -39,6 +39,7 @@ impl ChatWidget {
+                 }
+                 self.replay_thread_item(item, turn_id.clone(), replay_kind);
+             }
++            self.flush_pending_atomic_reasoning_response(/*reasoning_output_tokens*/ None);
+             let status = if hidden_nested_review_turn {
+                 TurnStatus::Completed
+             } else {
+@@ -132,24 +133,26 @@ impl ChatWidget {
+             }
+             ThreadItem::Plan { text, .. } => self.on_plan_item_completed(text),
+             ThreadItem::Reasoning {
+-                summary, content, ..
++                id,
++                summary,
++                content,
++                reasoning_output_tokens,
+             } => {
+-                if from_replay {
+-                    let reasoning_parts = summary.into_iter().chain(
++                let reasoning_parts = summary
++                    .into_iter()
++                    .chain(
+                         self.config
+                             .show_raw_agent_reasoning
+                             .then_some(content)
+                             .into_iter()
+                             .flatten(),
+-                    );
+-                    for (index, delta) in reasoning_parts.enumerate() {
+-                        if index > 0 {
+-                            self.on_reasoning_section_break();
+-                        }
+-                        self.on_agent_reasoning_delta(delta);
+-                    }
+-                }
+-                self.on_agent_reasoning_final();
++                    )
++                    .collect();
++                self.on_agent_reasoning_item_completed(
++                    id,
++                    reasoning_parts,
++                    reasoning_output_tokens,
++                );
+             }
+             item @ ThreadItem::CommandExecution {
+                 status: codex_app_server_protocol::CommandExecutionStatus::InProgress,
+diff --git a/codex-rs/tui/src/chatwidget/streaming.rs b/codex-rs/tui/src/chatwidget/streaming.rs
+index 3ca4769f97..74543c9856 100644
+--- a/codex-rs/tui/src/chatwidget/streaming.rs
++++ b/codex-rs/tui/src/chatwidget/streaming.rs
+@@ -262,16 +262,17 @@ impl ChatWidget {
+             .or_else(|| extract_first_bold(&self.reasoning_buffer));
+     }
+ 
+-    pub(super) fn on_agent_reasoning_final(&mut self) {
+-        // At the end of a reasoning block, record transcript-only content.
+-        if !self.reasoning_buffer.is_empty() {
+-            self.reasoning_summary_parts
+-                .push(std::mem::take(&mut self.reasoning_buffer));
+-        }
+-        if !self.reasoning_summary_parts.is_empty() {
+-            let reasoning_parts = std::mem::take(&mut self.reasoning_summary_parts);
+-            let cell = history_cell::new_reasoning_summary_block(reasoning_parts, &self.config.cwd);
+-            self.add_boxed_history(cell);
++    pub(super) fn on_agent_reasoning_item_completed(
++        &mut self,
++        reasoning_item_id: String,
++        reasoning_parts: Vec<String>,
++        reasoning_output_tokens: Option<i64>,
++    ) {
++        self.pending_atomic_reasoning_items
++            .push((reasoning_item_id, reasoning_parts));
++        if let Some(reasoning_output_tokens) = reasoning_output_tokens.filter(|tokens| *tokens > 0)
++        {
++            self.flush_pending_atomic_reasoning_response(Some(reasoning_output_tokens));
+         }
+         self.reasoning_buffer.clear();
+         self.reasoning_header = None;
+@@ -279,6 +280,23 @@ impl ChatWidget {
+         self.request_redraw();
+     }
+ 
++    pub(super) fn flush_pending_atomic_reasoning_response(
++        &mut self,
++        reasoning_output_tokens: Option<i64>,
++    ) {
++        if self.pending_atomic_reasoning_items.is_empty() {
++            return;
++        }
++        let cells = history_cell::new_atomic_reasoning_response_blocks(
++            std::mem::take(&mut self.pending_atomic_reasoning_items),
++            &self.config.cwd,
++            reasoning_output_tokens,
++        );
++        for cell in cells {
++            self.add_boxed_history(cell);
++        }
++    }
++
+     pub(super) fn on_reasoning_section_break(&mut self) {
+         // Start a new reasoning block for header extraction and accumulate transcript.
+         if !self.reasoning_buffer.is_empty() {
+@@ -307,6 +325,7 @@ impl ChatWidget {
+         self.reasoning_buffer.clear();
+         self.reasoning_header = None;
+         self.reasoning_summary_parts.clear();
++        self.pending_atomic_reasoning_items.clear();
+         self.status_state.remember_retry_status_header();
+         self.bottom_pane.ensure_status_indicator();
+         self.status_state.model_output_run_state = ModelOutputRunState::Thinking;
+diff --git a/codex-rs/tui/src/chatwidget/tests/helpers.rs b/codex-rs/tui/src/chatwidget/tests/helpers.rs
+index 55259bff5c..f3f1644d44 100644
+--- a/codex-rs/tui/src/chatwidget/tests/helpers.rs
++++ b/codex-rs/tui/src/chatwidget/tests/helpers.rs
+@@ -583,6 +583,7 @@ pub(super) fn handle_agent_reasoning_final(chat: &mut ChatWidget) {
+                 id: "reasoning-1".to_string(),
+                 summary: Vec::new(),
+                 content: Vec::new(),
++                reasoning_output_tokens: Some(1),
+             },
+         }),
+         /*replay_kind*/ None,
+diff --git a/codex-rs/tui/src/chatwidget/tests/history_replay.rs b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
+index e83ac8b856..055cca4ee4 100644
+--- a/codex-rs/tui/src/chatwidget/tests/history_replay.rs
++++ b/codex-rs/tui/src/chatwidget/tests/history_replay.rs
+@@ -1047,6 +1047,7 @@ async fn replayed_reasoning_item_preserves_summary_parts_and_hides_raw_reasoning
+                 "**Checking tests**\n\n<!-- -->".to_string(),
+             ],
+             content: vec!["Raw reasoning".to_string()],
++            reasoning_output_tokens: Some(516),
+         },
+         "turn-1".to_string(),
+         ReplayKind::ThreadSnapshot,
+@@ -1058,7 +1059,7 @@ async fn replayed_reasoning_item_preserves_summary_parts_and_hides_raw_reasoning
+         }
+         other => panic!("expected InsertHistoryCell, got {other:?}"),
+     };
+-    assert_eq!(rendered, "▪ done\n");
++    assert_eq!(rendered, "▪ Plan ▪ 516 tokens\n  done\n");
+     assert!(!rendered.contains("Raw reasoning"));
+ }
+ 
+@@ -1095,17 +1096,16 @@ async fn replayed_reasoning_item_shows_raw_reasoning_when_enabled() {
+             id: "reasoning-1".to_string(),
+             summary: vec!["Summary only".to_string()],
+             content: vec!["Raw reasoning".to_string()],
++            reasoning_output_tokens: Some(516),
+         },
+         "turn-1".to_string(),
+         ReplayKind::ThreadSnapshot,
+     );
+ 
+-    let rendered = match rx.try_recv() {
+-        Ok(AppEvent::InsertHistoryCell(cell)) => {
+-            lines_to_single_string(&cell.transcript_lines(/*width*/ 80))
+-        }
+-        other => panic!("expected InsertHistoryCell, got {other:?}"),
+-    };
++    let rendered = drain_insert_history(&mut rx)
++        .into_iter()
++        .map(|lines| lines_to_single_string(&lines))
++        .collect::<String>();
+     assert!(rendered.contains("Raw reasoning"));
+ }
+ 
+@@ -1269,6 +1269,7 @@ async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
+                 id: "reasoning-1".to_string(),
+                 summary: vec!["Summary only".to_string()],
+                 content: Vec::new(),
++                reasoning_output_tokens: Some(516),
+             },
+         }),
+         /*replay_kind*/ None,
+@@ -1283,6 +1284,84 @@ async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
+     assert_eq!(rendered.matches("Summary only").count(), 1);
+ }
+ 
++#[tokio::test]
++async fn live_reasoning_response_waits_for_tail_usage_and_preserves_item_boundaries() {
++    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
++    chat.show_welcome_banner = false;
++
++    for (id, summary, reasoning_output_tokens) in [
++        (
++            "rs_first",
++            vec![
++                "**First head**",
++                "**First detail one**",
++                "**First detail two**",
++            ],
++            None,
++        ),
++        (
++            "rs_second",
++            vec![
++                "**Second head**",
++                "**Second detail one**",
++                "**Second detail two**",
++            ],
++            None,
++        ),
++        (
++            "rs_third",
++            vec![
++                "**Third head**",
++                "**Third detail one**",
++                "**Third detail two**",
++            ],
++            Some(1_402),
++        ),
++    ] {
++        chat.handle_server_notification(
++            ServerNotification::ItemCompleted(ItemCompletedNotification {
++                thread_id: "thread-1".to_string(),
++                turn_id: "turn-1".to_string(),
++                completed_at_ms: 0,
++                item: AppServerThreadItem::Reasoning {
++                    id: id.to_string(),
++                    summary: summary.into_iter().map(str::to_string).collect(),
++                    content: Vec::new(),
++                    reasoning_output_tokens,
++                },
++            }),
++            /*replay_kind*/ None,
++        );
++        if reasoning_output_tokens.is_none() {
++            assert!(drain_insert_history(&mut rx).is_empty());
++        }
++    }
++
++    let rendered = drain_insert_history(&mut rx)
++        .into_iter()
++        .flat_map(|lines| {
++            lines
++                .into_iter()
++                .map(|line| line.to_string())
++                .filter(|line| !line.is_empty())
++        })
++        .collect::<Vec<_>>();
++    assert_eq!(
++        rendered,
++        vec![
++            "▪ First head ▪ first ▪ 1,402 tokens",
++            "  First detail one",
++            "  First detail two",
++            "▪ Second head ▪ second",
++            "  Second detail one",
++            "  Second detail two",
++            "▪ Third head ▪ third",
++            "  Third detail one",
++            "  Third detail two",
++        ]
++    );
++}
++
+ #[tokio::test]
+ async fn live_reasoning_summary_drops_empty_parts_without_losing_content() {
+     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+@@ -1345,6 +1424,7 @@ async fn live_reasoning_summary_drops_empty_parts_without_losing_content() {
+                     "**Checking tests**\n\n<!-- -->".to_string(),
+                 ],
+                 content: Vec::new(),
++                reasoning_output_tokens: Some(516),
+             },
+         }),
+         /*replay_kind*/ None,
+@@ -1356,7 +1436,7 @@ async fn live_reasoning_summary_drops_empty_parts_without_losing_content() {
+         }
+         other => panic!("expected InsertHistoryCell, got {other:?}"),
+     };
+-    assert_eq!(rendered, "▪ done\n");
++    assert_eq!(rendered, "▪ Plan ▪ 516 tokens\n  done\n");
+ }
+ 
+ #[tokio::test]
+diff --git a/codex-rs/tui/src/chatwidget/turn_runtime.rs b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+index ba15071f5e..a81aefc893 100644
+--- a/codex-rs/tui/src/chatwidget/turn_runtime.rs
++++ b/codex-rs/tui/src/chatwidget/turn_runtime.rs
+@@ -99,6 +99,7 @@ impl ChatWidget {
+             self.refresh_status_surfaces();
+         }
+         self.reasoning_summary_parts.clear();
++        self.pending_atomic_reasoning_items.clear();
+         self.reasoning_buffer.clear();
+         self.reasoning_header = None;
+         self.set_ambient_pet_notification(
+diff --git a/codex-rs/tui/src/history_cell/messages.rs b/codex-rs/tui/src/history_cell/messages.rs
+index cb8b326c1f..347d78e5f9 100644
+--- a/codex-rs/tui/src/history_cell/messages.rs
++++ b/codex-rs/tui/src/history_cell/messages.rs
+@@ -315,6 +315,10 @@ pub(crate) struct ReasoningSummaryCell {
+     /// Session cwd used to render local file links inside the reasoning body.
+     cwd: PathBuf,
+     transcript_only: bool,
++    atomic: bool,
++    atomic_head: bool,
++    reasoning_item_id: Option<String>,
++    reasoning_output_tokens: Option<i64>,
+ }
+ 
+ impl ReasoningSummaryCell {
+@@ -326,6 +330,33 @@ impl ReasoningSummaryCell {
+             content,
+             cwd: cwd.to_path_buf(),
+             transcript_only,
++            atomic: false,
++            atomic_head: false,
++            reasoning_item_id: None,
++            reasoning_output_tokens: None,
++        }
++    }
++
++    pub(crate) fn new_atomic(
++        header: String,
++        content: String,
++        cwd: &Path,
++        reasoning_item_id: String,
++        reasoning_output_tokens: Option<i64>,
++        atomic_head: bool,
++    ) -> Self {
++        Self {
++            _header: header,
++            content,
++            cwd: cwd.to_path_buf(),
++            transcript_only: false,
++            atomic: true,
++            atomic_head,
++            reasoning_item_id: reasoning_item_id
++                .strip_prefix("rs_")
++                .filter(|item_id| !item_id.is_empty())
++                .map(ToOwned::to_owned),
++            reasoning_output_tokens,
+         }
+     }
+ 
+@@ -338,7 +369,7 @@ impl ReasoningSummaryCell {
+             &mut lines,
+         );
+         let summary_style = Style::default().dim().italic();
+-        let summary_lines = lines
++        let mut summary_lines = lines
+             .into_iter()
+             .map(|mut line| {
+                 line.spans = line
+@@ -349,11 +380,61 @@ impl ReasoningSummaryCell {
+                 line
+             })
+             .collect::<Vec<_>>();
++        if self.atomic {
++            if !self._header.is_empty() {
++                let header = self
++                    ._header
++                    .strip_prefix("**")
++                    .and_then(|header| header.strip_suffix("**"))
++                    .unwrap_or(self._header.as_str())
++                    .to_string();
++                summary_lines.insert(
++                    0,
++                    Line::from(Span::styled(
++                        header,
++                        summary_style.add_modifier(Modifier::BOLD),
++                    )),
++                );
++            }
++            let mut metadata = Vec::new();
++            if let Some(item_id) = self.reasoning_item_id.as_deref() {
++                metadata.push(Span::styled(
++                    item_id.to_string(),
++                    Style::default().fg(Color::DarkGray),
++                ));
++            }
++            if let Some(tokens) = self.reasoning_output_tokens {
++                if !metadata.is_empty() {
++                    metadata.push(Span::styled(" ▪ ", Style::default().dim()));
++                }
++                metadata.push(Span::styled(
++                    format!(
++                        "{} tokens",
++                        codex_protocol::num_format::format_with_separators(tokens)
++                    ),
++                    Style::default().fg(Color::Yellow),
++                ));
++            }
++            if !metadata.is_empty() {
++                if let Some(first_line) = summary_lines.first_mut() {
++                    first_line
++                        .spans
++                        .push(Span::styled(" ▪ ", Style::default().dim()));
++                    first_line.spans.extend(metadata);
++                } else {
++                    summary_lines.push(Line::from(metadata));
++                }
++            }
++        }
+ 
+         adaptive_wrap_lines(
+             &summary_lines,
+             RtOptions::new(width as usize)
+-                .initial_indent("▪ ".dim().into())
++                .initial_indent(if self.atomic_head {
++                    "▪ ".dim().into()
++                } else {
++                    "  ".into()
++                })
+                 .subsequent_indent("  ".into()),
+         )
+     }
+@@ -780,6 +861,83 @@ pub(crate) fn new_reasoning_summary_block(
+     ))
+ }
+ 
++pub(crate) fn new_atomic_reasoning_summary_blocks(
++    reasoning_parts: Vec<String>,
++    cwd: &Path,
++    reasoning_item_id: String,
++    reasoning_output_tokens: Option<i64>,
++) -> Vec<Box<dyn HistoryCell>> {
++    new_atomic_reasoning_response_blocks(
++        vec![(reasoning_item_id, reasoning_parts)],
++        cwd,
++        reasoning_output_tokens,
++    )
++}
++
++pub(crate) fn new_atomic_reasoning_response_blocks(
++    reasoning_items: Vec<(String, Vec<String>)>,
++    cwd: &Path,
++    reasoning_output_tokens: Option<i64>,
++) -> Vec<Box<dyn HistoryCell>> {
++    let mut response_usage = reasoning_output_tokens;
++    let mut cells: Vec<Box<dyn HistoryCell>> = Vec::new();
++    for (reasoning_item_id, reasoning_parts) in reasoning_items {
++        let mut blocks = split_atomic_reasoning_summary_parts(&reasoning_parts);
++        if blocks.is_empty() {
++            blocks.push(("[No reasoning summary]".to_string(), String::new()));
++        }
++        for (index, (header, content)) in blocks.into_iter().enumerate() {
++            let atomic_head = index == 0;
++            cells.push(Box::new(ReasoningSummaryCell::new_atomic(
++                header,
++                content,
++                cwd,
++                atomic_head
++                    .then(|| reasoning_item_id.clone())
++                    .unwrap_or_default(),
++                atomic_head.then(|| response_usage.take()).flatten(),
++                atomic_head,
++            )));
++        }
++    }
++    cells
++}
++
++fn split_atomic_reasoning_summary_parts(reasoning_parts: &[String]) -> Vec<(String, String)> {
++    let mut leading_empty_part_header = None;
++    let mut blocks = Vec::with_capacity(reasoning_parts.len());
++
++    for part in reasoning_parts {
++        let part = part.trim();
++        if part.is_empty() {
++            continue;
++        }
++        let header_end = part.strip_prefix("**").and_then(|after_open| {
++            after_open
++                .find("**")
++                .and_then(|close| (close > 0).then_some(close + 4))
++        });
++        let body = header_end.map_or(part, |header_end| &part[header_end..]);
++        if body.trim() == "<!-- -->" {
++            if blocks.is_empty()
++                && leading_empty_part_header.is_none()
++                && let Some(header_end) = header_end
++            {
++                leading_empty_part_header = Some(part[..header_end].to_string());
++            }
++            continue;
++        }
++        blocks.push(split_reasoning_summary_parts(&[part.to_string()]));
++    }
++
++    if blocks.is_empty()
++        && let Some(header) = leading_empty_part_header
++    {
++        blocks.push((header, String::new()));
++    }
++    blocks
++}
++
+ /// Split structured reasoning-summary parts into the status header and renderable content.
+ pub(crate) fn split_reasoning_summary_parts(reasoning_parts: &[String]) -> (String, String) {
+     let mut leading_empty_part_header = None;
+diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
+index 62d9f72fd3..b685110482 100644
+--- a/codex-rs/tui/src/history_cell/tests.rs
++++ b/codex-rs/tui/src/history_cell/tests.rs
+@@ -2494,6 +2494,191 @@ fn reasoning_summary_block() {
+     assert_eq!(rendered_transcript, vec!["▪ Detailed reasoning goes here."]);
+ }
+ 
++#[test]
++fn atomic_reasoning_item_renders_id_and_exact_usage_without_summary() {
++    let mut cells = new_atomic_reasoning_summary_blocks(
++        Vec::new(),
++        &test_cwd(),
++        "rs_abc123".to_string(),
++        Some(516),
++    );
++    let cell = cells.remove(0);
++
++    let lines = cell.transcript_lines(/*width*/ 80);
++    assert_eq!(
++        render_lines(&lines),
++        vec!["▪ [No reasoning summary] ▪ abc123 ▪ 516 tokens"]
++    );
++    assert_eq!(
++        lines[0]
++            .spans
++            .iter()
++            .find(|span| span.content == "abc123")
++            .and_then(|span| span.style.fg),
++        Some(Color::DarkGray)
++    );
++    assert_eq!(
++        lines[0]
++            .spans
++            .iter()
++            .find(|span| span.content == "516 tokens")
++            .and_then(|span| span.style.fg),
++        Some(Color::Yellow)
++    );
++    assert!(
++        lines[0]
++            .spans
++            .iter()
++            .filter(|span| span.content == " ▪ ")
++            .all(|span| span.style.add_modifier.contains(Modifier::DIM))
++    );
++}
++
++#[test]
++fn atomic_reasoning_item_without_item_owned_usage_renders_id_only() {
++    let mut cells = new_atomic_reasoning_summary_blocks(
++        vec!["**First item**\n\nPartial summary.".to_string()],
++        &test_cwd(),
++        "rs_first".to_string(),
++        None,
++    );
++    let cell = cells.remove(0);
++
++    let lines = cell.transcript_lines(/*width*/ 80);
++    assert_eq!(
++        render_lines(&lines),
++        vec!["▪ First item ▪ first", "  Partial summary."]
++    );
++    assert_eq!(
++        lines[0].spans.last().and_then(|span| span.style.fg),
++        Some(Color::DarkGray)
++    );
++}
++
++#[test]
++fn atomic_reasoning_item_appends_metadata_to_visible_summary() {
++    let mut cells = new_atomic_reasoning_summary_blocks(
++        vec!["**Planning**\n\nInspect the response.".to_string()],
++        &test_cwd(),
++        "rs_abc123".to_string(),
++        Some(1_024),
++    );
++    let cell = cells.remove(0);
++
++    let lines = cell.transcript_lines(/*width*/ 120);
++    assert_eq!(
++        render_lines(&lines),
++        vec![
++            "▪ Planning ▪ abc123 ▪ 1,024 tokens",
++            "  Inspect the response."
++        ]
++    );
++    let span_count = lines[0].spans.len();
++    assert_eq!(
++        lines[0].spans[span_count - 3].style.fg,
++        Some(Color::DarkGray)
++    );
++    assert_eq!(lines[0].spans[span_count - 1].style.fg, Some(Color::Yellow));
++}
++
++#[test]
++fn atomic_reasoning_item_hides_synthetic_id_without_hiding_exact_usage() {
++    let mut cells = new_atomic_reasoning_summary_blocks(
++        vec!["**Recovered item**".to_string()],
++        &test_cwd(),
++        "item-42".to_string(),
++        Some(37),
++    );
++    let cell = cells.remove(0);
++
++    let lines = cell.transcript_lines(/*width*/ 80);
++    assert_eq!(render_lines(&lines), vec!["▪ Recovered item ▪ 37 tokens"]);
++    assert_eq!(
++        lines[0].spans.last().and_then(|span| span.style.fg),
++        Some(Color::Yellow)
++    );
++}
++
++#[test]
++fn atomic_reasoning_item_preserves_independent_summary_part_boundaries() {
++    let cells = new_atomic_reasoning_summary_blocks(
++        vec![
++            "**Planning focused testing and formatting**".to_string(),
++            "**Configuring test environment and filtering**".to_string(),
++        ],
++        &test_cwd(),
++        "rs_abc123".to_string(),
++        Some(173),
++    );
++
++    assert_eq!(cells.len(), 2);
++    assert_eq!(
++        render_transcript(cells[0].as_ref()),
++        vec!["▪ Planning focused testing and formatting ▪ abc123 ▪ 173 tokens"]
++    );
++    assert_eq!(
++        render_transcript(cells[1].as_ref()),
++        vec!["  Configuring test environment and filtering"]
++    );
++}
++
++#[test]
++fn atomic_reasoning_response_groups_parts_under_three_item_identities() {
++    let cells = new_atomic_reasoning_response_blocks(
++        vec![
++            (
++                "rs_first".to_string(),
++                vec![
++                    "**Distinguishing source changes from installed binary**".to_string(),
++                    "**Reviewing current improvements before committing**".to_string(),
++                    "**Preparing concise commentary for observation**".to_string(),
++                ],
++            ),
++            (
++                "rs_second".to_string(),
++                vec![
++                    "**Planning chain grouping implementation**".to_string(),
++                    "**Designing buffering and flushing logic**".to_string(),
++                    "**Defining PendingAtomicReasoningItem structure**".to_string(),
++                ],
++            ),
++            (
++                "rs_third".to_string(),
++                vec![
++                    "**Designing atomic reasoning response builder**".to_string(),
++                    "**Assessing replay preorganization scope**".to_string(),
++                    "**Outlining replay grouping plan**".to_string(),
++                ],
++            ),
++        ],
++        &test_cwd(),
++        Some(1_402),
++    );
++
++    let rendered = cells
++        .iter()
++        .flat_map(|cell| render_transcript(cell.as_ref()))
++        .collect::<Vec<_>>();
++    assert_eq!(
++        rendered,
++        vec![
++            "▪ Distinguishing source changes from installed binary ▪ first ▪ 1,402 tokens",
++            "  Reviewing current improvements before committing",
++            "  Preparing concise commentary for observation",
++            "▪ Planning chain grouping implementation ▪ second",
++            "  Designing buffering and flushing logic",
++            "  Defining PendingAtomicReasoningItem structure",
++            "▪ Designing atomic reasoning response builder ▪ third",
++            "  Assessing replay preorganization scope",
++            "  Outlining replay grouping plan",
++        ]
++    );
++    assert_eq!(
++        rendered.iter().filter(|line| line.starts_with('▪')).count(),
++        3
++    );
++}
++
+ #[test]
+ fn reasoning_summary_height_matches_wrapped_rendering_for_url_like_content() {
+     let summary = "example.test/api/v1/projects/alpha-team/releases/2026-02-17/builds/1234567890/artifacts/reports/performance/summary/detail/with/a/very/long/path/that/keeps/going";
+diff --git a/codex-rs/tui/src/resume_picker.rs b/codex-rs/tui/src/resume_picker.rs
+index 1c0d6f3166..1d44f9fe6a 100644
+--- a/codex-rs/tui/src/resume_picker.rs
++++ b/codex-rs/tui/src/resume_picker.rs
+@@ -6407,6 +6407,7 @@ session_picker_view = "dense"
+                     id: String::from("reasoning-1"),
+                     summary: Vec::new(),
+                     content: vec![String::from("private raw chain of thought")],
++                    reasoning_output_tokens: None,
+                 }],
+                 status: codex_app_server_protocol::TurnStatus::Completed,
+                 error: None,
+@@ -6478,6 +6479,7 @@ session_picker_view = "dense"
+                     id: String::from("reasoning-1"),
+                     summary: vec![String::from("public summary")],
+                     content: vec![String::from("raw reasoning content")],
++                    reasoning_output_tokens: None,
+                 }],
+                 status: codex_app_server_protocol::TurnStatus::Completed,
+                 error: None,
+diff --git a/codex-rs/tui/src/thread_transcript.rs b/codex-rs/tui/src/thread_transcript.rs
+index c3f9a99872..bcce4a5a85 100644
+--- a/codex-rs/tui/src/thread_transcript.rs
++++ b/codex-rs/tui/src/thread_transcript.rs
+@@ -11,10 +11,8 @@ use crate::history_cell::AgentMarkdownCell;
+ use crate::history_cell::AgentMessageChannel;
+ use crate::history_cell::HistoryCell;
+ use crate::history_cell::PlainHistoryCell;
+-use crate::history_cell::ReasoningSummaryCell;
+ use crate::history_cell::UserHistoryCell;
+ use crate::history_cell::UserPromptIdentity;
+-use crate::history_cell::split_reasoning_summary_parts;
+ use crate::inline_visualization::InlineVisualizationContext;
+ use crate::multi_agents::sub_agent_activity_summary;
+ use codex_app_server_protocol::Thread;
+@@ -65,6 +63,7 @@ pub(crate) fn thread_to_transcript_cells(
+     for turn in thread.turns {
+         let turn_id = turn.id;
+         let mut initial_user_prompt = true;
++        let mut pending_reasoning_items = Vec::new();
+         for item in turn.items {
+             match item {
+                 ThreadItem::UserMessage {
+@@ -130,23 +129,27 @@ pub(crate) fn thread_to_transcript_cells(
+                     }
+                 }
+                 ThreadItem::Reasoning {
+-                    summary, content, ..
++                    id,
++                    summary,
++                    content,
++                    reasoning_output_tokens,
+                 } => {
+-                    let (header, text) =
++                    let parts =
+                         if matches!(raw_reasoning_visibility, RawReasoningVisibility::Visible)
+                             && !content.is_empty()
+                         {
+-                            ("Reasoning".to_string(), content.join("\n\n"))
++                            vec![format!("**Reasoning**\n\n{}", content.join("\n\n"))]
+                         } else {
+-                            split_reasoning_summary_parts(&summary)
++                            summary
+                         };
+-                    if !text.trim().is_empty() {
+-                        cells.push(Arc::new(ReasoningSummaryCell::new(
+-                            header,
+-                            text,
++                    pending_reasoning_items.push((id, parts));
++                    if reasoning_output_tokens.is_some_and(|tokens| tokens > 0) {
++                        append_atomic_reasoning_response(
++                            &mut cells,
++                            &mut pending_reasoning_items,
+                             cwd.as_path(),
+-                            /*transcript_only*/ false,
+-                        )));
++                            reasoning_output_tokens,
++                        );
+                     }
+                 }
+                 other => {
+@@ -156,6 +159,12 @@ pub(crate) fn thread_to_transcript_cells(
+                 }
+             }
+         }
++        append_atomic_reasoning_response(
++            &mut cells,
++            &mut pending_reasoning_items,
++            cwd.as_path(),
++            /*reasoning_output_tokens*/ None,
++        );
+     }
+     if cells.is_empty() {
+         cells.push(Arc::new(PlainHistoryCell::new(vec![
+@@ -165,6 +174,26 @@ pub(crate) fn thread_to_transcript_cells(
+     cells
+ }
+ 
++fn append_atomic_reasoning_response(
++    cells: &mut TranscriptCells,
++    pending_reasoning_items: &mut Vec<(String, Vec<String>)>,
++    cwd: &std::path::Path,
++    reasoning_output_tokens: Option<i64>,
++) {
++    if pending_reasoning_items.is_empty() {
++        return;
++    }
++    cells.extend(
++        crate::history_cell::new_atomic_reasoning_response_blocks(
++            std::mem::take(pending_reasoning_items),
++            cwd,
++            reasoning_output_tokens,
++        )
++        .into_iter()
++        .map(Arc::from),
++    );
++}
++
+ fn take_user_prompt_identity(
+     initial_user_prompt: &mut bool,
+     turn_id: &str,

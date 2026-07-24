@@ -1,3 +1,77 @@
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor_tests.rs b/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
+index c5f707bd67..32c1da2dbe 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor_tests.rs
+@@ -324,6 +324,57 @@ mod thread_processor_behavior_tests {
+         assert_eq!(turns.last(), Some(&active_turn));
+     }
+ 
++    #[test]
++    fn bounded_active_turn_boundary_prevents_duplicate_resume_user_input() {
++        let persisted_items = vec![
++            RolloutItem::EventMsg(EventMsg::TurnStarted(
++                codex_protocol::protocol::TurnStartedEvent {
++                    turn_id: "live-turn".to_string(),
++                    trace_id: None,
++                    started_at: None,
++                    model_context_window: None,
++                    collaboration_mode_kind: Default::default(),
++                },
++            )),
++            RolloutItem::EventMsg(EventMsg::UserMessage(
++                codex_protocol::protocol::UserMessageEvent {
++                    client_id: None,
++                    message: "same user input".to_string(),
++                    images: None,
++                    local_images: Vec::new(),
++                    text_elements: Vec::new(),
++                    ..Default::default()
++                },
++            )),
++        ];
++        let active_turn = Turn {
++            id: "live-turn".to_string(),
++            items: vec![ThreadItem::UserMessage {
++                id: "canonical-user-message".to_string(),
++                client_id: None,
++                content: vec![V2UserInput::Text {
++                    text: "same user input".to_string(),
++                    text_elements: Vec::new(),
++                }],
++            }],
++            items_view: TurnItemsView::Full,
++            error: None,
++            status: TurnStatus::InProgress,
++            started_at: None,
++            completed_at: None,
++            duration_ms: None,
++        };
++
++        let turns = reconstruct_thread_turns_for_turns_list(
++            &persisted_items,
++            ThreadStatus::Idle,
++            /*has_live_running_thread*/ true,
++            Some(active_turn.clone()),
++        );
++
++        assert_eq!(turns, vec![active_turn]);
++    }
++
+     #[test]
+     fn validate_dynamic_tools_rejects_empty_namespace() {
+         let tools = vec![dynamic_tool(
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_resume.rs b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
+index d2105f5613..4959ecf8cf 100644
+--- a/codex-rs/app-server/tests/suite/v2/thread_resume.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
+@@ -213,6 +213,7 @@ async fn thread_resume_rejects_paginated_writer_owned_by_another_process() -> Re
+     let read_id = secondary
+         .send_thread_read_request(ThreadReadParams {
+             thread_id: thread.id.clone(),
++            history_window: None,
+             include_turns: false,
+         })
+         .await?;
 diff --git a/codex-rs/rollout/src/lib.rs b/codex-rs/rollout/src/lib.rs
 index 5a1f5fbe0c..3a1ebf5569 100644
 --- a/codex-rs/rollout/src/lib.rs
@@ -11,6 +85,68 @@ index 5a1f5fbe0c..3a1ebf5569 100644
  pub use reverse_jsonl_scanner::ReverseJsonlScanner;
  pub use reverse_jsonl_scanner::ScanOutcome;
  pub use rollout_reference_index::RolloutReferenceIndex;
+diff --git a/codex-rs/rollout/src/model_context.rs b/codex-rs/rollout/src/model_context.rs
+index 45fc5de6bf..0cb68e4bd3 100644
+--- a/codex-rs/rollout/src/model_context.rs
++++ b/codex-rs/rollout/src/model_context.rs
+@@ -4,6 +4,7 @@ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::InterAgentCommunication;
+ use codex_protocol::protocol::RolloutItem;
+ use codex_protocol::protocol::SessionMetaLine;
++use codex_protocol::protocol::TurnStartedEvent;
+ 
+ /// Whether a reverse model-context scan needs more rollout items.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -66,13 +67,35 @@ impl ModelContextScan {
+     /// Call this after the reader reaches the beginning of its source or after [`Self::push`]
+     /// returns [`ModelContextScanProgress::Complete`].
+     pub fn finish(mut self, session_meta: SessionMetaLine) -> Vec<RolloutItem> {
++        let bounded_cutoff = self.has_bounded_cutoff();
++        let synthetic_active_turn_id = (bounded_cutoff
++            && !self.saw_completed_turn_context
++            && self.active_segment.has_user_turn
++            && self.active_segment.has_turn_context)
++            .then(|| self.active_segment.turn_id.clone())
++            .flatten();
+         self.items_newest_first.reverse();
+-        if self.has_bounded_cutoff() {
++        if bounded_cutoff {
+             // A bounded scan stops before reaching the head. Prepend the separately loaded head
+             // SessionMeta, which remains canonical when copied fork history contains later
+             // metadata.
+             self.items_newest_first
+                 .insert(0, RolloutItem::SessionMeta(session_meta));
++            // A long active turn can begin far outside the bounded suffix. Reintroduce only its
++            // structural boundary so history projection and the in-memory active-turn snapshot
++            // use the same stable turn id. This event is not model-visible.
++            if let Some(turn_id) = synthetic_active_turn_id {
++                self.items_newest_first.insert(
++                    1,
++                    RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
++                        turn_id,
++                        trace_id: None,
++                        started_at: None,
++                        model_context_window: None,
++                        collaboration_mode_kind: Default::default(),
++                    })),
++                );
++            }
+         }
+         self.items_newest_first
+     }
+@@ -170,7 +193,11 @@ impl ModelContextScan {
+     }
+ 
+     fn has_bounded_cutoff(&self) -> bool {
+-        !self.must_scan_to_start && self.saw_compaction && self.saw_completed_turn_context
++        let current_segment_has_context =
++            self.active_segment.has_user_turn && self.active_segment.has_turn_context;
++        !self.must_scan_to_start
++            && self.saw_compaction
++            && (self.saw_completed_turn_context || current_segment_has_context)
+     }
+ }
+ 
 diff --git a/codex-rs/rollout/src/reverse_jsonl_scanner.rs b/codex-rs/rollout/src/reverse_jsonl_scanner.rs
 index cf6b6b8e9d..18c34742bf 100644
 --- a/codex-rs/rollout/src/reverse_jsonl_scanner.rs
@@ -433,10 +569,10 @@ index 69a677ff74..a8c39bacc6 100644
 +    Ok(false)
 +}
 diff --git a/codex-rs/thread-store/src/local/model_context_tests.rs b/codex-rs/thread-store/src/local/model_context_tests.rs
-index 6393b60134..03e44f6631 100644
+index 6393b60134..171a4584de 100644
 --- a/codex-rs/thread-store/src/local/model_context_tests.rs
 +++ b/codex-rs/thread-store/src/local/model_context_tests.rs
-@@ -170,6 +170,150 @@ async fn returns_scanned_full_history_at_bof_without_checkpoint() {
+@@ -170,6 +170,210 @@ async fn returns_scanned_full_history_at_bof_without_checkpoint() {
      assert_reverse_scan_matches_full_history(home.path(), path.as_path()).await;
  }
  
@@ -517,6 +653,66 @@ index 6393b60134..03e44f6631 100644
 +    assert!(
 +        matches!(context.items.first(), Some(RolloutItem::SessionMeta(meta)) if meta.meta.id == thread_id)
 +    );
++}
++
++#[tokio::test]
++async fn long_active_legacy_turn_with_recent_compaction_stays_within_scan_budget() {
++    let home = TempDir::new().expect("temp dir");
++    let uuid = Uuid::from_u128(/*v*/ 1105);
++    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
++    let path = write_session_file_with_history_mode(
++        home.path(),
++        "2025-01-03T13-02-04",
++        uuid,
++        ThreadHistoryMode::Legacy,
++    )
++    .expect("write legacy rollout");
++    let turn_id = "turn-long-active";
++    append_items(path.as_path(), [turn_started(turn_id)]);
++    let oversized_prefix = "x".repeat(256 * 1024);
++    for _ in 0..68 {
++        append_items(path.as_path(), [agent_message(&oversized_prefix)]);
++    }
++    append_items(
++        path.as_path(),
++        [
++            completed_user_message(turn_id, "latest steer"),
++            turn_context(home.path(), turn_id),
++            compacted("latest checkpoint", Some(Vec::new())),
++        ],
++    );
++    let source_len = std::fs::metadata(path.as_path())
++        .expect("rollout metadata")
++        .len();
++    assert!(source_len > LEGACY_MODEL_CONTEXT_MAX_BYTES);
++    let meta = codex_rollout::read_session_meta_line(path.as_path())
++        .await
++        .expect("read metadata");
++
++    let metrics = legacy_scan_metrics(path.as_path(), meta).expect("bounded legacy scan");
++    assert!(
++        metrics.bytes_read < LEGACY_MODEL_CONTEXT_MAX_BYTES,
++        "{metrics:?} of {source_len}"
++    );
++    let store = LocalThreadStore::new(test_config(home.path()), None);
++    let context = store
++        .load_latest_model_context(LoadThreadHistoryParams {
++            thread_id,
++            include_archived: false,
++        })
++        .await
++        .expect("load bounded active-turn context");
++    assert!(context.items.iter().any(|item| {
++        matches!(item, RolloutItem::Compacted(compacted) if compacted.message == "latest checkpoint")
++    }));
++    assert!(context.items.iter().any(|item| {
++        matches!(item, RolloutItem::TurnContext(context) if context.turn_id.as_deref() == Some(turn_id))
++    }));
++    assert!(matches!(
++        context.items.get(1),
++        Some(RolloutItem::EventMsg(EventMsg::TurnStarted(started)))
++            if started.turn_id == turn_id
++    ));
 +}
 +
 +#[tokio::test]
